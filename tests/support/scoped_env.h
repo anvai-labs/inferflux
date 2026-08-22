@@ -22,17 +22,20 @@ namespace test {
 class ScopedEnvVar {
 public:
   ScopedEnvVar(std::string name, std::string value) : name_(std::move(name)) {
-    const char *existing = std::getenv(name_.c_str());
-    if (existing != nullptr) {
-      had_original_ = true;
-      original_value_ = existing;
-    }
+    SaveOriginal();
     Set(value);
   }
 
-  // Overload accepting const char* for convenience.
+  // A null value means "temporarily unset", matching ScopedEnvVar call sites.
   ScopedEnvVar(std::string name, const char *value)
-      : ScopedEnvVar(std::move(name), std::string(value ? value : "")) {}
+      : name_(std::move(name)) {
+    SaveOriginal();
+    if (value) {
+      Set(value);
+    } else {
+      Unset();
+    }
+  }
 
   ~ScopedEnvVar() {
     if (had_original_) {
@@ -46,6 +49,14 @@ public:
   ScopedEnvVar &operator=(const ScopedEnvVar &) = delete;
 
 private:
+  void SaveOriginal() {
+    const char *existing = std::getenv(name_.c_str());
+    if (existing != nullptr) {
+      had_original_ = true;
+      original_value_ = existing;
+    }
+  }
+
   void Set(const std::string &value) {
 #ifdef _WIN32
     _putenv_s(name_.c_str(), value.c_str());

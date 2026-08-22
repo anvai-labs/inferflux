@@ -1,8 +1,8 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "runtime/backends/backend_factory.h"
-#include "runtime/backends/cuda/cuda_backend.h"
 #ifdef INFERFLUX_HAS_CUDA
+#include "runtime/backends/cuda/cuda_backend.h"
 #include "runtime/backends/cuda/inferflux_cuda_backend.h"
 #endif
 #include "runtime/backends/llama/llama_backend_traits.h"
@@ -55,7 +55,6 @@ TEST_CASE("BackendFactory cpu hint resolves to CPU backend",
   REQUIRE(selection.config.gpu_layers == 0);
   REQUIRE(selection.capabilities.supports_logprobs);
   REQUIRE(selection.capabilities.supports_structured_output);
-  REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
 }
 
 TEST_CASE("BackendFactory cuda hint resolves predictably",
@@ -86,7 +85,6 @@ TEST_CASE("BackendFactory cuda hint resolves predictably",
 #else
   REQUIRE(selection.backend_label == "llama_cpp_cpu");
   REQUIRE(selection.config.gpu_layers == 0);
-  REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
 #endif
 }
 
@@ -105,7 +103,6 @@ TEST_CASE(
 #else
   REQUIRE(selection.backend != nullptr);
   REQUIRE(selection.backend_label == "llama_cpp_cpu");
-  REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
 #endif
 
   BackendFactory::SetExposurePolicy({true, true});
@@ -139,7 +136,6 @@ TEST_CASE("BackendFactory explicit inferflux_cuda hint uses native or "
   REQUIRE(selection.provider == BackendProvider::kLlamaCpp);
   REQUIRE(selection.backend != nullptr);
   REQUIRE(selection.backend_label == "llama_cpp_cpu");
-  REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
   REQUIRE(selection.used_fallback);
   REQUIRE(selection.fallback_reason.find("explicitly requested") !=
           std::string::npos);

@@ -224,7 +224,11 @@ private:
   //   4. eviction_mutex_
   // Cross-component: HttpServer locks are never held when calling Scheduler.
   mutable std::mutex queue_mutex_;
-  std::condition_variable queue_cv_;
+  // Prefill and decode workers have disjoint wake predicates. Separate
+  // condition variables prevent a notification intended for one pool from
+  // waking the other pool and leaving the eligible worker asleep.
+  std::condition_variable prefill_cv_;
+  std::condition_variable decode_cv_;
   std::thread worker_;
   std::vector<std::thread> decode_workers_;
   bool use_decode_workers_{false};

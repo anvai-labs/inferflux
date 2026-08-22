@@ -21,6 +21,33 @@ spec.loader.exec_module(run_throughput_gate)
 
 class ThroughputGateContractTests(unittest.TestCase):
 
+  def test_http_post_json_reports_response_header_timeout_and_closes(self):
+    conn = mock.Mock()
+    conn.getresponse.side_effect = TimeoutError("timed out")
+    with mock.patch.object(run_throughput_gate.http.client, "HTTPConnection",
+                           return_value=conn):
+      with self.assertRaisesRegex(
+          RuntimeError, "failed awaiting response headers: TimeoutError"):
+        run_throughput_gate.http_post_json(
+            "127.0.0.1", 8080, "/v1/completions", {"prompt": "hi"},
+            timeout_s=1.0, api_key="")
+    conn.close.assert_called_once_with()
+
+  def test_http_post_json_reports_body_timeout_with_framing_and_closes(self):
+    response = mock.Mock(status=200)
+    response.getheader.return_value = "321"
+    response.read.side_effect = TimeoutError("timed out")
+    conn = mock.Mock()
+    conn.getresponse.return_value = response
+    with mock.patch.object(run_throughput_gate.http.client, "HTTPConnection",
+                           return_value=conn):
+      with self.assertRaisesRegex(
+          RuntimeError, "reading response body .*content_length=321.*TimeoutError"):
+        run_throughput_gate.http_post_json(
+            "127.0.0.1", 8080, "/v1/completions", {"prompt": "hi"},
+            timeout_s=1.0, api_key="")
+    conn.close.assert_called_once_with()
+
   def test_read_metric_max_picks_max_series_value(self):
     metrics_text = """
 inferflux_batch_size_max{backend="cpu"} 3
@@ -94,10 +121,23 @@ inferflux_batch_size_max{backend="cuda"} 7
             "--gpu-profile",
             "none",
             "--require-backend-provider",
-            "llama_cpp",
+            "universal",
         ]):
       args = run_throughput_gate.parse_args()
     self.assertEqual(args.require_backend_provider, "llama_cpp")
+
+  def test_parse_args_normalizes_native_provider_alias(self):
+    with mock.patch.object(
+        sys, "argv",
+        [
+            "run_throughput_gate.py",
+            "--gpu-profile",
+            "none",
+            "--require-backend-provider",
+            "native",
+        ]):
+      args = run_throughput_gate.parse_args()
+    self.assertEqual(args.require_backend_provider, "inferflux")
 
   def test_fetch_metrics_snapshot_reads_batching_metrics(self):
     metrics_text = """

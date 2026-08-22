@@ -179,10 +179,6 @@ void UnifiedBatchLaneDispatcher::WorkerLoop(bool decode_lane) {
       result.success = false;
       result.error = e.what();
       result.outputs.clear();
-    } catch (const std::exception &e) {
-      result.success = false;
-      result.error = std::string("lane worker error: ") + e.what();
-      result.outputs.clear();
     }
 
     std::lock_guard<std::mutex> lock(mutex_);

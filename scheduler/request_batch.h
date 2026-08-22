@@ -98,6 +98,8 @@ struct ExecutionState {
   bool initialized{false};
   bool active{true};
   int tokens_generated{0};
+  int non_emitting_steps{0};
+  int max_non_emitting_steps{32};
   int decode_limit{0};
   int current_token{-1};
   bool slice_active{false};

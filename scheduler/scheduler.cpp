@@ -343,6 +343,8 @@ void ResetUnifiedStepState(InferenceRequest *req) {
   req->execution.initialized = false;
   req->execution.active = true;
   req->execution.tokens_generated = 0;
+  req->execution.non_emitting_steps = 0;
+  req->execution.max_non_emitting_steps = 32;
   req->execution.decode_limit = 0;
   req->execution.current_token = -1;
   req->execution.slice_active = false;
@@ -372,6 +374,8 @@ void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
   req->execution.tokens_generated = prior_completion_tokens;
   req->execution.decode_limit =
       prior_completion_tokens + remaining_decode_tokens;
+  req->execution.max_non_emitting_steps =
+      std::max(req->max_tokens * 8, 32);
   req->execution.slice_active = true;
 
   if (req->n_past >= 0 && req->first_token >= 0) {
@@ -390,10 +394,14 @@ void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
         GlobalMetrics().RecordStreamTokens(1);
         req->on_token(emit_piece, nullptr);
       }
+    } else {
+      req->execution.non_emitting_steps++;
     }
 
     if (stop_hit ||
         (req->cancellation_flag && req->cancellation_flag->load()) ||
+        req->execution.non_emitting_steps >=
+            req->execution.max_non_emitting_steps ||
         req->execution.tokens_generated >= req->execution.decode_limit) {
       req->execution.active = false;
     }
@@ -578,7 +586,8 @@ Scheduler::~Scheduler() {
     std::lock_guard<std::mutex> lock(queue_mutex_);
     stop_ = true;
   }
-  queue_cv_.notify_all();
+  prefill_cv_.notify_all();
+  decode_cv_.notify_all();
   if (worker_.joinable()) {
     worker_.join();
   }
@@ -819,7 +828,7 @@ void Scheduler::DecodeWorkerLoop() {
         if (disagg_config_.kv_transport) {
           while (!stop_ && batch.empty() && pending_decode_.empty() &&
                  !has_transport_work()) {
-            queue_cv_.wait_for(lock, kDisaggTransportPollInterval);
+            decode_cv_.wait_for(lock, kDisaggTransportPollInterval);
           }
           if (!stop_ && batch.empty() && !pending_decode_.empty()) {
             const auto deadline =
@@ -835,17 +844,17 @@ void Scheduler::DecodeWorkerLoop() {
               if (std::chrono::steady_clock::now() >= deadline) {
                 break;
               }
-              queue_cv_.wait_for(lock, kDisaggTransportPollInterval);
+              decode_cv_.wait_for(lock, kDisaggTransportPollInterval);
             }
           }
         } else {
-          queue_cv_.wait(lock, has_work);
+          decode_cv_.wait(lock, has_work);
           if (!stop_ && batch.empty() && !pending_decode_.empty()) {
             const auto deadline =
                 std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(config_.batch_accumulation_ms);
             while (!stop_ && !has_min_decode_batch()) {
-              if (queue_cv_.wait_until(lock, deadline) ==
+              if (decode_cv_.wait_until(lock, deadline) ==
                   std::cv_status::timeout) {
                 break;
               }
@@ -855,10 +864,10 @@ void Scheduler::DecodeWorkerLoop() {
       } else if (disagg_config_.kv_transport) {
         while (!stop_ && batch.empty() && pending_decode_.empty() &&
                !has_transport_work()) {
-          queue_cv_.wait_for(lock, kDisaggTransportPollInterval);
+          decode_cv_.wait_for(lock, kDisaggTransportPollInterval);
         }
       } else {
-        queue_cv_.wait(lock, has_work);
+        decode_cv_.wait(lock, has_work);
       }
 
       if (stop_ && batch.empty() && pending_decode_.empty() &&
@@ -902,7 +911,7 @@ void Scheduler::DecodeWorkerLoop() {
           while (!stop_ && !has_transport_work() &&
                  !compatible_pending_decode() &&
                  std::chrono::steady_clock::now() < deadline) {
-            if (queue_cv_.wait_until(lock, deadline) ==
+            if (decode_cv_.wait_until(lock, deadline) ==
                 std::cv_status::timeout) {
               break;
             }
@@ -1363,7 +1372,7 @@ void Scheduler::DecodeWorkerLoop() {
         }
         UpdateQueueDepthLocked();
       }
-      queue_cv_.notify_one();
+      decode_cv_.notify_one();
     }
 
     if (!use_stepwise_decode) {
@@ -1408,7 +1417,7 @@ std::future<InferenceResult> Scheduler::Generate(InferenceRequest request) {
     pending_prefill_.push_back(pending);
     UpdateQueueDepthLocked();
   }
-  queue_cv_.notify_one();
+  prefill_cv_.notify_one();
   return future;
 }
 
@@ -1471,13 +1480,13 @@ void Scheduler::WorkerLoop() {
         };
 
         if (config_.batch_accumulation_ms > 0) {
-          queue_cv_.wait(lock, has_work);
+          prefill_cv_.wait(lock, has_work);
           if (!stop_) {
             const auto deadline =
                 std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(config_.batch_accumulation_ms);
             while (!stop_ && !has_min_batch()) {
-              if (queue_cv_.wait_until(lock, deadline) ==
+              if (prefill_cv_.wait_until(lock, deadline) ==
                   std::cv_status::timeout) {
                 break;
               }
@@ -1485,7 +1494,7 @@ void Scheduler::WorkerLoop() {
           }
         } else {
           // No batch accumulation: wait for any work immediately
-          queue_cv_.wait(lock, has_work);
+          prefill_cv_.wait(lock, has_work);
         }
 
         if (stop_ && pending_prefill_.empty() && pending_decode_.empty()) {
@@ -2133,7 +2142,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         pending_decode_.push_back(pending);
       }
       UpdateQueueDepthLocked();
-      queue_cv_.notify_one();
+      decode_cv_.notify_one();
     } else {
       for (auto &pending : staged_decode_worker) {
         pending->inference.phase = RequestPhase::kDecode;
@@ -2327,12 +2336,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       // foundation).
       if (static_cast<int>(inference->bpe_prompt_tokens.size()) >=
           kMinPrefixTokens) {
+        LogSequenceSlotEvent("prefix_donation_begin", *inference);
         if (cache_)
           cache_->AcquireBlocks(
               inference->block_table); // Node ownership (§P1b)
+        LogSequenceSlotEvent("prefix_donation_blocks_acquired", *inference);
         prefix_cache_->Insert(inference->bpe_prompt_tokens,
                               inference->block_table, inference->sequence_id,
                               pending->resolved_backend);
+        LogSequenceSlotEvent("prefix_donation_end", *inference);
         donated = true;
       }
     }
@@ -2351,11 +2363,13 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       // >= 1.
       if (cache_)
         cache_->ReleaseBlocksRef(inference->block_table);
+      LogSequenceSlotEvent("scheduler_blocks_released", *inference);
       inference->block_table.clear();
       ResetSequenceLease(inference);
     }
     inference->phase = RequestPhase::kFinished;
     pending->promise.set_value(std::move(result));
+    LogSequenceSlotEvent("promise_completed", *inference);
   }
 
   if (!requeue.empty()) {
@@ -2366,7 +2380,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       }
       UpdateQueueDepthLocked();
     }
-    queue_cv_.notify_one();
+    prefill_cv_.notify_one();
   }
   auto batch_exec_end = std::chrono::steady_clock::now();
   double exec_ms =
@@ -2545,7 +2559,15 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
   }
 
   if (generation != 0 && backend) {
+    LogSequenceSlotEvent("backend_release_begin", /*request_id=*/-1, slot,
+                         generation, RequestPhase::kFinished,
+                         /*n_past=*/-1, /*remaining_decode_tokens=*/-1,
+                         backend->Name());
     auto fence = backend->BeginFreeSequence(slot);
+    LogSequenceSlotEvent("backend_release_end", /*request_id=*/-1, slot,
+                         generation, RequestPhase::kFinished,
+                         /*n_past=*/-1, /*remaining_decode_tokens=*/-1,
+                         backend->Name());
     if (fence.pending) {
       const scheduler::SequenceLease lease{slot, generation, -1};
       const bool retired = slot_manager_->RetireLease(
