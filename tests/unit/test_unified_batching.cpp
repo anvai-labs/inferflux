@@ -224,6 +224,12 @@ public:
     plans_[sequence_id].outputs = std::deque<UnifiedBatchOutput>(outputs);
   }
 
+  void SetSequencePlan(int sequence_id,
+                       const std::vector<UnifiedBatchOutput> &outputs) {
+    plans_[sequence_id].outputs =
+        std::deque<UnifiedBatchOutput>(outputs.begin(), outputs.end());
+  }
+
   UnifiedBatchHandle
   SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,
                           UnifiedBatchLane) override {
@@ -1194,6 +1200,50 @@ TEST_CASE("BatchExecutor ignores invisible control-token steps in async phased "
   REQUIRE(req.fairness.total_completion_tokens == 2);
   REQUIRE(req.phase == RequestPhase::kFinished);
   REQUIRE(streamed == std::vector<std::string>{"A", "B"});
+}
+
+TEST_CASE("BatchExecutor bounds repeated non-emitting tokens in async phased "
+          "generation",
+          "[unified_batch]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr);
+  auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
+
+  LlamaCppBackend::UnifiedBatchOutput first;
+  first.token = 700;
+  first.piece = "A";
+  first.ok = true;
+  LlamaCppBackend::UnifiedBatchOutput control;
+  control.token = 151643;
+  control.piece = "";
+  control.ok = true;
+  std::vector<LlamaCppBackend::UnifiedBatchOutput> outputs{first};
+  outputs.insert(outputs.end(), 32, control);
+  backend->SetSequencePlan(304, outputs);
+
+  InferenceRequest req;
+  req.id = 4;
+  req.model = "mock";
+  req.phase = RequestPhase::kPrefill;
+  req.n_past = 0;
+  req.sequence_id = 304;
+  req.bpe_prompt_tokens = {1, 2};
+  req.max_tokens = 2;
+  req.block_table = {304};
+
+  RequestBatch batch;
+  batch.requests = {&req};
+  auto results = executor->ExecuteBatch(batch, {backend});
+
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].completion == "A");
+  REQUIRE(results[0].completion_tokens == 1);
+  REQUIRE(req.phase == RequestPhase::kFinished);
 }
 
 TEST_CASE(

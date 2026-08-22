@@ -1,0 +1,194 @@
+name: GPU Behavioral Gates
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/gpu-gates.yml'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'runtime/**'
+      - 'scheduler/**'
+      - 'server/**'
+      - 'model/**'
+      - 'tests/**'
+      - 'scripts/run_throughput_gate.py'
+      - 'config/server.cuda.yaml'
+      - 'config/server.rocm.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: inferflux-dual-gpu
+  cancel-in-progress: false
+
+env:
+  GPU_MODEL_PATH: ${{ vars.INFERFLUX_GPU_MODEL_PATH }}
+
+jobs:
+  cuda-runtime:
+    name: CUDA runtime gate (RTX 4000 Ada)
+    if: ${{ vars.INFERFLUX_ENABLE_DUAL_GPU_GATE == 'true' }}
+    runs-on: [self-hosted, linux, x64, gpu, cuda, rocm, dual-gpu]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout trusted main revision
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          clean: true
+
+      - name: Verify NVIDIA device and model
+        run: |
+          set -euo pipefail
+          nvidia-smi --query-gpu=name,memory.total,driver_version,compute_cap --format=csv,noheader
+          test -f "${GPU_MODEL_PATH}"
+
+      - name: Configure CUDA-only build
+        run: |
+          cmake -S . -B build-ci-cuda \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=89 \
+            -DENABLE_CUDA=ON \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF \
+            -DENABLE_SBOM=OFF
+
+      - name: Build CUDA contracts
+        run: >-
+          cmake --build build-ci-cuda -j$(nproc) --target
+          inferfluxd inferctl inferflux_tests inferflux_fused_kernel_tests
+
+      - name: Run CUDA unit and behavioral contracts
+        run: ctest --test-dir build-ci-cuda --output-on-failure --timeout 180
+
+      - name: Run CUDA model-backed gate
+        run: |
+          python3 scripts/run_throughput_gate.py \
+            --server-bin ./build-ci-cuda/inferfluxd \
+            --config config/server.cuda.yaml \
+            --host 127.0.0.1 \
+            --port 18081 \
+            --endpoint /v1/chat/completions \
+            --model gpu-ci-model \
+            --backend cuda \
+            --concurrency 8 \
+            --requests 32 \
+            --warmup-requests 4 \
+            --max-tokens 32 \
+            --mixed-prompt-workload \
+            --min-success-rate 1.0 \
+            --require-metrics \
+            --require-native-forward-passes \
+            --require-backend-provider inferflux \
+            --require-no-backend-fallback \
+            --expect-cuda-attention-kernel fa2 \
+            --max-cuda-attention-fallbacks 0 \
+            --server-log-path build-ci-cuda/gpu-gate-server.log \
+            --server-env "INFERFLUX_MODELS=id=gpu-ci-model,path=${GPU_MODEL_PATH},backend=cuda,default=true"
+
+      - name: Upload CUDA evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cuda-gate-${{ github.sha }}
+          path: build-ci-cuda/gpu-gate-server.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  rocm-runtime:
+    name: ROCm runtime gate (Radeon AI PRO R9700)
+    needs: cuda-runtime
+    if: ${{ always() && vars.INFERFLUX_ENABLE_DUAL_GPU_GATE == 'true' }}
+    runs-on: [self-hosted, linux, x64, gpu, cuda, rocm, dual-gpu]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout trusted main revision
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          clean: true
+
+      - name: Verify AMD device and model
+        run: |
+          set -euo pipefail
+          rocminfo | grep -A8 'Name:[[:space:]]*gfx1201'
+          test -f "${GPU_MODEL_PATH}"
+
+      - name: Configure ROCm-only build
+        run: |
+          cmake -S . -B build-ci-rocm \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DCMAKE_HIP_ARCHITECTURES=gfx1201 \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=ON \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF \
+            -DENABLE_SBOM=OFF
+
+      - name: Build ROCm contracts
+        run: cmake --build build-ci-rocm -j$(nproc) --target inferfluxd inferctl inferflux_tests
+
+      - name: Run ROCm unit and behavioral contracts
+        run: ctest --test-dir build-ci-rocm --output-on-failure --timeout 180
+
+      - name: Run ROCm model-backed behavioral gate
+        run: |
+          python3 scripts/run_throughput_gate.py \
+            --server-bin ./build-ci-rocm/inferfluxd \
+            --config config/server.rocm.yaml \
+            --host 127.0.0.1 \
+            --port 18082 \
+            --endpoint /v1/chat/completions \
+            --model gpu-ci-model \
+            --backend rocm \
+            --concurrency 4 \
+            --requests 16 \
+            --warmup-requests 2 \
+            --max-tokens 8 \
+            --request-timeout-sec 30 \
+            --min-success-rate 1.0 \
+            --require-metrics \
+            --require-backend-provider llama_cpp \
+            --require-no-backend-fallback \
+            --server-log-path build-ci-rocm/gpu-gate-server.log \
+            --server-env "INFERFLUX_MODELS=id=gpu-ci-model,path=${GPU_MODEL_PATH},backend=rocm,default=true"
+
+      - name: Upload ROCm evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rocm-gate-${{ github.sha }}
+          path: build-ci-rocm/gpu-gate-server.log
+          if-no-files-found: ignore
+          retention-days: 30
+
+  gpu-gate-result:
+    name: Dual-GPU gate result
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [cuda-runtime, rocm-runtime]
+    steps:
+      - name: Report staged or enforced state
+        env:
+          GATE_ENABLED: ${{ vars.INFERFLUX_ENABLE_DUAL_GPU_GATE }}
+          CUDA_RESULT: ${{ needs.cuda-runtime.result }}
+          ROCM_RESULT: ${{ needs.rocm-runtime.result }}
+        run: |
+          set -euo pipefail
+          if [ "${GATE_ENABLED}" != "true" ]; then
+            echo "Dual-GPU gate is staged; enable after the restricted runner is online."
+            exit 0
+          fi
+          test "${CUDA_RESULT}" = "success"
+          test "${ROCM_RESULT}" = "success"

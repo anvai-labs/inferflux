@@ -1,0 +1,12 @@
+self-hosted-runner:
+  labels:
+    - gpu
+    - cuda
+    - rocm
+    - dual-gpu
+    - rtx4000-ada
+    - radeon-ai-pro-r9700
+    - compute-89
+    - gfx1201
+    - gpu-20gb
+    - gpu-32gb

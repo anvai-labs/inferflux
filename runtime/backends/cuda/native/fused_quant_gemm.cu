@@ -2443,9 +2443,9 @@ bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
 
 bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1WithEpilogue(
     const QuantizedWeightInfo &gate_raw, const QuantizedWeightInfo &up_raw,
-    const void *act_q8_1, half *output, void *act_q8_1_out, int M, int N,
-    int K, cudaStream_t stream) {
-  if (!act_q8_1 || !output || M <= 0 || N <= 0 || K <= 0) {
+    const void *act_q8_1, half *output, void *act_q8_1_out, int M, int N, int K,
+    cudaStream_t stream) {
+  if (!act_q8_1 || !output || !act_q8_1_out || M <= 0 || N <= 0 || K <= 0) {
     return false;
   }
   if (!gate_raw.data || !up_raw.data) {
@@ -2456,50 +2456,23 @@ bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1WithEpilogue(
     return false;
   }
 
-  using namespace runtime::cuda::native;
-
-  // Dispatch the Q8_1 epilogue variant
-  const auto *gate_w = reinterpret_cast<const block_q4_k *>(gate_raw.data);
-  const auto *up_w = reinterpret_cast<const block_q4_k *>(up_raw.data);
-  const auto *act = reinterpret_cast<const block_q8_1 *>(act_q8_1);
-  auto *q8_out = reinterpret_cast<block_q8_1 *>(act_q8_1_out);
-
-  int ncols;
-  if (M <= 1)
-    ncols = 1;
-  else if (M <= 2)
-    ncols = 2;
-  else if (M <= 4)
-    ncols = 4;
-  else
-    ncols = 8;
-  const dim3 grid(N, (M + ncols - 1) / ncols);
-  const int threads = calc_mmvq_threads(ncols);
-  const dim3 block(threads);
-  switch (ncols) {
-  case 1:
-    inferflux_mmvq_q4k_fused_gate_up_silu_q81<1>
-        <<<grid, block, 0, stream>>>(gate_w, up_w, act, output, q8_out, N, K, M);
-    break;
-  case 2:
-    inferflux_mmvq_q4k_fused_gate_up_silu_q81<2>
-        <<<grid, block, 0, stream>>>(gate_w, up_w, act, output, q8_out, N, K, M);
-    break;
-  case 4:
-    inferflux_mmvq_q4k_fused_gate_up_silu_q81<4>
-        <<<grid, block, 0, stream>>>(gate_w, up_w, act, output, q8_out, N, K, M);
-    break;
-  case 8:
-    inferflux_mmvq_q4k_fused_gate_up_silu_q81<8>
-        <<<grid, block, 0, stream>>>(gate_w, up_w, act, output, q8_out, N, K, M);
-    break;
+  // Correct Q8_1 quantization needs one scale and sum across each 32-value
+  // block. The experimental single-kernel implementation assigns independent
+  // output columns to separate CUDA blocks, so it cannot safely finalize those
+  // shared values. Preserve the API's output contract with the validated
+  // two-kernel path until a cooperative block-level epilogue is implemented.
+  if (!FusedGateUpSiluGemvQ8_1(gate_raw, up_raw, act_q8_1, output, M, N, K,
+                               stream)) {
+    return false;
   }
+  QuantizeRowQ8_1(output, act_q8_1_out, M, N, stream);
 
   static bool logged = false;
   if (!logged) {
     logged = true;
     log::Info("fused_quant_gemm",
-              "Using fused gate+up+SiLU+Q8_1 epilogue Q4_K kernel (M=" +
+              "Using correctness-preserving gate+up+SiLU Q8_1 epilogue "
+              "fallback (M=" +
                   std::to_string(M) + ", N=" + std::to_string(N) +
                   ", K=" + std::to_string(K) + ")");
   }

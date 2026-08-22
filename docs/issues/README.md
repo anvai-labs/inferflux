@@ -2,6 +2,11 @@
 
 This directory contains one markdown file per issue-ready ticket.
 
+> These files are April 2026 import snapshots. Revalidate their status and
+> dependencies against the canonical [product roadmap](../Roadmap.md),
+> [feature index](../features/README.md), and
+> [technical-debt register](../technical-debt/README.md) before import.
+
 ## Suggested Bulk Import Command (GitHub CLI)
 
 ```bash

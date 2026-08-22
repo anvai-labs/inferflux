@@ -1,22 +1,54 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-InferFlux production code spans `runtime/` (device backends, paged KV, speculative decoding), `server/` (HTTP/auth/metrics), plus `scheduler/`, `policy/`, and `model/`, while `cli/` hosts the `inferctl` client. Deployment tooling sits in `docker/`, `charts/`, and `scripts/`; configs live under `config/`, docs under `docs/`, and tests in `tests/unit` with scenario scaffolds in `tests/integration`. Treat `external/` as pinned vendor drops managed through CMake.
+Production C++ lives in `runtime/` (backends, paged KV, decoding), `server/`
+(HTTP, auth, metrics), `scheduler/`, `policy/`, `model/`, and `cli/` (`inferctl`).
+Deployment assets are in `docker/`, `charts/`, and `scripts/`; configuration is
+under `config/`, documentation under `docs/`, and tests under `tests/unit` and
+`tests/integration`. Treat `external/` as pinned, read-only vendor code.
 
 ## Build, Test, and Development Commands
-- `./scripts/build.sh` configures CMake into `build/` and compiles `inferfluxd` plus `inferctl` with the CUDA/ROCm/MPS toggles declared at the top of `CMakeLists.txt`.
-- `cmake -S . -B build && cmake --build build -j` is the fastest incremental loop when iterating on a single component.
-- `./scripts/run_dev.sh --config config/server.yaml` starts the dev server with sample API keys and guardrail knobs.
-- `./build/inferctl chat --message 'user:Hello' --api-key dev-key-123 --stream` (or `... completion`) verifies the OpenAI-style endpoints once `INFERFLUX_MODEL_PATH` points at a GGUF.
+
+- `./scripts/build.sh` creates a release build in `build/`.
+- `cmake -S . -B build && cmake --build build -j` is the incremental loop.
+- `ctest --test-dir build --output-on-failure` runs configured tests.
+- `./scripts/run_dev.sh --config config/server.yaml` starts the dev server.
+- `./build/inferctl chat --message 'user:Hello' --api-key dev-key-123 --stream`
+  exercises the API after a model is configured.
+
+Set `INFERFLUX_MODEL_PATH` for model-backed tests. Prefer a clean GPU build after
+backend changes because WSL timestamps can preserve stale objects.
 
 ## Coding Style & Naming Conventions
-We target C++17, keep headers beside their `.cpp` implementations, and rely on RAII plus `std::unique_ptr` for ownership. Run `clang-format` (2-space indent, sorted includes) on touched files. File names and free functions use snake_case, public types adopt PascalCase (`SpeculativeDecoder`), constants start with `k` (`kLRU`), and member fields end in `_`. Keep helpers inside anonymous namespaces and ensure everything lives in the `inferflux` namespace.
+Use C++17, RAII, smart pointers, and the `inferflux` namespace. Apply
+`clang-format` with 2-space indentation and sorted includes. Use snake_case for
+files and functions, PascalCase for public types, `k`-prefixed constants, and
+trailing underscores for members. Keep helpers in anonymous namespaces.
 
 ## Testing Guidelines
-Catch2-based unit tests (see `tests/unit/test_tokenizer.cpp`) run through `ctest --test-dir build --output-on-failure`. Integration smoke tests for SSE, guardrails, and rate limiting run via `ctest -R IntegrationSSE --output-on-failure` and require `INFERFLUX_MODEL_PATH` plus `INFERCTL_API_KEY`. Name `TEST_CASE`s after observable behaviors, keep fixtures deterministic in `tests/data/`, and attach CLI or HTTP transcripts whenever you touch user-visible flows.
+Unit tests use Catch2. Name `TEST_CASE`s after observable behavior and keep data
+in `tests/data/` deterministic. Run focused tests with
+`./build/inferflux_tests "case name"` or `ctest -R StubIntegration`. Attach test,
+CLI, or HTTP evidence for user-visible changes; never claim GPU coverage from a
+compile-only job.
+
+## Trusted GPU Runner Operations
+Use only `aiserver1-dual-gpu` for CUDA/ROCm runtime gates; hosted runners handle
+non-GPU work. This WSL environment has no systemd bus, so after a host restart
+run `/home/vsingh/actions-runner-inferflux-gpu/run.sh` in a durable terminal.
+Verify it with `gh api orgs/anvai-labs/actions/runners/9054 --jq .status`. Do not
+rerun `config.sh` during normal startup or register a second agent. Follow
+`docs/GPU_CI_BOOTSTRAP.md` for recovery. Keep public-repository access and GPU
+gate variables disabled until the trusted `main` workflow is promoted.
 
 ## Commit & Pull Request Guidelines
-History favors short imperative subjects such as `Add Metal/MPS and BLAS acceleration toggles`; keep the first line under ~72 characters, mention the subsystem, and explain the rationale in the body. Each PR should link a tracking issue, summarize config/env changes, attach `ctest` (or equivalent manual) output, and update `README.md`, `docs/`, or deployment assets when knobs move. Include screenshots or curl transcripts for API changes.
+Use imperative subjects under about 72 characters and explain rationale in the
+body. PRs should link an issue, describe config/environment changes, include test
+output, and update relevant docs or deployment assets. Add screenshots or curl
+transcripts for API changes.
 
 ## Security & Configuration Tips
-Never commit real API keys or passphrases into `config/`; rely on env vars such as `INFERFLUX_POLICY_PASSPHRASE`, `INFERCTL_API_KEY`, and `INFERFLUX_RATE_LIMIT_PER_MINUTE`. When modifying guardrail, auth, or audit paths (`policy/`, `server/auth/`, `server/logging/`), confirm `logs/audit.log` remains writable, document RBAC impacts, and describe rollback steps in the PR.
+Never commit keys or passphrases; use `INFERCTL_API_KEY`,
+`INFERFLUX_POLICY_PASSPHRASE`, and related environment variables. For auth,
+policy, or audit changes, verify `logs/audit.log`, document RBAC impact, and
+include rollback instructions.

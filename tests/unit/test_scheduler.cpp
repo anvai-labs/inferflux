@@ -933,8 +933,7 @@ TEST_CASE("Scheduler routes decode-ready prefill requests directly to decode",
   REQUIRE(backend->DecodeSubmissions() > 0);
 }
 
-TEST_CASE("Scheduler opportunistically accumulates decode batches when "
-          "min_batch_size is one",
+TEST_CASE("Scheduler accumulates decode batches up to min_batch_size",
           "[scheduler]") {
   SimpleTokenizer tokenizer;
   auto device = std::make_shared<CPUDeviceContext>();
@@ -952,7 +951,7 @@ TEST_CASE("Scheduler opportunistically accumulates decode batches when "
 
   Scheduler::Config scheduler_config;
   scheduler_config.max_batch_size = 4;
-  scheduler_config.min_batch_size = 1;
+  scheduler_config.min_batch_size = 2;
   scheduler_config.batch_accumulation_ms = 20;
 
   DisaggregatedConfig disagg_config;
@@ -983,6 +982,46 @@ TEST_CASE("Scheduler opportunistically accumulates decode batches when "
   const auto decode_batch_sizes = backend->DecodeBatchSizes();
   REQUIRE(std::any_of(decode_batch_sizes.begin(), decode_batch_sizes.end(),
                       [](int size) { return size >= 2; }));
+}
+
+TEST_CASE("Scheduler wakes the correct pool for sequential split requests",
+          "[scheduler][distributed]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      128, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<AsyncLaneStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "sequential-split-model";
+  info.path = "/tmp/sequential-split.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  Scheduler::Config scheduler_config;
+  scheduler_config.batch_accumulation_ms = 0;
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config, ModelSelectionOptions{},
+                      scheduler_config);
+
+  // A shared condition variable could wake the decode worker for new prefill
+  // work (or vice versa). Rapid concurrent submissions masked that defect, so
+  // exercise the user-visible sequential request pattern explicitly.
+  for (int i = 0; i < 32; ++i) {
+    InferenceRequest req;
+    req.model = info.id;
+    req.prompt = "sequential split request " + std::to_string(i);
+    req.max_tokens = 2;
+    auto future = scheduler.Generate(std::move(req));
+    REQUIRE(future.wait_for(std::chrono::milliseconds(500)) ==
+            std::future_status::ready);
+    REQUIRE_FALSE(future.get().no_backend);
+  }
 }
 
 TEST_CASE("Scheduler decode worker rebuilds stepwise decode cohorts",

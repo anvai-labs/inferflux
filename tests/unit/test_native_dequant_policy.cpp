@@ -7,8 +7,8 @@ namespace {
 
 class MockDequantPolicyLoader : public runtime::cuda::native::IModelLoader {
 public:
-  explicit MockDequantPolicyLoader(std::string format)
-      : format_(std::move(format)) {}
+  explicit MockDequantPolicyLoader(std::string format, bool has_cache = true)
+      : format_(std::move(format)), has_cache_(has_cache) {}
 
   bool Load(const std::filesystem::path &) override { return true; }
   const runtime::cuda::native::ModelInfo &GetModelInfo() const override {
@@ -31,8 +31,11 @@ public:
   GetDequantizedCachePolicy() const override {
     return policy_;
   }
-  void ClearDequantizedCache() override { ++clear_calls_; }
-  bool HasDequantizedCache() const override { return false; }
+  void ClearDequantizedCache() override {
+    ++clear_calls_;
+    has_cache_ = false;
+  }
+  bool HasDequantizedCache() const override { return has_cache_; }
   std::shared_ptr<runtime::cuda::native::IWeightAccessor>
   GetWeightAccessor(const std::string &) override {
     return nullptr;
@@ -46,6 +49,7 @@ private:
   runtime::cuda::native::ModelInfo model_info_{};
   runtime::cuda::native::DequantizedCachePolicy policy_{
       runtime::cuda::native::DequantizedCachePolicy::kNone};
+  bool has_cache_{true};
   int clear_calls_{0};
   int set_policy_calls_{0};
 };
@@ -129,6 +133,20 @@ TEST_CASE("InferfluxCudaExecutor retains dequant cache for model policy and "
       runtime::cuda::native::DequantizedCachePolicy::kNone;
   acc.ReleaseBatchScopedDequantizedCache();
   CHECK(safetensors_loader->clear_calls() == 0);
+}
+
+TEST_CASE("InferfluxCudaExecutor avoids cache cleanup when no dequantized "
+          "weights exist",
+          "[native_forward][dequant_policy]") {
+  InferfluxCudaExecutor executor;
+  ExecutorTestAccess acc(executor);
+
+  auto *loader = new MockDequantPolicyLoader("gguf", false);
+  acc.model_loader().reset(loader);
+  acc.dequantized_cache_policy() =
+      runtime::cuda::native::DequantizedCachePolicy::kBatchLifetime;
+  acc.ReleaseBatchScopedDequantizedCache();
+  CHECK(loader->clear_calls() == 0);
 }
 
 } // namespace inferflux

@@ -17,7 +17,8 @@ graph TD
     C --> C1[Architecture]
     C --> C2[Config Reference]
     C --> C3[Developer Guide]
-    C --> C4[Vision + PRD + Roadmap + TechDebt]
+    C --> C4[Vision + PRD + Product Roadmap]
+    C --> C6[ADRs + Features + Technical Debt]
     C --> C5[Modernization Audit]
 
     D --> D1[User Guide]
@@ -48,7 +49,12 @@ graph TD
 | Monitoring and tuning | [MONITORING](MONITORING.md) |
 | Archived throughput investigations | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) |
 | Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |
+| Trusted CUDA + ROCm runner setup | [GPU_CI_BOOTSTRAP](GPU_CI_BOOTSTRAP.md) |
 | Grades and execution plan | [Roadmap](Roadmap.md), [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
+| Dependency-ordered product/design plan | [Roadmap](Roadmap.md), [planning/PRINCIPLES_AND_PRIORITIZATION](planning/PRINCIPLES_AND_PRIORITIZATION.md) |
+| Architecture decisions | [adr/README](adr/README.md) |
+| Feature specifications | [features/README](features/README.md) |
+| Technical-debt register | [technical-debt/README](technical-debt/README.md) |
 | Modernization migration guide | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
 | Maintenance simplification review | [MAINTENANCE_REVIEW](MAINTENANCE_REVIEW.md) |
 | Competitive positioning | [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md) |

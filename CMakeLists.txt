@@ -391,7 +391,7 @@ if(ENABLE_ROCM)
   find_package(hipblas QUIET CONFIG PATHS /opt/rocm)
   if(hip_FOUND AND rocblas_FOUND AND hipblas_FOUND)
     message(STATUS "ROCm/HIP found: enabling ROCm build path")
-    set(LLAMA_HIP ON CACHE BOOL "" FORCE)
+    set(GGML_HIP ON CACHE BOOL "" FORCE)
     target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_ROCM=1)
     target_link_libraries(inferflux_core PUBLIC hip::host roc::rocblas roc::hipblas)
 
@@ -404,11 +404,13 @@ if(ENABLE_ROCM)
     if(ENABLE_ROCM)
       message(WARNING "ENABLE_ROCM=ON but ROCm toolkit not found; building without ROCm support")
     endif()
-    set(LLAMA_HIP OFF CACHE BOOL "" FORCE)
+    set(GGML_HIP OFF CACHE BOOL "" FORCE)
   endif()
+else()
+  set(GGML_HIP OFF CACHE BOOL "" FORCE)
 endif()
 
-if(TARGET CUDA::cudart AND LLAMA_HIP)
+if(ENABLE_CUDA AND CUDAToolkit_FOUND AND ENABLE_ROCM AND GGML_HIP)
   message(STATUS "Multi-backend build: CUDA + ROCm enabled simultaneously")
 endif()
 
@@ -492,9 +494,9 @@ set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
 # in WSL2, causing ggml_get_flags() to receive empty CCVER argument.
 # Disable ggml compiler warnings flags to skip the problematic detection path.
 set(GGML_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
-# NOTE: LLAMA_CUDA, LLAMA_METAL, and LLAMA_BLAS are set by the hardware-detection
-# blocks above.  Do NOT override them here — the former stale reset was a bug
-# that silently disabled GPU support even when CUDAToolkit was found.
+# NOTE: LLAMA_CUDA, GGML_HIP, LLAMA_METAL, and LLAMA_BLAS are set by the
+# hardware-detection blocks above. Do not override them here; stale resets can
+# silently disable an otherwise detected accelerator.
 add_subdirectory(external/llama.cpp EXCLUDE_FROM_ALL)
 target_link_libraries(inferflux_core PUBLIC llama)
 target_include_directories(inferflux_core PUBLIC
@@ -555,6 +557,10 @@ add_executable(inferfluxd server/main.cpp)
 if(MSVC)
   target_link_libraries(inferfluxd PRIVATE inferflux_core)
   target_link_options(inferfluxd PRIVATE /WHOLEARCHIVE:inferflux_core)
+elseif(APPLE)
+  target_link_libraries(inferfluxd PRIVATE inferflux_core)
+  target_link_options(inferfluxd PRIVATE
+    "LINKER:-force_load,$<TARGET_FILE:inferflux_core>")
 else()
   target_link_libraries(inferfluxd PRIVATE
     -Wl,--whole-archive inferflux_core -Wl,--no-whole-archive)
@@ -883,9 +889,9 @@ include(CPack)
 # ---------------------------------------------------------------------------
 # SBOM — generate CycloneDX / SPDX bill-of-materials after every build.
 #
-# The SBOM script (scripts/generate_sbom.py) walks the source tree for
-# vendored dependencies, reads their declared versions, and writes two
-# output files to ${CMAKE_BINARY_DIR}/sbom/:
+# The SBOM script (scripts/generate_sbom.py) reads the validated dependency
+# evidence in config/dependencies.json and writes two output files to
+# ${CMAKE_BINARY_DIR}/sbom/:
 #   inferflux-sbom.cdx.json   — CycloneDX 1.5 JSON (for supply-chain tooling)
 #   inferflux-sbom.spdx        — SPDX 2.3 tag-value (for license compliance)
 #
@@ -974,6 +980,7 @@ if(Python3_Interpreter_FOUND)
   # inject it as a ctest environment variable — this makes the tests work
   # regardless of whether the build directory is "build", "build-cov", etc.
   set(_INFERFLUX_SERVER_BIN "${CMAKE_BINARY_DIR}/inferfluxd")
+  set(_INFERCTL_BIN "${CMAKE_BINARY_DIR}/inferctl")
 
   # Focused throughput-gate contract tests (argument parsing + metrics parsing).
   add_test(
@@ -1004,7 +1011,8 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(StubIntegration PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
-    ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
+    ENVIRONMENT
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${_INFERCTL_BIN}")
 
   # Focused CLI contract gate: script-facing model-list output modes +
   # auth failure semantics.
@@ -1021,7 +1029,7 @@ if(Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
     ENVIRONMENT
-      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${_INFERCTL_BIN}")
 
   add_test(
     NAME IntegrationEmbeddingsRoutingContract
@@ -1053,7 +1061,7 @@ if(Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
     ENVIRONMENT
-      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${_INFERCTL_BIN}")
 
   # Focused CLI contract gate: strict fail-fast argument semantics for
   # automation-facing admin commands.
@@ -1104,7 +1112,7 @@ if(Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
     ENVIRONMENT
-      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${_INFERCTL_BIN}")
 
   add_test(
     NAME IntegrationCLIAdminPoolsContract
@@ -1113,7 +1121,7 @@ if(Python3_Interpreter_FOUND)
   set_tests_properties(IntegrationCLIAdminPoolsContract PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 30
-    ENVIRONMENT "INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
+    ENVIRONMENT "INFERCTL_BIN=${_INFERCTL_BIN}")
 
   # Native CUDA backend metrics contract (stub-mode: verifies metric names + format).
   add_test(NAME IntegrationNativeMetrics

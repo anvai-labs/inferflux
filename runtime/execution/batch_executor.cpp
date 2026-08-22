@@ -27,6 +27,8 @@ bool IsNonAccumulatingCompletion(std::string_view text) {
 
 bool IsVisibleGeneratedPiece(std::string_view piece) { return !piece.empty(); }
 
+int MaxNonEmittingSteps(int max_tokens) { return std::max(max_tokens * 8, 32); }
+
 bool HasValidUnifiedPhasedState(const InferenceRequest &req) {
   if (req.n_past < 0 || req.sequence_id < 0) {
     return false;
@@ -634,6 +636,8 @@ BatchExecutor::ExecuteBatchDecodePhased(
   struct ReqState {
     bool active{true};
     int tokens_generated{0};
+    int non_emitting_steps{0};
+    int max_non_emitting_steps{32};
     int decode_limit{0};
     int current_token{-1}; // token to feed in the next BatchDecodeStep
     bool slice_active{false};
@@ -668,6 +672,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
     if (limit <= 0)
       limit = 1;
     states[i].decode_limit = limit;
+    states[i].max_non_emitting_steps = MaxNonEmittingSteps(req->max_tokens);
     states[i].slice_active = (slice > 0) || (tuning_.decode_burst_tokens > 0);
 
     // Emit the first token (pre-sampled by Prefill while its logits were
@@ -693,6 +698,8 @@ BatchExecutor::ExecuteBatchDecodePhased(
             (req->cancellation_flag && req->cancellation_flag->load())) {
           states[i].active = false;
         }
+      } else {
+        states[i].non_emitting_steps++;
       }
     } else {
       // EOS at prefill time — nothing to generate.
@@ -756,6 +763,11 @@ BatchExecutor::ExecuteBatchDecodePhased(
             states[i].active = false;
           }
         }
+      } else if (++states[i].non_emitting_steps >=
+                 states[i].max_non_emitting_steps) {
+        states[i].active = false;
+        log::Warn("batch_executor",
+                  "phased decode stopped after too many non-emitting tokens");
       }
     }
   }
@@ -833,6 +845,8 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
   struct ReqState {
     bool active{true};
     int tokens_generated{0};
+    int non_emitting_steps{0};
+    int max_non_emitting_steps{32};
     int decode_limit{0};
     int current_token{-1};
     bool slice_active{false};
@@ -867,6 +881,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     if (limit <= 0)
       limit = 1;
     states[i].decode_limit = limit;
+    states[i].max_non_emitting_steps = MaxNonEmittingSteps(req->max_tokens);
     states[i].slice_active = (slice > 0) || (tuning_.decode_burst_tokens > 0);
 
     // If n_past is 0 and bpe_prompt_tokens is not empty, this is a fresh
@@ -895,6 +910,8 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
             (req->cancellation_flag && req->cancellation_flag->load())) {
           states[i].active = false;
         }
+      } else {
+        states[i].non_emitting_steps++;
       }
       LogUnifiedAssemblyState("seeded_decode", *req, piece, out.completion,
                               req->first_token, states[i].tokens_generated,
@@ -1123,6 +1140,12 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
             if (stop_hit) {
               states[i].active = false;
             }
+          } else if (++states[i].non_emitting_steps >=
+                     states[i].max_non_emitting_steps) {
+            states[i].active = false;
+            log::Warn(
+                "batch_executor",
+                "unified prefill stopped after too many non-emitting tokens");
           }
           LogUnifiedAssemblyState("prefill_emit", *req, piece,
                                   outcomes[i].result.completion, res.token,
@@ -1159,6 +1182,12 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
           if (stop_hit) {
             states[i].active = false;
           }
+        } else if (++states[i].non_emitting_steps >=
+                   states[i].max_non_emitting_steps) {
+          states[i].active = false;
+          log::Warn(
+              "batch_executor",
+              "unified decode stopped after too many non-emitting tokens");
         }
         LogUnifiedAssemblyState("decode_emit", *req, piece,
                                 outcomes[i].result.completion, res.token,
@@ -1371,6 +1400,12 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
                 burst_req->execution.active = false;
               }
             }
+          } else if (++burst_req->execution.non_emitting_steps >=
+                     burst_req->execution.max_non_emitting_steps) {
+            burst_req->execution.active = false;
+            log::Warn(
+                "batch_executor",
+                "unified burst stopped after too many non-emitting tokens");
           }
           if (stop_hit) {
             burst_req->execution.active = false;
@@ -1515,6 +1550,11 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
           }
           if (stop_hit)
             req->execution.active = false;
+        } else if (++req->execution.non_emitting_steps >=
+                   req->execution.max_non_emitting_steps) {
+          req->execution.active = false;
+          log::Warn("batch_executor", "unified prefill step stopped after too "
+                                      "many non-emitting tokens");
         }
         if (req->execution.tokens_generated >= req->execution.decode_limit) {
           req->execution.active = false;
@@ -1547,6 +1587,12 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
             req->execution.active = false;
           }
         }
+      } else if (++req->execution.non_emitting_steps >=
+                 req->execution.max_non_emitting_steps) {
+        req->execution.active = false;
+        log::Warn(
+            "batch_executor",
+            "unified decode step stopped after too many non-emitting tokens");
       }
       if (stop_hit)
         req->execution.active = false;

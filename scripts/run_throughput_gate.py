@@ -269,29 +269,69 @@ def selected_attention_kernel(metrics_text: str) -> str:
 def http_get(host: str, port: int, path: str, timeout_s: float,
              api_key: str) -> Tuple[int, str]:
   conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
-  headers = {}
+  # This harness creates a fresh HTTPConnection per request; explicitly close
+  # it so idle keep-alive sessions cannot occupy the server worker pool.
+  headers = {"Connection": "close"}
   if api_key:
     headers["Authorization"] = f"Bearer {api_key}"
-  conn.request("GET", path, headers=headers)
-  response = conn.getresponse()
-  body = response.read().decode("utf-8", errors="replace")
-  status = response.status
-  conn.close()
-  return status, body
+  try:
+    try:
+      conn.request("GET", path, headers=headers)
+    except Exception as exc:
+      raise RuntimeError(
+          f"HTTP GET {path} failed during request: "
+          f"{type(exc).__name__}: {exc}") from exc
+    try:
+      response = conn.getresponse()
+    except Exception as exc:
+      raise RuntimeError(
+          f"HTTP GET {path} failed awaiting response headers: "
+          f"{type(exc).__name__}: {exc}") from exc
+    try:
+      body = response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+      raise RuntimeError(
+          f"HTTP GET {path} failed reading response body "
+          f"(status={response.status}, content_length="
+          f"{response.getheader('Content-Length', 'unknown')}): "
+          f"{type(exc).__name__}: {exc}") from exc
+    return response.status, body
+  finally:
+    conn.close()
 
 
 def http_post_json(host: str, port: int, path: str, payload: Dict,
                    timeout_s: float, api_key: str) -> Tuple[int, str]:
   conn = http.client.HTTPConnection(host, port, timeout=timeout_s)
-  headers = {"Content-Type": "application/json"}
+  # This harness creates a fresh HTTPConnection per request; explicitly close
+  # it so idle keep-alive sessions cannot occupy the server worker pool.
+  headers = {"Content-Type": "application/json", "Connection": "close"}
   if api_key:
     headers["Authorization"] = f"Bearer {api_key}"
-  conn.request("POST", path, body=json.dumps(payload), headers=headers)
-  response = conn.getresponse()
-  body = response.read().decode("utf-8", errors="replace")
-  status = response.status
-  conn.close()
-  return status, body
+  try:
+    try:
+      conn.request("POST", path, body=json.dumps(payload), headers=headers)
+    except Exception as exc:
+      raise RuntimeError(
+          f"HTTP POST {path} failed during request: "
+          f"{type(exc).__name__}: {exc}") from exc
+    try:
+      response = conn.getresponse()
+    except Exception as exc:
+      raise RuntimeError(
+          f"HTTP POST {path} failed awaiting response headers: "
+          f"{type(exc).__name__}: {exc}") from exc
+    try:
+      body = response.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+      raise RuntimeError(
+          f"HTTP POST {path} failed reading response body "
+          f"(status={response.status}, content_length="
+          f"{response.getheader('Content-Length', 'unknown')}): "
+          f"{type(exc).__name__}: {exc}") from exc
+    return response.status, body
+  finally:
+    conn.close()
 
 
 def wait_for_server(host: str, port: int, timeout_s: float, api_key: str,
@@ -756,7 +796,8 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--require-cuda-lanes", action="store_true")
   parser.add_argument("--require-cuda-overlap", action="store_true")
   parser.add_argument("--require-backend-provider", default="any",
-                      choices=["any", "native", "llama_cpp", "universal"])
+                      choices=["any", "inferflux", "native", "llama_cpp",
+                               "universal"])
   parser.add_argument("--require-no-backend-fallback", action="store_true")
   parser.add_argument("--min-cuda-overlap-duration-ms", type=float, default=-1.0)
   parser.add_argument("--max-cuda-attention-fallbacks", type=float, default=-1.0)
@@ -822,6 +863,9 @@ def parse_args() -> argparse.Namespace:
   if args.require_backend_provider == "universal":
     # Backward-compatible alias for older automation.
     args.require_backend_provider = "llama_cpp"
+  elif args.require_backend_provider == "native":
+    # Backend exposure uses the canonical provider name "inferflux".
+    args.require_backend_provider = "inferflux"
   return apply_gpu_profile(args)
 
 

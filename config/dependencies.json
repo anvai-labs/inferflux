@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "dependencies": [
+    {
+      "name": "llama.cpp",
+      "version": "b8213",
+      "source_url": "https://github.com/ggml-org/llama.cpp",
+      "source_ref": "6c97bffd6508f4999d5bc292addd4f433a3648bc",
+      "source_digest": "git:6c97bffd6508f4999d5bc292addd4f433a3648bc",
+      "integration": "git-submodule",
+      "artifacts": [{"path": "external/llama.cpp"}],
+      "purl": "pkg:github/ggml-org/llama.cpp@6c97bffd6508f4999d5bc292addd4f433a3648bc",
+      "license": "MIT",
+      "owner": "Runtime",
+      "supported_toolchains": ["C++17 CPU", "CUDA 13.2 sm_89", "ROCm 7.2 gfx1201", "Metal/MPS"],
+      "upgrade_target": "v0.2.0 (bb4caa7540188872173c44d161602d9271386413)",
+      "rollback": "Restore the external/llama.cpp gitlink to source_ref and rebuild all provider lanes."
+    },
+    {
+      "name": "Catch2",
+      "version": "3.7.1",
+      "source_url": "https://github.com/catchorg/Catch2",
+      "source_ref": "v3.7.1 (fa43b77429ba76c462b1898d6cd2f2d7a9416b14)",
+      "source_digest": "git:fa43b77429ba76c462b1898d6cd2f2d7a9416b14",
+      "integration": "vendored-amalgamation",
+      "artifacts": [
+        {"path": "external/catch2/catch_amalgamated.hpp", "sha256": "91d47e2ddfb2949df22ff582d6c292554184da743e11d3811dcdd06b5b0a159b"},
+        {"path": "external/catch2/catch_amalgamated.cpp", "sha256": "450fc5f213a87668f0f48c91a2afa4f4226186fef453d36e6fa3bc184ccdb9ba"}
+      ],
+      "purl": "pkg:github/catchorg/Catch2@v3.7.1",
+      "license": "BSL-1.0",
+      "owner": "Test Infrastructure",
+      "supported_toolchains": ["C++17 CPU", "CUDA host compiler", "ROCm host compiler", "MSVC", "AppleClang"],
+      "upgrade_target": "v3.15.3",
+      "rollback": "Restore both amalgamated artifacts and their manifest hashes."
+    },
+    {
+      "name": "nlohmann-json",
+      "version": "3.11.3",
+      "source_url": "https://github.com/nlohmann/json",
+      "source_ref": "v3.11.3 (9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03)",
+      "source_digest": "git:9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+      "integration": "vendored-single-header",
+      "artifacts": [
+        {"path": "external/nlohmann/json.hpp", "sha256": "9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6"}
+      ],
+      "purl": "pkg:github/nlohmann/json@v3.11.3",
+      "license": "MIT",
+      "owner": "Runtime",
+      "supported_toolchains": ["C++17 CPU", "CUDA host compiler", "ROCm host compiler", "MSVC", "AppleClang"],
+      "upgrade_target": "v3.12.0",
+      "rollback": "Restore external/nlohmann/json.hpp and its manifest hash."
+    },
+    {
+      "name": "yaml-cpp",
+      "version": "2026-02-28",
+      "source_url": "https://github.com/jbeder/yaml-cpp",
+      "source_ref": "05c050c6c14d5c3a82cbc368b50d985896922196",
+      "source_digest": "git:05c050c6c14d5c3a82cbc368b50d985896922196",
+      "integration": "cmake-fetchcontent",
+      "artifacts": [],
+      "purl": "pkg:github/jbeder/yaml-cpp@05c050c6c14d5c3a82cbc368b50d985896922196",
+      "license": "MIT",
+      "owner": "Build",
+      "supported_toolchains": ["CMake 3.22+", "Linux", "Windows", "macOS"],
+      "upgrade_target": "hold; current pin is ahead of yaml-cpp 0.9.0",
+      "rollback": "Restore GIT_TAG in cmake/Dependencies.cmake to source_ref."
+    },
+    {
+      "name": "mlx-c",
+      "version": "0.5.0",
+      "source_url": "https://github.com/ml-explore/mlx-c",
+      "source_ref": "v0.5.0 (a1290d221f92bd020af805b7d14207eee4ec973b)",
+      "source_digest": "git:a1290d221f92bd020af805b7d14207eee4ec973b",
+      "integration": "cmake-fetchcontent-optional",
+      "artifacts": [],
+      "purl": "pkg:github/ml-explore/mlx-c@v0.5.0",
+      "license": "MIT",
+      "owner": "Apple Runtime",
+      "supported_toolchains": ["Apple Silicon", "macOS", "MLX 0.5.x"],
+      "upgrade_target": "v0.6.0",
+      "rollback": "Restore MLX_C_TAG to v0.5.0 and the matching Python MLX package."
+    },
+    {
+      "name": "OpenSSL",
+      "version": "system (libssl3)",
+      "source_url": "https://www.openssl.org",
+      "source_ref": "system-package",
+      "source_digest": "system-managed",
+      "integration": "system-dynamic-library",
+      "artifacts": [],
+      "purl": "pkg:generic/openssl",
+      "license": "Apache-2.0",
+      "owner": "Security",
+      "supported_toolchains": ["OpenSSL 3.x", "Linux", "Windows", "macOS"],
+      "upgrade_target": "test packaged minimum and current stable",
+      "rollback": "Use the platform-supported OpenSSL 3.x package; do not vendor."
+    }
+  ]
+}

@@ -1,67 +1,96 @@
-# InferFlux Roadmap
+# InferFlux Product and Design Roadmap
 
-**Snapshot date:** April 9, 2026
-**Current overall grade:** B+
-**Target overall grade:** A- after GPU CI lane and native structured output
+**Status:** Proposed for co-design
 
+**Planning epoch:** August 21, 2026
+
+**Horizon:** 16 engineering weeks; sequencing is a dependency model, not a delivery promise
+
+```mermaid
+flowchart LR
+  A[TD-001 Green baseline] --> B[TD-002 Required evidence gates]
+  B --> O[TD-006 Dependency/runtime currency]
+  O --> P[TD-007 Context and sequence capacity]
+  P --> C[ADR-0001 Runtime proof-or-pivot]
+  C --> D[TD-003 Reproducible runtime evidence]
+  D --> E[FTR-002 Agent contract]
+  E --> M[ADR-0003 Tenant boundary]
+  M --> F[FTR-003 Tenant-safe efficiency]
+  F --> G[FTR-004 SLO-aware operation]
+  G --> H[ADR-0004 Ownership model]
+  H --> N[TD-005 Ownership and dispatch debt]
+  N --> I[FTR-005 Distributed maturity]
+  A --> J[ADR-0002 Local transport]
+  J --> K[TD-004 CLI seams]
+  K --> L[FTR-001 One-command local UX]
 ```
-Trajectory: B- (Mar 31) → B+ (Apr 9)
 
-Completed since last snapshot:
-  ✓ inferflux_cuda at parity with llama.cpp at c=8 (1.02x)
-  ✓ 100% accuracy (chat template + repetition penalty)
-  ✓ 1.87x faster than Ollama, 2.23x faster than LM Studio
-  ✓ Design pattern audit (RAII, DIP, strategy, 0 bare catch)
-  ✓ CPU-only builds: 43/43 tests passing
-```
+## Outcomes We Work Backward From
 
-## 1) Grade Scorecard
+| Outcome | Release evidence |
+|---|---|
+| First useful response in under five minutes | Fresh-machine quickstart test and actionable failure diagnostics |
+| Trustworthy agent execution | Structured output/tool contract pass rate >=99% across supported providers |
+| Predictable cost and latency | TTFT, ITL, throughput, memory, cache isolation, and saturation gates |
+| Honest portability | Provider identity is explicit; unsupported behavior fails without silent fallback |
+| Scale without state corruption | One owner for sequence/KV state, idempotent cleanup, fault-injection proof |
 
-| Dimension | Current | Evidence in code today | Blocker to next grade |
+## Priority and Dependency Order
+
+| Order | Artifact | Why it is here | Exit gate |
 |---|---|---|---|
-| Throughput | B- | Native CUDA exceeds llama.cpp on single-sequence (~1.1x); MMQ accumulate kernels landed for M=9-64 (0ccbad3), CUDA graphs re-enabled on primary forward. March 31 baseline: c=1 65.6, c=4 148.3, c=8 174.6 tok/s | Residual c=8 instability (~75% pass rate) prevents a clean concurrent win claim |
-| Continuous batching | B- | Granular scheduler locks with fairness, prefix-affinity scoring, decode-worker pools, disaggregated KV channel; lane overlap race fixes (lane_overlap_mutex_) improved concurrent stability | Residual c=8 instability still not root-caused; sustained c>=8 wins require reliable pass rates |
-| Capability identity | A- | Provider/fallback identity is explicit across API, admin, CLI, and metrics | Some advanced behavior still depends on compatibility fallback |
-| Resource efficiency | B- | Memory-first GGUF direction, KV planner with multi-tier cache (GPU→host→disk), radix prefix cache, quantized execution are real | Native decode still spends too much work in its current down-proj kernels |
-| CI and release enforcement | B- | 827 unit + 137 integration tests, docs contract gate, SBOM generation | Required GPU/provider lane is still not a release blocker |
-| Distributed runtime | C+ | KV channel and SHM transport are production-tested, disaggregated health probes with timeout tracking, transport-aware readiness | Sequence ownership cleanup and worker-loss handling still need hardening |
-| OSS release readiness | B | Canonical docs, release process, SBOM, CI contract gates, and conventional OSS metadata (LICENSE, CONTRIBUTING, SECURITY, CODE_OF_CONDUCT) are in place | Release surface still needs tighter benchmark/doc hygiene and stronger GPU validation |
+| 1 | [TD-001](technical-debt/TD-001-green-mainline-baseline.md) | Every later claim depends on a reproducible baseline | CPU build and all model-free tests pass from a non-default build directory |
+| 2 | [TD-002](technical-debt/TD-002-required-evidence-gates.md) | Prevents correctness and performance regressions from becoming release claims | CPU contracts required; one stable CUDA behavioral lane defined |
+| 3 | [TD-006](technical-debt/TD-006-dependency-runtime-currency.md) | Runtime evidence is invalid when accelerator support silently compiles out or uses obsolete interfaces | Versioned CPU/CUDA/ROCm matrix passes on supported pins |
+| 4 | [TD-007](technical-debt/TD-007-context-sequence-capacity.md) | Load evidence is invalid until context capacity, errors, and request completion are deterministic | Mixed-prompt lifecycle and capacity matrix passes on CPU/CUDA/ROCm |
+| 5 | [ADR-0001](adr/ADR-0001-evidence-gated-runtime-portfolio.md) + [TD-003](technical-debt/TD-003-runtime-evidence-drift.md) | Decides whether native CUDA deserves continued proprietary-kernel investment | Representative correctness, throughput, memory, and reliability matrix |
+| 6 | [FTR-001](features/FTR-001-managed-local-and-endpoint-cli.md) | Removes the largest adoption failure without duplicating the runtime | `inferctl run` and explicit endpoint/context flows pass end-to-end tests |
+| 7 | [FTR-002](features/FTR-002-agent-api-contract.md) | Agent workloads require stronger contracts than basic chat | Native structured output plus Responses/tool compatibility gates |
+| 8 | [FTR-003](features/FTR-003-tenant-safe-adapters-and-cache.md) | Efficiency is unsafe unless tenant identity scopes reusable state | Per-request adapters and tenant-salted cache isolation are measured |
+| 9 | [FTR-004](features/FTR-004-slo-aware-serving.md) | Operators buy predictable service, not peak-token anecdotes | SLO admission, routing, and capacity signals validated under load |
+| 10 | [FTR-005](features/FTR-005-distributed-lifecycle.md) | Distribution magnifies lifecycle errors and follows single-node rigor | Worker-loss and ownership matrix passes in multi-process CI |
 
-## 2) Roadmap Priorities
+## Critical-Path Gantt
 
-| Priority | Workstream | Exit criteria |
-|---|---|---|
-| P0 | Residual c=8 concurrent instability | c=8 throughput gate passes reliably (>95%); clean runs already achieve 174.6 tok/s (32/32) but overall pass rate is ~75% |
-| P0 | Required GPU/provider release lane | Native/provider/runtime checks become mandatory for release confidence |
-| P1 | Structured-output native ownership | Grammar-constrained generation no longer relies on compatibility fallback for the CUDA path |
-| P1 | Distributed ownership maturity | Cleanup and worker-loss behavior are deterministic and covered by tests |
-| P2 | Benchmark and release hygiene | Release-facing benchmark narrative stays aligned with one maintained harness and current docs |
+```mermaid
+gantt
+  title InferFlux evidence-to-scale critical path
+  dateFormat YYYY-MM-DD
+  axisFormat %b %d
+  section Release truth
+  Green mainline baseline (TD-001)       :crit, t1, 2026-08-24, 10d
+  Required evidence gates (TD-002)       :crit, t2, after t1, 10d
+  Dependency/runtime currency (TD-006)   :crit, t6, after t2, 10d
+  Context and sequence capacity (TD-007) :crit, t7, after t6, 10d
+  Runtime proof and decision (ADR-0001/TD-003) :crit, t3, after t7, 10d
+  section Product adoption
+  Local transport and CLI (ADR-0002/FTR-001)   :p1, after t1, 20d
+  Agent API contract (FTR-002)                 :crit, p2, after t3, 25d
+  section Economy and scale
+  Tenant-safe adapters/cache (FTR-003)         :crit, p3, after p2, 25d
+  SLO-aware serving (FTR-004)                  :crit, p4, after p3, 20d
+  Ownership and distributed faults (ADR-0004/FTR-005) :crit, p5, after p4, 30d
+```
 
-## 3) Quarter Targets
+## Decision Gates
 
-| Window | Target |
-|---|---|
-| Q2 2026 | Keep canonical docs, OSS metadata, and release process aligned with the actual codebase |
-| Q3 2026 | Land a real native decode down-proj serving win and convert it into the default policy where appropriate |
-| Q4 2026 | Make GPU/provider behavior part of required release gating and improve distributed ownership cleanup |
+1. **Baseline gate:** no feature implementation merges while the portable build/test contract is red.
+2. **Runtime gate:** continue native CUDA investment only when retained evidence meets ADR-0001 thresholds; otherwise use the compatibility provider as the primary data plane.
+3. **Adoption gate:** local autostart must preserve the same API/policy semantics as remote serving.
+4. **Tenant gate:** reusable cache, adapter, session, and audit state must share one tenant identity boundary.
+5. **Scale gate:** no distributed maturity claim precedes deterministic ownership and cleanup tests.
 
-## 4) Grade Movement Rule
+## Deliberate Deferrals
 
-Grades move only when both are true:
+- Embedded inference inside `inferctl`; a managed daemon preserves one runtime contract.
+- Broad TP/EP or prefill/decode claims before sequence/KV ownership is closed.
+- New kernel families before the native-runtime proof-or-pivot decision.
+- Desktop UI work before the five-minute local workflow and agent contracts are reliable.
 
-1. A representative runtime path has evidence, not just a microbenchmark.
-2. The supporting behavior is covered by tests, docs, or release gating as appropriate.
+## Artifact Map
 
-## 5) Immediate Engineering Plan
-
-| Step | Why now |
-|---|---|
-| Diagnose and fix residual c=8 instability | MMQ accumulate and lane overlap mutex landed (0ccbad3) but ~75% pass rate at c=8 remains the top runtime risk |
-| Investigate atomic decode_relay state (7561fc7) interaction with lane overlap | Concurrent state management is the likely area for remaining race conditions |
-| Convert more GPU validation from ad hoc measurement into repeatable gates | Prevent regression churn during continued kernel work |
-
-## 6) References
-
-- [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
-- [benchmarks](benchmarks.md)
-- [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md)
+- [Planning method and scorecard](planning/PRINCIPLES_AND_PRIORITIZATION.md)
+- [Architecture decisions](adr/README.md)
+- [Feature specifications](features/README.md)
+- [Technical-debt register](technical-debt/README.md)
+- [Issue import snapshots](issues/README.md)

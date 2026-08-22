@@ -3187,8 +3187,20 @@ void HttpServer::HandleClient(ClientSession &session) {
 }
 
 bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
-  const char *data = payload.c_str();
-  std::size_t remaining = payload.size();
+  std::string connection_scoped_payload;
+  const std::string *wire_payload = &payload;
+  if (!session.keep_alive) {
+    constexpr std::string_view kKeepAlive = "Connection: keep-alive\r\n";
+    auto pos = payload.find(kKeepAlive);
+    if (pos != std::string::npos) {
+      connection_scoped_payload = payload;
+      connection_scoped_payload.replace(pos, kKeepAlive.size(),
+                                        "Connection: close\r\n");
+      wire_payload = &connection_scoped_payload;
+    }
+  }
+  const char *data = wire_payload->c_str();
+  std::size_t remaining = wire_payload->size();
   while (remaining > 0) {
     int sent = 0;
     if (session.ssl) {
