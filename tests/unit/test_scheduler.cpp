@@ -933,8 +933,7 @@ TEST_CASE("Scheduler routes decode-ready prefill requests directly to decode",
   REQUIRE(backend->DecodeSubmissions() > 0);
 }
 
-TEST_CASE("Scheduler opportunistically accumulates decode batches when "
-          "min_batch_size is one",
+TEST_CASE("Scheduler accumulates decode batches up to min_batch_size",
           "[scheduler]") {
   SimpleTokenizer tokenizer;
   auto device = std::make_shared<CPUDeviceContext>();
@@ -952,7 +951,7 @@ TEST_CASE("Scheduler opportunistically accumulates decode batches when "
 
   Scheduler::Config scheduler_config;
   scheduler_config.max_batch_size = 4;
-  scheduler_config.min_batch_size = 1;
+  scheduler_config.min_batch_size = 2;
   scheduler_config.batch_accumulation_ms = 20;
 
   DisaggregatedConfig disagg_config;
