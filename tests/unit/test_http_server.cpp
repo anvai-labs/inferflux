@@ -3,6 +3,7 @@
 #include "runtime/disaggregated/kv_channel.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "scheduler/scheduler.h"
+#include "server/http/completion_payload.h"
 #include "server/http/http_server.h"
 #include "server/metrics/metrics.h"
 #include "support/scoped_env.h"
@@ -56,6 +57,18 @@ std::unique_ptr<HttpServer> MakeServer(Scheduler *scheduler,
 }
 
 } // namespace
+
+TEST_CASE("Completion JSON replaces malformed model UTF-8",
+          "[http_server][utf8]") {
+  const std::string malformed(1, static_cast<char>(0x9B));
+  const nlohmann::json payload = {
+      {"choices", {{{"message", {{"content", malformed}}}}}}};
+
+  const auto encoded = SerializeJsonUtf8Safe(payload);
+  const auto decoded = nlohmann::json::parse(encoded);
+
+  REQUIRE(decoded["choices"][0]["message"]["content"] == "\xEF\xBF\xBD");
+}
 
 TEST_CASE("LookupHeaderValueForTest matches header names case-insensitively",
           "[http_server]") {
