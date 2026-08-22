@@ -68,3 +68,10 @@ Profiling and exploratory analysis docs may remain in-repo, but they should not 
 - [ ] Commands were validated against current CLI usage text.
 - [ ] Links point to existing files.
 - [ ] Claims about API endpoints match current source.
+
+## Planning Artifacts
+
+Architecture decisions, feature specifications, and technical-debt records live
+under `docs/adr/`, `docs/features/`, and `docs/technical-debt/`. Keep IDs unique,
+declare dependencies explicitly, update the directory index and `docs/Roadmap.md`,
+then run `python3 scripts/check_planning_artifacts.py`.

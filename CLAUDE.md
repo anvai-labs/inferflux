@@ -76,6 +76,33 @@ Test files are in `tests/unit/` (one per module). Framework: Catch2 v3.7.1. Avai
 
 Integration test suites (Python, require built `inferfluxd`): `StubIntegration`, `IntegrationCLIModelListContract`, `IntegrationEmbeddingsRoutingContract`, `IntegrationModelIdentityContract`, `SSECancel`, `ShmSmoke`, `SSEMetrics`, `BackendIdentityContract`, `BenchmarkHarnessDefaults`, `BenchmarkResponseClassifier`, `InferctlAdminPools`, `NativePhaseTiming`, `ThroughputGateContract`, `ThroughputGateFailureContract`, `IntegrationSSE` (needs model).
 
+## Trusted Dual-GPU Actions Runner
+
+Only GPU runtime jobs use the organization self-hosted runner; keep CPU, docs,
+packaging, and compile-only jobs on GitHub-hosted runners. The registered runner
+is `aiserver1-dual-gpu` in group `inferflux-gpu-trusted-staging`, with CUDA and
+ROCm labels. Do not register two runner agents against these shared devices.
+
+This WSL environment has no systemd bus. Do not use `svc.sh`; after every host
+restart, start the listener in a durable host terminal and leave it running:
+
+```bash
+cd /home/vsingh/actions-runner-inferflux-gpu
+./run.sh
+
+# Verify from another terminal
+gh api orgs/anvai-labs/actions/runners/9054 \
+  --jq '{name,status,busy,labels:[.labels[].name]}'
+```
+
+`config.sh` is first-time or recovery-only. If registration must be rebuilt,
+request a fresh short-lived organization token and use the exact group, name,
+and labels documented in `docs/GPU_CI_BOOTSTRAP.md`; never log or commit the
+token. Keep `allows_public_repositories=false` and GPU gate variables `false`
+until `.github/workflows/gpu-gates.yml` is present on trusted `main` and the
+group is restricted to that exact workflow/ref. The workflow must run CUDA and
+then ROCm serially and must never execute pull-request code.
+
 **First-token parity probe** (`tests/tools/first_token_probe.cpp`): builds `inferflux_first_token_probe` binary that runs a single forward pass and emits top-N logit distributions as JSON. Used by `tests/integration/first_token_parity_probe_test.py` to validate numeric parity across backends. Set `INFERFLUX_FIRST_TOKEN_PROBE_BIN` to override the binary path (defaults to `build/inferflux_first_token_probe`).
 
 ## Architecture
