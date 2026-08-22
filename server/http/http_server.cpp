@@ -736,7 +736,7 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
     choices.push_back(BuildChoice(i, results[i], tc, chat_mode));
   }
   j["choices"] = choices;
-  return j.dump();
+  return SerializeJsonUtf8Safe(j);
 }
 
 // Single-result overload: preserves the original call sites unchanged.
@@ -815,7 +815,7 @@ std::string BuildStreamChunk(const std::string &id, std::string_view model,
     }
     j["choices"] = json::array({choice});
   }
-  return "data: " + j.dump() + "\n\n";
+  return "data: " + SerializeJsonUtf8Safe(j) + "\n\n";
 }
 
 // §2.3: emit SSE delta sequence for a streaming tool call response.

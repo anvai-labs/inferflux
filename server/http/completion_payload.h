@@ -84,6 +84,10 @@ struct CompletionRequestPayload {
   int best_of{1};
 };
 
+/// Serialize a response payload while replacing malformed UTF-8 emitted by a
+/// model with U+FFFD so one bad token cannot turn a completion into HTTP 500.
+std::string SerializeJsonUtf8Safe(const nlohmann::json &payload);
+
 /// Build a JSON error response body.
 std::string BuildErrorBody(const std::string &error);
 
