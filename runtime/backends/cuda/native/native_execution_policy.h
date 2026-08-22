@@ -23,6 +23,12 @@ struct NativeExecutionPolicy {
   bool enable_attn_split_kv{false};
   int attn_split_chunk{512};
   int attn_split_qsplit_override{-1};
+  // Prefer the packed dp4a tier over Q8_1 activations for tiny decode
+  // batches (measured faster at M=1-2 on Ada; MMQ keeps winning at larger
+  // M). Applied by switching the WHOLE compute-section policy to
+  // disable_q81_activations for the step — gating individual dispatch
+  // sites desyncs operator selection onto cuBLAS fallbacks. -1 = off.
+  int packed_tier_max_batch{-1};
   bool phase_timing_enabled{false};
   bool force_cublas{false};
   bool disable_prepacked_activations{false};
@@ -69,6 +75,8 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_CUDA_ATTN_SPLIT_CHUNK", 512, 64, 8192);
     policy.attn_split_qsplit_override =
         ParseIntEnv("INFERFLUX_CUDA_ATTN_QSPLIT", -1, 1, 8);
+    policy.packed_tier_max_batch =
+        ParseIntEnv("INFERFLUX_CUDA_PACKED_TIER_MAX_BATCH", -1, -1, 8);
     // CUDA graph capture: cudaDeviceSynchronize drains async work before
     // capture to prevent heap corruption. Disable with
     // INFERFLUX_DISABLE_CUDA_GRAPH=1 if issues arise.

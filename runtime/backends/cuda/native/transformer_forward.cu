@@ -1663,6 +1663,21 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
   cudaError_t err;
   const int B = batch_size;
 
+  // Small-batch tier switch: the whole compute section must see ONE
+  // consistent tier decision (operator selection, dispatch guards, fused
+  // path checks), so tiny batches run on a step-local policy copy with the
+  // Q8_1 tier disabled rather than gating individual sites — which desyncs
+  // selection and execution onto cuBLAS fallbacks. Tier depends only on B,
+  // so per-B graph capture/recapture stays consistent by construction.
+  NativeExecutionPolicy step_policy_storage;
+  const NativeExecutionPolicy *active_policy = &execution_policy_;
+  if (execution_policy_.packed_tier_max_batch >= 0 &&
+      B <= execution_policy_.packed_tier_max_batch) {
+    step_policy_storage = execution_policy_;
+    step_policy_storage.disable_q81_activations = true;
+    active_policy = &step_policy_storage;
+  }
+
   // ===== Phase 2: metadata upload only =====
   // KV append and FlashDecode now derive addresses on device from the regular
   // KV layout, so there is no per-batch read-pointer upload here.
@@ -1797,13 +1812,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                 [&]() {
                   return TryQ8_1ProjectionGroup(
                       qkv_plans, d_residual_, input_norm, d_act_q8_1_, B,
-                      hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
+                      hidden_size_, rms_norm_eps_, stream_, active_policy);
                 },
                 [&]() {
                   return TryPackedProjectionGroup(
                       qkv_plans, d_residual_, input_norm, d_norm_out_,
                       d_packed_activation_, d_packed_activation_scales_, B,
-                      hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
+                      hidden_size_, rms_norm_eps_, stream_, active_policy);
                 },
                 [&]() {
                   bool norm_computed = false;
@@ -1820,7 +1835,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             return TryQ8_1Gemv<T>(
                                 q_raw, d_norm_out_, d_q_, d_act_q8_1_, B,
                                 num_heads_ * head_dim_, hidden_size_, stream_,
-                                "q_proj", &execution_policy_);
+                                "q_proj", active_policy);
                           },
                           [&]() {
                             if (capturing) {
@@ -1849,7 +1864,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             return TryQ8_1Gemv<T>(
                                 k_raw, d_norm_out_, d_k_new_, d_act_q8_1_, B,
                                 num_kv_heads_ * head_dim_, hidden_size_,
-                                stream_, "k_proj", &execution_policy_);
+                                stream_, "k_proj", active_policy);
                           },
                           [&]() {
                             if (capturing) {
@@ -1878,7 +1893,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             return TryQ8_1Gemv<T>(
                                 v_raw, d_norm_out_, d_v_new_, d_act_q8_1_, B,
                                 num_kv_heads_ * head_dim_, hidden_size_,
-                                stream_, "v_proj", &execution_policy_);
+                                stream_, "v_proj", active_policy);
                           },
                           [&]() {
                             if (capturing) {
@@ -2013,11 +2028,11 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         bool o_accumulated = false;
         if (!TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_, d_act_q8_1_, B,
                             hidden_size_, num_heads_ * head_dim_, stream_,
-                            "o_proj", &execution_policy_) &&
+                            "o_proj", active_policy) &&
             !TryPackedGemv<T>(o_raw, d_attn_out_, d_norm_out_,
                               d_packed_activation_, d_packed_activation_scales_,
                               B, hidden_size_, num_heads_ * head_dim_, stream_,
-                              "o_proj", &execution_policy_)) {
+                              "o_proj", active_policy)) {
           if (capturing) {
             capture_abort = true;
             return false;
@@ -2049,8 +2064,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         // matrices and applies SiLU activation at write-back, halving
         // weight memory traffic vs separate gate+up projections.
         if constexpr (std::is_same_v<T, half>) {
-          if (execution_policy_.enable_fused_gate_up_silu &&
-              !Q81ActivationsDisabled(execution_policy_) && d_act_q8_1_ &&
+          if (active_policy->enable_fused_gate_up_silu &&
+              !Q81ActivationsDisabled(*active_policy) && d_act_q8_1_ &&
               gate_raw.data && up_raw.data &&
               gate_raw.quant_type == up_raw.quant_type &&
               FusedQuantGemm::SupportsQ8_1Activations(gate_raw.quant_type) &&
@@ -2080,7 +2095,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
               gate_raw, up_raw, InferfluxCudaDispatchPhase::kDecode,
               FusedDispatchGeometry{B, intermediate_size_, hidden_size_, 2,
                                     true, true},
-              g_allow_fused_quantized_matmul, execution_policy_);
+              g_allow_fused_quantized_matmul, *active_policy);
           const std::string ffn_quant =
               ProjectionGroupQuantLabel(gate_raw, up_raw);
           NativeFfnExecutionSummary ffn_summary;
@@ -2090,15 +2105,14 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                   [&]() {
                     return TryQ8_1ProjectionGroup(
                         ffn_plans, d_residual_, post_attn_norm, d_act_q8_1_, B,
-                        hidden_size_, rms_norm_eps_, stream_,
-                        &execution_policy_, ffn_selected_op);
+                        hidden_size_, rms_norm_eps_, stream_, active_policy,
+                        ffn_selected_op);
                   },
                   [&]() {
                     return TryPackedProjectionGroup(
                         ffn_plans, d_residual_, post_attn_norm, d_norm_out_,
                         d_packed_activation_, d_packed_activation_scales_, B,
-                        hidden_size_, rms_norm_eps_, stream_,
-                        &execution_policy_);
+                        hidden_size_, rms_norm_eps_, stream_, active_policy);
                   },
                   [&]() {
                     bool ffn_norm_computed = false;
@@ -2112,11 +2126,11 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                               return true;
                             },
                             [&]() {
-                              return TryQ8_1Gemv<T>(
-                                  gate_raw, d_norm_out_, d_ffn_gate_,
-                                  d_act_q8_1_, B, intermediate_size_,
-                                  hidden_size_, stream_, "gate_proj",
-                                  &execution_policy_);
+                              return TryQ8_1Gemv<T>(gate_raw, d_norm_out_,
+                                                    d_ffn_gate_, d_act_q8_1_, B,
+                                                    intermediate_size_,
+                                                    hidden_size_, stream_,
+                                                    "gate_proj", active_policy);
                             },
                             [&]() {
                               if (capturing) {
@@ -2145,7 +2159,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                               return TryQ8_1Gemv<T>(
                                   up_raw, d_norm_out_, d_ffn_up_, d_act_q8_1_,
                                   B, intermediate_size_, hidden_size_, stream_,
-                                  "up_proj", &execution_policy_);
+                                  "up_proj", active_policy);
                             },
                             [&]() {
                               if (capturing) {
@@ -2177,12 +2191,12 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
           // post-activation FP16 result.  Just quantize and run down GEMV.
           bool down_ok = TryQ8_1Gemv<T>(
               down_raw, d_ffn_gate_, d_ffn_down_, d_act_q8_1_, B, hidden_size_,
-              intermediate_size_, stream_, "down_proj", &execution_policy_);
+              intermediate_size_, stream_, "down_proj", active_policy);
           if (!down_ok) {
             down_ok =
                 TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_, d_act_q8_1_,
                               B, hidden_size_, intermediate_size_, stream_,
-                              "down_proj", &execution_policy_);
+                              "down_proj", active_policy);
           }
           if (!down_ok) {
             if (capturing) {
@@ -2200,7 +2214,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
               down_raw, down_mmq, InferfluxCudaDispatchPhase::kDecode,
               FusedDispatchGeometry{B, hidden_size_, intermediate_size_, 1,
                                     true, false},
-              g_allow_fused_quantized_matmul, execution_policy_);
+              g_allow_fused_quantized_matmul, *active_policy);
           NativeDownProjExecutionSummary down_summary;
           if (!ExecuteInferfluxCudaDownProjStage(
                   down_selected_op, "decode", ProjectionQuantLabel(down_raw),
@@ -2209,20 +2223,20 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                     return TryMmqSiluMulGemv<T>(
                         down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
                         d_act_q8_1_, B, hidden_size_, intermediate_size_,
-                        stream_, "down_proj", &execution_policy_);
+                        stream_, "down_proj", active_policy);
                   },
                   [&]() {
                     return TryQ8_1SiluMulGemv<T>(
                         down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
                         d_act_q8_1_, B, hidden_size_, intermediate_size_,
-                        stream_, "down_proj", &execution_policy_);
+                        stream_, "down_proj", active_policy);
                   },
                   [&]() {
                     return TryPackedSiluMulGemv<T>(
                         down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
                         d_packed_activation_, d_packed_activation_scales_, B,
                         hidden_size_, intermediate_size_, stream_, "down_proj",
-                        &execution_policy_);
+                        active_policy);
                   },
                   [&]() {
                     cuda_kernel::SiluMul<T>(d_ffn_gate_, d_ffn_up_, d_ffn_gate_,
@@ -2236,28 +2250,28 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                           TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
                                         d_act_q8_1_, B, hidden_size_,
                                         intermediate_size_, stream_,
-                                        "down_proj", &execution_policy_) ||
+                                        "down_proj", active_policy) ||
                           TryQ8_1Gemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
                                          d_act_q8_1_, B, hidden_size_,
                                          intermediate_size_, stream_,
-                                         "down_proj", &execution_policy_);
+                                         "down_proj", active_policy);
                     } else {
                       down_ok =
                           TryQ8_1Gemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
                                          d_act_q8_1_, B, hidden_size_,
                                          intermediate_size_, stream_,
-                                         "down_proj", &execution_policy_) ||
+                                         "down_proj", active_policy) ||
                           TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
                                         d_act_q8_1_, B, hidden_size_,
                                         intermediate_size_, stream_,
-                                        "down_proj", &execution_policy_);
+                                        "down_proj", active_policy);
                     }
                     if (!down_ok &&
                         !TryPackedGemv<T>(
                             down_raw, d_ffn_gate_, d_ffn_down_,
                             d_packed_activation_, d_packed_activation_scales_,
                             B, hidden_size_, intermediate_size_, stream_,
-                            "down_proj", &execution_policy_)) {
+                            "down_proj", active_policy)) {
                       if (capturing) {
                         capture_abort = true;
                         return false;
@@ -2299,7 +2313,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       // Q8_1 fused RmsNorm+Quantize+GEMV for LM head
       bool lm_q8_1_ok = false;
       if constexpr (std::is_same_v<T, half>) {
-        if (!Q81ActivationsDisabled(execution_policy_) && lm_raw.data &&
+        if (!Q81ActivationsDisabled(*active_policy) && lm_raw.data &&
             d_act_q8_1_ &&
             FusedQuantGemm::SupportsQ8_1Activations(lm_raw.quant_type) &&
             FusedQuantGemm::ShouldUseFusedPath(
@@ -2311,7 +2325,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                                    rms_norm_eps_, stream_);
           lm_q8_1_ok = FusedQuantGemm::GemvQ8_1(
               lm_raw, d_act_q8_1_, d_logits_typed_, B, vocab_size_,
-              hidden_size_, stream_, &execution_policy_);
+              hidden_size_, stream_, active_policy);
         }
       }
       if (!lm_q8_1_ok &&
@@ -2319,12 +2333,12 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                    d_packed_activation_,
                                    d_packed_activation_scales_, d_logits_typed_,
                                    B, vocab_size_, hidden_size_, rms_norm_eps_,
-                                   stream_, "lm_head", &execution_policy_)) {
+                                   stream_, "lm_head", active_policy)) {
         cuda_kernel::RmsNorm<T>(d_residual_, final_norm, d_norm_out_, B,
                                 hidden_size_, rms_norm_eps_, stream_);
         if (!TryQ8_1Gemv<T>(lm_raw, d_norm_out_, d_logits_typed_, d_act_q8_1_,
                             B, vocab_size_, hidden_size_, stream_, "lm_head",
-                            &execution_policy_)) {
+                            active_policy)) {
           if (capturing) {
             capture_abort = true;
             return false;
