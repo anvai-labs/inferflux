@@ -374,8 +374,7 @@ void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
   req->execution.tokens_generated = prior_completion_tokens;
   req->execution.decode_limit =
       prior_completion_tokens + remaining_decode_tokens;
-  req->execution.max_non_emitting_steps =
-      std::max(req->max_tokens * 8, 32);
+  req->execution.max_non_emitting_steps = std::max(req->max_tokens * 8, 32);
   req->execution.slice_active = true;
 
   if (req->n_past >= 0 && req->first_token >= 0) {

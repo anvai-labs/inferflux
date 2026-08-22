@@ -27,9 +27,7 @@ bool IsNonAccumulatingCompletion(std::string_view text) {
 
 bool IsVisibleGeneratedPiece(std::string_view piece) { return !piece.empty(); }
 
-int MaxNonEmittingSteps(int max_tokens) {
-  return std::max(max_tokens * 8, 32);
-}
+int MaxNonEmittingSteps(int max_tokens) { return std::max(max_tokens * 8, 32); }
 
 bool HasValidUnifiedPhasedState(const InferenceRequest &req) {
   if (req.n_past < 0 || req.sequence_id < 0) {
@@ -1555,9 +1553,8 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
         } else if (++req->execution.non_emitting_steps >=
                    req->execution.max_non_emitting_steps) {
           req->execution.active = false;
-          log::Warn(
-              "batch_executor",
-              "unified prefill step stopped after too many non-emitting tokens");
+          log::Warn("batch_executor", "unified prefill step stopped after too "
+                                      "many non-emitting tokens");
         }
         if (req->execution.tokens_generated >= req->execution.decode_limit) {
           req->execution.active = false;

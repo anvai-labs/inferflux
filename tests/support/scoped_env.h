@@ -27,8 +27,7 @@ public:
   }
 
   // A null value means "temporarily unset", matching ScopedEnvVar call sites.
-  ScopedEnvVar(std::string name, const char *value)
-      : name_(std::move(name)) {
+  ScopedEnvVar(std::string name, const char *value) : name_(std::move(name)) {
     SaveOriginal();
     if (value) {
       Set(value);

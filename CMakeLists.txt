@@ -557,6 +557,10 @@ add_executable(inferfluxd server/main.cpp)
 if(MSVC)
   target_link_libraries(inferfluxd PRIVATE inferflux_core)
   target_link_options(inferfluxd PRIVATE /WHOLEARCHIVE:inferflux_core)
+elseif(APPLE)
+  target_link_libraries(inferfluxd PRIVATE inferflux_core)
+  target_link_options(inferfluxd PRIVATE
+    "LINKER:-force_load,$<TARGET_FILE:inferflux_core>")
 else()
   target_link_libraries(inferfluxd PRIVATE
     -Wl,--whole-archive inferflux_core -Wl,--no-whole-archive)

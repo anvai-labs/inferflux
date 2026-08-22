@@ -159,7 +159,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching contract
         run: |
-          EXPECTED_TP_GATE_CONTRACT_TESTS=6
+          EXPECTED_TP_GATE_CONTRACT_TESTS=9
           ACTUAL_TP_GATE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateContractTests method count: expected=${EXPECTED_TP_GATE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_CONTRACT_TESTS}" ]; then
@@ -292,9 +292,9 @@ jobs:
             build-essential cmake libssl-dev libyaml-cpp-dev
 
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.15
+        uses: Jimver/cuda-toolkit@v0.2.36
         with:
-          cuda: '12.3.0'
+          cuda: '13.0.1'
           method: 'network'
 
       - name: Configure (CUDA=ON)
@@ -579,7 +579,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching contract
         run: |
-          EXPECTED_TP_GATE_CONTRACT_TESTS=6
+          EXPECTED_TP_GATE_CONTRACT_TESTS=9
           ACTUAL_TP_GATE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateContractTests method count: expected=${EXPECTED_TP_GATE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_CONTRACT_TESTS}" ]; then
@@ -784,8 +784,8 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # clang-format style gate
-  # Reports violations as annotations but does not block merge by default.
-  # Change `continue-on-error: true` → `false` to enforce formatting in CI.
+  # Checks complete changed files on pushes/PRs so legacy formatting debt does
+  # not hide regressions. Scheduled runs retain the full-tree diagnostic.
   # ---------------------------------------------------------------------------
   clang-format:
     name: clang-format check
@@ -795,6 +795,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install clang-format
         run: |
@@ -803,8 +805,35 @@ jobs:
 
       - name: Check formatting
         run: |
-          find server runtime scheduler model cli net io policy \
-            \( -name '*.cpp' -o -name '*.h' \) \
-            ! -path '*/external/*' \
-            | sort \
-            | xargs clang-format --dry-run --Werror
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+            if [ -z "${base}" ] || [[ "${base}" =~ ^0+$ ]]; then
+              base="${head}^"
+            fi
+          else
+            mapfile -t files < <(
+              find server runtime scheduler model cli net io policy \
+                \( -name '*.cpp' -o -name '*.h' \) \
+                ! -path '*/external/*' | sort
+            )
+          fi
+
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            mapfile -t files < <(
+              git diff --name-only --diff-filter=ACMR "${base}" "${head}" -- \
+                server runtime scheduler model cli net io policy \
+                | grep -E '\.(cpp|h)$' || true
+            )
+          fi
+
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No changed C++ files require formatting checks."
+            exit 0
+          fi
+          printf 'Checking %s\n' "${files[@]}"
+          clang-format --dry-run --Werror "${files[@]}"

@@ -2443,8 +2443,8 @@ bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
 
 bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1WithEpilogue(
     const QuantizedWeightInfo &gate_raw, const QuantizedWeightInfo &up_raw,
-    const void *act_q8_1, half *output, void *act_q8_1_out, int M, int N,
-    int K, cudaStream_t stream) {
+    const void *act_q8_1, half *output, void *act_q8_1_out, int M, int N, int K,
+    cudaStream_t stream) {
   if (!act_q8_1 || !output || !act_q8_1_out || M <= 0 || N <= 0 || K <= 0) {
     return false;
   }
