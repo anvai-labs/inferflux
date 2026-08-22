@@ -740,6 +740,17 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
     return false;
   if (!alloc(&d_attn_out_, rows * num_heads_ * head_dim_))
     return false;
+  // Split-attention partials: [max_batch][num_heads][kMaxAttnKSplits]
+  // [2 + head_dim] floats (identity-partial merge state per KV chunk).
+  {
+    const size_t floats = static_cast<size_t>(max_batch_size_) * num_heads_ *
+                          kMaxAttnKSplits * (2 + head_dim_);
+    err = cudaMalloc(&d_attn_partials_, floats * sizeof(float));
+    if (err != cudaSuccess) {
+      return false;
+    }
+    device_workspace_bytes_ += floats * sizeof(float);
+  }
   if (!alloc(&d_ffn_gate_, rows * intermediate_size_))
     return false;
   if (!alloc(&d_ffn_up_, rows * intermediate_size_))
@@ -812,6 +823,10 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
   free_buf(&d_k_new_);
   free_buf(&d_v_new_);
   free_buf(&d_attn_out_);
+  if (d_attn_partials_) {
+    cudaFree(d_attn_partials_);
+    d_attn_partials_ = nullptr;
+  }
   free_buf(&d_ffn_gate_);
   free_buf(&d_ffn_up_);
   free_buf(&d_ffn_down_);
@@ -1938,11 +1953,42 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       {
         NVTX_SCOPE("FlashAttention2");
         float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
-        err = cuda_kernel::FlashDecodeMultiSeqStrided<T>(
-            d_q_, typed_cache->Buffer(), d_attn_out_, d_batch_seq_ids_,
-            d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_, head_dim_,
-            typed_cache->SlotStride(), typed_cache->LayerStride(),
-            typed_cache->KvStride(), attn_scale, stream_);
+        if (policy.enable_attn_split_kv && d_attn_partials_) {
+          // Split geometry is fixed at capture time from the configured
+          // context length so graph replays stay shape-static; per-sequence
+          // kv_lens early-exit empty chunks on device.
+          int qsplit = policy.attn_split_qsplit_override;
+          // Measured on RTX 4000 Ada (Qwen2.5-3B, GQA 8): Q-head
+          // parallelism dominates at decode contexts — qsplit=8 with a
+          // single KV split gains ~17% at max_seq 2048. The 8x KV re-read
+          // only pays off against the latency win once contexts grow well
+          // past 2k, where KV chunking takes over instead.
+          int chunk = policy.attn_split_chunk;
+          if (qsplit <= 0) {
+            qsplit = max_seq_len_ <= 2048 ? 8 : max_seq_len_ <= 4096 ? 4 : 2;
+            if (max_seq_len_ <= 2048) {
+              // Keep ksplits=1 below 2k: chunking adds a combine pass and
+              // identity partials that only pay at long context.
+              chunk = std::max(chunk, max_seq_len_);
+            }
+          }
+          // Chunk floor of 64 positions matches the FA2 KV tile size.
+          chunk = std::max(chunk, 64);
+          const int ksplits = std::min(
+              kMaxAttnKSplits, std::max(1, (max_seq_len_ + chunk - 1) / chunk));
+          err = cuda_kernel::FlashDecodeMultiSeqStridedSplit<T>(
+              d_q_, typed_cache->Buffer(), d_attn_out_, d_attn_partials_,
+              d_batch_seq_ids_, d_batch_kv_lens_, layer, B, num_heads_,
+              num_kv_heads_, head_dim_, typed_cache->SlotStride(),
+              typed_cache->LayerStride(), typed_cache->KvStride(), attn_scale,
+              qsplit, chunk, ksplits, stream_);
+        } else {
+          err = cuda_kernel::FlashDecodeMultiSeqStrided<T>(
+              d_q_, typed_cache->Buffer(), d_attn_out_, d_batch_seq_ids_,
+              d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_, head_dim_,
+              typed_cache->SlotStride(), typed_cache->LayerStride(),
+              typed_cache->KvStride(), attn_scale, stream_);
+        }
         if (err != cudaSuccess) {
           log::Error("llama_forward",
                      "FlashDecodeMultiSeqStrided launch failed: " +

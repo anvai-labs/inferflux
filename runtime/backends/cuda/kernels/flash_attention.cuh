@@ -40,14 +40,30 @@ cudaError_t FlashDecodeMultiSeq(const T *Q, const T *const *d_k_ptrs,
  * d_seq_ids/d_kv_lens: [B] sequence IDs and KV lengths on device.
  */
 template <typename T>
-cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
-                                       const int *d_seq_ids,
-                                       const int *d_kv_lens, int layer,
-                                       int batch_size, int num_heads,
-                                       int num_kv_heads, int head_dim,
-                                       size_t slot_stride, size_t layer_stride,
-                                       size_t kv_stride, float scale,
-                                       cudaStream_t stream = 0);
+cudaError_t FlashDecodeMultiSeqStrided(
+    const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,
+    const int *d_kv_lens, int layer, int batch_size, int num_heads,
+    int num_kv_heads, int head_dim, size_t slot_stride, size_t layer_stride,
+    size_t kv_stride, float scale, cudaStream_t stream = 0);
+
+/**
+ * FlashDecodeMultiSeqStridedSplit: split-parallel decode attention.
+ *
+ * Parallelizes over the Q-heads sharing each KV head (qsplit — targets the
+ * short-context case where the monolithic GQA kernel leaves most SMs idle)
+ * and over fixed KV chunks of `chunk` positions (ksplits — targets long
+ * contexts where serial tile iteration dominates). When ksplits > 1, CTAs
+ * write unnormalized online-softmax partials to `d_partials`
+ * ([batch][num_heads][ksplits][2 + head_dim] floats) and a combine pass
+ * merges them; otherwise output is written directly.
+ */
+template <typename T>
+cudaError_t FlashDecodeMultiSeqStridedSplit(
+    const T *Q, const T *kv_buffer, T *O, float *d_partials,
+    const int *d_seq_ids, const int *d_kv_lens, int layer, int batch_size,
+    int num_heads, int num_kv_heads, int head_dim, size_t slot_stride,
+    size_t layer_stride, size_t kv_stride, float scale, int qsplit, int chunk,
+    int ksplits, cudaStream_t stream = 0);
 
 } // namespace cuda_kernel
 } // namespace inferflux

@@ -163,6 +163,9 @@ private:
   T *d_k_new_{nullptr};
   T *d_v_new_{nullptr};
   T *d_attn_out_{nullptr};
+  // Split-attention merge partials (see FlashDecodeMultiSeqStridedSplit).
+  static constexpr int kMaxAttnKSplits = 8;
+  float *d_attn_partials_{nullptr};
   T *d_ffn_gate_{nullptr};
   T *d_ffn_up_{nullptr};
   T *d_ffn_down_{nullptr};

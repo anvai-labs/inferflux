@@ -106,10 +106,9 @@ void ApplyRopeHost(std::vector<half> *q, std::vector<half> *k, int seq_len,
       for (int head = 0; head < heads; ++head) {
         const int offset = pos * heads * head_dim + head * head_dim;
         for (int pair_idx = 0; pair_idx < half_dim; ++pair_idx) {
-          const float freq = 1.0f / std::pow(
-                                        freq_base,
-                                        2.0f * pair_idx /
-                                            static_cast<float>(head_dim));
+          const float freq =
+              1.0f / std::pow(freq_base,
+                              2.0f * pair_idx / static_cast<float>(head_dim));
           const float angle = position * freq;
           const float cos_val = std::cos(angle);
           const float sin_val = std::sin(angle);
@@ -159,7 +158,8 @@ void FillQuantizedRows(runtime::cuda::native::GGUF::TensorType tensor_type,
     for (int row = 0; row < rows; ++row) {
       for (int blk = 0; blk < blocks_per_row; ++blk) {
         auto &block = w[static_cast<size_t>(row) * blocks_per_row + blk];
-        block.d = encode_half(0.012f * static_cast<float>(((row + blk) % 5) + 1));
+        block.d =
+            encode_half(0.012f * static_cast<float>(((row + blk) % 5) + 1));
         block.dmin =
             encode_half(0.006f * static_cast<float>(((row + blk) % 3) + 1));
         for (int i = 0; i < 12; ++i) {
@@ -209,8 +209,8 @@ void RunLmHeadLongPrefillContract(
   constexpr int K = 2048;
   constexpr int N = 4096;
   constexpr float eps = 1e-5f;
-  constexpr std::array<int, 10> sample_outputs = {
-      0, 1, 2, 17, 63, 255, 511, 1023, 2047, 4095};
+  constexpr std::array<int, 10> sample_outputs = {0,   1,   2,    17,   63,
+                                                  255, 511, 1023, 2047, 4095};
 
   const FusedDispatchGeometry geometry{M, N, K, 1, false, true};
   REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, geometry));
@@ -250,14 +250,12 @@ void RunLmHeadLongPrefillContract(
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_norm_weight),
                      K * sizeof(half)) == cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_act_q8_1),
-                     (K / QK8_1) *
-                         sizeof(runtime::cuda::native::block_q8_1)) ==
+                     (K / QK8_1) * sizeof(runtime::cuda::native::block_q8_1)) ==
           cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out), N * sizeof(half)) ==
           cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq),
-                     static_cast<size_t>(N) * K * sizeof(half)) ==
-          cudaSuccess);
+                     static_cast<size_t>(N) * K * sizeof(half)) == cudaSuccess);
 
   REQUIRE(cudaMemcpy(d_w, h_weights.data(), weight_bytes,
                      cudaMemcpyHostToDevice) == cudaSuccess);
@@ -266,24 +264,26 @@ void RunLmHeadLongPrefillContract(
   REQUIRE(cudaMemcpy(d_norm_weight, h_norm_weight.data(), K * sizeof(half),
                      cudaMemcpyHostToDevice) == cudaSuccess);
 
-  FusedQuantGemm::FusedRmsNormQuantizeQ8_1(d_residual, d_norm_weight, d_act_q8_1,
-                                           M, K, eps, nullptr);
+  FusedQuantGemm::FusedRmsNormQuantizeQ8_1(d_residual, d_norm_weight,
+                                           d_act_q8_1, M, K, eps, nullptr);
   if (tensor_type == runtime::cuda::native::GGUF::TensorType::Q4_K) {
-    REQUIRE(runtime::cuda::native::dequantize_q4_k(
-                reinterpret_cast<const runtime::cuda::native::block_q4_k *>(d_w),
-                d_deq, static_cast<size_t>(N) * K) == cudaSuccess);
+    REQUIRE(
+        runtime::cuda::native::dequantize_q4_k(
+            reinterpret_cast<const runtime::cuda::native::block_q4_k *>(d_w),
+            d_deq, static_cast<size_t>(N) * K) == cudaSuccess);
   } else {
-    REQUIRE(runtime::cuda::native::dequantize_q6_k(
-                reinterpret_cast<const runtime::cuda::native::block_q6_k *>(d_w),
-                d_deq, static_cast<size_t>(N) * K) == cudaSuccess);
+    REQUIRE(
+        runtime::cuda::native::dequantize_q6_k(
+            reinterpret_cast<const runtime::cuda::native::block_q6_k *>(d_w),
+            d_deq, static_cast<size_t>(N) * K) == cudaSuccess);
   }
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   std::vector<runtime::cuda::native::block_q8_1> q8_1_blocks(K / QK8_1);
-  REQUIRE(cudaMemcpy(q8_1_blocks.data(), d_act_q8_1,
-                     q8_1_blocks.size() *
-                         sizeof(runtime::cuda::native::block_q8_1),
-                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(
+      cudaMemcpy(q8_1_blocks.data(), d_act_q8_1,
+                 q8_1_blocks.size() * sizeof(runtime::cuda::native::block_q8_1),
+                 cudaMemcpyDeviceToHost) == cudaSuccess);
   const std::vector<half> deq =
       CopyDeviceHalfs(d_deq, static_cast<size_t>(N) * K);
 
@@ -304,13 +304,12 @@ void RunLmHeadLongPrefillContract(
   for (int out_idx : sample_outputs) {
     float ref = 0.0f;
     for (int i = 0; i < K; ++i) {
-      ref += act_ref[i] *
-             __half2float(deq[static_cast<size_t>(out_idx) * K + i]);
+      ref +=
+          act_ref[i] * __half2float(deq[static_cast<size_t>(out_idx) * K + i]);
     }
     CAPTURE(static_cast<int>(tensor_type), out_idx);
     const float tolerance = std::max(margin, std::fabs(ref) * 1.0e-3f);
-    REQUIRE(__half2float(out[out_idx]) ==
-            Catch::Approx(ref).margin(tolerance));
+    REQUIRE(__half2float(out[out_idx]) == Catch::Approx(ref).margin(tolerance));
   }
 
   REQUIRE(cudaFree(d_deq) == cudaSuccess);
@@ -375,7 +374,8 @@ TEST_CASE("ModelForwardFactory: supported model types", "[native_forward]") {
 // InferfluxCudaExecutor Interface Tests
 // ============================================================================
 
-TEST_CASE("InferfluxCudaExecutor: Name and fallback state", "[native_forward]") {
+TEST_CASE("InferfluxCudaExecutor: Name and fallback state",
+          "[native_forward]") {
   InferfluxCudaExecutor executor;
   REQUIRE(executor.Name() == "inferflux_cuda");
   REQUIRE_FALSE(executor.IsFallback());
@@ -392,8 +392,7 @@ TEST_CASE("NativeExecutionPolicy loads hot-path policy from env",
   ScopedEnvVar disable_packed("INFERFLUX_DISABLE_PREPACKED_ACTIVATIONS", "1");
   ScopedEnvVar disable_q81("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS", "1");
   ScopedEnvVar disable_fused("INFERFLUX_DISABLE_FUSED_GEMV", "1");
-  ScopedEnvVar debug_decode_mapping("INFERFLUX_CUDA_DEBUG_DECODE_MAPPING",
-                                    "1");
+  ScopedEnvVar debug_decode_mapping("INFERFLUX_CUDA_DEBUG_DECODE_MAPPING", "1");
   ScopedEnvVar debug_decode_mapping_limit(
       "INFERFLUX_CUDA_DEBUG_DECODE_MAPPING_LIMIT", "21");
   ScopedEnvVar debug_logits("INFERFLUX_DEBUG_LOGITS", "1");
@@ -633,9 +632,8 @@ TEST_CASE("ModelForward::WarmWeightCaches default is no-op",
   // Base class WarmWeightCaches() is a no-op — subclasses override.
   // This ensures the interface contract: callers can always call it safely.
   struct StubForward : ModelForward {
-    bool Initialize(const SafetensorsLoader::ModelConfig &,
-                    const WeightMap &, IKvCacheGpu *, CublasGemm *,
-                    cudaStream_t) override {
+    bool Initialize(const SafetensorsLoader::ModelConfig &, const WeightMap &,
+                    IKvCacheGpu *, CublasGemm *, cudaStream_t) override {
       return true;
     }
     bool Forward(const std::vector<int> &, int, int, float *) override {
@@ -701,9 +699,10 @@ TEST_CASE(
   REQUIRE(true);
 }
 
-TEST_CASE("InferfluxCudaExecutor: NativeSerializeSequence returns empty with no "
-          "model",
-          "[native_forward]") {
+TEST_CASE(
+    "InferfluxCudaExecutor: NativeSerializeSequence returns empty with no "
+    "model",
+    "[native_forward]") {
   InferfluxCudaExecutor executor;
   auto blob = executor.NativeSerializeSequence(0);
   REQUIRE(blob.empty());
@@ -1340,6 +1339,144 @@ TEST_CASE(
   REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
 }
 
+TEST_CASE(
+    "FlashDecodeMultiSeqStridedSplit matches monolithic decode across splits",
+    "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping split FlashDecode parity.");
+    return;
+  }
+
+  constexpr int batch_size = 2;
+  constexpr int num_heads = 16;
+  constexpr int num_kv_heads = 2;
+  constexpr int head_dim = 128;
+  constexpr int q_cols = num_heads * head_dim;
+  constexpr int kv_cols = num_kv_heads * head_dim;
+  constexpr int max_seq_len = 96;
+  constexpr int max_batch = 4;
+  constexpr int layer = 0;
+  // Non-multiple of every chunk size exercised below, plus a kv_len that
+  // spans multiple chunks when chunk is small.
+  const std::array<int, batch_size> seq_ids = {0, 2};
+  const std::array<int, batch_size> kv_lens = {37, 91};
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
+
+  KvCacheGpuTyped<half> cache;
+  REQUIRE(cache.Allocate(/*num_layers=*/1, num_kv_heads, head_dim, max_seq_len,
+                         max_batch));
+
+  const std::vector<half> h_q =
+      MakeWaveTensor(static_cast<size_t>(batch_size) * q_cols, 0.03f);
+  const std::vector<half> h_k0 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[0]) * kv_cols, 0.02f, 0.01f);
+  const std::vector<half> h_v0 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[0]) * kv_cols, 0.02f, -0.01f);
+  const std::vector<half> h_k1 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[1]) * kv_cols, 0.025f, 0.02f);
+  const std::vector<half> h_v1 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[1]) * kv_cols, 0.015f, 0.03f);
+
+  half *d_q = nullptr;
+  half *d_o_mono = nullptr;
+  half *d_o_split = nullptr;
+  float *d_partials = nullptr;
+  int *d_seq_ids = nullptr;
+  int *d_kv_lens = nullptr;
+
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_q),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_o_mono),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_o_split),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  const size_t partial_floats =
+      static_cast<size_t>(batch_size) * num_heads * 8 * (2 + head_dim);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_partials),
+                     partial_floats * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_seq_ids),
+                     batch_size * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_kv_lens),
+                     batch_size * sizeof(int)) == cudaSuccess);
+
+  half *d_k0 = nullptr;
+  half *d_v0 = nullptr;
+  half *d_k1 = nullptr;
+  half *d_v1 = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k0),
+                     h_k0.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_v0),
+                     h_v0.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k1),
+                     h_k1.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_v1),
+                     h_v1.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_k0, h_k0.data(), h_k0.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_v0, h_v0.data(), h_v0.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_k1, h_k1.data(), h_k1.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_v1, h_v1.data(), h_v1.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cache.Append(layer, seq_ids[0], /*start_pos=*/0, kv_lens[0], d_k0,
+                       d_v0, stream) == cudaSuccess);
+  REQUIRE(cache.Append(layer, seq_ids[1], /*start_pos=*/0, kv_lens[1], d_k1,
+                       d_v1, stream) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_seq_ids, seq_ids.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_kv_lens, kv_lens.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  REQUIRE(cuda_kernel::FlashDecodeMultiSeqStrided<half>(
+              d_q, cache.Buffer(), d_o_mono, d_seq_ids, d_kv_lens, layer,
+              batch_size, num_heads, num_kv_heads, head_dim, cache.SlotStride(),
+              cache.LayerStride(), cache.KvStride(), scale,
+              stream) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+  const std::vector<half> o_mono = CopyDeviceHalfs(d_o_mono, h_q.size());
+
+  // (qsplit, chunk, ksplits) configs: pure Q-split, pure KV-split with
+  // non-multiple chunk boundaries, and both.
+  const std::vector<std::array<int, 3>> configs = {
+      {8, 96, 1}, {2, 96, 1}, {1, 16, 6}, {2, 24, 4}, {4, 32, 3}};
+  for (const auto &cfg : configs) {
+    REQUIRE(cudaMemset(d_o_split, 0xAB, h_q.size() * sizeof(half)) ==
+            cudaSuccess);
+    REQUIRE(cuda_kernel::FlashDecodeMultiSeqStridedSplit<half>(
+                d_q, cache.Buffer(), d_o_split, d_partials, d_seq_ids,
+                d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim,
+                cache.SlotStride(), cache.LayerStride(), cache.KvStride(),
+                scale, cfg[0], cfg[1], cfg[2], stream) == cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+    const std::vector<half> o_split = CopyDeviceHalfs(d_o_split, h_q.size());
+    for (size_t i = 0; i < o_mono.size(); ++i) {
+      REQUIRE(__half2float(o_split[i]) ==
+              Catch::Approx(__half2float(o_mono[i])).margin(4e-3f));
+    }
+  }
+
+  REQUIRE(cudaFree(d_kv_lens) == cudaSuccess);
+  REQUIRE(cudaFree(d_seq_ids) == cudaSuccess);
+  REQUIRE(cudaFree(d_partials) == cudaSuccess);
+  REQUIRE(cudaFree(d_o_split) == cudaSuccess);
+  REQUIRE(cudaFree(d_o_mono) == cudaSuccess);
+  REQUIRE(cudaFree(d_v1) == cudaSuccess);
+  REQUIRE(cudaFree(d_k1) == cudaSuccess);
+  REQUIRE(cudaFree(d_v0) == cudaSuccess);
+  REQUIRE(cudaFree(d_k0) == cudaSuccess);
+  REQUIRE(cudaFree(d_q) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
 TEST_CASE("FlashAttention2Typed matches naive causal attention for Qwen "
           "long-prefill geometry",
           "[native_forward][cuda_runtime_contract]") {
@@ -1408,9 +1545,8 @@ TEST_CASE("FlashAttention2Typed matches naive causal attention for Qwen "
       for (int k_pos = 0; k_pos <= q_pos; ++k_pos) {
         float dot = 0.0f;
         for (int d = 0; d < head_dim; ++d) {
-          const float qv =
-              __half2float(h_q[static_cast<size_t>(q_pos) * q_cols +
-                               head * head_dim + d]);
+          const float qv = __half2float(
+              h_q[static_cast<size_t>(q_pos) * q_cols + head * head_dim + d]);
           const float kv =
               __half2float(h_k[static_cast<size_t>(k_pos) * kv_cols +
                                kv_head * head_dim + d]);
@@ -1456,7 +1592,8 @@ TEST_CASE("RoPE matches host reference for Qwen long-prefill geometry",
           "[native_forward][cuda_runtime_contract]") {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
-    SUCCEED("No CUDA device available; skipping Qwen long-prefill RoPE parity.");
+    SUCCEED(
+        "No CUDA device available; skipping Qwen long-prefill RoPE parity.");
     return;
   }
 
@@ -1518,7 +1655,8 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
           "[native_forward][cuda_runtime_contract]") {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
-    SUCCEED("No CUDA device available; skipping long-prefill lm_head Q4_K parity.");
+    SUCCEED(
+        "No CUDA device available; skipping long-prefill lm_head Q4_K parity.");
     return;
   }
 
@@ -1531,7 +1669,8 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
           "[native_forward][cuda_runtime_contract]") {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
-    SUCCEED("No CUDA device available; skipping long-prefill lm_head Q6_K parity.");
+    SUCCEED(
+        "No CUDA device available; skipping long-prefill lm_head Q6_K parity.");
     return;
   }
 
@@ -2064,8 +2203,8 @@ TEST_CASE("FusedQuantGemm::GemvPackedTriple preserves sampled outputs for "
     for (int row = 0; row < rows; ++row) {
       for (int blk = 0; blk < blocks_per_row; ++blk) {
         auto &block = blocks[static_cast<size_t>(row) * blocks_per_row + blk];
-        block.d = encode_half(
-            0.0095f * static_cast<float>(((row + seed + blk) % 5) + 1));
+        block.d = encode_half(0.0095f *
+                              static_cast<float>(((row + seed + blk) % 5) + 1));
         block.dmin = encode_half(
             0.0060f * static_cast<float>(((row + seed + blk) % 3) + 1));
         for (int i = 0; i < K_SCALE_SIZE; ++i) {
@@ -2210,16 +2349,13 @@ TEST_CASE("FusedQuantGemm::GemvPackedTriple preserves sampled outputs for "
       CopyDeviceHalfs(d_v, static_cast<size_t>(M) * NV);
 
   for (size_t i = 0; i < q_out.size(); ++i) {
-    REQUIRE(__half2float(q_out[i]) ==
-            Catch::Approx(ref_q[i]).margin(4.0e-1f));
+    REQUIRE(__half2float(q_out[i]) == Catch::Approx(ref_q[i]).margin(4.0e-1f));
   }
   for (size_t i = 0; i < k_out.size(); ++i) {
-    REQUIRE(__half2float(k_out[i]) ==
-            Catch::Approx(ref_k[i]).margin(3.0e-1f));
+    REQUIRE(__half2float(k_out[i]) == Catch::Approx(ref_k[i]).margin(3.0e-1f));
   }
   for (size_t i = 0; i < v_out.size(); ++i) {
-    REQUIRE(__half2float(v_out[i]) ==
-            Catch::Approx(ref_v[i]).margin(3.0e-1f));
+    REQUIRE(__half2float(v_out[i]) == Catch::Approx(ref_v[i]).margin(3.0e-1f));
   }
 
   REQUIRE(cudaFree(d_v_deq) == cudaSuccess);
@@ -3815,7 +3951,7 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves sampled outputs for "
   constexpr int K = 2048;
   constexpr int N0 = 11008;
   constexpr int N1 = 11008;
-  const std::array<int, 10> sample_rows = {0, 1, 2, 17, 63,
+  const std::array<int, 10> sample_rows = {0,   1,    2,    17,   63,
                                            511, 2047, 4095, 8191, 11007};
 
   auto encode_half = [](float value) {
@@ -3851,8 +3987,8 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves sampled outputs for "
 
   const auto h_w0 = make_q4_k_weights(N0, 3);
   const auto h_w1 = make_q4_k_weights(N1, 7);
-  const std::vector<half> h_input = MakeWaveTensor(static_cast<size_t>(M) * K,
-                                                   0.015f, -0.002f);
+  const std::vector<half> h_input =
+      MakeWaveTensor(static_cast<size_t>(M) * K, 0.015f, -0.002f);
 
   runtime::cuda::native::block_q4_k *d_w0 = nullptr;
   runtime::cuda::native::block_q4_k *d_w1 = nullptr;
@@ -3871,9 +4007,8 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves sampled outputs for "
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
                      h_input.size() * sizeof(half)) == cudaSuccess);
   REQUIRE(
-      cudaMalloc(&d_act_q8_1,
-                 static_cast<size_t>(M) * (K / QK8_1) *
-                     sizeof(runtime::cuda::native::block_q8_1)) ==
+      cudaMalloc(&d_act_q8_1, static_cast<size_t>(M) * (K / QK8_1) *
+                                  sizeof(runtime::cuda::native::block_q8_1)) ==
       cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out0),
                      static_cast<size_t>(M) * N0 * sizeof(half)) ==
@@ -3910,10 +4045,10 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves sampled outputs for "
       CopyDeviceHalfs(d_deq1, static_cast<size_t>(N1) * K);
   std::vector<runtime::cuda::native::block_q8_1> q8_1_blocks(
       static_cast<size_t>(M) * (K / QK8_1));
-  REQUIRE(cudaMemcpy(
-              q8_1_blocks.data(), d_act_q8_1,
-              q8_1_blocks.size() * sizeof(runtime::cuda::native::block_q8_1),
-              cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(
+      cudaMemcpy(q8_1_blocks.data(), d_act_q8_1,
+                 q8_1_blocks.size() * sizeof(runtime::cuda::native::block_q8_1),
+                 cudaMemcpyDeviceToHost) == cudaSuccess);
 
   std::vector<float> act_ref(static_cast<size_t>(M) * K, 0.0f);
   for (int m = 0; m < M; ++m) {
@@ -3934,8 +4069,10 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1Pair preserves sampled outputs for "
   REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, M, K, nullptr));
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
-  const std::vector<half> out0 = CopyDeviceHalfs(d_out0, static_cast<size_t>(M) * N0);
-  const std::vector<half> out1 = CopyDeviceHalfs(d_out1, static_cast<size_t>(M) * N1);
+  const std::vector<half> out0 =
+      CopyDeviceHalfs(d_out0, static_cast<size_t>(M) * N0);
+  const std::vector<half> out1 =
+      CopyDeviceHalfs(d_out1, static_cast<size_t>(M) * N1);
 
   auto check_samples = [&](const std::vector<half> &weights,
                            const std::vector<half> &actual, int rows) {
@@ -5012,8 +5149,8 @@ TEST_CASE("FusedQuantGemm::DownProjMmq preserves per-row Q4_K outputs for "
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   if (prev) {
-    REQUIRE(portable_setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", prev_value.c_str(), 1) ==
-            0);
+    REQUIRE(portable_setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", prev_value.c_str(),
+                            1) == 0);
   } else {
     REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ") == 0);
   }
@@ -5149,8 +5286,8 @@ TEST_CASE("FusedQuantGemm::DownProjMmq preserves per-row Q6_K outputs for "
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
   if (prev) {
-    REQUIRE(portable_setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", prev_value.c_str(), 1) ==
-            0);
+    REQUIRE(portable_setenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", prev_value.c_str(),
+                            1) == 0);
   } else {
     REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_DOWNPROJ_MMQ") == 0);
   }
@@ -5690,8 +5827,9 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
   const char *prev =
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
-                 1) == 0);
+  REQUIRE(
+      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+                      "1", 1) == 0);
 
   constexpr int M = 1;
   constexpr int K = 11008;
@@ -5794,11 +5932,12 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
   }
 
   if (prev) {
-    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
-                   prev_value.c_str(), 1) == 0);
+    REQUIRE(
+        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+                        prev_value.c_str(), 1) == 0);
   } else {
-    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
-            0);
+    REQUIRE(portable_unsetenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") == 0);
   }
   REQUIRE(cudaFree(d_deq) == cudaSuccess);
   REQUIRE(cudaFree(d_out) == cudaSuccess);
@@ -5812,7 +5951,8 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
           "[native_forward][cuda_runtime_contract]") {
   int device_count = 0;
   if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
-    SUCCEED("No CUDA device available; skipping long-prefill down-proj parity.");
+    SUCCEED(
+        "No CUDA device available; skipping long-prefill down-proj parity.");
     return;
   }
 
@@ -5837,7 +5977,7 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
   constexpr int K = 11008;
   constexpr int N = 2048;
   constexpr int kBlocksPerRow = K / QK_K;
-  const std::array<int, 10> sample_outputs = {0, 1, 2, 17, 63,
+  const std::array<int, 10> sample_outputs = {0,   1,   2,    17,   63,
                                               127, 511, 1023, 1535, 2047};
 
   auto encode_half = [](float value) {
@@ -5847,8 +5987,8 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
     return bits;
   };
 
-  std::vector<runtime::cuda::native::block_q4_k> h_w(
-      static_cast<size_t>(N) * kBlocksPerRow);
+  std::vector<runtime::cuda::native::block_q4_k> h_w(static_cast<size_t>(N) *
+                                                     kBlocksPerRow);
   for (int row = 0; row < N; ++row) {
     for (int blk = 0; blk < kBlocksPerRow; ++blk) {
       auto &block = h_w[static_cast<size_t>(row) * kBlocksPerRow + blk];
@@ -5879,16 +6019,13 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
                      h_input.size() * sizeof(half)) == cudaSuccess);
   REQUIRE(
-      cudaMalloc(&d_act_q8_1,
-                 static_cast<size_t>(M) * (K / QK8_1) *
-                     sizeof(runtime::cuda::native::block_q8_1)) ==
+      cudaMalloc(&d_act_q8_1, static_cast<size_t>(M) * (K / QK8_1) *
+                                  sizeof(runtime::cuda::native::block_q8_1)) ==
       cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out),
-                     static_cast<size_t>(M) * N * sizeof(half)) ==
-          cudaSuccess);
+                     static_cast<size_t>(M) * N * sizeof(half)) == cudaSuccess);
   REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_deq),
-                     static_cast<size_t>(N) * K * sizeof(half)) ==
-          cudaSuccess);
+                     static_cast<size_t>(N) * K * sizeof(half)) == cudaSuccess);
 
   REQUIRE(cudaMemcpy(d_w, h_w.data(),
                      h_w.size() * sizeof(runtime::cuda::native::block_q4_k),
@@ -5905,10 +6042,10 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
       CopyDeviceHalfs(d_deq, static_cast<size_t>(N) * K);
   std::vector<runtime::cuda::native::block_q8_1> q8_1_blocks(
       static_cast<size_t>(M) * (K / QK8_1));
-  REQUIRE(cudaMemcpy(
-              q8_1_blocks.data(), d_act_q8_1,
-              q8_1_blocks.size() * sizeof(runtime::cuda::native::block_q8_1),
-              cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(
+      cudaMemcpy(q8_1_blocks.data(), d_act_q8_1,
+                 q8_1_blocks.size() * sizeof(runtime::cuda::native::block_q8_1),
+                 cudaMemcpyDeviceToHost) == cudaSuccess);
 
   std::vector<float> act_ref(static_cast<size_t>(M) * K, 0.0f);
   for (int row = 0; row < M; ++row) {
@@ -5926,7 +6063,8 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves sampled outputs for long-prefill "
   REQUIRE(FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_out, M, N, K, nullptr));
   REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
 
-  const std::vector<half> out = CopyDeviceHalfs(d_out, static_cast<size_t>(M) * N);
+  const std::vector<half> out =
+      CopyDeviceHalfs(d_out, static_cast<size_t>(M) * N);
   for (int row = 0; row < M; ++row) {
     for (int out_idx : sample_outputs) {
       CAPTURE(row, out_idx);
@@ -5965,8 +6103,9 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
   const char *prev =
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
-                 1) == 0);
+  REQUIRE(
+      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+                      "1", 1) == 0);
 
   constexpr int M = 1;
   constexpr int K = 11008;
@@ -6071,11 +6210,12 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
   }
 
   if (prev) {
-    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
-                   prev_value.c_str(), 1) == 0);
+    REQUIRE(
+        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+                        prev_value.c_str(), 1) == 0);
   } else {
-    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
-            0);
+    REQUIRE(portable_unsetenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") == 0);
   }
   REQUIRE(cudaFree(d_deq) == cudaSuccess);
   REQUIRE(cudaFree(d_out) == cudaSuccess);
@@ -6102,9 +6242,9 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
   const char *prev = std::getenv(
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(
-      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-             "1", 1) == 0);
+  REQUIRE(portable_setenv(
+              "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+              "1", 1) == 0);
 
   constexpr int M = 2;
   constexpr int K = 11008;
@@ -6212,9 +6352,9 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
   }
 
   if (prev) {
-    REQUIRE(
-        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-               prev_value.c_str(), 1) == 0);
+    REQUIRE(portable_setenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+                prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(
         portable_unsetenv(
@@ -6246,9 +6386,9 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
   const char *prev = std::getenv(
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(
-      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-             "1", 1) == 0);
+  REQUIRE(portable_setenv(
+              "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+              "1", 1) == 0);
 
   constexpr int M = 2;
   constexpr int K = 11008;
@@ -6358,9 +6498,9 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for exact "
   }
 
   if (prev) {
-    REQUIRE(
-        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-               prev_value.c_str(), 1) == 0);
+    REQUIRE(portable_setenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+                prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(
         portable_unsetenv(
@@ -6452,18 +6592,20 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q4_K decode hot "
   const char *prev =
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
-                 1) == 0);
+  REQUIRE(
+      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+                      "1", 1) == 0);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
               true, true,
               true) == FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed);
   if (prev) {
-    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
-                   prev_value.c_str(), 1) == 0);
+    REQUIRE(
+        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+                        prev_value.c_str(), 1) == 0);
   } else {
-    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
-            0);
+    REQUIRE(portable_unsetenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") == 0);
   }
 }
 
@@ -6496,18 +6638,20 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes exact Q6_K decode hot "
   const char *prev =
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", "1",
-                 1) == 0);
+  REQUIRE(
+      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+                      "1", 1) == 0);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
               true, true,
               true) == FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed);
   if (prev) {
-    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
-                   prev_value.c_str(), 1) == 0);
+    REQUIRE(
+        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED",
+                        prev_value.c_str(), 1) == 0);
   } else {
-    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") ==
-            0);
+    REQUIRE(portable_unsetenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED") == 0);
   }
 }
 
@@ -6519,17 +6663,17 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes two-row Q4_K decode "
   const char *prev = std::getenv(
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(
-      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-             "1", 1) == 0);
+  REQUIRE(portable_setenv(
+              "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+              "1", 1) == 0);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
               true, true, true) ==
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
   if (prev) {
-    REQUIRE(
-        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-               prev_value.c_str(), 1) == 0);
+    REQUIRE(portable_setenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+                prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(
         portable_unsetenv(
@@ -6557,17 +6701,17 @@ TEST_CASE("FusedQuantGemm: down-proj selector promotes two-row Q6_K decode "
   const char *prev = std::getenv(
       "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(
-      portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-             "1", 1) == 0);
+  REQUIRE(portable_setenv(
+              "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+              "1", 1) == 0);
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
               true, true, true) ==
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
   if (prev) {
-    REQUIRE(
-        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-               prev_value.c_str(), 1) == 0);
+    REQUIRE(portable_setenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
+                prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(
         portable_unsetenv(
@@ -6623,8 +6767,8 @@ TEST_CASE("FusedQuantGemm: down-proj selector honors MMQ batch override for "
               true, true, true) == FusedQuantGemm::DownProjOperator::kMmq);
 
   if (prev) {
-    REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", prev_value.c_str(), 1) ==
-            0);
+    REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH",
+                            prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(portable_unsetenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH") == 0);
   }
@@ -6636,15 +6780,16 @@ TEST_CASE("FusedQuantGemm: invalid MMQ batch override is ignored",
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
   const char *prev = std::getenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH");
   std::string prev_value = prev ? prev : "";
-  REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "not_a_number", 1) == 0);
+  REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "not_a_number",
+                          1) == 0);
 
   REQUIRE(FusedQuantGemm::SelectDownProjOperator(
               quant_type, FusedDispatchGeometry{1, 4096, 11008, 1, true, false},
               true, true, true) == FusedQuantGemm::DownProjOperator::kQ81Gemv);
 
   if (prev) {
-    REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", prev_value.c_str(), 1) ==
-            0);
+    REQUIRE(portable_setenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH",
+                            prev_value.c_str(), 1) == 0);
   } else {
     REQUIRE(portable_unsetenv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH") == 0);
   }
@@ -6764,25 +6909,26 @@ TEST_CASE("FusedQuantGemm: specialized grouped Q8_1 fast path is limited to "
       std::getenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K");
   const bool had_prev = prev_value != nullptr;
   const std::string prev = had_prev ? std::string(prev_value) : std::string();
-  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", "0",
-                 1) == 0);
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
+                          "0", 1) == 0);
   REQUIRE_FALSE(
       FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m1));
   REQUIRE_FALSE(
       FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m2));
 
-  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", "1",
-                 1) == 0);
+  REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
+                          "1", 1) == 0);
   REQUIRE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m1));
   REQUIRE_FALSE(
       FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(q4k, hot_m2));
 
   if (had_prev) {
-    REQUIRE(portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
-                   prev.c_str(), 1) == 0);
+    REQUIRE(
+        portable_setenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K",
+                        prev.c_str(), 1) == 0);
   } else {
-    REQUIRE(portable_unsetenv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K") ==
-            0);
+    REQUIRE(portable_unsetenv(
+                "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K") == 0);
   }
 
   REQUIRE_FALSE(FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(
@@ -6845,7 +6991,8 @@ TEST_CASE("FusedQuantGemm: FFN grouped selector keeps the proven "
               q4k, q4k, FusedDispatchGeometry{2, 11008, 2048, 2, true, true},
               true, true,
               &policy) == FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4);
-  // M>=3 Q4_K decode uses MMQ3 (default-ON via enable_experimental_q81_grouped_mmq3)
+  // M>=3 Q4_K decode uses MMQ3 (default-ON via
+  // enable_experimental_q81_grouped_mmq3)
   REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
               q4k, q4k, FusedDispatchGeometry{3, 11008, 2048, 2, true, true},
               true, true,
@@ -6865,8 +7012,7 @@ TEST_CASE("FusedQuantGemm: FFN grouped selector keeps the proven "
   REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
               q4k, q4k, FusedDispatchGeometry{4, 11008, 2048, 2, true, true},
               true, true,
-              &policy) ==
-          FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4);
+              &policy) == FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4);
   // M=3 with rowquad enabled: rowquad needs M>=4, MMQ3 matches at M>=3
   REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
               q4k, q4k, FusedDispatchGeometry{3, 11008, 2048, 2, true, true},
@@ -6894,8 +7040,9 @@ TEST_CASE("FusedQuantGemm: FFN grouped selector falls back to packed path "
               false, true) == FusedQuantGemm::FfnProjOperator::kPackedGroup);
 }
 
-TEST_CASE("InferfluxCudaDispatchPolicy: wrapper selectors preserve policy gates",
-          "[native_forward]") {
+TEST_CASE(
+    "InferfluxCudaDispatchPolicy: wrapper selectors preserve policy gates",
+    "[native_forward]") {
   NativeExecutionPolicy policy;
   const int q4k =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
@@ -6926,9 +7073,10 @@ TEST_CASE("InferfluxCudaDispatchPolicy: wrapper selectors preserve policy gates"
               policy) == FusedQuantGemm::FfnProjOperator::kFallback);
 }
 
-TEST_CASE("InferfluxCudaDispatchPolicy: phase-aware FFN registry keeps prefill on "
-          "generic grouped Q8_1 path",
-          "[native_forward]") {
+TEST_CASE(
+    "InferfluxCudaDispatchPolicy: phase-aware FFN registry keeps prefill on "
+    "generic grouped Q8_1 path",
+    "[native_forward]") {
   NativeExecutionPolicy policy;
   const int q4k =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
@@ -6945,7 +7093,8 @@ TEST_CASE("InferfluxCudaDispatchPolicy: phase-aware FFN registry keeps prefill o
               FusedDispatchGeometry{1, 11008, 2048, 2, true, true},
               /*allow_fused_quantized_matmul=*/true,
               policy) == FusedQuantGemm::FfnProjOperator::kQ81Group);
-  // M>=3 Q4_K decode uses MMQ3 (default-ON via enable_experimental_q81_grouped_mmq3)
+  // M>=3 Q4_K decode uses MMQ3 (default-ON via
+  // enable_experimental_q81_grouped_mmq3)
   REQUIRE(SelectInferfluxCudaFfnProjOperator(
               raw, raw, InferfluxCudaDispatchPhase::kDecode,
               FusedDispatchGeometry{3, 11008, 2048, 2, true, true},
@@ -6962,13 +7111,13 @@ TEST_CASE("InferfluxCudaDispatchPolicy: phase-aware FFN registry keeps prefill o
               raw, raw, InferfluxCudaDispatchPhase::kDecode,
               FusedDispatchGeometry{4, 11008, 2048, 2, true, true},
               /*allow_fused_quantized_matmul=*/true,
-              policy) ==
-          FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4);
+              policy) == FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4);
 }
 
-TEST_CASE("InferfluxCudaDispatchPolicy: phase-aware down-proj registry preserves "
-          "existing operator ladder",
-          "[native_forward]") {
+TEST_CASE(
+    "InferfluxCudaDispatchPolicy: phase-aware down-proj registry preserves "
+    "existing operator ladder",
+    "[native_forward]") {
   NativeExecutionPolicy policy;
   const int q4k =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
@@ -6995,9 +7144,10 @@ TEST_CASE("InferfluxCudaDispatchPolicy: phase-aware down-proj registry preserves
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
 }
 
-TEST_CASE("InferfluxCudaLinearExecutor: FFN helper falls back from Q8_1 to packed "
-          "without invoking generic path",
-          "[native_forward]") {
+TEST_CASE(
+    "InferfluxCudaLinearExecutor: FFN helper falls back from Q8_1 to packed "
+    "without invoking generic path",
+    "[native_forward]") {
   std::vector<std::string> calls;
   NativeFfnExecutionSummary summary;
 
@@ -7026,9 +7176,10 @@ TEST_CASE("InferfluxCudaLinearExecutor: FFN helper falls back from Q8_1 to packe
   REQUIRE(summary.actual_op == FusedQuantGemm::FfnProjOperator::kPackedGroup);
 }
 
-TEST_CASE("InferfluxCudaLinearExecutor: normalized projection helper computes norm "
-          "once before dense fallback",
-          "[native_forward]") {
+TEST_CASE(
+    "InferfluxCudaLinearExecutor: normalized projection helper computes norm "
+    "once before dense fallback",
+    "[native_forward]") {
   std::vector<std::string> calls;
   bool norm_computed = false;
 
@@ -7049,9 +7200,10 @@ TEST_CASE("InferfluxCudaLinearExecutor: normalized projection helper computes no
   REQUIRE(calls == std::vector<std::string>{"norm", "dense"});
 }
 
-TEST_CASE("InferfluxCudaLinearExecutor: grouped projection helper uses packed path "
-          "before generic fallback",
-          "[native_forward]") {
+TEST_CASE(
+    "InferfluxCudaLinearExecutor: grouped projection helper uses packed path "
+    "before generic fallback",
+    "[native_forward]") {
   std::vector<std::string> calls;
   NativeGroupedProjectionSummary summary;
 
@@ -7076,9 +7228,10 @@ TEST_CASE("InferfluxCudaLinearExecutor: grouped projection helper uses packed pa
   REQUIRE(summary.used_packed);
 }
 
-TEST_CASE("InferfluxCudaLinearExecutor: down-proj helper invokes fallback only after "
-          "all fused paths miss",
-          "[native_forward]") {
+TEST_CASE(
+    "InferfluxCudaLinearExecutor: down-proj helper invokes fallback only after "
+    "all fused paths miss",
+    "[native_forward]") {
   std::vector<std::string> calls;
   NativeDownProjExecutionSummary summary;
 
@@ -7136,8 +7289,8 @@ TEST_CASE("FusedQuantGemm: metric names distinguish V2 hot-path variants",
               FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K, q4k, 1, 2048) ==
           std::string("q8_1_group_hot_q4k"));
   REQUIRE(FusedQuantGemm::FfnProjOperatorMetricName(
-              FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4, q4k, 4, 2048) ==
-          std::string("q8_1_group_row_quad_m4"));
+              FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4, q4k, 4,
+              2048) == std::string("q8_1_group_row_quad_m4"));
   REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
               FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed, q4k, 2,
               11008) == std::string("q8_1_gemv_row_pair_hot_fixed"));
@@ -7218,7 +7371,8 @@ TEST_CASE("FusedQuantGemm: CUDA runtime contract launches Q8_1 fused decode "
       std::getenv("INFERFLUX_DISABLE_Q8_1_ACTIVATIONS");
   if (disable_q81_env && (std::string(disable_q81_env) == "1" ||
                           std::string(disable_q81_env) == "true")) {
-    SUCCEED("Q8_1 activations disabled via INFERFLUX_DISABLE_Q8_1_ACTIVATIONS.");
+    SUCCEED(
+        "Q8_1 activations disabled via INFERFLUX_DISABLE_Q8_1_ACTIVATIONS.");
     return;
   }
 
@@ -7263,10 +7417,9 @@ TEST_CASE("FusedQuantGemm: CUDA runtime contract launches Q8_1 fused decode "
     REQUIRE(cudaMemset(d_output, 0,
                        static_cast<size_t>(m_fallback) * N * sizeof(half)) ==
             cudaSuccess);
-    REQUIRE(
-        cudaMalloc(&d_act_q8_1, static_cast<size_t>(m_fallback) *
-                                    q8_1_blocks_per_row * q8_1_block_size) ==
-        cudaSuccess);
+    REQUIRE(cudaMalloc(&d_act_q8_1, static_cast<size_t>(m_fallback) *
+                                        q8_1_blocks_per_row *
+                                        q8_1_block_size) == cudaSuccess);
 
     QuantizedWeightInfo info;
     info.data = d_weight;
@@ -7278,8 +7431,8 @@ TEST_CASE("FusedQuantGemm: CUDA runtime contract launches Q8_1 fused decode "
     // Quantize activations to Q8_1
     FusedQuantGemm::QuantizeRowQ8_1(d_activation, d_act_q8_1, m_fused, K,
                                     nullptr);
-    const bool used_fused = FusedQuantGemm::GemvQ8_1(
-        info, d_act_q8_1, d_output, m_fused, N, K, nullptr);
+    const bool used_fused = FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_output,
+                                                     m_fused, N, K, nullptr);
     REQUIRE(used_fused);
     REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
     REQUIRE(cudaGetLastError() == cudaSuccess);
