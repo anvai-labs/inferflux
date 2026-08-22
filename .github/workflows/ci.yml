@@ -77,11 +77,10 @@ jobs:
             -DENABLE_SBOM=ON
 
       # ------------------------------------------------------------------
-      # Build core targets (inferflux_core, inferfluxd, inferctl)
-      # NOTE: Tests require CUDA due to GGUF/CUDA coupling - run on CUDA runners
+      # Build the complete CPU contract, including the model-free test binary.
       # ------------------------------------------------------------------
       - name: Build
-        run: cmake --build build -j$(nproc) --target inferflux_core inferfluxd inferctl
+        run: cmake --build build -j$(nproc)
 
       # ------------------------------------------------------------------
       # Focused assertion: canonical OSS docs contract
@@ -91,20 +90,23 @@ jobs:
       - name: Assert docs contract gate
         run: python3 scripts/check_docs_contract.py
 
+      - name: Assert planning artifact graph
+        run: python3 scripts/check_planning_artifacts.py
+
+      - name: Assert dependency manifest evidence
+        run: python3 scripts/check_dependency_manifest.py
+
       - name: ccache stats
         run: ccache --show-stats
 
       # ------------------------------------------------------------------
-      # Unit + stub-integration tests
-      # NOTE: Tests require CUDA due to GGUF/CUDA coupling - skipped on CPU-only builds
+      # Unit + model-free integration tests.
       # IntegrationSSE is gated by INFERFLUX_MODEL_PATH — since that env var
       # is not set here, CMake never registers that ctest entry, so a plain
       # "ctest --test-dir build" skips it automatically.
       # ------------------------------------------------------------------
-      - name: Skip tests (CPU-only)
-        run: |
-          echo "Tests are skipped on CPU-only builds due to GGUF/CUDA coupling."
-          echo "Tests are run on CUDA-enabled runners in other jobs."
+      - name: Run complete model-free test suite
+        run: ctest --test-dir build --output-on-failure --timeout 120
 
       # ------------------------------------------------------------------
       # Focused assertion: inferctl model-list output modes
@@ -149,23 +151,6 @@ jobs:
             exit 1
           fi
           ctest --test-dir build -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
-
-      # ------------------------------------------------------------------
-      # Focused assertion: GGUF memory-contract gate
-      # Ensures batch policy dequantized-cache cleanup remains explicit and
-      # test count drift is surfaced for this contract suite.
-      # ------------------------------------------------------------------
-      - name: Assert GGUF memory contract gate
-        run: |
-          EXPECTED_GGUF_MEMORY_CONTRACT_TESTS=1
-          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=$(./build/inferflux_tests "[memory_contract]" --list-tests 2>/dev/null | awk '/matching test case/{print $1}' | tail -n 1)
-          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS:-0}
-          echo "GGUFMemoryContractTests count: expected=${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS} actual=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}"
-          if [ "${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}" -ne "${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS}" ]; then
-            echo "::error::GGUFMemoryContractTests count drifted; update EXPECTED_GGUF_MEMORY_CONTRACT_TESTS in .github/workflows/ci.yml"
-            exit 1
-          fi
-          ctest --test-dir build -R GGUFMemoryContractTests --output-on-failure --timeout 90 -V
 
       # ------------------------------------------------------------------
       # Focused assertion: throughput gate batching contract
@@ -393,7 +378,8 @@ jobs:
   # ---------------------------------------------------------------------------
   cuda-throughput-gate:
     name: CUDA throughput gate (self-hosted)
-    if: ${{ vars.INFERFLUX_ENABLE_CUDA_THROUGHPUT_GATE == 'true' }}
+    # Defense in depth: persistent runners must never execute public PR code.
+    if: ${{ github.event_name != 'pull_request' && vars.INFERFLUX_ENABLE_CUDA_THROUGHPUT_GATE == 'true' }}
     runs-on: [self-hosted, linux, x64, cuda]
     timeout-minutes: 45
     env:
@@ -589,23 +575,6 @@ jobs:
           ctest --test-dir build-cov -R IntegrationCLIAdminArgContract --output-on-failure --timeout 90 -V
 
       # ------------------------------------------------------------------
-      # Focused assertion: GGUF memory-contract gate
-      # Ensures batch policy dequantized-cache cleanup remains explicit and
-      # test count drift is surfaced for this contract suite.
-      # ------------------------------------------------------------------
-      - name: Assert GGUF memory contract gate
-        run: |
-          EXPECTED_GGUF_MEMORY_CONTRACT_TESTS=1
-          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=$(./build-cov/inferflux_tests "[memory_contract]" --list-tests 2>/dev/null | awk '/matching test case/{print $1}' | tail -n 1)
-          ACTUAL_GGUF_MEMORY_CONTRACT_TESTS=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS:-0}
-          echo "GGUFMemoryContractTests count: expected=${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS} actual=${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}"
-          if [ "${ACTUAL_GGUF_MEMORY_CONTRACT_TESTS}" -ne "${EXPECTED_GGUF_MEMORY_CONTRACT_TESTS}" ]; then
-            echo "::error::GGUFMemoryContractTests count drifted; update EXPECTED_GGUF_MEMORY_CONTRACT_TESTS in .github/workflows/ci.yml"
-            exit 1
-          fi
-          ctest --test-dir build-cov -R GGUFMemoryContractTests --output-on-failure --timeout 90 -V
-
-      # ------------------------------------------------------------------
       # Focused assertion: throughput gate batching contract
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching contract
@@ -738,7 +707,8 @@ jobs:
   # ---------------------------------------------------------------------------
   gguf-quantization-tests-cuda:
     name: GGUF & Quantization Tests (self-hosted CUDA)
-    if: ${{ vars.INFERFLUX_ENABLE_CUDA_GGUF_TESTS == 'true' }}
+    # Defense in depth: persistent runners must never execute public PR code.
+    if: ${{ github.event_name != 'pull_request' && vars.INFERFLUX_ENABLE_CUDA_GGUF_TESTS == 'true' }}
     runs-on: [self-hosted, linux, x64, cuda]
     timeout-minutes: 30
 

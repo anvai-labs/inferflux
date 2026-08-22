@@ -22,7 +22,7 @@ jobs:
   linux-packages:
     name: Linux (tgz/deb/rpm)
     runs-on: ubuntu-latest
-    if: ${{ env.SHOULD_PACKAGE == 'true' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
 
     steps:
       - name: Checkout (with submodules)
@@ -88,7 +88,7 @@ jobs:
   mac-packages:
     name: macOS (tgz/pkg/dmg)
     runs-on: macos-latest
-    if: ${{ env.SHOULD_PACKAGE == 'true' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
 
     steps:
       - name: Checkout (with submodules)
@@ -145,7 +145,7 @@ jobs:
   windows-packages:
     name: Windows (MSI)
     runs-on: windows-latest
-    if: ${{ env.SHOULD_PACKAGE == 'true' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
 
     steps:
       - name: Checkout (with submodules)
@@ -206,7 +206,7 @@ jobs:
     name: Homebrew & Winget manifests
     runs-on: ubuntu-latest
     needs: [linux-packages, mac-packages, windows-packages]
-    if: ${{ env.SHOULD_PACKAGE == 'true' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
 
     steps:
       - name: Checkout (templates)
@@ -292,30 +292,30 @@ jobs:
           # Homebrew formula is valid for both tag and nightly builds because
           # the source URL points to an existing commit/tag archive on GitHub.
           cat > artifacts/manifests/homebrew/inferflux.rb <<EOF
-class Inferflux < Formula
-  desc "InferFlux inference server and CLI"
-  homepage "https://github.com/inferencial/InferFlux"
-  url "${SRC_URL}"
-  version "${VERSION}"
-  sha256 "${SRC_SHA}"
-  license "Apache-2.0"
+          class Inferflux < Formula
+            desc "InferFlux inference server and CLI"
+            homepage "https://github.com/inferencial/InferFlux"
+            url "${SRC_URL}"
+            version "${VERSION}"
+            sha256 "${SRC_SHA}"
+            license "Apache-2.0"
 
-  depends_on "cmake" => :build
-  depends_on "openssl@3"
-  depends_on "yaml-cpp"
+            depends_on "cmake" => :build
+            depends_on "openssl@3"
+            depends_on "yaml-cpp"
 
-  def install
-    system "cmake", "-S", ".", "-B", "build", "-DENABLE_WEBUI=ON", *std_cmake_args
-    system "cmake", "--build", "build", "-j"
-    bin.install "build/inferfluxd", "build/inferctl"
-    pkgshare.install "docs/Quickstart.md"
-  end
+            def install
+              system "cmake", "-S", ".", "-B", "build", "-DENABLE_WEBUI=ON", *std_cmake_args
+              system "cmake", "--build", "build", "-j"
+              bin.install "build/inferfluxd", "build/inferctl"
+              pkgshare.install "docs/Quickstart.md"
+            end
 
-  test do
-    assert_match "Usage", shell_output("#{bin}/inferctl status --help", 1)
-  end
-end
-EOF
+            test do
+              assert_match "Usage", shell_output("#{bin}/inferctl status --help", 1)
+            end
+          end
+          EOF
 
           # Winget manifests reference release download URLs that only exist
           # once a GitHub Release is published.  Only generate for tagged builds;
@@ -325,26 +325,26 @@ EOF
             mkdir -p artifacts/manifests/winget
             installer_url="https://github.com/inferencial/InferFlux/releases/download/${MSI_TAG}/${MSI_NAME}"
             cat > artifacts/manifests/winget/inferencial.inferflux.yaml <<EOF
-Id: Inferencial.InferFlux
-Name: InferFlux
-Publisher: Inferencial Labs
-PublisherUrl: https://inferencial.ai
-PackageUrl: https://github.com/inferencial/InferFlux
-License: Apache-2.0
-ShortDescription: C++ LLM inference server and CLI.
-Moniker: inferflux
-Version: ${VERSION}
-InstallerType: wix
-Installers:
-  - Architecture: x64
-    InstallerUrl: ${installer_url}
-    InstallerSha256: ${MSI_SHA}
-Commands:
-  - inferfluxd
-  - inferctl
-UpgradeBehavior: install
-ReleaseNotesUrl: https://github.com/inferencial/InferFlux/releases/tag/${MSI_TAG}
-EOF
+          Id: Inferencial.InferFlux
+          Name: InferFlux
+          Publisher: Inferencial Labs
+          PublisherUrl: https://inferencial.ai
+          PackageUrl: https://github.com/inferencial/InferFlux
+          License: Apache-2.0
+          ShortDescription: C++ LLM inference server and CLI.
+          Moniker: inferflux
+          Version: ${VERSION}
+          InstallerType: wix
+          Installers:
+            - Architecture: x64
+              InstallerUrl: ${installer_url}
+              InstallerSha256: ${MSI_SHA}
+          Commands:
+            - inferfluxd
+            - inferctl
+          UpgradeBehavior: install
+          ReleaseNotesUrl: https://github.com/inferencial/InferFlux/releases/tag/${MSI_TAG}
+          EOF
           fi
 
       - name: Upload manifests
@@ -357,7 +357,7 @@ EOF
   create-release:
     name: Publish tagged release
     needs: [linux-packages, mac-packages, windows-packages, manifests]
-    if: ${{ env.IS_TAG_RELEASE == 'true' }}
+    if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/') }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -381,7 +381,7 @@ EOF
           HEAD_BRANCH: ${{ env.HEAD_BRANCH }}
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release_tag.outputs.value }}
           name: InferFlux ${{ steps.release_tag.outputs.value }}
