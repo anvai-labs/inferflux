@@ -1445,9 +1445,10 @@ TEST_CASE(
   const std::vector<half> o_mono = CopyDeviceHalfs(d_o_mono, h_q.size());
 
   // (qsplit, chunk, ksplits) configs: pure Q-split, pure KV-split with
-  // non-multiple chunk boundaries, and both.
+  // non-multiple chunk boundaries, both, and a non-divisor qsplit that the
+  // launcher must snap down to a ratio divisor (3 → 2 for GQA 8).
   const std::vector<std::array<int, 3>> configs = {
-      {8, 96, 1}, {2, 96, 1}, {1, 16, 6}, {2, 24, 4}, {4, 32, 3}};
+      {8, 96, 1}, {2, 96, 1}, {1, 16, 6}, {2, 24, 4}, {4, 32, 3}, {3, 96, 1}};
   for (const auto &cfg : configs) {
     REQUIRE(cudaMemset(d_o_split, 0xAB, h_q.size() * sizeof(half)) ==
             cudaSuccess);

@@ -1197,6 +1197,12 @@ LaunchSplitGQADecode(const T *Q, const T *kv_buffer, T *O, float *partials,
                      size_t kv_stride, float scale, int qsplit, int chunk,
                      int ksplits, cudaStream_t stream) {
   qsplit = max(1, min(qsplit, GQARatio));
+  // qsplit must DIVIDE the ratio: heads_per_cta = ratio/qsplit covers
+  // qsplit*heads_per_cta heads in total, and a non-divisor value would
+  // silently leave the trailing Q-heads uncomputed.
+  while (qsplit > 1 && GQARatio % qsplit != 0) {
+    --qsplit;
+  }
   const int heads_per_cta = GQARatio / qsplit;
   int threads = 1;
   while (threads < head_dim) {

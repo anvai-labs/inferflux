@@ -1960,13 +1960,21 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
           int qsplit = policy.attn_split_qsplit_override;
           // Measured on RTX 4000 Ada (Qwen2.5-3B, GQA 8): Q-head
           // parallelism dominates at decode contexts — qsplit=8 with a
-          // single KV split gains ~17% at max_seq 2048. The 8x KV re-read
-          // only pays off against the latency win once contexts grow well
-          // past 2k, where KV chunking takes over instead.
+          // single KV split gains ~15% at batch 1. Two constraints shape
+          // the heuristic: enough CTAs to cover the SMs (~2 per SM), and no
+          // more KV re-read parallelism than that needs — at batch 16 the
+          // unsplit grid already spans 32 CTAs and 8x re-reads plus 256
+          // tiny CTAs regress. Graphs are per-B, so B is static here.
           int chunk = policy.attn_split_chunk;
           if (qsplit <= 0) {
-            qsplit = max_seq_len_ <= 2048 ? 8 : max_seq_len_ <= 4096 ? 4 : 2;
-            if (max_seq_len_ <= 2048) {
+            const int kTargetCtas = 96; // ~2x SM count on Ada
+            qsplit = kTargetCtas / std::max(1, B * num_kv_heads_);
+            qsplit = std::max(1, std::min(qsplit, 8));
+            if (max_seq_len_ > 2048) {
+              // Long contexts: KV re-reads get expensive as kv grows; lean
+              // on KV chunking instead.
+              qsplit = std::min(qsplit, 2);
+            } else {
               // Keep ksplits=1 below 2k: chunking adds a combine pass and
               // identity partials that only pay at long context.
               chunk = std::max(chunk, max_seq_len_);
