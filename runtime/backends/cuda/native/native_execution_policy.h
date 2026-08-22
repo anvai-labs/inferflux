@@ -29,6 +29,11 @@ struct NativeExecutionPolicy {
   // disable_q81_activations for the step — gating individual dispatch
   // sites desyncs operator selection onto cuBLAS fallbacks. -1 = off.
   int packed_tier_max_batch{-1};
+  // Use the fused gate+up+SiLU MMVQ kernel only for batches up to this
+  // size. The fused kernel is memory-bandwidth-inefficient as M grows
+  // (32% of peak at M=16 vs 63% at M=1); the unfused grouped path wins
+  // by ~13% end to end at c=16. -1 = always (historic default).
+  int fused_gate_up_silu_max_batch{-1};
   bool phase_timing_enabled{false};
   bool force_cublas{false};
   bool disable_prepacked_activations{false};
@@ -77,6 +82,8 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_CUDA_ATTN_QSPLIT", -1, 1, 8);
     policy.packed_tier_max_batch =
         ParseIntEnv("INFERFLUX_CUDA_PACKED_TIER_MAX_BATCH", -1, -1, 8);
+    policy.fused_gate_up_silu_max_batch =
+        ParseIntEnv("INFERFLUX_CUDA_FUSED_GATE_UP_SILU_MAX_BATCH", -1, -1, 64);
     // CUDA graph capture: cudaDeviceSynchronize drains async work before
     // capture to prevent heap corruption. Disable with
     // INFERFLUX_DISABLE_CUDA_GRAPH=1 if issues arise.

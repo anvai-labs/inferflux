@@ -2064,7 +2064,11 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         // matrices and applies SiLU activation at write-back, halving
         // weight memory traffic vs separate gate+up projections.
         if constexpr (std::is_same_v<T, half>) {
+          // Fused gate+up+SiLU MMVQ loses bandwidth efficiency as M grows
+          // (~13% end-to-end loss at c=16); cap it to small batches.
           if (active_policy->enable_fused_gate_up_silu &&
+              (active_policy->fused_gate_up_silu_max_batch < 0 ||
+               B <= active_policy->fused_gate_up_silu_max_batch) &&
               !Q81ActivationsDisabled(*active_policy) && d_act_q8_1_ &&
               gate_raw.data && up_raw.data &&
               gate_raw.quant_type == up_raw.quant_type &&
