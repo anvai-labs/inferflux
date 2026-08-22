@@ -103,6 +103,18 @@ public:
                     const std::vector<int> &sequence_ids, float *d_logits,
                     int batch_size) override;
 
+  BatchMetaDevice BatchMetaDevicePointers() const override {
+    return {d_batch_token_ids_, d_batch_n_past_, d_batch_seq_ids_,
+            d_batch_kv_lens_};
+  }
+
+  bool DecodeGraphReady(int batch_size) const override {
+    return decode_graph_exec_ != nullptr && graph_batch_size_ == batch_size &&
+           graph_enabled_;
+  }
+
+  bool BatchForwardDevice(int batch_size, float *d_logits) override;
+
   void WarmWeightCaches() override;
   void SetStream(cudaStream_t stream) override;
   void SetExecutionPolicy(const NativeExecutionPolicy &policy) override;

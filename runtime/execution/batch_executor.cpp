@@ -86,7 +86,8 @@ std::string DebugSnippet(std::string_view text, std::size_t max_len = 96) {
   return std::string(text.substr(0, max_len)) + "...";
 }
 
-void LogUnifiedAssemblyState(std::string_view stage, const InferenceRequest &req,
+void LogUnifiedAssemblyState(std::string_view stage,
+                             const InferenceRequest &req,
                              std::string_view piece,
                              std::string_view completion, int token,
                              int tokens_generated, int n_past, bool stop_hit,
@@ -94,17 +95,17 @@ void LogUnifiedAssemblyState(std::string_view stage, const InferenceRequest &req
   if (!UnifiedAssemblyDebugEnabled() || !ConsumeUnifiedAssemblyBudget()) {
     return;
   }
-  log::Info(
-      "batch_executor",
-      "unified_assembly[" + std::string(stage) + "]: request_id=" +
-          std::to_string(req.id) + ", sequence_id=" +
-          std::to_string(req.sequence_id) + ", n_past=" + std::to_string(n_past) +
-          ", token=" + std::to_string(token) + ", generated=" +
-          std::to_string(tokens_generated) + ", stop_hit=" +
-          std::string(stop_hit ? "true" : "false") + ", active=" +
-          std::string(active ? "true" : "false") + ", piece=" +
-          json(DebugSnippet(piece)).dump() + ", completion=" +
-          json(DebugSnippet(completion)).dump());
+  log::Info("batch_executor",
+            "unified_assembly[" + std::string(stage) +
+                "]: request_id=" + std::to_string(req.id) +
+                ", sequence_id=" + std::to_string(req.sequence_id) +
+                ", n_past=" + std::to_string(n_past) +
+                ", token=" + std::to_string(token) +
+                ", generated=" + std::to_string(tokens_generated) +
+                ", stop_hit=" + std::string(stop_hit ? "true" : "false") +
+                ", active=" + std::string(active ? "true" : "false") +
+                ", piece=" + json(DebugSnippet(piece)).dump() +
+                ", completion=" + json(DebugSnippet(completion)).dump());
 }
 
 LlamaCppBackend::UnifiedBatchInput
@@ -120,6 +121,30 @@ MakeUnifiedBatchInput(const InferenceRequest &req, int n_past,
   input.client_request_id = req.client_request_id;
   input.sequence_generation = req.sequence_generation;
   return input;
+}
+
+// Burst decode is eligible for a step when every request is past prefill and
+// every input is a single-token greedy decode — the exact set the direct
+// step path already routes here (grammar/logprobs/response-format requests
+// are excluded upstream by the scheduler).
+bool BurstStepEligible(
+    const std::vector<InferenceRequest *> &active_reqs,
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &batch_inputs) {
+  if (batch_inputs.empty() || active_reqs.size() != batch_inputs.size()) {
+    return false;
+  }
+  for (auto *req : active_reqs) {
+    if (req->exec_in_prefill) {
+      return false;
+    }
+  }
+  for (const auto &input : batch_inputs) {
+    if (input.tokens.size() != 1 || !input.request_logits ||
+        input.sampling.temperature > 0.0f) {
+      return false;
+    }
+  }
+  return true;
 }
 
 // RAII guard that calls SetupSampler before execution and TeardownSampler on
@@ -662,8 +687,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
     if (limit <= 0)
       limit = 1;
     states[i].decode_limit = limit;
-    states[i].slice_active =
-        (slice > 0) || (tuning_.decode_burst_tokens > 0);
+    states[i].slice_active = (slice > 0) || (tuning_.decode_burst_tokens > 0);
 
     // Emit the first token (pre-sampled by Prefill while its logits were
     // fresh).
@@ -802,7 +826,8 @@ BatchExecutor::ExecuteBatchDecodePhased(
     req->first_piece.clear();
 
     // Accumulate and track remaining decode budget.
-    if (!out.completion.empty() && !IsNonAccumulatingCompletion(out.completion)) {
+    if (!out.completion.empty() &&
+        !IsNonAccumulatingCompletion(out.completion)) {
       req->accumulated_output.append(out.completion);
       if (req->remaining_decode_tokens >= 0) {
         req->remaining_decode_tokens = remaining_after_slice;
@@ -862,8 +887,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     if (limit <= 0)
       limit = 1;
     states[i].decode_limit = limit;
-    states[i].slice_active =
-        (slice > 0) || (tuning_.decode_burst_tokens > 0);
+    states[i].slice_active = (slice > 0) || (tuning_.decode_burst_tokens > 0);
 
     // If n_past is 0 and bpe_prompt_tokens is not empty, this is a fresh
     // prefill. (Note: In the current scheduler, Prefill() is called BEFORE
@@ -1112,10 +1136,10 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
               states[i].active = false;
             }
           }
-          LogUnifiedAssemblyState(
-              "prefill_emit", *req, piece, outcomes[i].result.completion,
-              res.token, states[i].tokens_generated, req->n_past, stop_hit,
-              states[i].active);
+          LogUnifiedAssemblyState("prefill_emit", *req, piece,
+                                  outcomes[i].result.completion, res.token,
+                                  states[i].tokens_generated, req->n_past,
+                                  stop_hit, states[i].active);
         }
       } else {
         // Decode step processing.
@@ -1133,8 +1157,8 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
           outcomes[i].result.completion += piece;
 
           std::string emit_piece;
-          stop_hit = ApplyStop(piece, outcomes[i].result.completion,
-                               req->stop, &emit_piece);
+          stop_hit = ApplyStop(piece, outcomes[i].result.completion, req->stop,
+                               &emit_piece);
 
           if (req->on_token && !emit_piece.empty()) {
             GlobalMetrics().RecordStreamTokens(1);
@@ -1203,7 +1227,8 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     }
     req->first_piece.clear();
 
-    if (!out.completion.empty() && !IsNonAccumulatingCompletion(out.completion)) {
+    if (!out.completion.empty() &&
+        !IsNonAccumulatingCompletion(out.completion)) {
       req->accumulated_output.append(out.completion);
       if (req->remaining_decode_tokens >= 0) {
         req->remaining_decode_tokens = remaining_after_slice;
@@ -1298,9 +1323,8 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
           *req, req->prefill_offset, std::move(chunk), is_last_chunk));
       active_reqs.push_back(req);
     } else if (req->exec_tokens_generated < req->exec_decode_limit) {
-      batch_inputs.push_back(
-          MakeUnifiedBatchInput(*req, req->n_past, {req->exec_current_token},
-                                true));
+      batch_inputs.push_back(MakeUnifiedBatchInput(
+          *req, req->n_past, {req->exec_current_token}, true));
       active_reqs.push_back(req);
     } else {
       req->exec_active = false;
@@ -1383,6 +1407,63 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     if (!step_ok) {
       step_outputs.clear();
     }
+  } else if (backend->SupportsUnifiedBatchBurst() &&
+             BurstStepEligible(active_reqs, batch_inputs)) {
+    // Burst-pipelined decode: the backend runs several tokens per call and
+    // streams them through the sink below (emission logic mirrors the
+    // per-step loop). On burst failure fall through to the normal path.
+    UnifiedBurstOptions burst_options;
+    const BurstTokenSink sink = [&](const BurstTokenEvent &ev) -> bool {
+      auto *req = active_reqs[ev.input_idx];
+      req->n_past += 1;
+      req->exec_current_token = ev.token_id;
+      const std::string piece(ev.piece);
+      bool stop_hit = false;
+      if (IsVisibleGeneratedPiece(piece)) {
+        req->exec_tokens_generated++;
+        req->exec_result.completion += piece;
+        std::string emit_piece;
+        stop_hit = ApplyStop(piece, req->exec_result.completion, req->stop,
+                             &emit_piece);
+        if (req->on_token && !emit_piece.empty()) {
+          GlobalMetrics().RecordStreamTokens(1);
+          req->on_token(emit_piece, nullptr);
+          if (req->cancellation_flag && req->cancellation_flag->load()) {
+            req->exec_active = false;
+            return false;
+          }
+        }
+      }
+      if (stop_hit) {
+        req->exec_active = false;
+        return false;
+      }
+      if (req->exec_tokens_generated >= req->exec_decode_limit) {
+        req->exec_active = false;
+        return false;
+      }
+      LogUnifiedAssemblyState("burst_decode_emit", *req, piece,
+                              req->exec_result.completion, ev.token_id,
+                              req->exec_tokens_generated, req->n_past, stop_hit,
+                              req->exec_active);
+      return true;
+    };
+    const UnifiedBurstResult burst =
+        backend->ExecuteUnifiedBatchBurst(batch_inputs, burst_options, sink);
+    if (burst.ok) {
+      // Post-burst bookkeeping: sequences the executor marked finished
+      // (device EOS or sink stop) deactivate here; the sink already did
+      // per-token emission, n_past, and exec_current_token.
+      for (std::size_t j = 0; j < active_reqs.size(); ++j) {
+        if (burst.finished[j]) {
+          active_reqs[j]->exec_active = false;
+        }
+      }
+      return;
+    }
+    log::Warn("batch_executor",
+              "Unified batch burst failed; falling back to per-step decode");
+    step_outputs = backend->ExecuteUnifiedBatch(batch_inputs);
   } else {
     step_outputs = backend->ExecuteUnifiedBatch(batch_inputs);
   }

@@ -22,6 +22,7 @@ enum class CopyTraceSite : size_t {
   kSamplerLogitsToProbsD2D,
   kSamplerTempToProbsD2D,
   kSamplerCopyLogitsD2H,
+  kBurstSlotD2H,
   kCount,
 };
 
@@ -43,6 +44,7 @@ inline std::array<CopyTraceEntry, static_cast<size_t>(CopyTraceSite::kCount)>
         {"sampler.logits_to_probs_d2d"},
         {"sampler.temp_to_probs_d2d"},
         {"sampler.copy_logits_d2h"},
+        {"burst.slot_d2h"},
     }};
 
 inline bool CopyTraceEnabled() {
@@ -65,16 +67,16 @@ inline void LogCopyTraceSummaryAtExit() {
     }
     const uint64_t bytes = entry.bytes.load(std::memory_order_relaxed);
     const uint64_t api_ns = entry.api_ns.load(std::memory_order_relaxed);
-    const double avg_us =
-        calls > 0 ? static_cast<double>(api_ns) / static_cast<double>(calls) /
-                        1000.0
-                  : 0.0;
-    std::fprintf(stderr,
-                 "[native_copy_trace] site=%s calls=%llu bytes=%llu api_ns=%llu "
-                 "avg_us=%.3f\n",
-                 entry.label, static_cast<unsigned long long>(calls),
-                 static_cast<unsigned long long>(bytes),
-                 static_cast<unsigned long long>(api_ns), avg_us);
+    const double avg_us = calls > 0 ? static_cast<double>(api_ns) /
+                                          static_cast<double>(calls) / 1000.0
+                                    : 0.0;
+    std::fprintf(
+        stderr,
+        "[native_copy_trace] site=%s calls=%llu bytes=%llu api_ns=%llu "
+        "avg_us=%.3f\n",
+        entry.label, static_cast<unsigned long long>(calls),
+        static_cast<unsigned long long>(bytes),
+        static_cast<unsigned long long>(api_ns), avg_us);
   }
   std::fprintf(stderr, "[native_copy_trace] summary end\n");
 }
@@ -88,10 +90,9 @@ inline void EnsureCopyTraceRegistered() {
 }
 
 template <typename DstPtr, typename SrcPtr>
-inline cudaError_t TracedCudaMemcpyAsync(CopyTraceSite site, DstPtr dst,
-                                         SrcPtr src, size_t count,
-                                         enum cudaMemcpyKind kind,
-                                         cudaStream_t stream) {
+inline cudaError_t
+TracedCudaMemcpyAsync(CopyTraceSite site, DstPtr dst, SrcPtr src, size_t count,
+                      enum cudaMemcpyKind kind, cudaStream_t stream) {
   if (!CopyTraceEnabled()) {
     return cudaMemcpyAsync(dst, src, count, kind, stream);
   }
@@ -101,7 +102,8 @@ inline cudaError_t TracedCudaMemcpyAsync(CopyTraceSite site, DstPtr dst,
   const auto end = std::chrono::steady_clock::now();
   auto &entry = kCopyTraceEntries[static_cast<size_t>(site)];
   entry.calls.fetch_add(1, std::memory_order_relaxed);
-  entry.bytes.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
+  entry.bytes.fetch_add(static_cast<uint64_t>(count),
+                        std::memory_order_relaxed);
   entry.api_ns.fetch_add(
       static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(end - start)

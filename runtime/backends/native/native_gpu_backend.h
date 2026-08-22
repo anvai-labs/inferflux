@@ -34,6 +34,11 @@ public:
   // --- LlamaCppBackend overrides (delegating to runtime) ---
   std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
+  bool SupportsUnifiedBatchBurst() const override;
+  UnifiedBurstResult
+  ExecuteUnifiedBatchBurst(const std::vector<UnifiedBatchInput> &inputs,
+                           const UnifiedBurstOptions &options,
+                           const BurstTokenSink &sink) override;
   bool SupportsAsyncUnifiedBatch() const override;
   bool SupportsSplitPrefillDecodeHandoff() const override;
   bool SupportsProcessLocalSequenceTransfer() const override;

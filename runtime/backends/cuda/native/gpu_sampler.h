@@ -77,6 +77,18 @@ public:
                           const std::vector<uint32_t> &seeds);
   void CollectSampleBatch(std::vector<int> *out_tokens);
 
+  /**
+   * Graph-safe batched greedy argmax: launches ONLY the BatchedArgmaxKernel
+   * writing the device result buffer. No memcpy, no event, no host state
+   * changes — used by the decode-burst pipeline, which copies results into
+   * its own ring slots. Returns false on launch failure.
+   */
+  bool EnqueueBatchedArgmax(const float *d_logits, int batch_size);
+
+  /// Device pointer to the batched argmax results ([kMaxBatchSize] ints).
+  /// Valid after Initialize(); written by EnqueueBatchedArgmax.
+  const int *batch_result_device() const { return d_result_batch_; }
+
   std::size_t DeviceWorkspaceBytes() const;
   std::size_t HostWorkspaceBytes() const;
 
@@ -96,10 +108,10 @@ private:
   int vocab_size_{0};
 
   // Scratch buffers
-  float *d_probs_{nullptr}; // [vocab_size] probabilities
-  int *d_indices_{nullptr}; // [vocab_size] sorted indices
-  float *d_temp_{nullptr};  // [vocab_size] temp storage
-  int *d_result_{nullptr};  // [1] sampled token ID (device)
+  float *d_probs_{nullptr};       // [vocab_size] probabilities
+  int *d_indices_{nullptr};       // [vocab_size] sorted indices
+  float *d_temp_{nullptr};        // [vocab_size] temp storage
+  int *d_result_{nullptr};        // [1] sampled token ID (device)
   int *h_result_pinned_{nullptr}; // [1] sampled token ID (host pinned)
 
   // For argmax
@@ -108,9 +120,9 @@ private:
 
   // Batch buffers (allocated once, sized for max batch)
   static constexpr int kMaxBatchSize = 64;
-  int *d_result_batch_{nullptr};             // [kMaxBatchSize] on device
-  int *h_result_batch_pinned_{nullptr};      // [kMaxBatchSize] host pinned
-  float *h_logits_pinned_{nullptr};          // [vocab_size] host pinned
+  int *d_result_batch_{nullptr};        // [kMaxBatchSize] on device
+  int *h_result_batch_pinned_{nullptr}; // [kMaxBatchSize] host pinned
+  float *h_logits_pinned_{nullptr};     // [vocab_size] host pinned
 
   // cuRAND
   curandGenerator_t rng_{nullptr};

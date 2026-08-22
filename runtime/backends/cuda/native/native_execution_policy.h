@@ -11,6 +11,13 @@ namespace inferflux {
 struct NativeExecutionPolicy {
   bool enable_batched_decode{true};
   bool disable_cuda_graph{false};
+  // Burst-pipelined decode: enqueue K decode steps (forward + sample +
+  // on-device token feed) per ExecuteUnifiedBatchBurst() call and consume
+  // tokens from a pinned ring while the GPU runs ahead. Default off until
+  // parity + benchmark gates pass (S1 rollout).
+  bool enable_decode_burst{false};
+  int decode_burst_chunk{8};
+  int decode_burst_max_ms{40};
   bool phase_timing_enabled{false};
   bool force_cublas{false};
   bool disable_prepacked_activations{false};
@@ -45,6 +52,12 @@ struct NativeExecutionPolicy {
     NativeExecutionPolicy policy;
     policy.enable_batched_decode =
         ParseBoolEnv("INFERFLUX_ENABLE_BATCHED_DECODE", true);
+    policy.enable_decode_burst =
+        ParseBoolEnv("INFERFLUX_CUDA_DECODE_BURST", false);
+    policy.decode_burst_chunk =
+        ParseIntEnv("INFERFLUX_CUDA_DECODE_BURST_CHUNK", 8, 1, 32);
+    policy.decode_burst_max_ms =
+        ParseIntEnv("INFERFLUX_CUDA_DECODE_BURST_MAX_MS", 40, 1, 1000);
     // CUDA graph capture: cudaDeviceSynchronize drains async work before
     // capture to prevent heap corruption. Disable with
     // INFERFLUX_DISABLE_CUDA_GRAPH=1 if issues arise.
@@ -65,9 +78,8 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_CUDA_DEBUG_DECODE_MAPPING_LIMIT", 32, 1,
                     std::numeric_limits<int>::max());
     policy.debug_logits = ParseBoolEnv("INFERFLUX_DEBUG_LOGITS", false);
-    policy.debug_logits_limit =
-        ParseIntEnv("INFERFLUX_DEBUG_LOGITS_LIMIT", 64, 1,
-                    std::numeric_limits<int>::max());
+    policy.debug_logits_limit = ParseIntEnv("INFERFLUX_DEBUG_LOGITS_LIMIT", 64,
+                                            1, std::numeric_limits<int>::max());
     policy.debug_operator_selection =
         ParseBoolEnv("INFERFLUX_CUDA_DEBUG_OPERATOR_SELECTION", false);
     policy.debug_operator_selection_limit =
@@ -90,16 +102,15 @@ struct NativeExecutionPolicy {
     policy.enable_experimental_q81_downproj_hot_fixed = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_HOT_FIXED", false);
     policy.enable_experimental_q81_downproj_rowpair_hot_fixed = ParseBoolEnv(
-        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED",
-        false);
+        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_DOWNPROJ_ROWPAIR_HOT_FIXED", false);
     policy.enable_experimental_q81_grouped_hot_q4k = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_HOT_Q4K", true);
     policy.enable_experimental_q81_grouped_rowpair_w4 = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4", true);
     policy.enable_experimental_q81_grouped_rowquad_m4 = ParseBoolEnv(
         "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWQUAD_M4", false);
-    policy.enable_experimental_q81_grouped_mmq3 = ParseBoolEnv(
-        "INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_MMQ3", true);
+    policy.enable_experimental_q81_grouped_mmq3 =
+        ParseBoolEnv("INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_MMQ3", true);
     policy.enable_downproj_mmq =
         ParseBoolEnv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", false);
     policy.downproj_mmq_min_batch_override =
@@ -124,10 +135,9 @@ private:
       return default_value;
     }
     std::string lowered(raw);
-    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
-                   [](unsigned char ch) {
-                     return static_cast<char>(std::tolower(ch));
-                   });
+    std::transform(
+        lowered.begin(), lowered.end(), lowered.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
     return lowered == "1" || lowered == "true" || lowered == "yes" ||
            lowered == "on";
   }

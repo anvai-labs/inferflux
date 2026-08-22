@@ -66,6 +66,21 @@ public:
   std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
 
+  // Burst-pipelined decode: backends that keep sampled tokens on device may
+  // run several decode steps per call and stream tokens through the sink
+  // while the GPU runs ahead. Default: not supported (callers fall back to
+  // per-token ExecuteUnifiedBatch).
+  virtual bool SupportsUnifiedBatchBurst() const { return false; }
+  virtual UnifiedBurstResult
+  ExecuteUnifiedBatchBurst(const std::vector<UnifiedBatchInput> &inputs,
+                           const UnifiedBurstOptions &options,
+                           const BurstTokenSink &sink) {
+    (void)inputs;
+    (void)options;
+    (void)sink;
+    return UnifiedBurstResult{};
+  }
+
   bool SupportsAsyncUnifiedBatch() const override;
   UnifiedBatchHandle SubmitUnifiedBatchAsync(
       const std::vector<UnifiedBatchInput> &inputs,
@@ -87,7 +102,7 @@ public:
          const std::vector<std::string> &stop_seqs = {}) override;
   void CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) override;
   PrefillResult PrefillPartial(const std::string &prompt, int sequence_id,
-                                int n_past_start) override;
+                               int n_past_start) override;
   void FreeSequence(int sequence_id) override;
   SequenceReleaseFence BeginFreeSequence(int sequence_id) override;
   bool PollFreeSequence(const SequenceReleaseFence &fence) override;

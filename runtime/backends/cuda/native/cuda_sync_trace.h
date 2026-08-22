@@ -20,6 +20,7 @@ enum class SyncTraceSite : size_t {
   kPrefillForwardDrain,
   kTimingForwardReady,
   kTimingSamplingReady,
+  kBurstChunkReady,
   kCount,
 };
 
@@ -38,6 +39,7 @@ inline std::array<SyncTraceEntry, static_cast<size_t>(SyncTraceSite::kCount)>
         {"executor.prefill_forward_drain"},
         {"executor.timing_forward_ready"},
         {"executor.timing_sampling_ready"},
+        {"burst.chunk_ready"},
     }};
 
 inline bool SyncTraceEnabled() {
@@ -59,14 +61,14 @@ inline void LogSyncTraceSummaryAtExit() {
       continue;
     }
     const uint64_t api_ns = entry.api_ns.load(std::memory_order_relaxed);
-    const double avg_us =
-        calls > 0 ? static_cast<double>(api_ns) / static_cast<double>(calls) /
-                        1000.0
-                  : 0.0;
-    std::fprintf(stderr,
-                 "[native_sync_trace] site=%s calls=%llu api_ns=%llu avg_us=%.3f\n",
-                 entry.label, static_cast<unsigned long long>(calls),
-                 static_cast<unsigned long long>(api_ns), avg_us);
+    const double avg_us = calls > 0 ? static_cast<double>(api_ns) /
+                                          static_cast<double>(calls) / 1000.0
+                                    : 0.0;
+    std::fprintf(
+        stderr,
+        "[native_sync_trace] site=%s calls=%llu api_ns=%llu avg_us=%.3f\n",
+        entry.label, static_cast<unsigned long long>(calls),
+        static_cast<unsigned long long>(api_ns), avg_us);
   }
   std::fprintf(stderr, "[native_sync_trace] summary end\n");
 }

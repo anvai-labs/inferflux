@@ -144,6 +144,24 @@ NativeGpuBackend::ExecuteUnifiedBatch(
   return runtime_->ExecuteUnifiedBatch(inputs);
 }
 
+bool NativeGpuBackend::SupportsUnifiedBatchBurst() const {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+  if (!runtime_) {
+    return false;
+  }
+  return runtime_->NativeSupportsUnifiedBatchBurst();
+}
+
+UnifiedBurstResult NativeGpuBackend::ExecuteUnifiedBatchBurst(
+    const std::vector<UnifiedBatchInput> &inputs,
+    const UnifiedBurstOptions &options, const BurstTokenSink &sink) {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+  if (!runtime_) {
+    return UnifiedBurstResult{};
+  }
+  return runtime_->NativeExecuteUnifiedBatchBurst(inputs, options, sink);
+}
+
 bool NativeGpuBackend::SupportsAsyncUnifiedBatch() const {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (!runtime_) {
@@ -186,8 +204,8 @@ int NativeGpuBackend::UnifiedBatchTokenCapacity() const {
   return backend->UnifiedBatchTokenCapacity();
 }
 
-PrefillResult
-NativeGpuBackend::Prefill(const std::string &prompt, int sequence_id) {
+PrefillResult NativeGpuBackend::Prefill(const std::string &prompt,
+                                        int sequence_id) {
   auto backend = DelegateBackend();
   if (!backend) {
     return {};
@@ -195,9 +213,9 @@ NativeGpuBackend::Prefill(const std::string &prompt, int sequence_id) {
   return backend->Prefill(prompt, sequence_id);
 }
 
-PrefillResult
-NativeGpuBackend::PrefillPartial(const std::string &prompt, int sequence_id,
-                                 int n_past_start) {
+PrefillResult NativeGpuBackend::PrefillPartial(const std::string &prompt,
+                                               int sequence_id,
+                                               int n_past_start) {
   auto backend = DelegateBackend();
   if (!backend) {
     return {};
@@ -220,8 +238,7 @@ void NativeGpuBackend::FreeSequence(int sequence_id) {
   }
 }
 
-SequenceReleaseFence
-NativeGpuBackend::BeginFreeSequence(int sequence_id) {
+SequenceReleaseFence NativeGpuBackend::BeginFreeSequence(int sequence_id) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
     return runtime_->NativeBeginFreeSequence(sequence_id);

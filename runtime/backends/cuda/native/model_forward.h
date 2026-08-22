@@ -1,10 +1,10 @@
 #pragma once
 
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 #include "runtime/backends/cuda/native/cublas_gemm.h"
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
 #include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/weight_map.h"
-#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -69,6 +69,32 @@ public:
       }
     }
     return true;
+  }
+
+  /// Device-resident batch decode metadata used by the burst token feed.
+  struct BatchMetaDevice {
+    int *token_ids{nullptr};
+    int *n_past{nullptr};
+    int *seq_ids{nullptr};
+    int *kv_lens{nullptr};
+  };
+
+  /// Access the device batch metadata buffers (fixed addresses). Only
+  /// meaningful for forwarders that support device-fed decode.
+  virtual BatchMetaDevice BatchMetaDevicePointers() const { return {}; }
+
+  /// True when a replayable decode graph exists for this batch size — i.e.
+  /// subsequent steps can be enqueued as a single graph launch.
+  virtual bool DecodeGraphReady(int /*batch_size*/) const { return false; }
+
+  /**
+   * Batched forward pass WITHOUT the host metadata upload: the device-side
+   * token/n_past/kv_len buffers are assumed current (advanced on device by
+   * the burst token-feed kernel). Used for burst-pipelined decode steps
+   * after the first. Default: unsupported.
+   */
+  virtual bool BatchForwardDevice(int /*batch_size*/, float * /*d_logits*/) {
+    return false;
   }
 
   /**

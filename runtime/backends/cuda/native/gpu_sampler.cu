@@ -1,6 +1,6 @@
-#include "runtime/backends/cuda/native/gpu_sampler.h"
 #include "runtime/backends/cuda/native/cuda_copy_trace.h"
 #include "runtime/backends/cuda/native/cuda_sync_trace.h"
+#include "runtime/backends/cuda/native/gpu_sampler.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
 
 #include "server/logging/logger.h"
@@ -307,8 +307,8 @@ bool GpuSampler::Initialize(int vocab_size, cudaStream_t stream) {
   err = cudaMalloc(&d_result_batch_, kMaxBatchSize * sizeof(int));
   if (err != cudaSuccess)
     return false;
-  err = cudaMallocHost(reinterpret_cast<void **>(&h_result_pinned_),
-                       sizeof(int));
+  err =
+      cudaMallocHost(reinterpret_cast<void **>(&h_result_pinned_), sizeof(int));
   if (err != cudaSuccess)
     return false;
   err = cudaMallocHost(reinterpret_cast<void **>(&h_result_batch_pinned_),
@@ -561,8 +561,8 @@ void GpuSampler::EnqueueSampleBatch(const float *d_logits, int batch_size,
     int threads = 256;
     int smem = threads * (sizeof(float) + sizeof(int));
 
-    BatchedArgmaxKernel<<<B, threads, smem, stream_>>>(d_logits, d_result_batch_,
-                                                       vocab_size_, B);
+    BatchedArgmaxKernel<<<B, threads, smem, stream_>>>(
+        d_logits, d_result_batch_, vocab_size_, B);
 
     runtime::cuda::native::TracedCudaMemcpyAsync(
         runtime::cuda::native::CopyTraceSite::kSamplerBatchResultD2H,
@@ -576,14 +576,25 @@ void GpuSampler::EnqueueSampleBatch(const float *d_logits, int batch_size,
 
   for (int i = 0; i < batch_size; ++i) {
     const float *logits_i = d_logits + i * vocab_size_;
-    const uint32_t seed =
-        i < static_cast<int>(seeds.size()) ? seeds[static_cast<size_t>(i)]
-                                           : UINT32_MAX;
+    const uint32_t seed = i < static_cast<int>(seeds.size())
+                              ? seeds[static_cast<size_t>(i)]
+                              : UINT32_MAX;
     EnqueueSample(logits_i, temperatures[i], top_ks[i], top_ps[i], seed);
     h_result_batch_pinned_[i] = CollectSample();
   }
   completion_pending_ = false;
   pending_batch_size_ = batch_size;
+}
+
+bool GpuSampler::EnqueueBatchedArgmax(const float *d_logits, int batch_size) {
+  if (batch_size <= 0 || batch_size > kMaxBatchSize) {
+    return false;
+  }
+  int threads = 256;
+  int smem = threads * (sizeof(float) + sizeof(int));
+  BatchedArgmaxKernel<<<batch_size, threads, smem, stream_>>>(
+      d_logits, d_result_batch_, vocab_size_, batch_size);
+  return cudaGetLastError() == cudaSuccess;
 }
 
 void GpuSampler::CollectSampleBatch(std::vector<int> *out_tokens) {

@@ -241,7 +241,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures" FORCE)
     message(STATUS "CUDA native arch: probing local GPU architecture")
   elseif(NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING "CUDA architectures" FORCE)
+    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING "CUDA architectures" FORCE)
   endif()
   enable_language(CUDA)
   if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
@@ -252,7 +252,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
           "CUDA architectures" FORCE)
       message(STATUS "CUDA native arch resolved to ${CMAKE_CUDA_ARCHITECTURES}")
     else()
-      set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90" CACHE STRING
+      set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING
           "CUDA architectures" FORCE)
       message(WARNING
         "Failed to resolve native CUDA architecture; falling back to standard multi-arch build")
@@ -294,6 +294,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/model_forward_factory.cpp
     runtime/backends/cuda/native/transformer_forward.cu
+    runtime/backends/cuda/native/decode_burst.cu
     runtime/backends/cuda/native/fused_quant_gemm.cu
     # GGUF quantization support (Phase 1-5: Foundation, GGUF Parsing, Handlers, CUDA Kernels, Forward Pass)
     runtime/backends/cuda/native/safetensors_adapter.cpp
