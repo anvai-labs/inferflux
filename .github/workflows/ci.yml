@@ -12,6 +12,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ---------------------------------------------------------------------------
   # Primary build + test job
@@ -174,7 +178,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching failure diagnostics
         run: |
-          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=5
+          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=6
           ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_failure_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateFailureContractTests method count: expected=${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS}" ]; then
@@ -301,6 +305,7 @@ jobs:
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=89 \
             -DENABLE_CUDA=ON \
             -DENABLE_ROCM=OFF \
             -DENABLE_MPS=OFF \
@@ -310,7 +315,7 @@ jobs:
 
       # Build only the server binary; unit tests can't run without a GPU.
       - name: Build (compile-only)
-        run: cmake --build build --target inferfluxd -j$(nproc)
+        run: cmake --build build --target inferfluxd -j2
 
   # ---------------------------------------------------------------------------
   # Vulkan compile-check — verifies GGML_VULKAN=ON builds clean.
@@ -593,7 +598,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching failure diagnostics
         run: |
-          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=5
+          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=6
           ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_failure_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateFailureContractTests method count: expected=${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS}" ]; then
