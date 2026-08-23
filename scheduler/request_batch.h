@@ -13,6 +13,7 @@
 #include "runtime/logprob.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/structured_output/structured_constraint.h"
+#include "runtime/text/incremental_utf8.h"
 
 namespace inferflux {
 
@@ -186,6 +187,9 @@ struct InferenceRequest {
   std::function<void(const std::string &, const TokenLogprob *)> on_token;
   std::string
       accumulated_output; // Aggregated completion text across fairness slices.
+  // Native tokenizers may split one UTF-8 code point across token pieces.
+  // Preserve the incomplete suffix across scheduler fairness slices.
+  IncrementalUtf8Assembler output_utf8;
 
   // Shared cancellation flag toggled when the HTTP connection closes.
   std::shared_ptr<std::atomic<bool>> cancellation_flag;

@@ -1246,6 +1246,152 @@ TEST_CASE("BatchExecutor bounds repeated non-emitting tokens in async phased "
   REQUIRE(req.phase == RequestPhase::kFinished);
 }
 
+TEST_CASE("BatchExecutor preserves UTF-8 split across native token pieces",
+          "[unified_batch][utf8]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  MetricsRegistry metrics;
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr, &metrics);
+  auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
+
+  LlamaCppBackend::UnifiedBatchOutput middle;
+  middle.token = 701;
+  middle.piece = "\x82";
+  middle.ok = true;
+  LlamaCppBackend::UnifiedBatchOutput last;
+  last.token = 702;
+  last.piece = "\xAC";
+  last.ok = true;
+  backend->SetSequencePlan(305, {middle, last});
+
+  std::string streamed;
+  InferenceRequest req;
+  req.model = "mock";
+  req.phase = RequestPhase::kDecode;
+  req.n_past = 5;
+  req.sequence_id = 305;
+  req.first_token = 700;
+  req.first_piece = "\xE2";
+  req.max_tokens = 3;
+  req.block_table = {305};
+  req.on_token = [&](const std::string &piece, const TokenLogprob *) {
+    streamed.append(piece);
+  };
+
+  RequestBatch batch;
+  batch.requests = {&req};
+  const auto results = executor->ExecuteBatch(batch, {backend});
+
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].completion == "\xE2\x82\xAC");
+  REQUIRE(results[0].completion_tokens == 3);
+  REQUIRE(streamed == results[0].completion);
+  REQUIRE(req.accumulated_output == results[0].completion);
+  REQUIRE(metrics.RenderPrometheus().find(
+              "inferflux_output_utf8_replacements_total{backend=\"cpu\"} 0") !=
+          std::string::npos);
+}
+
+TEST_CASE("BatchExecutor replaces incomplete terminal native token pieces",
+          "[unified_batch][utf8]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  MetricsRegistry metrics;
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr, &metrics);
+  auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
+
+  std::string streamed;
+  InferenceRequest req;
+  req.model = "mock";
+  req.phase = RequestPhase::kDecode;
+  req.n_past = 5;
+  req.sequence_id = 306;
+  req.first_token = 700;
+  req.first_piece = "\xE2\x82";
+  req.max_tokens = 1;
+  req.block_table = {306};
+  req.on_token = [&](const std::string &piece, const TokenLogprob *) {
+    streamed.append(piece);
+  };
+
+  RequestBatch batch;
+  batch.requests = {&req};
+  const auto results = executor->ExecuteBatch(batch, {backend});
+
+  REQUIRE(results.size() == 1);
+  REQUIRE(results[0].completion == "\xEF\xBF\xBD");
+  REQUIRE(streamed == results[0].completion);
+  REQUIRE(metrics.RenderPrometheus().find(
+              "inferflux_output_utf8_replacements_total{backend=\"cpu\"} 1") !=
+          std::string::npos);
+}
+
+TEST_CASE("BatchExecutor retains incomplete UTF-8 across fairness slices",
+          "[unified_batch][utf8][fairness]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  BatchExecutor::UnifiedBatchTuning tuning;
+  tuning.decode_burst_tokens = 1;
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr, tuning);
+  auto backend = std::make_shared<SequencedAsyncUnifiedBackend>();
+
+  LlamaCppBackend::UnifiedBatchOutput middle;
+  middle.token = 701;
+  middle.piece = "\x82";
+  middle.ok = true;
+  LlamaCppBackend::UnifiedBatchOutput last;
+  last.token = 702;
+  last.piece = "\xAC";
+  last.ok = true;
+  backend->SetSequencePlan(307, {middle, last});
+
+  std::string streamed;
+  InferenceRequest req;
+  req.model = "mock";
+  req.phase = RequestPhase::kDecode;
+  req.n_past = 5;
+  req.sequence_id = 307;
+  req.first_token = 700;
+  req.first_piece = "\xE2";
+  req.max_tokens = 3;
+  req.fairness.remaining_decode_tokens = 3;
+  req.block_table = {307};
+  req.on_token = [&](const std::string &piece, const TokenLogprob *) {
+    streamed.append(piece);
+  };
+
+  RequestBatch batch;
+  batch.requests = {&req};
+  const auto first = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(first[0].completion.empty());
+  REQUIRE(req.output_utf8.HasPendingBytes());
+  REQUIRE(req.phase == RequestPhase::kPending);
+
+  const auto second = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(second[0].completion.empty());
+  REQUIRE(req.output_utf8.HasPendingBytes());
+  REQUIRE(req.phase == RequestPhase::kPending);
+
+  const auto third = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(third[0].completion == "\xE2\x82\xAC");
+  REQUIRE_FALSE(req.output_utf8.HasPendingBytes());
+  REQUIRE(req.accumulated_output == third[0].completion);
+  REQUIRE(streamed == third[0].completion);
+  REQUIRE(req.phase == RequestPhase::kFinished);
+}
+
 TEST_CASE(
     "BatchExecutor treats empty backend generation as zero-token sentinel",
     "[unified_batch]") {

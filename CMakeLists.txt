@@ -95,6 +95,8 @@ add_library(inferflux_core STATIC
   runtime/speculative/speculative_decoder.h
   runtime/execution/batch_executor.cpp
   runtime/execution/batch_executor.h
+  runtime/text/incremental_utf8.cpp
+  runtime/text/incremental_utf8.h
   runtime/execution/unified_batch_lane_dispatcher.cpp
   runtime/execution/unified_batch_lane_dispatcher.h
   runtime/execution/parallel_context.cpp
@@ -624,6 +626,7 @@ add_executable(inferflux_tests
   tests/unit/test_audit_logger.cpp
   tests/unit/test_metrics.cpp
   tests/unit/test_http_server.cpp
+  tests/unit/test_incremental_utf8.cpp
   tests/unit/test_scheduler.cpp
   tests/unit/test_batch_selection_policy.cpp
   tests/unit/test_session_handle_manager.cpp

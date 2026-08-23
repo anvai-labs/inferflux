@@ -336,6 +336,36 @@ std::string ResolveResultModelId(const InferenceRequest &req) {
   return req.resolved_model.empty() ? req.model : req.resolved_model;
 }
 
+bool AppendGeneratedPiece(InferenceRequest *req, std::string_view raw_piece) {
+  auto assembled = req->output_utf8.Append(raw_piece);
+  GlobalMetrics().RecordOutputUtf8Replacements(assembled.replacements);
+  if (assembled.text.empty()) {
+    return false;
+  }
+  req->execution.result.completion.append(assembled.text);
+  std::string emit_piece;
+  const bool stop_hit = ApplyStop(
+      assembled.text, req->execution.result.completion, req->stop, &emit_piece);
+  if (req->on_token && !emit_piece.empty()) {
+    GlobalMetrics().RecordStreamTokens(1);
+    req->on_token(emit_piece, nullptr);
+  }
+  return stop_hit;
+}
+
+void FinishGeneratedText(InferenceRequest *req) {
+  auto assembled = req->output_utf8.Finish();
+  GlobalMetrics().RecordOutputUtf8Replacements(assembled.replacements);
+  if (assembled.text.empty()) {
+    return;
+  }
+  req->execution.result.completion.append(assembled.text);
+  if (req->on_token) {
+    GlobalMetrics().RecordStreamTokens(1);
+    req->on_token(assembled.text, nullptr);
+  }
+}
+
 void ResetUnifiedStepState(InferenceRequest *req) {
   if (!req) {
     return;
@@ -385,14 +415,7 @@ void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
     bool stop_hit = false;
     if (!piece.empty()) {
       req->execution.tokens_generated++;
-      req->execution.result.completion += piece;
-      std::string emit_piece;
-      stop_hit = ApplyStop(piece, req->execution.result.completion, req->stop,
-                           &emit_piece);
-      if (req->on_token && !emit_piece.empty()) {
-        GlobalMetrics().RecordStreamTokens(1);
-        req->on_token(emit_piece, nullptr);
-      }
+      stop_hit = AppendGeneratedPiece(req, piece);
     } else {
       req->execution.non_emitting_steps++;
     }
@@ -453,6 +476,7 @@ void FinalizeUnifiedDecodeStepResult(InferenceRequest *req,
     return;
   }
 
+  FinishGeneratedText(req);
   SyncUnifiedDecodeStepProgress(req);
   result->model_id = ResolveResultModelId(*req);
   result->completion = req->accumulated_output;

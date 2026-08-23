@@ -795,10 +795,6 @@ std::string BuildStreamChunk(const std::string &id, std::string_view model,
                    {"finish_reason", nullptr}};
     if (logprob != nullptr) {
       // Per-token logprob in OpenAI streaming format.
-      std::vector<int> tok_bytes;
-      tok_bytes.reserve(content.size());
-      for (unsigned char c : content)
-        tok_bytes.push_back(static_cast<int>(c));
       json top_arr = json::array();
       for (const auto &[alt_tok, alt_lp] : logprob->top_logprobs) {
         std::vector<int> alt_bytes;
@@ -810,12 +806,18 @@ std::string BuildStreamChunk(const std::string &id, std::string_view model,
       choice["logprobs"] = {
           {"content", json::array({{{"token", logprob->token},
                                     {"logprob", logprob->logprob},
-                                    {"bytes", tok_bytes},
+                                    {"bytes", logprob->bytes},
                                     {"top_logprobs", top_arr}}})}};
     }
     j["choices"] = json::array({choice});
   }
   return "data: " + SerializeJsonUtf8Safe(j) + "\n\n";
+}
+
+std::string BuildStreamChunkForTest(const std::string &content,
+                                    const TokenLogprob *logprob) {
+  return BuildStreamChunk("chatcmpl-test", "test-model", 0, content, false,
+                          "stop", logprob);
 }
 
 // §2.3: emit SSE delta sequence for a streaming tool call response.

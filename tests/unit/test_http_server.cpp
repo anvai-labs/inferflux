@@ -70,6 +70,24 @@ TEST_CASE("Completion JSON replaces malformed model UTF-8",
   REQUIRE(decoded["choices"][0]["message"]["content"] == "\xEF\xBF\xBD");
 }
 
+TEST_CASE("Streaming logprobs preserve raw token bytes",
+          "[http_server][utf8]") {
+  TokenLogprob logprob;
+  logprob.token = std::string(1, static_cast<char>(0x9B));
+  logprob.logprob = -0.5f;
+  logprob.bytes = {0x9B};
+
+  const auto event = BuildStreamChunkForTest("\xEF\xBF\xBD", &logprob);
+  REQUIRE(event.rfind("data: ", 0) == 0);
+  const auto payload = event.substr(6, event.size() - 8);
+  const auto decoded = nlohmann::json::parse(payload);
+  const auto &entry = decoded["choices"][0]["logprobs"]["content"][0];
+
+  REQUIRE(entry["token"] == "\xEF\xBF\xBD");
+  REQUIRE(entry["bytes"] == nlohmann::json::array({0x9B}));
+  REQUIRE(decoded["choices"][0]["delta"]["content"] == "\xEF\xBF\xBD");
+}
+
 TEST_CASE("LookupHeaderValueForTest matches header names case-insensitively",
           "[http_server]") {
   const std::string headers =

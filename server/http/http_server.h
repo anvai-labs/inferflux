@@ -41,6 +41,9 @@ inline std::string LookupHeaderValueForTest(const std::string &headers,
   return GetHeaderValue(headers, name);
 }
 
+std::string BuildStreamChunkForTest(const std::string &content,
+                                    const TokenLogprob *logprob);
+
 class HttpServer {
 public:
   struct TlsConfig {
