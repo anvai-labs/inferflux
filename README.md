@@ -83,7 +83,7 @@ Details: [docs/TechDebt_and_Competitive_Roadmap.md](docs/TechDebt_and_Competitiv
 | Proven advantage | `llama_cpp_cuda` 2.5x faster than Ollama, 4x faster than LM Studio at c=8. `inferflux_cuda` 1.16x faster than Ollama, 1.88x faster than LM Studio |
 | Native CUDA | `inferflux_cuda` functional with correct tokenization and chat templates. 50+ fused GEMV kernels, FlashAttention-2, repetition penalty. Accuracy parity with llama.cpp is the top priority |
 | Architecture | RAII, DIP (registry-based backend factory), strategy pattern (batch selection), MetricsRegistry DI, InferenceRequest decomposed |
-| Still open | GPU memory overhead, native structured output, protected-branch enforcement, speculative decoding integration |
+| Still open | GPU memory overhead, native structured output, speculative decoding integration |
 
 ## Design Principles
 

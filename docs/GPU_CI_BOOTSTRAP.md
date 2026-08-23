@@ -1,6 +1,6 @@
 # Trusted Dual-GPU CI Bootstrap
 
-**Status:** Operational; branch protection pending
+**Status:** Operational; hosted checks protect `main`
 
 ```mermaid
 flowchart LR
@@ -39,6 +39,25 @@ The runner group is restricted to
 the serial CUDA/ROCm jobs. This trust boundary follows
 [ADR-0005](adr/ADR-0005-trusted-gpu-release-evidence.md).
 
+## Protected Branch Contract
+
+The following GitHub-hosted checks are required, strict, and enforced for
+administrators. Force pushes and branch deletion are disabled.
+
+| Required check | Contract |
+|---|---|
+| `Build & Test (ubuntu-latest)` | Complete model-free suite and contract assertions |
+| `Build & Test (macos-latest, MPS)` | macOS runtime and unit coverage |
+| `Build (macos-latest, MLX flag)` | MLX configuration compiles |
+| `CUDA compile check (ubuntu-latest)` | CUDA sources compile on a hosted runner |
+| `Build check (Vulkan)` | Vulkan configuration compiles |
+| `GGUF & Quantization Tests (ubuntu-latest)` | Portable GGUF contracts pass |
+| `Coverage (ubuntu-latest)` | Coverage build, tests, and upload pass |
+| `clang-format check` | Touched C++ remains formatted |
+
+`Dual-GPU gate result` is deliberately absent from pull-request requirements;
+it is required by the release process for the exact promoted SHA.
+
 ## WSL Listener Lifecycle
 
 The current WSL execution environment has no systemd bus, so the runner's
@@ -67,7 +86,7 @@ Never write the token to documentation, logs, or source control.
 
 ## Promotion Evidence
 
-The runner, model variable, and dual-GPU jobs are operational. Four consecutive
-trusted-main runs passed on August 22-23, 2026, including retained CUDA and ROCm
-artifacts. TD-002 remains open until hosted checks protect `main` and the
+The runner, model variable, dual-GPU jobs, and protected hosted checks are
+operational. Four consecutive trusted-main runs passed on August 22-23, 2026,
+including retained CUDA and ROCm artifacts. TD-002 remains open until the
 release checklist is exercised against an exact-SHA GPU result.

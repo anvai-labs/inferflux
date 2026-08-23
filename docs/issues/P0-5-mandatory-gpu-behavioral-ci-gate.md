@@ -29,7 +29,7 @@ GPU validation is partially advisory and environment-dependent, reducing confide
 - [x] CUDA and ROCm logs are consistently uploaded by exact revision.
 - [x] Release docs define GPU gate expectations and exception handling.
 - [x] CI names are stable for repository protection and release automation.
-- [ ] Hosted checks protect `main` from unvalidated merges.
+- [x] Hosted checks protect `main` from unvalidated merges.
 
 Pre-merge execution on the persistent GPU host was superseded by
 [ADR-0005](../adr/ADR-0005-trusted-gpu-release-evidence.md). A disposable,

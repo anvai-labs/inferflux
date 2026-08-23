@@ -34,7 +34,8 @@ for trusted `main` workflow code. Four consecutive dual-GPU runs passed on
 August 22-23, 2026, with exact-SHA artifacts. Node 24-native action upgrades are
 also validated on hosted and self-hosted runners.
 
-Remaining work is enforcement: `main` has no branch protection as of August 23,
-2026. Require stable hosted checks, then exercise the exact-SHA release checklist.
-ADR-0005 intentionally makes persistent-GPU evidence a post-merge release gate
-rather than exposing the host to pull-request code.
+Eight stable hosted checks protect `main` as of August 23, 2026, with strict
+up-to-date enforcement for administrators. Remaining work is to exercise the
+exact-SHA checklist during a release. ADR-0005 intentionally makes persistent-
+GPU evidence a post-merge release gate rather than exposing the host to
+pull-request code.

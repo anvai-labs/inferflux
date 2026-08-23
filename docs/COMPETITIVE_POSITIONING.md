@@ -62,7 +62,7 @@ InferFlux Positioning (Apr 2026):
 |---|---|
 | GPU memory overhead (+2.5 GB) | Partially mitigated (aliasing, splits, budget). Structural from pre-allocated workspace. |
 | Native structured output | Still delegates to llama.cpp parity backend |
-| GPU CI enforcement | Trusted CUDA+ROCm main gate operational; branch protection pending |
+| GPU CI enforcement | Eight hosted checks protect `main`; trusted CUDA+ROCm release gate operational |
 | Speculative decoding | Partially integrated |
 
 ## 5) Release-Facing Guidance
