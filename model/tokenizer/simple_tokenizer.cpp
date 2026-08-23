@@ -56,6 +56,7 @@ std::vector<int> SimpleTokenizer::Encode(const std::string &text) {
   }
   std::vector<int> tokens;
   tokens.push_back(1); // <bos>
+  std::lock_guard<std::mutex> lock(mutex_);
   for (const auto &word : words) {
     tokens.push_back(AddToken(word));
   }
@@ -63,6 +64,9 @@ std::vector<int> SimpleTokenizer::Encode(const std::string &text) {
 }
 
 std::string SimpleTokenizer::Decode(const std::vector<int> &tokens) const {
+  // Lock against concurrent Encode's lazy reverse_ growth: a push_back
+  // realloc mid-Decode would dangle the reverse_[token] references below.
+  std::lock_guard<std::mutex> lock(mutex_);
   std::ostringstream stream;
   bool first_word = true;
   for (int token : tokens) {
