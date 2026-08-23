@@ -7404,6 +7404,154 @@ TEST_CASE(
   REQUIRE(summary.actual_op == FusedQuantGemm::DownProjOperator::kFallback);
 }
 
+// Regression shape of the kQ81GroupMmq3 allowlist bug: every selectable
+// operator must reach the lambda of its own tier when that tier is
+// available, and actual_op must equal the selection. Before the executor
+// allowlist learned kQ81GroupMmq3, that operator silently degraded to the
+// packed catch-all (metrics attributed packed_group, the tiled kernel never
+// launched, ~25% of c=16 throughput lost for months).
+TEST_CASE("InferfluxCudaLinearExecutor: every FFN operator reaches its tier "
+          "when available",
+          "[native_forward][dispatch_reachability]") {
+  using Op = FusedQuantGemm::FfnProjOperator;
+  const std::array<Op, 7> kAllFfnOps = {
+      Op::kFallback,          Op::kQ81Group,          Op::kQ81GroupHotQ4K,
+      Op::kQ81GroupRowPairW4, Op::kQ81GroupRowQuadM4, Op::kQ81GroupMmq3,
+      Op::kPackedGroup};
+
+  for (const Op op : kAllFfnOps) {
+    bool q81_called = false;
+    bool packed_called = false;
+    bool fallback_called = false;
+    NativeFfnExecutionSummary summary;
+
+    const bool ok = ExecuteInferfluxCudaFfnProjectionStage(
+        op, "decode", "q4_k",
+        static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 4,
+        11008, 2048,
+        [&]() {
+          q81_called = true;
+          return true;
+        },
+        [&]() {
+          packed_called = true;
+          return true;
+        },
+        [&]() {
+          fallback_called = true;
+          return true;
+        },
+        &summary);
+
+    CAPTURE(static_cast<int>(op));
+    REQUIRE(ok);
+
+    switch (op) {
+    case Op::kQ81Group:
+    case Op::kQ81GroupHotQ4K:
+    case Op::kQ81GroupRowPairW4:
+    case Op::kQ81GroupRowQuadM4:
+    case Op::kQ81GroupMmq3:
+      // The Q8_1 lambda must be the one invoked — this is the exact
+      // assertion that fails when an operator is missing from the
+      // executor's dispatch.
+      REQUIRE(q81_called);
+      REQUIRE_FALSE(packed_called);
+      REQUIRE(summary.used_q81);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kPackedGroup:
+      REQUIRE(packed_called);
+      REQUIRE_FALSE(q81_called);
+      REQUIRE(summary.used_packed);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kFallback:
+      // Documented current behavior: kFallback falls through to the packed
+      // catch-all rather than the dense fallback (the force_cublas
+      // divergence). Tightened when the executor becomes a switch.
+      REQUIRE(packed_called);
+      REQUIRE(summary.actual_op == Op::kPackedGroup);
+      break;
+    }
+  }
+}
+
+TEST_CASE("InferfluxCudaLinearExecutor: every down-proj operator reaches its "
+          "tier when available",
+          "[native_forward][dispatch_reachability]") {
+  using Op = FusedQuantGemm::DownProjOperator;
+  const std::array<Op, 8> kAllDownOps = {
+      Op::kFallback,        Op::kQ81Gemv,
+      Op::kQ81GemvHotFixed, Op::kQ81GemvRowPairHotFixed,
+      Op::kQ81GemvRowPair,  Op::kQ81GemvRowQuad,
+      Op::kPackedGemv,      Op::kMmq};
+
+  for (const Op op : kAllDownOps) {
+    bool mmq_called = false;
+    bool q81_called = false;
+    bool packed_called = false;
+    bool fallback_called = false;
+    NativeDownProjExecutionSummary summary;
+
+    const bool ok = ExecuteInferfluxCudaDownProjStage(
+        op, "decode", "q4_k",
+        static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 4,
+        2048, 11008,
+        [&]() {
+          mmq_called = true;
+          return true;
+        },
+        [&]() {
+          q81_called = true;
+          return true;
+        },
+        [&]() {
+          packed_called = true;
+          return true;
+        },
+        [&]() {
+          fallback_called = true;
+          return true;
+        },
+        [](FusedQuantGemm::DownProjOperator) {}, &summary);
+
+    CAPTURE(static_cast<int>(op));
+    REQUIRE(ok);
+
+    switch (op) {
+    case Op::kQ81Gemv:
+    case Op::kQ81GemvHotFixed:
+    case Op::kQ81GemvRowPairHotFixed:
+    case Op::kQ81GemvRowPair:
+    case Op::kQ81GemvRowQuad:
+      REQUIRE(q81_called);
+      REQUIRE_FALSE(mmq_called);
+      REQUIRE(summary.used_q81);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kMmq:
+      REQUIRE(mmq_called);
+      REQUIRE_FALSE(q81_called);
+      REQUIRE(summary.used_mmq);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kPackedGemv:
+      REQUIRE(packed_called);
+      REQUIRE(summary.used_packed);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kFallback:
+      // Documented current behavior: kFallback lands in the generic else
+      // branch and runs the Q8_1 path while actual_op stays kFallback.
+      // Tightened when the executor becomes a switch.
+      REQUIRE(q81_called);
+      REQUIRE(summary.actual_op == op);
+      break;
+    }
+  }
+}
+
 TEST_CASE("FusedQuantGemm: metric names distinguish V2 hot-path variants",
           "[native_forward]") {
   const int q4k =
