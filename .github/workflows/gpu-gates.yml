@@ -36,7 +36,7 @@ jobs:
 
     steps:
       - name: Checkout trusted main revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
           clean: true
@@ -95,7 +95,7 @@ jobs:
 
       - name: Upload CUDA evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cuda-gate-${{ github.sha }}
           path: build-ci-cuda/gpu-gate-server.log
@@ -111,7 +111,7 @@ jobs:
 
     steps:
       - name: Checkout trusted main revision
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           submodules: recursive
           clean: true
@@ -166,7 +166,7 @@ jobs:
 
       - name: Upload ROCm evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rocm-gate-${{ github.sha }}
           path: build-ci-rocm/gpu-gate-server.log
