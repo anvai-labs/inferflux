@@ -12,6 +12,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
@@ -458,12 +459,17 @@ public:
       : process_local_(process_local) {}
 
   bool Enqueue(disaggregated::KVPacket packet) override {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::unique_lock<std::mutex> lock(mutex_);
     if (packet.ticket_id > 0) {
       ticket_stages_[packet.ticket_id] = packet.ticket_stage;
     }
     packets_.push_back(packet);
     queue_.push_back(std::move(packet));
+    if (pause_enqueue_after_publish_) {
+      enqueue_visible_ = true;
+      cv_.notify_all();
+      cv_.wait(lock, [&] { return release_enqueue_; });
+    }
     return true;
   }
 
@@ -477,6 +483,8 @@ public:
     if (rewrite_dequeued_request_id_) {
       pkt.request_id = rewritten_request_id_;
     }
+    dequeued_ = true;
+    cv_.notify_all();
     return pkt;
   }
 
@@ -528,14 +536,42 @@ public:
     queue_.push_back(std::move(packet));
   }
 
+  // Makes a packet visible while keeping Enqueue() blocked, widening the
+  // transport/request publication window deterministically.
+  void EnablePublicationBarrier() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    pause_enqueue_after_publish_ = true;
+  }
+
+  bool WaitUntilVisible(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, timeout, [&] { return enqueue_visible_; });
+  }
+
+  bool WaitUntilDequeued(std::chrono::milliseconds timeout) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    return cv_.wait_for(lock, timeout, [&] { return dequeued_; });
+  }
+
+  void ReleaseEnqueue() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    release_enqueue_ = true;
+    cv_.notify_all();
+  }
+
 private:
   mutable std::mutex mutex_;
+  std::condition_variable cv_;
   std::vector<disaggregated::KVPacket> packets_;
   std::vector<disaggregated::KVPacket> queue_;
   std::unordered_map<uint64_t, disaggregated::KVTicketStage> ticket_stages_;
   bool rewrite_dequeued_request_id_{false};
   uint64_t rewritten_request_id_{0};
   bool process_local_{false};
+  bool pause_enqueue_after_publish_{false};
+  bool enqueue_visible_{false};
+  bool dequeued_{false};
+  bool release_enqueue_{false};
 };
 
 class CountingRouter final : public ModelRouter {
@@ -1562,6 +1598,78 @@ TEST_CASE("Scheduler stamps distributed KV packets with transport ticket ids",
           disaggregated::KVTicketStage::kEnqueued);
   REQUIRE(transport->GetTicketStage(packets.front().ticket_id) ==
           disaggregated::KVTicketStage::kCommitted);
+}
+
+TEST_CASE("Scheduler publishes distributed KV request before packet handling",
+          "[scheduler][distributed]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      16, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<SessionLeaseStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "dist-publication-model";
+  info.path = "/tmp/dist-publication.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  auto transport = std::make_shared<CapturingKVTransport>();
+  transport->EnablePublicationBarrier();
+  DisaggregatedConfig disagg_config;
+  disagg_config.decode_pool_size = 1;
+  disagg_config.kv_transport = transport;
+
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t enqueued_before = ReadDisaggTicketStageTotal("enqueued");
+  const int64_t acknowledged_before =
+      ReadDisaggTicketStageTotal("acknowledged");
+  const int64_t committed_before = ReadDisaggTicketStageTotal("committed");
+  const int64_t timed_out_before = ReadDisaggTicketStageTotal("timed_out");
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
+                      FairnessConfig{}, disagg_config);
+  REQUIRE(WaitForCondition([&] { return scheduler.LiveDecodeWorkers() == 1; }));
+
+  InferenceRequest req;
+  req.model = info.id;
+  req.prompt = "distributed publication test";
+  req.max_tokens = 4;
+
+  auto future = scheduler.Generate(std::move(req));
+  const bool packet_visible =
+      transport->WaitUntilVisible(std::chrono::milliseconds(1000));
+  const bool dequeued_while_publication_paused =
+      packet_visible &&
+      transport->WaitUntilDequeued(std::chrono::milliseconds(1000));
+  const auto packets = transport->Snapshot();
+  const uint64_t ticket_id = packets.empty() ? 0 : packets.front().ticket_id;
+  const bool matched_while_publication_paused =
+      dequeued_while_publication_paused && WaitForCondition([&] {
+        return transport->GetTicketStage(ticket_id) ==
+               disaggregated::KVTicketStage::kCommitted;
+      });
+  transport->ReleaseEnqueue();
+
+  const auto resp = future.get();
+  const bool ticket_committed = WaitForCondition([&] {
+    return transport->GetTicketStage(ticket_id) ==
+           disaggregated::KVTicketStage::kCommitted;
+  });
+
+  REQUIRE(packet_visible);
+  REQUIRE(dequeued_while_publication_paused);
+  REQUIRE(matched_while_publication_paused);
+  REQUIRE_FALSE(resp.no_backend);
+  REQUIRE(ticket_id > 0);
+  REQUIRE(ticket_committed);
+  REQUIRE(ReadDisaggTicketStageTotal("enqueued") - enqueued_before == 1);
+  REQUIRE(ReadDisaggTicketStageTotal("acknowledged") - acknowledged_before ==
+          1);
+  REQUIRE(ReadDisaggTicketStageTotal("committed") - committed_before == 1);
+  REQUIRE(ReadDisaggTicketStageTotal("timed_out") - timed_out_before == 0);
 }
 
 TEST_CASE("Scheduler keeps non-split backends on local decode lane",

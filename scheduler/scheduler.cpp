@@ -1005,6 +1005,14 @@ void Scheduler::DecodeWorkerLoop() {
               }
             }
           }
+          if (!ticket_committed) {
+            for (auto &pending : publishing_decode_) {
+              if (try_apply_packet(pending)) {
+                ticket_committed = true;
+                break;
+              }
+            }
+          }
         }
         if (pkt->ticket_id > 0) {
           const auto ticket_stage =
@@ -2043,6 +2051,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       const bool use_split_decode_workers =
           BackendUsesSplitDecodeWorkers(pending->resolved_backend);
       bool enqueued = false;
+      bool published_to_decode_worker = false;
       if (use_split_decode_workers && disagg_config_.kv_transport) {
         // Only enqueue when decode workers are live and draining the channel.
         // Without active consumers the channel fills to capacity (default 64)
@@ -2068,7 +2077,31 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         packet.n_past = inf.n_past;
         packet.sequence_id = inf.sequence_id;
         packet.metadata = inf.model;
+        // Register the request before Enqueue() can make its packet visible.
+        // Keep transport I/O outside queue_mutex_: ShmKVTransport may copy a
+        // large KV blob, and unrelated scheduler work must remain unblocked.
+        {
+          std::lock_guard<std::mutex> lock(queue_mutex_);
+          publishing_decode_.push_back(pending);
+        }
         enqueued = disagg_config_.kv_transport->Enqueue(std::move(packet));
+        {
+          std::lock_guard<std::mutex> lock(queue_mutex_);
+          auto publication = std::find(publishing_decode_.begin(),
+                                       publishing_decode_.end(), pending);
+          if (publication != publishing_decode_.end()) {
+            publishing_decode_.erase(publication);
+          }
+          if (enqueued) {
+            inf.phase = RequestPhase::kDecode;
+            pending_decode_.push_back(pending);
+            UpdateQueueDepthLocked();
+            published_to_decode_worker = true;
+          }
+        }
+        if (published_to_decode_worker) {
+          decode_cv_.notify_one();
+        }
       } else {
         enqueued = true;
       }
@@ -2078,7 +2111,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           metrics_->RecordDisaggKVTicketStage(
               disaggregated::KVTicketStageToString(
                   disaggregated::KVTicketStage::kEnqueued));
-          staged_decode_worker.push_back(pending);
+          if (!published_to_decode_worker) {
+            staged_decode_worker.push_back(pending);
+          }
         } else {
           staged_decode_local.push_back(pending);
         }

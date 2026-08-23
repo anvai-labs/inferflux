@@ -216,6 +216,10 @@ private:
   std::shared_ptr<RadixPrefixCache> prefix_cache_;
   std::vector<std::shared_ptr<PendingRequest>> pending_prefill_;
   std::vector<std::shared_ptr<PendingRequest>> pending_decode_;
+  // Split-decode requests registered before their transport packet can become
+  // visible. Decode workers use this registry only for packet matching; a
+  // request enters pending_decode_ after Enqueue() succeeds.
+  std::vector<std::shared_ptr<PendingRequest>> publishing_decode_;
 
   // Lock ordering (acquire in this order to prevent deadlock):
   //   1. queue_mutex_
