@@ -1,13 +1,14 @@
 # Trusted Dual-GPU CI Bootstrap
 
-**Status:** Runner registered and staged; workflow promotion pending
+**Status:** Operational; hosted checks protect `main`
 
 ```mermaid
 flowchart LR
   A[Register restricted runner] --> B[Pin model asset]
   B --> C[CUDA gate]
   C --> D[ROCm gate]
-  D --> E[Protect main]
+  D --> E[Retain exact-SHA evidence]
+  E --> F[Protect main hosted checks]
 ```
 
 ## Required Infrastructure
@@ -32,6 +33,30 @@ flowchart LR
 5. Retain logs and raw evidence on success and failure.
 6. Protect `main`; require hosted CPU checks on pull requests and require the
    dual-GPU workflow as post-merge/release evidence.
+
+The runner group is restricted to
+`gpu-gates.yml@refs/heads/main`; `INFERFLUX_ENABLE_DUAL_GPU_GATE=true` enables
+the serial CUDA/ROCm jobs. This trust boundary follows
+[ADR-0005](adr/ADR-0005-trusted-gpu-release-evidence.md).
+
+## Protected Branch Contract
+
+The following GitHub-hosted checks are required, strict, and enforced for
+administrators. Force pushes and branch deletion are disabled.
+
+| Required check | Contract |
+|---|---|
+| `Build & Test (ubuntu-latest)` | Complete model-free suite and contract assertions |
+| `Build & Test (macos-latest, MPS)` | macOS runtime and unit coverage |
+| `Build (macos-latest, MLX flag)` | MLX configuration compiles |
+| `CUDA compile check (ubuntu-latest)` | CUDA sources compile on a hosted runner |
+| `Build check (Vulkan)` | Vulkan configuration compiles |
+| `GGUF & Quantization Tests (ubuntu-latest)` | Portable GGUF contracts pass |
+| `Coverage (ubuntu-latest)` | Coverage build, tests, and upload pass |
+| `clang-format check` | Touched C++ remains formatted |
+
+`Dual-GPU gate result` is deliberately absent from pull-request requirements;
+it is required by the release process for the exact promoted SHA.
 
 ## WSL Listener Lifecycle
 
@@ -59,9 +84,9 @@ and these values: group `inferflux-gpu-trusted-staging`, name
 `gpu,cuda,rocm,dual-gpu,rtx4000-ada,radeon-ai-pro-r9700,compute-89,gfx1201,gpu-20gb,gpu-32gb`.
 Never write the token to documentation, logs, or source control.
 
-## Promotion Gate
+## Promotion Evidence
 
-Do not close TD-002 merely because the workflow file contains GPU jobs. Close it
-only after GitHub reports the configured runner, the model variable is present,
-three consecutive CUDA+ROCm runs pass, and the release process requires their
-stable names.
+The runner, model variable, dual-GPU jobs, and protected hosted checks are
+operational. Four consecutive trusted-main runs passed on August 22-23, 2026,
+including retained CUDA and ROCm artifacts. TD-002 remains open until the
+release checklist is exercised against an exact-SHA GPU result.

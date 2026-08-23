@@ -9,6 +9,7 @@
 ```mermaid
 flowchart LR
   A[TD-001 Green baseline] --> B[TD-002 Required evidence gates]
+  B --> Q[ADR-0005 Trusted GPU release evidence]
   B --> O[TD-006 Dependency/runtime currency]
   O --> P[TD-007 Context and sequence capacity]
   P --> C[ADR-0001 Runtime proof-or-pivot]
@@ -76,9 +77,10 @@ gantt
 
 1. **Baseline gate:** no feature implementation merges while the portable build/test contract is red.
 2. **Runtime gate:** continue native CUDA investment only when retained evidence meets ADR-0001 thresholds; otherwise use the compatibility provider as the primary data plane.
-3. **Adoption gate:** local autostart must preserve the same API/policy semantics as remote serving.
-4. **Tenant gate:** reusable cache, adapter, session, and audit state must share one tenant identity boundary.
-5. **Scale gate:** no distributed maturity claim precedes deterministic ownership and cleanup tests.
+3. **Release gate:** require exact-SHA CUDA and ROCm evidence without exposing the persistent GPU host to pull-request code (ADR-0005).
+4. **Adoption gate:** local autostart must preserve the same API/policy semantics as remote serving.
+5. **Tenant gate:** reusable cache, adapter, session, and audit state must share one tenant identity boundary.
+6. **Scale gate:** no distributed maturity claim precedes deterministic ownership and cleanup tests.
 
 ## Deliberate Deferrals
 

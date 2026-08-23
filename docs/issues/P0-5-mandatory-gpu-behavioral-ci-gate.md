@@ -1,4 +1,4 @@
-# [P0-5] Mandatory GPU Behavioral CI Gate
+# [P0-5] Trusted GPU Behavioral Release Gate
 
 Priority: P0
 Owner: QA + Runtime
@@ -17,14 +17,20 @@ GPU validation is partially advisory and environment-dependent, reducing confide
 - `docs/DeveloperGuide.md`
 
 ## Test Plan
-1. Make one GPU lane required (not advisory) for protected branch workflows.
+1. Require hosted portable checks for pull requests and protect `main`.
 2. Ensure the lane executes throughput gate plus focused capability and contract assertions.
 3. Verify CI artifact publication for perf diagnostics on pass or fail.
 4. Validate branch protection docs reference the required check name.
+5. Require exact-revision CUDA and ROCm evidence before release promotion.
 
 ## Acceptance Checklist
-- [ ] At least one CUDA behavioral job is required for merge.
-- [ ] Required job runs throughput gate and fails on threshold breach.
-- [ ] GPU job logs and artifacts are consistently uploaded.
-- [ ] Release docs define GPU gate expectations and fallback process.
-- [ ] CI names are stable so repository protection rules remain valid.
+- [x] Persistent GPU runner is restricted to trusted `main` workflow code.
+- [x] CUDA job runs throughput gate and fails on threshold breach.
+- [x] CUDA and ROCm logs are consistently uploaded by exact revision.
+- [x] Release docs define GPU gate expectations and exception handling.
+- [x] CI names are stable for repository protection and release automation.
+- [x] Hosted checks protect `main` from unvalidated merges.
+
+Pre-merge execution on the persistent GPU host was superseded by
+[ADR-0005](../adr/ADR-0005-trusted-gpu-release-evidence.md). A disposable,
+isolated runner is required before untrusted pull-request code can run on GPU.

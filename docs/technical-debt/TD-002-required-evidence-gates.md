@@ -14,25 +14,28 @@ environment-dependent, allowing provider regressions to outlive the change.
 ## Remediation
 
 - Build and run the complete model-free suite in the required CPU job.
-- Add one required CUDA behavioral job with pinned runner/toolchain/model assets.
+- Add trusted CUDA and ROCm behavioral jobs with pinned runner/toolchain/model assets.
 - Separate correctness/reliability gates from performance trend reporting.
 - Upload machine-readable configs, revisions, raw results, and failure artifacts.
 - Document an explicit, time-bounded release exception process.
 
 ## Exit Criteria
 
-- Branch protection names stable CPU and CUDA checks as required.
+- Branch protection names stable hosted checks as required.
 - CI configuration contains no contradictory skip/run contract.
 - A deliberately broken CPU contract and CUDA provider assertion both block CI.
-- Release checklist links retained artifacts and their provenance.
+- Release checklist requires exact-SHA CUDA and ROCm artifacts and provenance.
 
 ## Current Evidence and Remaining Work
 
-The required CPU job now builds and runs the full model-free suite. The
-organization runner `aiserver1-dual-gpu` is registered with CUDA and ROCm labels,
-but remains staged with public-repository access and gate variables disabled.
-Local CUDA CTest and model-backed native-provider evidence pass. ROCm now builds
-real HIP kernels after correcting `GGML_HIP`; its model-backed timeout remains
-open. Promotion and branch protection wait for the trusted workflow on `main`
-and three consecutive dual-GPU runs described in
-[GPU CI Bootstrap](../GPU_CI_BOOTSTRAP.md).
+The required CPU job builds and runs the full model-free suite. The restricted
+`aiserver1-dual-gpu` runner executes serial CUDA and ROCm model-backed gates only
+for trusted `main` workflow code. Four consecutive dual-GPU runs passed on
+August 22-23, 2026, with exact-SHA artifacts. Node 24-native action upgrades are
+also validated on hosted and self-hosted runners.
+
+Eight stable hosted checks protect `main` as of August 23, 2026, with strict
+up-to-date enforcement for administrators. Remaining work is to exercise the
+exact-SHA checklist during a release. ADR-0005 intentionally makes persistent-
+GPU evidence a post-merge release gate rather than exposing the host to
+pull-request code.
