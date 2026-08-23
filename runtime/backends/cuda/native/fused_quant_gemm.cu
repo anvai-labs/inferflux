@@ -117,13 +117,13 @@ GpuProfile &GetGpuProfile() {
       profile.sm_minor = prop.minor;
       // memoryClockRate removed in CUDA 13+; use cudaDeviceGetAttribute.
       int mem_clock_khz = 0, mem_bus_width = 0;
-      cudaDeviceGetAttribute(&mem_clock_khz,
-                             cudaDevAttrMemoryClockRate, device);
-      cudaDeviceGetAttribute(&mem_bus_width,
-                             cudaDevAttrGlobalMemoryBusWidth, device);
-      profile.memory_bandwidth_gb_s =
-          static_cast<float>(mem_clock_khz) * 2.0f *
-          static_cast<float>(mem_bus_width) / 8.0f / 1e6f;
+      cudaDeviceGetAttribute(&mem_clock_khz, cudaDevAttrMemoryClockRate,
+                             device);
+      cudaDeviceGetAttribute(&mem_bus_width, cudaDevAttrGlobalMemoryBusWidth,
+                             device);
+      profile.memory_bandwidth_gb_s = static_cast<float>(mem_clock_khz) * 2.0f *
+                                      static_cast<float>(mem_bus_width) / 8.0f /
+                                      1e6f;
       profile.sm_count = prop.multiProcessorCount;
       profile.has_dp4a =
           (prop.major > 6) || (prop.major == 6 && prop.minor >= 1);
@@ -1021,41 +1021,6 @@ FusedQuantGemm::FfnProjOperator FusedQuantGemm::SelectFfnProjOperator(
   return selected;
 }
 
-const char *
-FusedQuantGemm::FfnProjOperatorName(FusedQuantGemm::FfnProjOperator op) {
-  switch (op) {
-  case FusedQuantGemm::FfnProjOperator::kQ81Group:
-    return "q8_1_group";
-  case FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K:
-    return "q8_1_group_hot_q4k";
-  case FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4:
-    return "q8_1_group_row_pair_w4";
-  case FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4:
-    return "q8_1_group_row_quad_m4";
-  case FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3:
-    return "q8_1_group_mmq3";
-  case FusedQuantGemm::FfnProjOperator::kPackedGroup:
-    return "packed_group";
-  case FusedQuantGemm::FfnProjOperator::kFallback:
-  default:
-    return "fallback";
-  }
-}
-
-const char *
-FusedQuantGemm::FfnProjOperatorMetricName(FusedQuantGemm::FfnProjOperator op,
-                                          int quant_type, int m, int k) {
-  (void)k;
-  const auto qtype = static_cast<GGUF::TensorType>(quant_type);
-  if (op == FusedQuantGemm::FfnProjOperator::kQ81Group &&
-      (qtype == GGUF::TensorType::Q4_K || qtype == GGUF::TensorType::Q6_K)) {
-    if (m <= 8)
-      return "q8_1_group_mmvq";
-    return "q8_1_group_mmq";
-  }
-  return FfnProjOperatorName(op);
-}
-
 FusedQuantGemm::DownProjOperator FusedQuantGemm::SelectDownProjOperator(
     int quant_type, const FusedDispatchGeometry &geometry, bool allow_q81,
     bool allow_packed, bool allow_mmq, const NativeExecutionPolicy *policy) {
@@ -1095,40 +1060,6 @@ FusedQuantGemm::DownProjOperator FusedQuantGemm::SelectDownProjOperator(
       DescribeInferfluxCudaDownProjDispatchDecision(
           profile, decision.reason ? decision.reason : "fallback"));
   return selected;
-}
-
-const char *
-FusedQuantGemm::DownProjOperatorName(FusedQuantGemm::DownProjOperator op) {
-  switch (op) {
-  case FusedQuantGemm::DownProjOperator::kQ81Gemv:
-    return "q8_1_gemv";
-  case FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed:
-    return "q8_1_gemv_hot_fixed";
-  case FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed:
-    return "q8_1_gemv_row_pair_hot_fixed";
-  case FusedQuantGemm::DownProjOperator::kQ81GemvRowPair:
-    return "q8_1_gemv_row_pair";
-  case FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad:
-    return "q8_1_gemv_row_quad";
-  case FusedQuantGemm::DownProjOperator::kPackedGemv:
-    return "packed_gemv";
-  case FusedQuantGemm::DownProjOperator::kMmq:
-    return "mmq";
-  case FusedQuantGemm::DownProjOperator::kFallback:
-  default:
-    return "fallback";
-  }
-}
-
-const char *
-FusedQuantGemm::DownProjOperatorMetricName(FusedQuantGemm::DownProjOperator op,
-                                           int quant_type, int m, int k) {
-  (void)quant_type;
-  (void)k;
-  if (op == FusedQuantGemm::DownProjOperator::kQ81Gemv) {
-    return (m <= 8) ? "q8_1_mmvq" : "q8_1_mmq";
-  }
-  return DownProjOperatorName(op);
 }
 
 bool FusedQuantGemm::GemvPacked(const QuantizedWeightInfo &weight,
@@ -1253,7 +1184,6 @@ using Q8_1DispatchTripleFn = bool (*)(const void *data0, const void *data1,
                                       int N1, half *output2, int N2, int M,
                                       int K, cudaStream_t stream);
 
-
 template <
     typename BlockType, int Outputs,
     void (*Q8_1GroupKernel)(PackedProjectionGroupParams<BlockType, Outputs>,
@@ -1290,7 +1220,6 @@ bool DispatchQ8_1GemvPair(const void *data0, const void *data1,
       {data0, data1}, act_q8_1, {output0, output1}, {N0, N1}, M, K, stream);
 }
 
-
 template <typename BlockType,
           void (*Q8_1GroupKernel)(PackedProjectionGroupParams<BlockType, 3>,
                                   const block_q8_1 *, int)>
@@ -1304,15 +1233,13 @@ bool DispatchQ8_1GemvTriple(const void *data0, const void *data1,
       {N0, N1, N2}, M, K, stream);
 }
 
-
-
 // ============================================================================
 // MMVQ (weight-read-first) dispatch helpers
 // ============================================================================
 
 // MMVQ single-output dispatch for Q4_K
 bool DispatchQ8_1MmvqQ4K(const void *data, const void *act_q8_1, half *output,
-                          int M, int N, int K, cudaStream_t stream) {
+                         int M, int N, int K, cudaStream_t stream) {
   return DispatchMmvq<block_q4_k, inferflux_mmvq_q4k<1>, inferflux_mmvq_q4k<2>,
                       inferflux_mmvq_q4k<4>, inferflux_mmvq_q4k<8>>(
       data, act_q8_1, output, M, N, K, stream);
@@ -1320,7 +1247,7 @@ bool DispatchQ8_1MmvqQ4K(const void *data, const void *act_q8_1, half *output,
 
 // MMVQ single-output dispatch for Q6_K
 bool DispatchQ8_1MmvqQ6K(const void *data, const void *act_q8_1, half *output,
-                          int M, int N, int K, cudaStream_t stream) {
+                         int M, int N, int K, cudaStream_t stream) {
   return DispatchMmvq<block_q6_k, inferflux_mmvq_q6k<1>, inferflux_mmvq_q6k<2>,
                       inferflux_mmvq_q6k<4>, inferflux_mmvq_q6k<8>>(
       data, act_q8_1, output, M, N, K, stream);
@@ -1328,7 +1255,7 @@ bool DispatchQ8_1MmvqQ6K(const void *data, const void *act_q8_1, half *output,
 
 // MMVQ single-output dispatch for Q8_0
 bool DispatchQ8_1MmvqQ8_0(const void *data, const void *act_q8_1, half *output,
-                           int M, int N, int K, cudaStream_t stream) {
+                          int M, int N, int K, cudaStream_t stream) {
   return DispatchMmvq<block_q8_0, inferflux_mmvq_q8_0<1>,
                       inferflux_mmvq_q8_0<2>, inferflux_mmvq_q8_0<4>,
                       inferflux_mmvq_q8_0<8>>(data, act_q8_1, output, M, N, K,
@@ -1337,7 +1264,7 @@ bool DispatchQ8_1MmvqQ8_0(const void *data, const void *act_q8_1, half *output,
 
 // MMVQ single-output dispatch for Q8_K
 bool DispatchQ8_1MmvqQ8K(const void *data, const void *act_q8_1, half *output,
-                          int M, int N, int K, cudaStream_t stream) {
+                         int M, int N, int K, cudaStream_t stream) {
   return DispatchMmvq<block_q8_k, inferflux_mmvq_q8k<1>, inferflux_mmvq_q8k<2>,
                       inferflux_mmvq_q8k<4>, inferflux_mmvq_q8k<8>>(
       data, act_q8_1, output, M, N, K, stream);
@@ -1347,84 +1274,81 @@ bool DispatchQ8_1MmvqQ8K(const void *data, const void *act_q8_1, half *output,
 // MMQ dispatch functions (batch 9-64)
 // ============================================================================
 
-bool DispatchMmqQ4K(const void *data, const void *act_q8_1, half *output,
-                    int M, int N, int K, cudaStream_t stream) {
-  return DispatchMmq<block_q4_k, inferflux_mmq_q4k<16>,
-                     inferflux_mmq_q4k<32>>(data, act_q8_1, output, M, N, K, 8,
-                                            stream);
+bool DispatchMmqQ4K(const void *data, const void *act_q8_1, half *output, int M,
+                    int N, int K, cudaStream_t stream) {
+  return DispatchMmq<block_q4_k, inferflux_mmq_q4k<16>, inferflux_mmq_q4k<32>>(
+      data, act_q8_1, output, M, N, K, 8, stream);
 }
 
-bool DispatchMmqQ6K(const void *data, const void *act_q8_1, half *output,
-                    int M, int N, int K, cudaStream_t stream) {
-  return DispatchMmq<block_q6_k, inferflux_mmq_q6k<16>,
-                     inferflux_mmq_q6k<32>>(data, act_q8_1, output, M, N, K, 8,
-                                            stream);
+bool DispatchMmqQ6K(const void *data, const void *act_q8_1, half *output, int M,
+                    int N, int K, cudaStream_t stream) {
+  return DispatchMmq<block_q6_k, inferflux_mmq_q6k<16>, inferflux_mmq_q6k<32>>(
+      data, act_q8_1, output, M, N, K, 8, stream);
 }
 
 bool DispatchMmqQ8_0(const void *data, const void *act_q8_1, half *output,
                      int M, int N, int K, cudaStream_t stream) {
   return DispatchMmq<block_q8_0, inferflux_mmq_q8_0<16>,
-                     inferflux_mmq_q8_0<32>>(data, act_q8_1, output, M, N, K,
-                                             4, stream);
+                     inferflux_mmq_q8_0<32>>(data, act_q8_1, output, M, N, K, 4,
+                                             stream);
 }
 
-bool DispatchMmqQ8K(const void *data, const void *act_q8_1, half *output,
-                    int M, int N, int K, cudaStream_t stream) {
-  return DispatchMmq<block_q8_k, inferflux_mmq_q8k<16>,
-                     inferflux_mmq_q8k<32>>(data, act_q8_1, output, M, N, K, 8,
-                                            stream);
+bool DispatchMmqQ8K(const void *data, const void *act_q8_1, half *output, int M,
+                    int N, int K, cudaStream_t stream) {
+  return DispatchMmq<block_q8_k, inferflux_mmq_q8k<16>, inferflux_mmq_q8k<32>>(
+      data, act_q8_1, output, M, N, K, 8, stream);
 }
 
 // MMVQ pair dispatch for Q4_K
 bool DispatchQ8_1MmvqPairQ4K(const void *data0, const void *data1,
-                              const void *act_q8_1, half *output0, int N0,
-                              half *output1, int N1, int M, int K,
-                              cudaStream_t stream) {
-  return DispatchMmvqPair<
-      block_q4_k, inferflux_mmvq_q4k_group<1, 2>,
-      inferflux_mmvq_q4k_group<2, 2>, inferflux_mmvq_q4k_group<4, 2>,
-      inferflux_mmvq_q4k_group<8, 2>>(data0, data1, act_q8_1, output0, N0,
-                                      output1, N1, M, K, stream);
+                             const void *act_q8_1, half *output0, int N0,
+                             half *output1, int N1, int M, int K,
+                             cudaStream_t stream) {
+  return DispatchMmvqPair<block_q4_k, inferflux_mmvq_q4k_group<1, 2>,
+                          inferflux_mmvq_q4k_group<2, 2>,
+                          inferflux_mmvq_q4k_group<4, 2>,
+                          inferflux_mmvq_q4k_group<8, 2>>(
+      data0, data1, act_q8_1, output0, N0, output1, N1, M, K, stream);
 }
 
 // MMVQ pair dispatch for Q6_K
 bool DispatchQ8_1MmvqPairQ6K(const void *data0, const void *data1,
-                              const void *act_q8_1, half *output0, int N0,
-                              half *output1, int N1, int M, int K,
-                              cudaStream_t stream) {
-  return DispatchMmvqPair<
-      block_q6_k, inferflux_mmvq_q6k_group<1, 2>,
-      inferflux_mmvq_q6k_group<2, 2>, inferflux_mmvq_q6k_group<4, 2>,
-      inferflux_mmvq_q6k_group<8, 2>>(data0, data1, act_q8_1, output0, N0,
-                                      output1, N1, M, K, stream);
+                             const void *act_q8_1, half *output0, int N0,
+                             half *output1, int N1, int M, int K,
+                             cudaStream_t stream) {
+  return DispatchMmvqPair<block_q6_k, inferflux_mmvq_q6k_group<1, 2>,
+                          inferflux_mmvq_q6k_group<2, 2>,
+                          inferflux_mmvq_q6k_group<4, 2>,
+                          inferflux_mmvq_q6k_group<8, 2>>(
+      data0, data1, act_q8_1, output0, N0, output1, N1, M, K, stream);
 }
 
 // MMVQ triple dispatch for Q4_K
 bool DispatchQ8_1MmvqTripleQ4K(const void *data0, const void *data1,
-                                const void *data2, const void *act_q8_1,
-                                half *output0, int N0, half *output1, int N1,
-                                half *output2, int N2, int M, int K,
-                                cudaStream_t stream) {
-  return DispatchMmvqTriple<
-      block_q4_k, inferflux_mmvq_q4k_group<1, 3>,
-      inferflux_mmvq_q4k_group<2, 3>, inferflux_mmvq_q4k_group<4, 3>,
-      inferflux_mmvq_q4k_group<8, 3>>(data0, data1, data2, act_q8_1, output0,
-                                      N0, output1, N1, output2, N2, M, K,
-                                      stream);
+                               const void *data2, const void *act_q8_1,
+                               half *output0, int N0, half *output1, int N1,
+                               half *output2, int N2, int M, int K,
+                               cudaStream_t stream) {
+  return DispatchMmvqTriple<block_q4_k, inferflux_mmvq_q4k_group<1, 3>,
+                            inferflux_mmvq_q4k_group<2, 3>,
+                            inferflux_mmvq_q4k_group<4, 3>,
+                            inferflux_mmvq_q4k_group<8, 3>>(
+      data0, data1, data2, act_q8_1, output0, N0, output1, N1, output2, N2, M,
+      K, stream);
 }
 
 // MMVQ triple dispatch for Q6_K
 bool DispatchQ8_1MmvqTripleQ6K(const void *data0, const void *data1,
-                                const void *data2, const void *act_q8_1,
-                                half *output0, int N0, half *output1, int N1,
-                                half *output2, int N2, int M, int K,
-                                cudaStream_t stream) {
-  return DispatchMmvqTriple<
-      block_q6_k, inferflux_mmvq_q6k_group<1, 3>,
-      inferflux_mmvq_q6k_group<2, 3>, inferflux_mmvq_q6k_group<4, 3>,
-      inferflux_mmvq_q6k_group<8, 3>>(data0, data1, data2, act_q8_1, output0,
-                                      N0, output1, N1, output2, N2, M, K,
-                                      stream);
+                               const void *data2, const void *act_q8_1,
+                               half *output0, int N0, half *output1, int N1,
+                               half *output2, int N2, int M, int K,
+                               cudaStream_t stream) {
+  return DispatchMmvqTriple<block_q6_k, inferflux_mmvq_q6k_group<1, 3>,
+                            inferflux_mmvq_q6k_group<2, 3>,
+                            inferflux_mmvq_q6k_group<4, 3>,
+                            inferflux_mmvq_q6k_group<8, 3>>(
+      data0, data1, data2, act_q8_1, output0, N0, output1, N1, output2, N2, M,
+      K, stream);
 }
 
 // ============================================================================
@@ -1436,7 +1360,7 @@ bool DispatchQ8_1MmvqTripleQ6K(const void *data0, const void *data1,
 // ============================================================================
 
 bool DispatchQ8_1GemvQ4K(const void *data, const void *act_q8_1, half *output,
-                          int M, int N, int K, cudaStream_t stream) {
+                         int M, int N, int K, cudaStream_t stream) {
   if (M <= 8)
     return DispatchQ8_1MmvqQ4K(data, act_q8_1, output, M, N, K, stream);
   if (M <= 64)
@@ -1445,7 +1369,7 @@ bool DispatchQ8_1GemvQ4K(const void *data, const void *act_q8_1, half *output,
 }
 
 bool DispatchQ8_1GemvQ6K(const void *data, const void *act_q8_1, half *output,
-                          int M, int N, int K, cudaStream_t stream) {
+                         int M, int N, int K, cudaStream_t stream) {
   if (M <= 8)
     return DispatchQ8_1MmvqQ6K(data, act_q8_1, output, M, N, K, stream);
   if (M <= 64)
@@ -1454,7 +1378,7 @@ bool DispatchQ8_1GemvQ6K(const void *data, const void *act_q8_1, half *output,
 }
 
 bool DispatchQ8_1GemvQ8_0(const void *data, const void *act_q8_1, half *output,
-                           int M, int N, int K, cudaStream_t stream) {
+                          int M, int N, int K, cudaStream_t stream) {
   if (M <= 8)
     return DispatchQ8_1MmvqQ8_0(data, act_q8_1, output, M, N, K, stream);
   if (M <= 64)
@@ -1463,7 +1387,7 @@ bool DispatchQ8_1GemvQ8_0(const void *data, const void *act_q8_1, half *output,
 }
 
 bool DispatchQ8_1GemvQ8K(const void *data, const void *act_q8_1, half *output,
-                          int M, int N, int K, cudaStream_t stream) {
+                         int M, int N, int K, cudaStream_t stream) {
   if (M <= 8)
     return DispatchQ8_1MmvqQ8K(data, act_q8_1, output, M, N, K, stream);
   if (M <= 64)
@@ -1474,35 +1398,33 @@ bool DispatchQ8_1GemvQ8K(const void *data, const void *act_q8_1, half *output,
 // Grouped pair dispatch: MMVQ for M<=8, V1 group fallback for M>8
 // (grouped MMQ not yet implemented)
 bool DispatchQ8_1GemvPairQ4K(const void *data0, const void *data1,
-                              const void *act_q8_1, half *output0, int N0,
-                              half *output1, int N1, int M, int K,
-                              cudaStream_t stream) {
+                             const void *act_q8_1, half *output0, int N0,
+                             half *output1, int N1, int M, int K,
+                             cudaStream_t stream) {
   if (M <= 8)
-    return DispatchQ8_1MmvqPairQ4K(data0, data1, act_q8_1, output0, N0,
-                                   output1, N1, M, K, stream);
-  return DispatchQ8_1GemvPair<block_q4_k,
-                              fused_dequant_gemv_q4k_q8_1_group<2>>(
+    return DispatchQ8_1MmvqPairQ4K(data0, data1, act_q8_1, output0, N0, output1,
+                                   N1, M, K, stream);
+  return DispatchQ8_1GemvPair<block_q4_k, fused_dequant_gemv_q4k_q8_1_group<2>>(
       data0, data1, act_q8_1, output0, N0, output1, N1, M, K, stream);
 }
 
 bool DispatchQ8_1GemvPairQ6K(const void *data0, const void *data1,
-                              const void *act_q8_1, half *output0, int N0,
-                              half *output1, int N1, int M, int K,
-                              cudaStream_t stream) {
+                             const void *act_q8_1, half *output0, int N0,
+                             half *output1, int N1, int M, int K,
+                             cudaStream_t stream) {
   if (M <= 8)
-    return DispatchQ8_1MmvqPairQ6K(data0, data1, act_q8_1, output0, N0,
-                                   output1, N1, M, K, stream);
-  return DispatchQ8_1GemvPair<block_q6_k,
-                              fused_dequant_gemv_q6k_q8_1_group<2>>(
+    return DispatchQ8_1MmvqPairQ6K(data0, data1, act_q8_1, output0, N0, output1,
+                                   N1, M, K, stream);
+  return DispatchQ8_1GemvPair<block_q6_k, fused_dequant_gemv_q6k_q8_1_group<2>>(
       data0, data1, act_q8_1, output0, N0, output1, N1, M, K, stream);
 }
 
 // Grouped triple dispatch: MMVQ for M<=8, V1 group fallback for M>8
 bool DispatchQ8_1GemvTripleQ4K(const void *data0, const void *data1,
-                                const void *data2, const void *act_q8_1,
-                                half *output0, int N0, half *output1, int N1,
-                                half *output2, int N2, int M, int K,
-                                cudaStream_t stream) {
+                               const void *data2, const void *act_q8_1,
+                               half *output0, int N0, half *output1, int N1,
+                               half *output2, int N2, int M, int K,
+                               cudaStream_t stream) {
   if (M <= 8)
     return DispatchQ8_1MmvqTripleQ4K(data0, data1, data2, act_q8_1, output0, N0,
                                      output1, N1, output2, N2, M, K, stream);
@@ -1513,10 +1435,10 @@ bool DispatchQ8_1GemvTripleQ4K(const void *data0, const void *data1,
 }
 
 bool DispatchQ8_1GemvTripleQ6K(const void *data0, const void *data1,
-                                const void *data2, const void *act_q8_1,
-                                half *output0, int N0, half *output1, int N1,
-                                half *output2, int N2, int M, int K,
-                                cudaStream_t stream) {
+                               const void *data2, const void *act_q8_1,
+                               half *output0, int N0, half *output1, int N1,
+                               half *output2, int N2, int M, int K,
+                               cudaStream_t stream) {
   if (M <= 8)
     return DispatchQ8_1MmvqTripleQ6K(data0, data1, data2, act_q8_1, output0, N0,
                                      output1, N1, output2, N2, M, K, stream);
@@ -1544,22 +1466,22 @@ struct Q8_1DispatchTripleEntry {
 const Q8_1DispatchEntry &GetQ8_1DispatchEntry(GGUF::TensorType qtype) {
   static const bool dp4a = GetGpuProfile().has_dp4a;
   static const Q8_1DispatchEntry table[kMaxTensorType] = {
-      {nullptr, nullptr},                                  // 0: F32
-      {nullptr, nullptr},                                  // 1: F16
-      {nullptr, nullptr},                                  // 2: Q4_0
-      {nullptr, nullptr},                                  // 3: Q4_1
-      {nullptr, nullptr},                                  // 4: (unused)
-      {nullptr, nullptr},                                  // 5: (unused)
-      {nullptr, nullptr},                                  // 6: Q5_0
-      {nullptr, nullptr},                                  // 7: Q5_1
-      {dp4a ? DispatchQ8_1GemvQ8_0 : nullptr, "Q8_0"},    // 8
-      {nullptr, nullptr},                                  // 9: Q8_1
-      {nullptr, nullptr},                                  // 10: Q2_K
-      {nullptr, nullptr},                                  // 11: Q3_K
-      {dp4a ? DispatchQ8_1GemvQ4K : nullptr, "Q4_K"},     // 12
-      {nullptr, nullptr},                                  // 13: Q5_K
-      {dp4a ? DispatchQ8_1GemvQ6K : nullptr, "Q6_K"},     // 14
-      {dp4a ? DispatchQ8_1GemvQ8K : nullptr, "Q8_K"},     // 15
+      {nullptr, nullptr},                              // 0: F32
+      {nullptr, nullptr},                              // 1: F16
+      {nullptr, nullptr},                              // 2: Q4_0
+      {nullptr, nullptr},                              // 3: Q4_1
+      {nullptr, nullptr},                              // 4: (unused)
+      {nullptr, nullptr},                              // 5: (unused)
+      {nullptr, nullptr},                              // 6: Q5_0
+      {nullptr, nullptr},                              // 7: Q5_1
+      {dp4a ? DispatchQ8_1GemvQ8_0 : nullptr, "Q8_0"}, // 8
+      {nullptr, nullptr},                              // 9: Q8_1
+      {nullptr, nullptr},                              // 10: Q2_K
+      {nullptr, nullptr},                              // 11: Q3_K
+      {dp4a ? DispatchQ8_1GemvQ4K : nullptr, "Q4_K"},  // 12
+      {nullptr, nullptr},                              // 13: Q5_K
+      {dp4a ? DispatchQ8_1GemvQ6K : nullptr, "Q6_K"},  // 14
+      {dp4a ? DispatchQ8_1GemvQ8K : nullptr, "Q8_K"},  // 15
   };
 
   static const Q8_1DispatchEntry empty = {nullptr, nullptr};
@@ -1572,28 +1494,28 @@ const Q8_1DispatchEntry &GetQ8_1DispatchEntry(GGUF::TensorType qtype) {
 const Q8_1DispatchPairEntry &GetQ8_1DispatchPairEntry(GGUF::TensorType qtype) {
   static const bool dp4a = GetGpuProfile().has_dp4a;
   static const Q8_1DispatchPairEntry table[kMaxTensorType] = {
-      {nullptr, nullptr},                                        // 0: F32
-      {nullptr, nullptr},                                        // 1: F16
-      {nullptr, nullptr},                                        // 2: Q4_0
-      {nullptr, nullptr},                                        // 3: Q4_1
-      {nullptr, nullptr},                                        // 4: (unused)
-      {nullptr, nullptr},                                        // 5: (unused)
-      {nullptr, nullptr},                                        // 6: Q5_0
-      {nullptr, nullptr},                                        // 7: Q5_1
+      {nullptr, nullptr}, // 0: F32
+      {nullptr, nullptr}, // 1: F16
+      {nullptr, nullptr}, // 2: Q4_0
+      {nullptr, nullptr}, // 3: Q4_1
+      {nullptr, nullptr}, // 4: (unused)
+      {nullptr, nullptr}, // 5: (unused)
+      {nullptr, nullptr}, // 6: Q5_0
+      {nullptr, nullptr}, // 7: Q5_1
       {dp4a ? DispatchQ8_1GemvPair<block_q8_0,
                                    fused_dequant_gemv_q8_0_q8_1_group<2>>
             : nullptr,
-       "Q8_0"},                                                  // 8
-      {nullptr, nullptr},                                        // 9: Q8_1
-      {nullptr, nullptr},                                        // 10: Q2_K
-      {nullptr, nullptr},                                        // 11: Q3_K
-      {dp4a ? DispatchQ8_1GemvPairQ4K : nullptr, "Q4_K"},       // 12
-      {nullptr, nullptr},                                        // 13: Q5_K
-      {dp4a ? DispatchQ8_1GemvPairQ6K : nullptr, "Q6_K"},       // 14
+       "Q8_0"},                                           // 8
+      {nullptr, nullptr},                                 // 9: Q8_1
+      {nullptr, nullptr},                                 // 10: Q2_K
+      {nullptr, nullptr},                                 // 11: Q3_K
+      {dp4a ? DispatchQ8_1GemvPairQ4K : nullptr, "Q4_K"}, // 12
+      {nullptr, nullptr},                                 // 13: Q5_K
+      {dp4a ? DispatchQ8_1GemvPairQ6K : nullptr, "Q6_K"}, // 14
       {dp4a ? DispatchQ8_1GemvPair<block_q8_k,
                                    fused_dequant_gemv_q8k_q8_1_group<2>>
             : nullptr,
-       "Q8_K"},                                                  // 15
+       "Q8_K"}, // 15
   };
 
   static const Q8_1DispatchPairEntry empty = {nullptr, nullptr};
@@ -1607,28 +1529,28 @@ const Q8_1DispatchTripleEntry &
 GetQ8_1DispatchTripleEntry(GGUF::TensorType qtype) {
   static const bool dp4a = GetGpuProfile().has_dp4a;
   static const Q8_1DispatchTripleEntry table[kMaxTensorType] = {
-      {nullptr, nullptr},                                          // 0: F32
-      {nullptr, nullptr},                                          // 1: F16
-      {nullptr, nullptr},                                          // 2: Q4_0
-      {nullptr, nullptr},                                          // 3: Q4_1
-      {nullptr, nullptr},                                          // 4: (unused)
-      {nullptr, nullptr},                                          // 5: (unused)
-      {nullptr, nullptr},                                          // 6: Q5_0
-      {nullptr, nullptr},                                          // 7: Q5_1
+      {nullptr, nullptr}, // 0: F32
+      {nullptr, nullptr}, // 1: F16
+      {nullptr, nullptr}, // 2: Q4_0
+      {nullptr, nullptr}, // 3: Q4_1
+      {nullptr, nullptr}, // 4: (unused)
+      {nullptr, nullptr}, // 5: (unused)
+      {nullptr, nullptr}, // 6: Q5_0
+      {nullptr, nullptr}, // 7: Q5_1
       {dp4a ? DispatchQ8_1GemvTriple<block_q8_0,
                                      fused_dequant_gemv_q8_0_q8_1_group<3>>
             : nullptr,
-       "Q8_0"},                                                    // 8
-      {nullptr, nullptr},                                          // 9: Q8_1
-      {nullptr, nullptr},                                          // 10: Q2_K
-      {nullptr, nullptr},                                          // 11: Q3_K
-      {dp4a ? DispatchQ8_1GemvTripleQ4K : nullptr, "Q4_K"},       // 12
-      {nullptr, nullptr},                                          // 13: Q5_K
-      {dp4a ? DispatchQ8_1GemvTripleQ6K : nullptr, "Q6_K"},       // 14
+       "Q8_0"},                                             // 8
+      {nullptr, nullptr},                                   // 9: Q8_1
+      {nullptr, nullptr},                                   // 10: Q2_K
+      {nullptr, nullptr},                                   // 11: Q3_K
+      {dp4a ? DispatchQ8_1GemvTripleQ4K : nullptr, "Q4_K"}, // 12
+      {nullptr, nullptr},                                   // 13: Q5_K
+      {dp4a ? DispatchQ8_1GemvTripleQ6K : nullptr, "Q6_K"}, // 14
       {dp4a ? DispatchQ8_1GemvTriple<block_q8_k,
                                      fused_dequant_gemv_q8k_q8_1_group<3>>
             : nullptr,
-       "Q8_K"},                                                    // 15
+       "Q8_K"}, // 15
   };
 
   static const Q8_1DispatchTripleEntry empty = {nullptr, nullptr};
@@ -1817,22 +1739,21 @@ bool FusedQuantGemm::GemvQ8_1(const QuantizedWeightInfo &weight,
   auto idx = static_cast<uint32_t>(qtype);
   if (idx < kMaxTensorType && !logged[idx] && entry.name) {
     logged[idx] = true;
-    const char *kernel_name =
-        (M <= 8) ? "MMVQ weight-read-first" : (M <= 64) ? "MMQ tiled GEMM"
-                                                         : "Q8_1 activation";
+    const char *kernel_name = (M <= 8)    ? "MMVQ weight-read-first"
+                              : (M <= 64) ? "MMQ tiled GEMM"
+                                          : "Q8_1 activation";
     log::Info("fused_quant_gemm",
               std::string("Using ") + kernel_name + " kernel for " +
-                  entry.name + " (M=" + std::to_string(M) +
-                  ", N=" + std::to_string(N) + ", K=" + std::to_string(K) +
-                  ")");
+                  entry.name + " (M=" + std::to_string(M) + ", N=" +
+                  std::to_string(N) + ", K=" + std::to_string(K) + ")");
   }
 
   return entry.fn(weight.data, act_q8_1, output, M, N, K, stream);
 }
 
-static bool GemvQ8_1PairMmq3(
-    const std::array<PackedProjectionSpec, 2> &projections,
-    const void *act_q8_1, int M, int K, cudaStream_t stream);
+static bool
+GemvQ8_1PairMmq3(const std::array<PackedProjectionSpec, 2> &projections,
+                 const void *act_q8_1, int M, int K, cudaStream_t stream);
 
 bool FusedQuantGemm::GemvQ8_1Pair(
     const std::array<PackedProjectionSpec, 2> &projections,
@@ -1877,12 +1798,13 @@ bool FusedQuantGemm::GemvQ8_1Pair(
     static bool rowquad_m4_logged[kMaxTensorType] = {};
     if (idx < kMaxTensorType && !rowquad_m4_logged[idx] && entry.name) {
       rowquad_m4_logged[idx] = true;
-      log::Info("fused_quant_gemm",
-                std::string("Using exact-M4 grouped Q8_1 row-quad kernel for ") +
-                    entry.name + " (M=" + std::to_string(M) +
-                    ", N=" + std::to_string(projections[0].output_cols) + "/" +
-                    std::to_string(projections[1].output_cols) +
-                    ", K=" + std::to_string(K) + ")");
+      log::Info(
+          "fused_quant_gemm",
+          std::string("Using exact-M4 grouped Q8_1 row-quad kernel for ") +
+              entry.name + " (M=" + std::to_string(M) +
+              ", N=" + std::to_string(projections[0].output_cols) + "/" +
+              std::to_string(projections[1].output_cols) +
+              ", K=" + std::to_string(K) + ")");
     }
     return GemvQ8_1PairRowQuadCandidate(projections, act_q8_1, M, K, stream);
   }
@@ -1964,19 +1886,18 @@ bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
   static bool logged = false;
   if (!logged) {
     logged = true;
-    log::Info("fused_quant_gemm",
-              "Using fused gate+up+SiLU Q4_K MMVQ kernel (M=" +
-                  std::to_string(M) + ", N=" + std::to_string(N) +
-                  ", K=" + std::to_string(K) + ")");
+    log::Info(
+        "fused_quant_gemm",
+        "Using fused gate+up+SiLU Q4_K MMVQ kernel (M=" + std::to_string(M) +
+            ", N=" + std::to_string(N) + ", K=" + std::to_string(K) + ")");
   }
 
-  return DispatchMmvqFusedGateUpSilu<
-      block_q4_k, inferflux_mmvq_q4k_fused_gate_up_silu<1>,
-      inferflux_mmvq_q4k_fused_gate_up_silu<2>,
-      inferflux_mmvq_q4k_fused_gate_up_silu<4>,
-      inferflux_mmvq_q4k_fused_gate_up_silu<8>>(gate_raw.data, up_raw.data,
-                                                 act_q8_1, output, N, M, K,
-                                                 stream);
+  return DispatchMmvqFusedGateUpSilu<block_q4_k,
+                                     inferflux_mmvq_q4k_fused_gate_up_silu<1>,
+                                     inferflux_mmvq_q4k_fused_gate_up_silu<2>,
+                                     inferflux_mmvq_q4k_fused_gate_up_silu<4>,
+                                     inferflux_mmvq_q4k_fused_gate_up_silu<8>>(
+      gate_raw.data, up_raw.data, act_q8_1, output, N, M, K, stream);
 }
 
 bool FusedQuantGemm::GemvQ8_1PairRowQuadCandidate(
@@ -2018,9 +1939,9 @@ bool FusedQuantGemm::GemvQ8_1PairRowQuadCandidate(
   return cudaGetLastError() == cudaSuccess;
 }
 
-static bool GemvQ8_1PairMmq3(
-    const std::array<PackedProjectionSpec, 2> &projections,
-    const void *act_q8_1, int M, int K, cudaStream_t stream) {
+static bool
+GemvQ8_1PairMmq3(const std::array<PackedProjectionSpec, 2> &projections,
+                 const void *act_q8_1, int M, int K, cudaStream_t stream) {
   if (!act_q8_1 || M < 3 || K <= 0) {
     return false;
   }
@@ -2096,14 +2017,13 @@ bool FusedQuantGemm::GemvQ8_1Triple(
     static bool triple_logged[kMaxTensorType] = {};
     if (idx < kMaxTensorType && !triple_logged[idx] && entry.name) {
       triple_logged[idx] = true;
-      log::Info(
-          "fused_quant_gemm",
-          std::string("Using MMVQ grouped Q8_1 triple for ") + entry.name +
-              " (M=" + std::to_string(M) +
-              ", N=" + std::to_string(projections[0].output_cols) + "/" +
-              std::to_string(projections[1].output_cols) + "/" +
-              std::to_string(projections[2].output_cols) +
-              ", K=" + std::to_string(K) + ")");
+      log::Info("fused_quant_gemm",
+                std::string("Using MMVQ grouped Q8_1 triple for ") +
+                    entry.name + " (M=" + std::to_string(M) +
+                    ", N=" + std::to_string(projections[0].output_cols) + "/" +
+                    std::to_string(projections[1].output_cols) + "/" +
+                    std::to_string(projections[2].output_cols) +
+                    ", K=" + std::to_string(K) + ")");
     }
   }
 

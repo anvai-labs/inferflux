@@ -7467,11 +7467,12 @@ TEST_CASE("InferfluxCudaLinearExecutor: every FFN operator reaches its tier "
       REQUIRE(summary.actual_op == op);
       break;
     case Op::kFallback:
-      // Documented current behavior: kFallback falls through to the packed
-      // catch-all rather than the dense fallback (the force_cublas
-      // divergence). Tightened when the executor becomes a switch.
-      REQUIRE(packed_called);
-      REQUIRE(summary.actual_op == Op::kPackedGroup);
+      // kFallback means the selector requested the dense fallback
+      // (force_cublas or no fused tier ready) — the fused catch-alls are
+      // skipped entirely.
+      REQUIRE(fallback_called);
+      REQUIRE_FALSE(packed_called);
+      REQUIRE(summary.actual_op == op);
       break;
     }
   }
@@ -7542,10 +7543,9 @@ TEST_CASE("InferfluxCudaLinearExecutor: every down-proj operator reaches its "
       REQUIRE(summary.actual_op == op);
       break;
     case Op::kFallback:
-      // Documented current behavior: kFallback lands in the generic else
-      // branch and runs the Q8_1 path while actual_op stays kFallback.
-      // Tightened when the executor becomes a switch.
-      REQUIRE(q81_called);
+      // kFallback means the selector requested the dense fallback — the
+      // fused catch-alls are skipped entirely.
+      REQUIRE(fallback_called);
       REQUIRE(summary.actual_op == op);
       break;
     }

@@ -316,6 +316,15 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   if(INFERFLUX_CUDA_USE_FAST_MATH)
     target_compile_options(inferflux_cuda_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
     target_compile_options(inferflux_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+  endif()
+  # Dispatch exhaustiveness gate (top level, applies to all configurations):
+  # switches over dispatch_catalog.h enums carry no default clause, so an
+  # operator added without wiring its label switch or executor stage fails
+  # the build.
+  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    target_compile_options(inferflux_core PRIVATE -Werror=switch)
+    target_compile_options(inferflux_tests PRIVATE -Werror=switch)
+  endif()
     message(STATUS "CUDA fast math enabled (--use_fast_math)")
   endif()
   target_compile_definitions(inferflux_core PUBLIC INFERFLUX_NATIVE_KERNELS_READY=1)
