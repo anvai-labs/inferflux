@@ -618,7 +618,7 @@ jobs:
       # The action is a no-op if the token is absent (advisory mode).
       # ------------------------------------------------------------------
       - name: Upload to Codecov
-        uses: codecov/codecov-action@v4
+        uses: codecov/codecov-action@v7
         with:
           files: build-cov/coverage/lcov.info
           flags: unittests
