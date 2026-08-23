@@ -34,6 +34,10 @@ struct NativeExecutionPolicy {
   // (32% of peak at M=16 vs 63% at M=1); the unfused grouped path wins
   // by ~13% end to end at c=16. -1 = always (historic default).
   int fused_gate_up_silu_max_batch{-1};
+  // Fold Q/K bias into BatchedRoPE's register load and V bias into the KV
+  // append store, deleting the three per-layer BiasAdd launches. Off by
+  // default; null-bias models take the identical old path either way.
+  bool enable_bias_rope_fusion{false};
   bool phase_timing_enabled{false};
   bool force_cublas{false};
   bool disable_prepacked_activations{false};
@@ -84,6 +88,8 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_CUDA_PACKED_TIER_MAX_BATCH", -1, -1, 8);
     policy.fused_gate_up_silu_max_batch =
         ParseIntEnv("INFERFLUX_CUDA_FUSED_GATE_UP_SILU_MAX_BATCH", -1, -1, 64);
+    policy.enable_bias_rope_fusion =
+        ParseBoolEnv("INFERFLUX_CUDA_FUSE_BIAS_ROPE", false);
     // CUDA graph capture: cudaDeviceSynchronize drains async work before
     // capture to prevent heap corruption. Disable with
     // INFERFLUX_DISABLE_CUDA_GRAPH=1 if issues arise.

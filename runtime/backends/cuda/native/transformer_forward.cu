@@ -1793,6 +1793,11 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
     // Transformer layers
     for (int layer = 0; layer < num_layers_; layer++) {
       NVTX_SCOPE("Layer");
+      // Bias-fold plumbing: assigned after the QKV projection below, read
+      // by the RoPE and KV-append stages.
+      const T *rope_q_bias = nullptr;
+      const T *rope_k_bias = nullptr;
+      const T *append_v_bias = nullptr;
       const T *input_norm =
           reinterpret_cast<const T *>(weights_->LayerInputNorm(layer));
       const T *post_attn_norm =
@@ -1914,22 +1919,31 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
           return false;
         }
 
-        // Biases (if present)
+        // Biases (if present): either folded into the RoPE register load /
+        // KV-append store (one fewer kernel + one fewer half-rounding), or
+        // applied by standalone BiasAdd launches.
         const T *q_bias =
             reinterpret_cast<const T *>(weights_->LayerQProjBias(layer));
         const T *k_bias =
             reinterpret_cast<const T *>(weights_->LayerKProjBias(layer));
         const T *v_bias =
             reinterpret_cast<const T *>(weights_->LayerVProjBias(layer));
-        if (q_bias)
-          cuda_kernel::BiasAdd<T>(d_q_, q_bias, B, num_heads_ * head_dim_,
-                                  stream_);
-        if (k_bias)
-          cuda_kernel::BiasAdd<T>(d_k_new_, k_bias, B,
-                                  num_kv_heads_ * head_dim_, stream_);
-        if (v_bias)
-          cuda_kernel::BiasAdd<T>(d_v_new_, v_bias, B,
-                                  num_kv_heads_ * head_dim_, stream_);
+        const bool fold_bias = active_policy->enable_bias_rope_fusion;
+        if (!fold_bias) {
+          if (q_bias)
+            cuda_kernel::BiasAdd<T>(d_q_, q_bias, B, num_heads_ * head_dim_,
+                                    stream_);
+          if (k_bias)
+            cuda_kernel::BiasAdd<T>(d_k_new_, k_bias, B,
+                                    num_kv_heads_ * head_dim_, stream_);
+          if (v_bias)
+            cuda_kernel::BiasAdd<T>(d_v_new_, v_bias, B,
+                                    num_kv_heads_ * head_dim_, stream_);
+        } else {
+          rope_q_bias = q_bias;
+          rope_k_bias = k_bias;
+          append_v_bias = v_bias;
+        }
       }
       pt.qkv_ms += pt.Mark();
 
@@ -1938,7 +1952,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         NVTX_SCOPE("RoPE");
         err = cuda_kernel::BatchedRoPE<T>(
             d_q_, d_k_new_, B, num_heads_, num_kv_heads_, head_dim_,
-            d_batch_n_past_, rope_freq_base_, stream_, rope_type_);
+            d_batch_n_past_, rope_freq_base_, stream_, rope_type_, rope_q_bias,
+            rope_k_bias);
         if (err != cudaSuccess) {
           log::Error("llama_forward", "BatchedRoPE launch failed: " +
                                           std::string(cudaGetErrorString(err)));
@@ -1955,7 +1970,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             d_k_new_, d_v_new_, typed_cache->Buffer(), d_batch_seq_ids_,
             d_batch_n_past_, layer, B, typed_cache->KvDim(),
             typed_cache->SlotStride(), typed_cache->LayerStride(),
-            typed_cache->KvStride(), stream_);
+            typed_cache->KvStride(), stream_, append_v_bias);
         if (err != cudaSuccess) {
           log::Error("llama_forward", "BatchedKvAppendStrided launch failed: " +
                                           std::string(cudaGetErrorString(err)));

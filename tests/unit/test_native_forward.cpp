@@ -1066,6 +1066,142 @@ TEST_CASE("BatchedRoPE matches per-sequence decode RoPE for Qwen geometry",
   REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
 }
 
+TEST_CASE("Bias fold into RoPE and KV append matches BiasAdd-then-transform",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping bias-fold parity.");
+    return;
+  }
+
+  constexpr int batch_size = 2;
+  constexpr int num_heads = 16;
+  constexpr int num_kv_heads = 2;
+  constexpr int head_dim = 128;
+  constexpr int q_cols = num_heads * head_dim;
+  constexpr int kv_cols = num_kv_heads * head_dim;
+  const std::array<int, batch_size> n_past = {5, 11};
+  const std::array<int, batch_size> seq_ids = {0, 1};
+
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
+
+  const std::vector<half> h_q =
+      MakeWaveTensor(static_cast<size_t>(batch_size) * q_cols, 0.03f);
+  const std::vector<half> h_k =
+      MakeWaveTensor(static_cast<size_t>(batch_size) * kv_cols, 0.02f, 0.01f);
+  const std::vector<half> h_v =
+      MakeWaveTensor(static_cast<size_t>(batch_size) * kv_cols, 0.025f, -0.01f);
+  const std::vector<half> h_q_bias =
+      MakeWaveTensor(static_cast<size_t>(q_cols), 0.01f, 0.005f);
+  const std::vector<half> h_k_bias =
+      MakeWaveTensor(static_cast<size_t>(kv_cols), 0.008f, -0.004f);
+  const std::vector<half> h_v_bias =
+      MakeWaveTensor(static_cast<size_t>(kv_cols), 0.006f, 0.003f);
+
+  auto dev_copy = [&](const std::vector<half> &h) {
+    half *d = nullptr;
+    REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d),
+                       h.size() * sizeof(half)) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d, h.data(), h.size() * sizeof(half),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    return d;
+  };
+
+  half *d_q_a = dev_copy(h_q), *d_k_a = dev_copy(h_k), *d_v_a = dev_copy(h_v);
+  half *d_q_b = dev_copy(h_q), *d_k_b = dev_copy(h_k), *d_v_b = dev_copy(h_v);
+  half *d_q_bias = dev_copy(h_q_bias);
+  half *d_k_bias = dev_copy(h_k_bias);
+  half *d_v_bias = dev_copy(h_v_bias);
+  int *d_n_past = nullptr;
+  int *d_seq_ids = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_n_past),
+                     batch_size * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_seq_ids),
+                     batch_size * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_n_past, n_past.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_seq_ids, seq_ids.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  KvCacheGpuTyped<half> cache_a, cache_b;
+  constexpr int max_seq = 32;
+  constexpr int max_batch = 4;
+  REQUIRE(cache_a.Allocate(1, num_kv_heads, head_dim, max_seq, max_batch));
+  REQUIRE(cache_b.Allocate(1, num_kv_heads, head_dim, max_seq, max_batch));
+
+  // Unfused: BiasAdd each, then RoPE / KV append without bias params.
+  REQUIRE(cuda_kernel::BiasAdd<half>(d_q_a, d_q_bias, batch_size, q_cols,
+                                     stream) == cudaSuccess);
+  REQUIRE(cuda_kernel::BiasAdd<half>(d_k_a, d_k_bias, batch_size, kv_cols,
+                                     stream) == cudaSuccess);
+  REQUIRE(cuda_kernel::BiasAdd<half>(d_v_a, d_v_bias, batch_size, kv_cols,
+                                     stream) == cudaSuccess);
+  REQUIRE(cuda_kernel::BatchedRoPE<half>(d_q_a, d_k_a, batch_size, num_heads,
+                                         num_kv_heads, head_dim, d_n_past,
+                                         1000000.0f, stream,
+                                         /*rope_type=*/0) == cudaSuccess);
+  REQUIRE(cuda_kernel::BatchedKvAppendStrided<half>(
+              d_k_a, d_v_a, cache_a.Buffer(), d_seq_ids, d_n_past,
+              /*layer=*/0, batch_size, num_kv_heads * head_dim,
+              cache_a.SlotStride(), cache_a.LayerStride(), cache_a.KvStride(),
+              stream) == cudaSuccess);
+
+  // Fused: bias folded into the RoPE load and the append store.
+  REQUIRE(cuda_kernel::BatchedRoPE<half>(
+              d_q_b, d_k_b, batch_size, num_heads, num_kv_heads, head_dim,
+              d_n_past, 1000000.0f, stream,
+              /*rope_type=*/0, d_q_bias, d_k_bias) == cudaSuccess);
+  REQUIRE(cuda_kernel::BatchedKvAppendStrided<half>(
+              d_k_b, d_v_b, cache_b.Buffer(), d_seq_ids, d_n_past,
+              /*layer=*/0, batch_size, num_kv_heads * head_dim,
+              cache_b.SlotStride(), cache_b.LayerStride(), cache_b.KvStride(),
+              stream, d_v_bias) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  const std::vector<half> q_a = CopyDeviceHalfs(d_q_a, h_q.size());
+  const std::vector<half> k_a = CopyDeviceHalfs(d_k_a, h_k.size());
+  const std::vector<half> q_b = CopyDeviceHalfs(d_q_b, h_q.size());
+  const std::vector<half> k_b = CopyDeviceHalfs(d_k_b, h_k.size());
+  // Fused keeps the biased value in registers through rotation (one fewer
+  // half rounding), so allow the same tolerance as the other RoPE parities.
+  for (size_t i = 0; i < q_a.size(); ++i) {
+    REQUIRE(__half2float(q_b[i]) ==
+            Catch::Approx(__half2float(q_a[i])).margin(5e-3f));
+  }
+  for (size_t i = 0; i < k_a.size(); ++i) {
+    REQUIRE(__half2float(k_b[i]) ==
+            Catch::Approx(__half2float(k_a[i])).margin(5e-3f));
+  }
+
+  // V cache rows: both paths round the same float sum once, so compare the
+  // stored cache contents exactly.
+  const half *v_cache_a = cache_a.GetV(0, seq_ids[0]);
+  const half *v_cache_b = cache_b.GetV(0, seq_ids[0]);
+  std::vector<half> row_a(kv_cols), row_b(kv_cols);
+  REQUIRE(cudaMemcpy(row_a.data(), v_cache_a, kv_cols * sizeof(half),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(cudaMemcpy(row_b.data(), v_cache_b, kv_cols * sizeof(half),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (int i = 0; i < kv_cols; ++i) {
+    REQUIRE(__half2float(row_b[i]) ==
+            Catch::Approx(__half2float(row_a[i])).margin(1e-6f));
+  }
+
+  REQUIRE(cudaFree(d_seq_ids) == cudaSuccess);
+  REQUIRE(cudaFree(d_n_past) == cudaSuccess);
+  REQUIRE(cudaFree(d_v_bias) == cudaSuccess);
+  REQUIRE(cudaFree(d_k_bias) == cudaSuccess);
+  REQUIRE(cudaFree(d_q_bias) == cudaSuccess);
+  REQUIRE(cudaFree(d_v_b) == cudaSuccess);
+  REQUIRE(cudaFree(d_k_b) == cudaSuccess);
+  REQUIRE(cudaFree(d_q_b) == cudaSuccess);
+  REQUIRE(cudaFree(d_v_a) == cudaSuccess);
+  REQUIRE(cudaFree(d_k_a) == cudaSuccess);
+  REQUIRE(cudaFree(d_q_a) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
 TEST_CASE(
     "FlashDecodeMultiSeq matches per-sequence FlashAttention decode for Qwen "
     "geometry",
