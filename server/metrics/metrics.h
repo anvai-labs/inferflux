@@ -38,6 +38,7 @@ public:
   void RecordSuccess(int prompt_tokens, int completion_tokens);
   void RecordError();
   void RecordEmptyGeneration();
+  void RecordOutputUtf8Replacements(std::size_t replacements);
   void RecordSpeculative(std::size_t total_chunks, std::size_t accepted_chunks,
                          std::size_t reused_tokens);
   void RecordBatch(std::size_t request_count, std::size_t token_count);
@@ -318,6 +319,7 @@ private:
   std::atomic<uint64_t> total_requests_{0};
   std::atomic<uint64_t> total_errors_{0};
   std::atomic<uint64_t> total_empty_generations_{0};
+  std::atomic<uint64_t> output_utf8_replacements_{0};
   std::atomic<uint64_t> total_prompt_tokens_{0};
   std::atomic<uint64_t> total_completion_tokens_{0};
   std::atomic<uint64_t> speculative_chunks_total_{0};

@@ -196,6 +196,10 @@ void MetricsRegistry::RecordEmptyGeneration() {
   total_empty_generations_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void MetricsRegistry::RecordOutputUtf8Replacements(std::size_t replacements) {
+  output_utf8_replacements_.fetch_add(replacements, std::memory_order_relaxed);
+}
+
 void MetricsRegistry::RecordSpeculative(std::size_t total_chunks,
                                         std::size_t accepted_chunks,
                                         std::size_t reused_tokens) {
@@ -1150,6 +1154,12 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_empty_generations_total counter\n";
   out << "inferflux_empty_generations_total{backend=\"" << backend << "\"} "
       << total_empty_generations_.load() << "\n";
+
+  out << "# HELP inferflux_output_utf8_replacements_total Malformed or "
+         "incomplete model-output byte sequences replaced with U+FFFD\n";
+  out << "# TYPE inferflux_output_utf8_replacements_total counter\n";
+  out << "inferflux_output_utf8_replacements_total{backend=\"" << backend
+      << "\"} " << output_utf8_replacements_.load() << "\n";
 
   out << "# HELP inferflux_prompt_tokens_total Total prompt tokens processed\n";
   out << "# TYPE inferflux_prompt_tokens_total counter\n";

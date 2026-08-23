@@ -27,6 +27,45 @@ bool IsNonAccumulatingCompletion(std::string_view text) {
 
 bool IsVisibleGeneratedPiece(std::string_view piece) { return !piece.empty(); }
 
+bool AppendGeneratedPiece(InferenceRequest *req, std::string_view raw_piece,
+                          std::string *completion, MetricsRegistry *metrics) {
+  if (!req || !completion || !metrics) {
+    return false;
+  }
+  auto assembled = req->output_utf8.Append(raw_piece);
+  metrics->RecordOutputUtf8Replacements(assembled.replacements);
+  if (assembled.text.empty()) {
+    return false;
+  }
+
+  completion->append(assembled.text);
+  std::string emit_piece;
+  const bool stop_hit =
+      ApplyStop(assembled.text, *completion, req->stop, &emit_piece);
+  if (req->on_token && !emit_piece.empty()) {
+    metrics->RecordStreamTokens(1);
+    req->on_token(emit_piece, nullptr);
+  }
+  return stop_hit;
+}
+
+void FinishGeneratedText(InferenceRequest *req, std::string *completion,
+                         MetricsRegistry *metrics) {
+  if (!req || !completion || !metrics) {
+    return;
+  }
+  auto assembled = req->output_utf8.Finish();
+  metrics->RecordOutputUtf8Replacements(assembled.replacements);
+  if (assembled.text.empty()) {
+    return;
+  }
+  completion->append(assembled.text);
+  if (req->on_token) {
+    metrics->RecordStreamTokens(1);
+    req->on_token(assembled.text, nullptr);
+  }
+}
+
 int MaxNonEmittingSteps(int max_tokens) { return std::max(max_tokens * 8, 32); }
 
 bool HasValidUnifiedPhasedState(const InferenceRequest &req) {
@@ -682,17 +721,9 @@ BatchExecutor::ExecuteBatchDecodePhased(
 
       std::string piece = req->first_piece;
       if (IsVisibleGeneratedPiece(piece)) {
-        out.completion += piece;
         states[i].tokens_generated = 1;
-
-        std::string emit_piece;
-        bool stop_hit =
-            ApplyStop(piece, out.completion, req->stop, &emit_piece);
-
-        if (req->on_token && !emit_piece.empty()) {
-          metrics_.RecordStreamTokens(1);
-          req->on_token(emit_piece, nullptr);
-        }
+        const bool stop_hit =
+            AppendGeneratedPiece(req, piece, &out.completion, &metrics_);
 
         if (stop_hit ||
             (req->cancellation_flag && req->cancellation_flag->load())) {
@@ -753,15 +784,11 @@ BatchExecutor::ExecuteBatchDecodePhased(
       states[i].current_token = sr.token;
       if (IsVisibleGeneratedPiece(sr.piece)) {
         states[i].tokens_generated++;
-        outcomes[i].result.completion += sr.piece;
-        if (req->on_token) {
-          metrics_.RecordStreamTokens(1);
-          req->on_token(sr.piece, nullptr);
-          // Recheck cancellation after the streaming callback (connection may
-          // have closed mid-chunk).
-          if (req->cancellation_flag && req->cancellation_flag->load()) {
-            states[i].active = false;
-          }
+        const bool stop_hit = AppendGeneratedPiece(
+            req, sr.piece, &outcomes[i].result.completion, &metrics_);
+        if (stop_hit ||
+            (req->cancellation_flag && req->cancellation_flag->load())) {
+          states[i].active = false;
         }
       } else if (++states[i].non_emitting_steps >=
                  states[i].max_non_emitting_steps) {
@@ -814,6 +841,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
     } else {
       req->phase = RequestPhase::kFinished;
       req->first_token = -1;
+      FinishGeneratedText(req, &out.completion, &metrics_);
     }
     req->first_piece.clear();
 
@@ -821,9 +849,9 @@ BatchExecutor::ExecuteBatchDecodePhased(
     if (!out.completion.empty() &&
         !IsNonAccumulatingCompletion(out.completion)) {
       req->accumulated_output.append(out.completion);
-      if (req->fairness.remaining_decode_tokens >= 0) {
-        req->fairness.remaining_decode_tokens = remaining_after_slice;
-      }
+    }
+    if (req->fairness.remaining_decode_tokens >= 0) {
+      req->fairness.remaining_decode_tokens = remaining_after_slice;
     }
 
     req->first_token_time = std::chrono::steady_clock::now();
@@ -895,16 +923,8 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
       std::string piece = req->first_piece;
       bool stop_hit = false;
       if (IsVisibleGeneratedPiece(piece)) {
-        out.completion += piece;
         states[i].tokens_generated = 1;
-
-        std::string emit_piece;
-        stop_hit = ApplyStop(piece, out.completion, req->stop, &emit_piece);
-
-        if (req->on_token && !emit_piece.empty()) {
-          metrics_.RecordStreamTokens(1);
-          req->on_token(emit_piece, nullptr);
-        }
+        stop_hit = AppendGeneratedPiece(req, piece, &out.completion, &metrics_);
 
         if (stop_hit ||
             (req->cancellation_flag && req->cancellation_flag->load())) {
@@ -1126,16 +1146,8 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
           bool stop_hit = false;
           if (IsVisibleGeneratedPiece(piece)) {
             states[i].tokens_generated++;
-            outcomes[i].result.completion += piece;
-
-            std::string emit_piece;
-            stop_hit = ApplyStop(piece, outcomes[i].result.completion,
-                                 req->stop, &emit_piece);
-
-            if (req->on_token && !emit_piece.empty()) {
-              metrics_.RecordStreamTokens(1);
-              req->on_token(emit_piece, nullptr);
-            }
+            stop_hit = AppendGeneratedPiece(
+                req, piece, &outcomes[i].result.completion, &metrics_);
 
             if (stop_hit) {
               states[i].active = false;
@@ -1165,18 +1177,10 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
         bool stop_hit = false;
         if (IsVisibleGeneratedPiece(piece)) {
           states[i].tokens_generated++;
-          outcomes[i].result.completion += piece;
-
-          std::string emit_piece;
-          stop_hit = ApplyStop(piece, outcomes[i].result.completion, req->stop,
-                               &emit_piece);
-
-          if (req->on_token && !emit_piece.empty()) {
-            metrics_.RecordStreamTokens(1);
-            req->on_token(emit_piece, nullptr);
-            if (req->cancellation_flag && req->cancellation_flag->load()) {
-              states[i].active = false;
-            }
+          stop_hit = AppendGeneratedPiece(
+              req, piece, &outcomes[i].result.completion, &metrics_);
+          if (req->cancellation_flag && req->cancellation_flag->load()) {
+            states[i].active = false;
           }
 
           if (stop_hit) {
@@ -1240,15 +1244,16 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     } else {
       req->phase = RequestPhase::kFinished;
       req->first_token = -1;
+      FinishGeneratedText(req, &out.completion, &metrics_);
     }
     req->first_piece.clear();
 
     if (!out.completion.empty() &&
         !IsNonAccumulatingCompletion(out.completion)) {
       req->accumulated_output.append(out.completion);
-      if (req->fairness.remaining_decode_tokens >= 0) {
-        req->fairness.remaining_decode_tokens = remaining_after_slice;
-      }
+    }
+    if (req->fairness.remaining_decode_tokens >= 0) {
+      req->fairness.remaining_decode_tokens = remaining_after_slice;
     }
     LogUnifiedAssemblyState("finalize", *req, std::string_view{},
                             out.completion, -1, gen, req->n_past, false,
@@ -1387,18 +1392,12 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
           bool stop_hit = false;
           if (IsVisibleGeneratedPiece(burst_out.piece)) {
             burst_req->execution.tokens_generated++;
-            burst_req->execution.result.completion += burst_out.piece;
-            std::string emit_piece;
-            stop_hit = ApplyStop(burst_out.piece,
-                                 burst_req->execution.result.completion,
-                                 burst_req->stop, &emit_piece);
-            if (burst_req->on_token && !emit_piece.empty()) {
-              metrics_.RecordStreamTokens(1);
-              burst_req->on_token(emit_piece, nullptr);
-              if (burst_req->cancellation_flag &&
-                  burst_req->cancellation_flag->load()) {
-                burst_req->execution.active = false;
-              }
+            stop_hit = AppendGeneratedPiece(
+                burst_req, burst_out.piece,
+                &burst_req->execution.result.completion, &metrics_);
+            if (burst_req->cancellation_flag &&
+                burst_req->cancellation_flag->load()) {
+              burst_req->execution.active = false;
             }
           } else if (++burst_req->execution.non_emitting_steps >=
                      burst_req->execution.max_non_emitting_steps) {
@@ -1540,14 +1539,8 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
         bool stop_hit = false;
         if (IsVisibleGeneratedPiece(piece)) {
           req->execution.tokens_generated++;
-          req->execution.result.completion += piece;
-          std::string emit_piece;
-          stop_hit = ApplyStop(piece, req->execution.result.completion,
-                               req->stop, &emit_piece);
-          if (req->on_token && !emit_piece.empty()) {
-            metrics_.RecordStreamTokens(1);
-            req->on_token(emit_piece, nullptr);
-          }
+          stop_hit = AppendGeneratedPiece(
+              req, piece, &req->execution.result.completion, &metrics_);
           if (stop_hit)
             req->execution.active = false;
         } else if (++req->execution.non_emitting_steps >=
@@ -1576,16 +1569,10 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
       bool stop_hit = false;
       if (IsVisibleGeneratedPiece(piece)) {
         req->execution.tokens_generated++;
-        req->execution.result.completion += piece;
-        std::string emit_piece;
-        stop_hit = ApplyStop(piece, req->execution.result.completion, req->stop,
-                             &emit_piece);
-        if (req->on_token && !emit_piece.empty()) {
-          metrics_.RecordStreamTokens(1);
-          req->on_token(emit_piece, nullptr);
-          if (req->cancellation_flag && req->cancellation_flag->load()) {
-            req->execution.active = false;
-          }
+        stop_hit = AppendGeneratedPiece(
+            req, piece, &req->execution.result.completion, &metrics_);
+        if (req->cancellation_flag && req->cancellation_flag->load()) {
+          req->execution.active = false;
         }
       } else if (++req->execution.non_emitting_steps >=
                  req->execution.max_non_emitting_steps) {

@@ -46,6 +46,17 @@ TEST_CASE("MetricsRegistry records empty generations", "[metrics]") {
           std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry records output UTF-8 replacements", "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordOutputUtf8Replacements(1);
+  registry.RecordOutputUtf8Replacements(2);
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(
+      output.find("inferflux_output_utf8_replacements_total{backend=\"cpu\"} "
+                  "3") != std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry records speculative stats", "[metrics]") {
   inferflux::MetricsRegistry registry;
   registry.RecordSpeculative(4, 3, 6);
