@@ -55,11 +55,14 @@ graph TD
     A[Tests] --> B[Unit: inferflux_tests]
     A --> C[Integration: ctest Python suites]
     A --> D[Contract gates]
+    A --> E[Trusted main GPU gates]
 
     D --> D1[Model identity]
     D --> D2[Embeddings routing]
     D --> D3[CLI admin arg contract]
     D --> D4[Throughput gate contracts]
+    E --> E1[CUDA model-backed]
+    E --> E2[ROCm model-backed]
 ```
 
 ### Core commands
@@ -90,6 +93,11 @@ ctest --test-dir build -R ThroughputGateFailureContractTests --output-on-failure
   --min-batch-size-max 2 \
   --min-batch-size-utilization 0.06
 ```
+
+Pull requests use hosted portable and CUDA compile checks. The persistent GPU
+runner accepts trusted `main` workflow code only; see
+[GPU CI Bootstrap](GPU_CI_BOOTSTRAP.md). Never add a `pull_request` trigger to
+`gpu-gates.yml` without a disposable isolated runner and a new security review.
 
 ## 5) Coding Conventions
 
@@ -130,6 +138,7 @@ Minimum for doc-related PRs:
 - [ ] New behavior covered by focused tests/contracts
 - [ ] Canonical docs updated when user-visible behavior changed
 - [ ] Docs contract gate passes (`python3 scripts/check_docs_contract.py`)
+- [ ] GPU/runtime changes have a green exact-SHA post-merge dual-GPU gate before release
 
 ## 9) Advanced Design and Backend References
 

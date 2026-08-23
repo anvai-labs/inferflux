@@ -41,7 +41,7 @@ flowchart TD
 | Dispatch policy | Adaptive threshold `base_threshold(SM) * 16/bpw` with geometry-aware boosts. Priority: Q8_1 > packed > fused RmsNorm+GEMV > standard GEMV > cuBLAS. | Threshold tuning is empirical, not auto-calibrated |
 | Memory policy | `dequant_cache_policy=none` is the default. Q8_1 path needs zero dequantized caches. | None at the policy level |
 | KV policy | KV precision is load-scoped; planner auto-tunes sequence budget against VRAM. `INFERFLUX_CUDA_KV_MAX_BATCH` / `INFERFLUX_CUDA_KV_MAX_SEQ` for explicit sizing. | Lower-precision KV needs proof |
-| TDD coverage | 100+ kernel correctness tests, 15+ dispatch geometry tests, 7 batched decode tests, 8 metrics tests | GPU CI lane not yet required |
+| TDD coverage | 100+ kernel correctness tests, 15+ dispatch geometry tests, 7 batched decode tests, 8 metrics tests | Trusted main CUDA+ROCm release gate operational; branch protection pending |
 
 ## 4) Design Rules
 

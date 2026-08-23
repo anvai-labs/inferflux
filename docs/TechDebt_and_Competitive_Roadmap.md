@@ -82,7 +82,7 @@ inferflux_cuda vs LM Studio:
 | P0 | llama_cpp_cuda c=1 request failures | Diagnosed | 4-5/16 timeout at c=1 due to GGML graph optimization on fresh load. Not an InferFlux bug — llama.cpp's internal graph compiler takes >120s on some prompt lengths. Benchmark uses 120s curl timeout. Fix: exclude c=1 from llama_cpp claims or increase timeout to 300s. c=4/c=8 fully reliable |
 | P0 | GPU memory overhead (+2.5GB) | Partial | Aliasing and splits save ~120MB. Remaining gap is KV pre-allocation + workspace |
 | P1 | Native structured output | Not started | Grammar-constrained generation still delegates to llama.cpp parity backend |
-| P1 | GPU CI lane | Not started | GPU regressions still discovered manually |
+| P1 | GPU CI enforcement | In progress | Trusted CUDA+ROCm main gate is operational; protect `main` with hosted checks |
 | P1 | Speculative decoding integration | Not started | Draft+validate partially wired |
 | P2 | Distributed sequence ownership | In progress | KV channel + SHM transport production-tested; cleanup needs hardening |
 
@@ -115,7 +115,7 @@ Code quality:
 | 2 | Wire GGUF metadata to /v1/models (loader→router) | Developer experience — Ollama-style model introspection |
 | 3 | Reduce GPU memory overhead | Cost — +2.5GB overhead limits model sizes on consumer GPUs |
 | 4 | Native structured output | Feature — eliminate last llama.cpp parity dependency |
-| 5 | GPU CI lane | Quality — prevent regressions |
+| 5 | GPU CI enforcement | Quality — protect merges and require exact-SHA release evidence |
 
 ## 6) OSS Release Readiness
 
@@ -125,4 +125,4 @@ Code quality:
 | Docs | A- | CLAUDE.md, BACKEND_DEVELOPMENT.md, API_SURFACE.md, CONFIG_REFERENCE.md all current |
 | Benchmark | B+ | 4-backend comparison, embedding similarity, 3-dimension scoring |
 | Tests | B+ | 43 CPU tests, stub integration, benchmark harness |
-| Release process | B | SBOM, CI docs gate, but GPU validation still manual |
+| Release process | B+ | SBOM, docs gate, and trusted dual-GPU evidence; branch protection still pending |
