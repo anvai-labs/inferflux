@@ -41,11 +41,10 @@ bool ExecuteNativeNormalizedProjectionStage(
 }
 
 template <typename TryQ81Fn, typename TryPackedFn, typename FallbackFn>
-bool ExecuteNativeGroupedProjectionStage(TryQ81Fn &&try_q81_group,
-                                         TryPackedFn &&try_packed_group,
-                                         FallbackFn &&run_fallback,
-                                         NativeGroupedProjectionSummary *summary =
-                                             nullptr) {
+bool ExecuteNativeGroupedProjectionStage(
+    TryQ81Fn &&try_q81_group, TryPackedFn &&try_packed_group,
+    FallbackFn &&run_fallback,
+    NativeGroupedProjectionSummary *summary = nullptr) {
   NativeGroupedProjectionSummary local_summary;
   local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81_group)();
   if (!local_summary.used_q81) {
@@ -72,7 +71,8 @@ bool ExecuteInferfluxCudaFfnProjectionStage(
   if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81Group ||
       selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K ||
       selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4 ||
-      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4) {
+      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4 ||
+      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3) {
     local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81_group)();
     if (local_summary.used_q81) {
       local_summary.actual_op = selected_op;
@@ -100,7 +100,8 @@ bool ExecuteInferfluxCudaFfnProjectionStage(
       /*grouped_outputs=*/2);
   const std::string_view metric_op_view(metric_op);
   if (metric_op_view.find("row_pair") != std::string_view::npos) {
-    GlobalMetrics().RecordInferfluxCudaRowPairSelection(phase, metric_op, batch_rows);
+    GlobalMetrics().RecordInferfluxCudaRowPairSelection(phase, metric_op,
+                                                        batch_rows);
   }
 
   if (summary) {
@@ -173,12 +174,14 @@ bool ExecuteInferfluxCudaDownProjStage(
       local_summary.actual_op, quant_type, batch_rows, intermediate_size);
   GlobalMetrics().RecordInferfluxCudaDownProjOperator(phase, metric_op);
   GlobalMetrics().RecordInferfluxCudaDownProjGeometry(
-      phase, metric_op, quant_label, batch_rows, hidden_size, intermediate_size);
+      phase, metric_op, quant_label, batch_rows, hidden_size,
+      intermediate_size);
   if (local_summary.actual_op ==
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPair ||
       local_summary.actual_op ==
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed) {
-    GlobalMetrics().RecordInferfluxCudaRowPairSelection(phase, metric_op, batch_rows);
+    GlobalMetrics().RecordInferfluxCudaRowPairSelection(phase, metric_op,
+                                                        batch_rows);
   }
 
   if (local_summary.actual_op != FusedQuantGemm::DownProjOperator::kFallback) {
