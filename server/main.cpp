@@ -1067,14 +1067,14 @@ int main(int argc, char **argv) {
           std::string(backend_allow_llama_cpp_fallback ? "true" : "false") +
           ", strict_inferflux_request=" +
           std::string(backend_strict_inferflux_request ? "true" : "false"));
-  // TODO(perf): When allow_llama_cpp_fallback=true with prefer_inferflux=true,
-  // the parity delegate may load a second copy of model weights via llama.cpp
-  // for features the inferflux backend doesn't support (logprobs, structured
-  // output). This doubles GPU memory for model weights. Disable fallback via
-  // allow_llama_cpp_fallback=false or
-  // INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE=1 to avoid this. Long-term fix:
-  // make the parity delegate truly lazy and share the GGUF weight data with the
-  // inferflux backend.
+  // When allow_llama_cpp_fallback=true with prefer_inferflux=true and the
+  // parity delegate is explicitly enabled, the delegate loads a second copy
+  // of the model weights via llama.cpp — lazily, on the first request that
+  // needs it (grammar-constrained output), after a free-VRAM pre-check.
+  // The delegate is OFF by default (INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE
+  // defaults true); disable fallback via allow_llama_cpp_fallback=false to
+  // avoid the duplicate weights entirely. Long-term fix: share the GGUF
+  // weight data between the two backends.
   if (backend_prefer_inferflux && backend_allow_llama_cpp_fallback) {
     inferflux::log::Warn(
         "server",

@@ -6,15 +6,39 @@
 #include "runtime/backends/llama/llama_backend_traits.h"
 #include "server/logging/logger.h"
 
+#if defined(INFERFLUX_HAS_CUDA)
+#include <cuda_runtime.h>
+#endif
+
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <filesystem>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace inferflux {
 
 namespace {
+
+// Free-VRAM probe for the parity-delegate pre-check. CUDA builds query the
+// driver; other device stacks report "unknown" and the pre-check is skipped
+// (the lazy load then fails through its normal error path).
+bool QueryFreeDeviceMemory(size_t *free_bytes) {
+#if defined(INFERFLUX_HAS_CUDA)
+  size_t free_v = 0;
+  size_t total_v = 0;
+  if (cudaMemGetInfo(&free_v, &total_v) != cudaSuccess) {
+    return false;
+  }
+  *free_bytes = free_v;
+  return true;
+#else
+  (void)free_bytes;
+  return false;
+#endif
+}
 
 bool ParseBoolEnv(const char *name, bool default_value) {
   const char *raw = std::getenv(name);
@@ -782,6 +806,28 @@ std::shared_ptr<LlamaCppBackend> NativeGpuBackend::EnsureParityBackend() const {
     return nullptr;
   }
   parity_delegate_init_attempted_ = true;
+
+  // Pre-check free VRAM so a doomed lazy load fails fast with a clear
+  // message instead of an OOM inside llama.cpp. The delegate re-reads the
+  // GGUF through llama.cpp, so budget at least the model file's size.
+  {
+    std::error_code ec;
+    const auto model_bytes = std::filesystem::file_size(parity_load_path_, ec);
+    size_t free_bytes = 0;
+    if (!ec && QueryFreeDeviceMemory(&free_bytes) &&
+        free_bytes < static_cast<size_t>(model_bytes)) {
+      log::Warn(LogTag(),
+                "Skipping parity delegate load: only " +
+                    std::to_string(free_bytes / (1024 * 1024)) +
+                    " MiB free but model needs at least " +
+                    std::to_string(static_cast<size_t>(model_bytes) /
+                                   (1024 * 1024)) +
+                    " MiB; structured-output remains unavailable on native "
+                    "provider");
+      parity_delegate_available_ = false;
+      return nullptr;
+    }
+  }
 
   auto backend = std::make_shared<LlamaCppBackend>();
   const auto tuned_cfg = TuneLlamaBackendConfig(ParityTarget(), loaded_config_);
