@@ -78,6 +78,10 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 | Overlap activity | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` | Non-zero deltas confirm mixed-workload lane activity |
 | Native KV sizing | `inferflux_cuda_kv_requested_max_seq`, `inferflux_cuda_kv_planned_max_seq`, `inferflux_cuda_kv_budget_bytes` | Planned values below requested show KV auto-tune is protecting VRAM |
 | Readiness on decode/disagg nodes | `/readyz` | Ready requires weights loaded, full decode-worker health, and timeout streak/debt below threshold |
+| **Dispatch divergence** | `inferflux_cuda_dispatch_divergence_total{layer,selected,actual,reason}` | Non-zero = an operator was selected but a different tier executed — a routing bug or forced fallback. `layer=ffn|down_proj` runtime mismatches, `layer=graph` capture aborts to cuBLAS, `layer=probe` load-time down-ranks. Any hit warrants investigation; see the dispatch trace below |
+| **Dispatch trace** | `INFERFLUX_CUDA_DISPATCH_TRACE=1` (+ `_LIMIT`, default 256) | One stderr line per projection dispatch (`[dispatch_trace] [ffn]: phase= M= N= K= selected= actual= tier=`); summarize with `python3 scripts/parse_dispatch_trace.py <log>` (exit 1 on divergence). In benchmarks: `INFERFLUX_BENCH_DISPATCH_TRACE=true` |
+| **Dispatch self-heal state** | `/readyz` `dispatch_degraded` / `dispatch_divergences` / `dispatch_downgraded_operators` | Present only when the load-time probe (`INFERFLUX_CUDA_DISPATCH_PROBE=1`, default on) down-ranked an operator or runtime divergence fired. Server stays 200-ready — degraded is visible, not fatal |
+| Operator down-rank drill | `INFERFLUX_CUDA_DISPATCH_PROBE_FORCE_UNHEALTHY=ffn:q8_1_group_mmq3,down:mmq` | Forces the listed operators unhealthy at load for A/B or incident reproduction; the dispatch rules then route to the next-best operator for the process lifetime |
 | Fail-closed admission | generation `503` with `error=distributed_kv_transport_degraded` | optional protection when degraded transport should stop new generation work immediately |
 
 Benchmark-only experiment:
@@ -169,6 +173,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 | InferFlux CUDA expected but missing | `/v1/models` exposure fields + native counters | inspect strict/fallback policy and model format path |
 | VRAM pressure | native KV planning metrics + dequant policy | tighten budget or keep memory-first dequant policy |
 | Cache not helping | prefix/kv reuse counters | validate warmup patterns and prefix-affinity policy |
+| Selected operator never executes | `inferflux_cuda_dispatch_divergence_total` + `parse_dispatch_trace.py` | The executor allowlist dropped the selection (kQ81GroupMmq3 incident class); the probe now down-ranks at load — check `/readyz` dispatch fields and the catalog (dispatch_catalog.h) |
 
 ## 9) Related Docs
 

@@ -318,7 +318,43 @@ The remaining gap is primarily weight bandwidth utilization (~40% of peak vs lla
 | `tests/unit/test_native_forward.cpp` | 100+ kernel correctness and dispatch policy tests |
 | `tests/unit/test_batched_decode.cpp` | Batched decode kernel isolation tests |
 
-## 11) Related Docs
+## 11) Adding an Operator (dispatch catalog checklist)
+
+The dispatch layer has a single source of truth:
+`runtime/backends/cuda/native/dispatch_catalog.h`. Adding a projection
+operator is exactly three edits — everything else derives or the build fails:
+
+1. **One enum member** in `FfnProjOperator` / `DownProjOperator` (namespace
+   scope, inside the catalog header).
+2. **One capability table row** in `kFfnOpTable` / `kDownOpTable`:
+   `{op, label, tier, distinct_execution, in_rules_table}`. Integrity
+   `static_assert`s fire on a missing row, a non-dense table, or a duplicate
+   label.
+3. **One registry rule** in `native_dispatch_registry.cpp`
+   (`GetInferfluxCuda*DispatchRules`) whose matcher selects it.
+
+Everything else is derived and enforced:
+- The executor stages (`native_linear_executor.h`) and the label helpers
+  are switches **without default clauses** under `-Werror=switch` — an
+  unwired operator fails the build at both sites.
+- The Prometheus operator-counter universe renders from
+  `kFfnMetricLabels` / `kDownMetricLabels` plus observed keys — a new label
+  can never be silently unexported.
+- The reachability tests enumerate every table row against the executor
+  stages; the load-time probe (`INFERFLUX_CUDA_DISPATCH_PROBE`, default on)
+  verifies real execution on real weights and down-ranks divergent
+  operators (self-heal) with `/readyz` visibility.
+- Runtime divergence is counted at
+  `inferflux_cuda_dispatch_divergence_total{layer,selected,actual,reason}`
+  and the per-dispatch trace (`INFERFLUX_CUDA_DISPATCH_TRACE=1`, parsed by
+  `scripts/parse_dispatch_trace.py`) exits non-zero on any mismatch.
+
+Incident history: the FFN executor's operator allowlist once omitted
+`kQ81GroupMmq3`; the selection was silently discarded and a ~5x slower
+kernel ran for months (commit `6f94cec` fixed it; the catalog exists so
+the bug class cannot be written, merged, or deployed silently again).
+
+## 12) Related Docs
 
 - [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md)
 - [MONITORING](MONITORING.md)
