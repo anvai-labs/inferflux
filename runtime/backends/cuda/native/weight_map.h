@@ -2,8 +2,21 @@
 
 #include "runtime/backends/cuda/inferflux_cuda_executor.h"
 
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>) && __has_include(<cuda_bf16.h>))
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+struct __nv_bfloat16;
+typedef __nv_bfloat16 __nv_bfloat16; // opaque in CPU builds
+#endif
 #include <string>
 #include <unordered_map>
 #include <vector>

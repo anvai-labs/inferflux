@@ -1,5 +1,12 @@
 #include "runtime/backends/cuda/native/safetensors_adapter.h"
 
+// sizeof_half on CPU builds: the guarded headers make __half opaque.
+#ifndef INFERFLUX_HAS_CUDA
+#define sizeof_half 2
+#else
+#define sizeof_half sizeof(half)
+#endif
+
 #include <cstring>
 
 namespace inferflux {
@@ -140,7 +147,7 @@ void SafetensorsQuantizationHandler::DequantizeGpuToGpu(const void *quantized,
   if (!quantized || !dequantized || num_elements == 0) {
     return;
   }
-  std::memcpy(dequantized, quantized, num_elements * sizeof(half));
+  std::memcpy(dequantized, quantized, num_elements * sizeof_half);
 }
 
 } // namespace native

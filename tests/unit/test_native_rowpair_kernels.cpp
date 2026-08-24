@@ -1,5 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/kernels/dequantization.cuh"
 
@@ -290,3 +291,4 @@ TEST_CASE("Native row-pair kernel parity requires CUDA",
 }
 
 #endif
+#endif // INFERFLUX_NATIVE_KERNELS_READY

@@ -3341,6 +3341,16 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
 
 bool InferfluxCudaExecutor::SupportsAsyncUnifiedBatch() const { return false; }
 
+bool InferfluxCudaExecutor::NativeSupportsUnifiedBatchBurst() const {
+  return false;
+}
+
+UnifiedBurstResult InferfluxCudaExecutor::NativeExecuteUnifiedBatchBurst(
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &,
+    const UnifiedBurstOptions &, const BurstTokenSink &) {
+  return UnifiedBurstResult{};
+}
+
 UnifiedBatchHandle InferfluxCudaExecutor::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &, UnifiedBatchLane) {
   return 0;
