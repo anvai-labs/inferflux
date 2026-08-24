@@ -1,22 +1,28 @@
 # Repository Guidelines
 
-## Project Structure & Module Organization
-InferFlux production code spans `runtime/` (device backends, paged KV, speculative decoding), `server/` (HTTP/auth/metrics), plus `scheduler/`, `policy/`, and `model/`, while `cli/` hosts the `inferctl` client. Deployment tooling sits in `docker/`, `charts/`, and `scripts/`; configs live under `config/`, docs under `docs/`, and tests in `tests/unit` with scenario scaffolds in `tests/integration`. Treat `external/` as pinned vendor drops managed through CMake.
+## Project Structure & Architecture
+
+InferFlux is a C++17 inference server. `runtime/` owns backend execution (CPU, CUDA, ROCm, MPS, Vulkan, OpenCL, and MLX), batching, caches, structured output, and distributed KV transport. `scheduler/` handles fairness, routing, and model selection; `server/` contains HTTP, auth, policy, metrics, logging, and diagnostics. Model/tokenizer code lives in `model/`, `inferctl` in `cli/`, and shared helpers in `io/` and `net/`. Tests are split across `tests/unit/`, `tests/integration/`, and `tests/tools/`. Keep deployment changes aligned across `config/`, `docker/`, `charts/`, and `deploy/`; canonical documentation lives in `docs/`. Treat `external/` and `third_party/` as pinned dependencies.
 
 ## Build, Test, and Development Commands
-- `./scripts/build.sh` configures CMake into `build/` and compiles `inferfluxd` plus `inferctl` with the CUDA/ROCm/MPS toggles declared at the top of `CMakeLists.txt`.
-- `cmake -S . -B build && cmake --build build -j` is the fastest incremental loop when iterating on a single component.
-- `./scripts/run_dev.sh --config config/server.yaml` starts the dev server with sample API keys and guardrail knobs.
-- `./build/inferctl chat --message 'user:Hello' --api-key dev-key-123 --stream` (or `... completion`) verifies the OpenAI-style endpoints once `INFERFLUX_MODEL_PATH` points at a GGUF.
 
-## Coding Style & Naming Conventions
-We target C++17, keep headers beside their `.cpp` implementations, and rely on RAII plus `std::unique_ptr` for ownership. Run `clang-format` (2-space indent, sorted includes) on touched files. File names and free functions use snake_case, public types adopt PascalCase (`SpeculativeDecoder`), constants start with `k` (`kLRU`), and member fields end in `_`. Keep helpers inside anonymous namespaces and ensure everything lives in the `inferflux` namespace.
+- `git submodule update --init --recursive` initializes the pinned `llama.cpp` dependency.
+- `./scripts/build.sh` creates a Release build in `build/`; use `--cpu-only`, `--all-backends`, or `BUILD_DIR=build-cuda` when appropriate.
+- `cmake -S . -B build -DENABLE_CUDA=OFF && cmake --build build -j` is the incremental loop. Other toggles include `ENABLE_ROCM`, `ENABLE_MPS`, `ENABLE_VULKAN`, `ENABLE_MLX`, `ENABLE_MTMD`, and `ENABLE_WEBUI`.
+- `INFERFLUX_MODEL_PATH=/path/model.gguf ./scripts/run_dev.sh config/server.yaml` starts `inferfluxd`. Verify it with `./build/inferctl status --api-key dev-key-123`.
+
+## Coding Style & Naming
+
+Use two-space indentation and run `clang-format -i` on touched `.cpp` and `.h` files. Prefer RAII and smart pointers. Files and free functions use `snake_case`, public types use `PascalCase`, constants use `kName`, and members end in `_`. Keep implementation-only helpers in anonymous namespaces and production symbols in `inferflux`. Add new sources and tests to `CMakeLists.txt`.
 
 ## Testing Guidelines
-Catch2-based unit tests (see `tests/unit/test_tokenizer.cpp`) run through `ctest --test-dir build --output-on-failure`. Integration smoke tests for SSE, guardrails, and rate limiting run via `ctest -R IntegrationSSE --output-on-failure` and require `INFERFLUX_MODEL_PATH` plus `INFERCTL_API_KEY`. Name `TEST_CASE`s after observable behaviors, keep fixtures deterministic in `tests/data/`, and attach CLI or HTTP transcripts whenever you touch user-visible flows.
 
-## Commit & Pull Request Guidelines
-History favors short imperative subjects such as `Add Metal/MPS and BLAS acceleration toggles`; keep the first line under ~72 characters, mention the subsystem, and explain the rationale in the body. Each PR should link a tracking issue, summarize config/env changes, attach `ctest` (or equivalent manual) output, and update `README.md`, `docs/`, or deployment assets when knobs move. Include screenshots or curl transcripts for API changes.
+Unit tests use vendored Catch2 and descriptive `TEST_CASE` names with focused tags such as `[paged_kv]`. Run `ctest --test-dir build --output-on-failure --timeout 90`; target a suite with `ctest --test-dir build -R ModelIdentityTests -V`. Python integration and stub-contract tests are registered through CTest and need no model. `IntegrationSSE` is registered only when `INFERFLUX_MODEL_PATH` is set. For documentation or public CLI/API changes, run `python3 scripts/check_docs_contract.py`. Install local checks with `bash scripts/install-hooks.sh`.
 
-## Security & Configuration Tips
-Never commit real API keys or passphrases into `config/`; rely on env vars such as `INFERFLUX_POLICY_PASSPHRASE`, `INFERCTL_API_KEY`, and `INFERFLUX_RATE_LIMIT_PER_MINUTE`. When modifying guardrail, auth, or audit paths (`policy/`, `server/auth/`, `server/logging/`), confirm `logs/audit.log` remains writable, document RBAC impacts, and describe rollback steps in the PR.
+## Commits & Pull Requests
+
+Use short, imperative subjects (`Fix ...`, `Add ...`, `Extract ...`) and explain rationale and observable effects in the body. PRs should link the issue, summarize backend/config/API impacts, list exact test commands and results, and update `README.md` or canonical `docs/` pages for user-visible changes. Include curl/CLI transcripts for endpoint changes and benchmark evidence for performance claims.
+
+## Security & Generated Data
+
+Never commit production keys, model files, policy stores, logs, or benchmark/profiling output. Use `INFERCTL_API_KEY`, `INFERFLUX_POLICY_STORE`, and `INFERFLUX_POLICY_PASSPHRASE`; sample `dev-key-123` is local-only. Changes under `policy/`, `server/auth/`, or `server/logging/` must preserve least-privilege scopes, atomic policy persistence, and a writable audit-log path.
