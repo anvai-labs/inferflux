@@ -5,7 +5,7 @@
 #ifndef INFERFLUX_HAS_CUDA
 #define sizeof_half 2
 #else
-#define sizeof_half sizeof_half
+#define sizeof_half sizeof(half)
 #endif
 #include "runtime/backends/cuda/native/safetensors_adapter.h"
 #include "server/logging/logger.h"
