@@ -303,7 +303,7 @@ jobs:
             build-essential cmake libssl-dev libyaml-cpp-dev
 
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.15
+        uses: Jimver/cuda-toolkit@v0.2.21
         with:
           cuda: '12.3.0'
           method: 'network'

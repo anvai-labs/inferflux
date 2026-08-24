@@ -554,6 +554,10 @@ add_executable(inferfluxd server/main.cpp)
 if(MSVC)
   target_link_libraries(inferfluxd PRIVATE inferflux_core)
   target_link_options(inferfluxd PRIVATE /WHOLEARCHIVE:inferflux_core)
+elseif(APPLE)
+  # ld64 has no --whole-archive; -force_load per object archive achieves
+  # the same self-registration guarantee.
+  target_link_libraries(inferfluxd PRIVATE "-Wl,-force_load,$<TARGET_FILE:inferflux_core>")
 else()
   target_link_libraries(inferfluxd PRIVATE
     -Wl,--whole-archive inferflux_core -Wl,--no-whole-archive)
