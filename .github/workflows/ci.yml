@@ -308,7 +308,8 @@ jobs:
           # installer) pulls nvidia-dkms/driver packages that fail to
           # configure on GitHub runners. cuda-toolkit-12-* provides nvcc +
           # cudart + headers without the driver.
-          wget -q -O - https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb | sudo dpkg -i - >/dev/null
+          wget -q -O /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends cuda-toolkit-12-6
 
@@ -541,6 +542,12 @@ jobs:
 
       - name: Build
         run: cmake --build build-cov -j$(nproc)
+
+      # StubIntegration (run by the coverage target) shells out to
+      # inferctl; its default path assumes the ./build tree this job
+      # doesn't use.
+      - name: Export coverage-tree binary paths
+        run: echo "INFERCTL_BIN=$PWD/build-cov/inferctl" >> "$GITHUB_ENV"
 
       # ------------------------------------------------------------------
       # Focused assertion: canonical OSS docs contract
