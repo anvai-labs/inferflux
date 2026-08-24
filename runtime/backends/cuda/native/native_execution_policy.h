@@ -38,6 +38,11 @@ struct NativeExecutionPolicy {
   // append store, deleting the three per-layer BiasAdd launches. Off by
   // default; null-bias models take the identical old path either way.
   bool enable_bias_rope_fusion{false};
+  // Unified dispatch trace: one machine-parseable line per projection
+  // dispatch (phase, geometry, selected, actual, tier). Budgeted like the
+  // other debug traces; parsed by scripts/parse_dispatch_trace.py.
+  bool dispatch_trace{false};
+  int dispatch_trace_limit{256};
   bool phase_timing_enabled{false};
   bool force_cublas{false};
   bool disable_prepacked_activations{false};
@@ -90,6 +95,11 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_CUDA_FUSED_GATE_UP_SILU_MAX_BATCH", -1, -1, 64);
     policy.enable_bias_rope_fusion =
         ParseBoolEnv("INFERFLUX_CUDA_FUSE_BIAS_ROPE", false);
+    policy.dispatch_trace =
+        ParseBoolEnv("INFERFLUX_CUDA_DISPATCH_TRACE", false);
+    policy.dispatch_trace_limit =
+        ParseIntEnv("INFERFLUX_CUDA_DISPATCH_TRACE_LIMIT", 256, 1,
+                    std::numeric_limits<int>::max());
     // CUDA graph capture: cudaDeviceSynchronize drains async work before
     // capture to prevent heap corruption. Disable with
     // INFERFLUX_DISABLE_CUDA_GRAPH=1 if issues arise.

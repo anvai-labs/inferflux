@@ -1367,7 +1367,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 }
                 return true;
               },
-              &ffn_summary)) {
+              &ffn_summary, &execution_policy_)) {
         return false;
       }
       pt.ffn_proj_ms += pt.Mark();
@@ -1462,7 +1462,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                     FusedQuantGemm::DownProjOperatorName(actual_op);
                 LogPackedGemmPath("down_proj", down_label.c_str());
               },
-              &down_summary)) {
+              &down_summary, &execution_policy_)) {
         return false;
       }
     }
@@ -2269,7 +2269,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                     }
                     return true;
                   },
-                  &ffn_summary)) {
+                  &ffn_summary, active_policy)) {
             return false;
           }
         } // end if (!fused_gate_up_silu)
@@ -2383,7 +2383,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                         FusedQuantGemm::DownProjOperatorName(actual_op);
                     LogPackedGemmPath("down_proj", down_label.c_str());
                   },
-                  &down_summary)) {
+                  &down_summary, active_policy)) {
             return false;
           }
         } // end else (!fused_gate_up_silu)

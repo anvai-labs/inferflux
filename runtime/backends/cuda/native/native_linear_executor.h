@@ -1,14 +1,39 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/dispatch_catalog.h"
+#include "runtime/backends/cuda/native/native_execution_policy.h"
+
+#include "server/logging/logger.h"
 
 #include "server/metrics/metrics.h"
+#include <cstdio>
 
 #include <string>
 #include <string_view>
 #include <utility>
 
 namespace inferflux {
+
+// Budgeted dispatch-trace emission (thread_local budget resets when the
+// limit changes, mirroring ConsumeOperatorSelectionBudget).
+inline bool ConsumeDispatchTraceBudget(const NativeExecutionPolicy *policy) {
+  if (!policy || !policy->dispatch_trace) {
+    return false;
+  }
+  struct Budget {
+    int limit;
+    int used;
+  };
+  thread_local Budget budget{0, 0};
+  if (budget.limit != policy->dispatch_trace_limit) {
+    budget = Budget{policy->dispatch_trace_limit, 0};
+  }
+  if (budget.used >= budget.limit) {
+    return false;
+  }
+  ++budget.used;
+  return true;
+}
 
 struct NativeFfnExecutionSummary {
   FfnProjOperator actual_op{FfnProjOperator::kFallback};
@@ -64,7 +89,8 @@ bool ExecuteInferfluxCudaFfnProjectionStage(
     const std::string &quant_label, int quant_type, int batch_rows,
     int intermediate_size, int hidden_size, TryQ81Fn &&try_q81_group,
     TryPackedFn &&try_packed_group, FallbackFn &&run_fallback,
-    NativeFfnExecutionSummary *summary = nullptr) {
+    NativeFfnExecutionSummary *summary = nullptr,
+    const NativeExecutionPolicy *policy = nullptr) {
   NativeFfnExecutionSummary local_summary;
 
   switch (selected_op) {
@@ -99,12 +125,26 @@ bool ExecuteInferfluxCudaFfnProjectionStage(
     }
   }
 
-  if (TierOf(selected_op) != TierOf(local_summary.actual_op) ||
+  const bool ffn_divergent =
+      TierOf(selected_op) != TierOf(local_summary.actual_op) ||
       (local_summary.actual_op == FfnProjOperator::kFallback &&
-       selected_op != FfnProjOperator::kFallback)) {
+       selected_op != FfnProjOperator::kFallback);
+  if (ffn_divergent) {
     ReportDispatchDivergence("ffn", FfnSelectionLabel(selected_op),
                              FfnSelectionLabel(local_summary.actual_op),
                              "tier_mismatch");
+  }
+  if (ConsumeDispatchTraceBudget(policy)) {
+    // Direct stderr like [phase_timing]: a diagnostic trace that must
+    // survive warning-level logging in benchmark harnesses.
+    std::fprintf(stderr,
+                 "[dispatch_trace] [ffn]: phase=%s M=%d N=%d K=%d "
+                 "selected=%s actual=%s tier=%s%s\n",
+                 phase, batch_rows, intermediate_size, hidden_size,
+                 FfnSelectionLabel(selected_op),
+                 FfnSelectionLabel(local_summary.actual_op),
+                 DispatchTierLabel(TierOf(local_summary.actual_op)),
+                 ffn_divergent ? " reason=tier_mismatch" : "");
   }
 
   const char *metric_op =
@@ -144,7 +184,8 @@ bool ExecuteInferfluxCudaDownProjStage(
     int hidden_size, int intermediate_size, TryMmqFn &&try_mmq,
     TryQ81Fn &&try_q81, TryPackedFn &&try_packed, FallbackFn &&run_fallback,
     LogFn &&log_selected_operator,
-    NativeDownProjExecutionSummary *summary = nullptr) {
+    NativeDownProjExecutionSummary *summary = nullptr,
+    const NativeExecutionPolicy *policy = nullptr) {
   NativeDownProjExecutionSummary local_summary;
 
   switch (selected_op) {
@@ -200,12 +241,24 @@ bool ExecuteInferfluxCudaDownProjStage(
     }
   }
 
-  if (TierOf(selected_op) != TierOf(local_summary.actual_op) ||
+  const bool down_divergent =
+      TierOf(selected_op) != TierOf(local_summary.actual_op) ||
       (local_summary.actual_op == DownProjOperator::kFallback &&
-       selected_op != DownProjOperator::kFallback)) {
+       selected_op != DownProjOperator::kFallback);
+  if (down_divergent) {
     ReportDispatchDivergence("down_proj", DownSelectionLabel(selected_op),
                              DownSelectionLabel(local_summary.actual_op),
                              "tier_mismatch");
+  }
+  if (ConsumeDispatchTraceBudget(policy)) {
+    std::fprintf(stderr,
+                 "[dispatch_trace] [down_proj]: phase=%s M=%d N=%d K=%d "
+                 "selected=%s actual=%s tier=%s%s\n",
+                 phase, batch_rows, hidden_size, intermediate_size,
+                 DownSelectionLabel(selected_op),
+                 DownSelectionLabel(local_summary.actual_op),
+                 DispatchTierLabel(TierOf(local_summary.actual_op)),
+                 down_divergent ? " reason=tier_mismatch" : "");
   }
 
   const char *metric_op =
