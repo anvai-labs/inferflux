@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <map>
 #include <set>
 #include <sstream>
 #include <vector>
@@ -958,6 +959,22 @@ void MetricsRegistry::RecordCudaAttentionKernelSwitch(
   const std::string key = from + "|" + to;
   std::lock_guard<std::mutex> lock(cuda_attention_switch_mutex_);
   cuda_attention_switch_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordInferfluxCudaDispatchDivergence(
+    std::string_view layer, std::string_view selected, std::string_view actual,
+    std::string_view reason) {
+  const std::string key = std::string(layer) + "|" + std::string(selected) +
+                          "|" + std::string(actual) + "|" +
+                          std::string(reason.empty() ? "unspecified" : reason);
+  std::lock_guard<std::mutex> lock(cuda_dispatch_divergence_mutex_);
+  cuda_dispatch_divergence_counts_[key] += 1;
+  cuda_dispatch_divergence_total_ += 1;
+}
+
+uint64_t MetricsRegistry::GetInferfluxCudaDispatchDivergences() const {
+  std::lock_guard<std::mutex> lock(cuda_dispatch_divergence_mutex_);
+  return cuda_dispatch_divergence_total_;
 }
 
 MetricsRegistry::CacheMetrics MetricsRegistry::GetCacheMetrics() const {
@@ -2485,6 +2502,31 @@ std::string MetricsRegistry::RenderPrometheus() const {
       out << "inferflux_cuda_attention_kernel_fallbacks_total{requested=\""
           << requested << "\",selected=\"" << selected << "\",reason=\""
           << reason << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_cuda_dispatch_divergence_total Selected vs "
+         "executed native dispatch operator divergences (layer|selected|"
+         "actual|reason)\n";
+  out << "# TYPE inferflux_cuda_dispatch_divergence_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(cuda_dispatch_divergence_mutex_);
+    std::map<std::string, uint64_t> sorted(
+        cuda_dispatch_divergence_counts_.begin(),
+        cuda_dispatch_divergence_counts_.end());
+    for (const auto &kv : sorted) {
+      const std::string::size_type b1 = kv.first.find('|');
+      const std::string::size_type b2 = kv.first.find('|', b1 + 1);
+      const std::string::size_type b3 = kv.first.find('|', b2 + 1);
+      if (b1 == std::string::npos || b2 == std::string::npos ||
+          b3 == std::string::npos) {
+        continue;
+      }
+      out << "inferflux_cuda_dispatch_divergence_total{layer=\""
+          << kv.first.substr(0, b1) << "\",selected=\""
+          << kv.first.substr(b1 + 1, b2 - b1 - 1) << "\",actual=\""
+          << kv.first.substr(b2 + 1, b3 - b2 - 1) << "\",reason=\""
+          << kv.first.substr(b3 + 1) << "\"} " << kv.second << "\n";
     }
   }
 

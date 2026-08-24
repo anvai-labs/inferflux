@@ -183,6 +183,15 @@ public:
   void RecordCudaAttentionKernelFallback(const std::string &requested_kernel,
                                          const std::string &selected_kernel,
                                          const std::string &reason);
+
+  // Dispatch divergence: the executor ran a different tier than the
+  // selector chose (layer=ffn|down_proj|graph|probe). The canonical signal
+  // for routing regressions like the kQ81GroupMmq3 allowlist bug.
+  void RecordInferfluxCudaDispatchDivergence(std::string_view layer,
+                                             std::string_view selected,
+                                             std::string_view actual,
+                                             std::string_view reason);
+  uint64_t GetInferfluxCudaDispatchDivergences() const;
   void RecordCudaAttentionKernelSwitch(const std::string &from_kernel,
                                        const std::string &to_kernel);
   void RecordDecodeWorkerBatchSize(std::size_t batch_size);
@@ -197,30 +206,36 @@ public:
   void RecordInferfluxCudaForwardShape(bool is_decode, int batch_size);
   void RecordInferfluxCudaForwardLatency(double forward_ms);
   void RecordInferfluxCudaForwardPass(bool is_decode, int batch_size,
-                               double forward_ms);
+                                      double forward_ms);
   void RecordInferfluxCudaSampling(int batch_size, double sampling_ms);
   void RecordInferfluxCudaBatchDecode(int batch_size, double total_ms);
-  void RecordInferfluxCudaForwardBatchSize(std::string_view phase, int batch_size);
+  void RecordInferfluxCudaForwardBatchSize(std::string_view phase,
+                                           int batch_size);
   void RecordInferfluxCudaFfnProjOperator(std::string_view phase,
-                                   std::string_view op);
+                                          std::string_view op);
   void RecordInferfluxCudaFfnProjGeometry(std::string_view phase,
-                                   std::string_view op,
-                                   std::string_view quant, int batch_size, int n,
-                                   int k, int grouped_outputs);
+                                          std::string_view op,
+                                          std::string_view quant,
+                                          int batch_size, int n, int k,
+                                          int grouped_outputs);
   void RecordInferfluxCudaDownProjOperator(std::string_view phase,
-                                    std::string_view op);
+                                           std::string_view op);
   void RecordInferfluxCudaDownProjGeometry(std::string_view phase,
-                                    std::string_view op,
-                                    std::string_view quant, int batch_size,
-                                    int n, int k);
+                                           std::string_view op,
+                                           std::string_view quant,
+                                           int batch_size, int n, int k);
   void RecordInferfluxCudaRowPairSelection(std::string_view phase,
-                                    std::string_view op, int batch_rows);
-  void RecordInferfluxCudaKvAutoTunePlan(int requested_max_seq, int planned_max_seq,
-                                  std::size_t requested_bytes,
-                                  std::size_t planned_bytes,
-                                  std::size_t budget_bytes);
-  void SetInferfluxCudaKvCacheOccupancy(int active_sequences, int max_sequences);
-  int GetQueueDepth() const { return queue_depth_.load(std::memory_order_relaxed); }
+                                           std::string_view op, int batch_rows);
+  void RecordInferfluxCudaKvAutoTunePlan(int requested_max_seq,
+                                         int planned_max_seq,
+                                         std::size_t requested_bytes,
+                                         std::size_t planned_bytes,
+                                         std::size_t budget_bytes);
+  void SetInferfluxCudaKvCacheOccupancy(int active_sequences,
+                                        int max_sequences);
+  int GetQueueDepth() const {
+    return queue_depth_.load(std::memory_order_relaxed);
+  }
   int GetPrefillQueueDepth() const {
     return prefill_queue_depth_.load(std::memory_order_relaxed);
   }
@@ -278,11 +293,12 @@ public:
       std::unordered_map<std::string, MemoryUsageMetrics> domains);
   InferfluxCudaModelMemorySnapshot GetInferfluxCudaModelMemorySnapshot() const;
 
-  void SetInferfluxCudaKvMemoryBytes(uint64_t total_bytes, uint64_t active_bytes,
-                              uint64_t prefix_retained_bytes,
-                              uint64_t free_bytes, int active_sequences,
-                              int prefix_retained_sequences,
-                              int free_sequences, int max_sequences);
+  void SetInferfluxCudaKvMemoryBytes(uint64_t total_bytes,
+                                     uint64_t active_bytes,
+                                     uint64_t prefix_retained_bytes,
+                                     uint64_t free_bytes, int active_sequences,
+                                     int prefix_retained_sequences,
+                                     int free_sequences, int max_sequences);
   InferfluxCudaKvMemorySnapshot GetInferfluxCudaKvMemorySnapshot() const;
   int GetInferfluxCudaKvMaxSequences() const {
     return inferflux_cuda_kv_max_sequences_.load(std::memory_order_relaxed);
@@ -431,6 +447,9 @@ private:
   std::chrono::steady_clock::time_point cuda_overlap_started_at_{};
   mutable std::mutex cuda_attention_fallback_mutex_;
   std::unordered_map<std::string, uint64_t> cuda_attention_fallback_counts_;
+  mutable std::mutex cuda_dispatch_divergence_mutex_;
+  std::unordered_map<std::string, uint64_t> cuda_dispatch_divergence_counts_;
+  uint64_t cuda_dispatch_divergence_total_{0};
   mutable std::mutex cuda_attention_switch_mutex_;
   std::unordered_map<std::string, uint64_t> cuda_attention_switch_counts_;
 
@@ -441,15 +460,20 @@ private:
   LatencyHistogram inferflux_cuda_forward_latency_;
   LatencyHistogram inferflux_cuda_sampling_latency_;
   mutable std::mutex inferflux_cuda_forward_batch_size_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_forward_batch_size_counts_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_forward_batch_size_counts_;
   mutable std::mutex inferflux_cuda_ffn_proj_operator_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_ffn_proj_operator_counts_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_ffn_proj_operator_counts_;
   mutable std::mutex inferflux_cuda_ffn_proj_geometry_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_ffn_proj_geometry_counts_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_ffn_proj_geometry_counts_;
   mutable std::mutex inferflux_cuda_down_proj_operator_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_down_proj_operator_counts_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_down_proj_operator_counts_;
   mutable std::mutex inferflux_cuda_down_proj_geometry_mutex_;
-  std::unordered_map<std::string, uint64_t> inferflux_cuda_down_proj_geometry_counts_;
+  std::unordered_map<std::string, uint64_t>
+      inferflux_cuda_down_proj_geometry_counts_;
   mutable std::mutex inferflux_cuda_rowpair_selection_mutex_;
   std::unordered_map<std::string, uint64_t>
       inferflux_cuda_rowpair_selection_counts_;

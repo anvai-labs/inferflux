@@ -252,28 +252,34 @@ TEST_CASE("MetricsRegistry records decode worker batch-size counters",
   registry.RecordDecodeWorkerStickyMerge(2);
 
   auto output = registry.RenderPrometheus();
-  REQUIRE(output.find("# HELP inferflux_scheduler_decode_worker_batch_size_total") !=
+  REQUIRE(output.find(
+              "# HELP inferflux_scheduler_decode_worker_batch_size_total") !=
           std::string::npos);
-  REQUIRE(output.find("# TYPE inferflux_scheduler_decode_worker_batch_size_total "
-                      "counter") != std::string::npos);
+  REQUIRE(
+      output.find("# TYPE inferflux_scheduler_decode_worker_batch_size_total "
+                  "counter") != std::string::npos);
   REQUIRE(output.find("inferflux_scheduler_decode_worker_batch_size_total{"
                       "bucket=\"1\"} 1") != std::string::npos);
   REQUIRE(output.find("inferflux_scheduler_decode_worker_batch_size_total{"
                       "bucket=\"4\"} 2") != std::string::npos);
-  REQUIRE(output.find("# HELP inferflux_scheduler_decode_worker_execution_path_total") !=
-          std::string::npos);
+  REQUIRE(
+      output.find(
+          "# HELP inferflux_scheduler_decode_worker_execution_path_total") !=
+      std::string::npos);
   REQUIRE(output.find("inferflux_scheduler_decode_worker_execution_path_total{"
                       "path=\"direct_stepwise\"} 2") != std::string::npos);
   REQUIRE(output.find("inferflux_scheduler_decode_worker_execution_path_total{"
                       "path=\"general\"} 1") != std::string::npos);
-  REQUIRE(output.find("# HELP inferflux_scheduler_decode_worker_sticky_merge_total") !=
+  REQUIRE(output.find(
+              "# HELP inferflux_scheduler_decode_worker_sticky_merge_total") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_scheduler_decode_worker_sticky_merge_total{"
                       "merged=\"1\"} 1") != std::string::npos);
   REQUIRE(output.find("inferflux_scheduler_decode_worker_sticky_merge_total{"
                       "merged=\"2\"} 2") != std::string::npos);
-  REQUIRE(output.find("inferflux_scheduler_decode_worker_sticky_merged_requests_"
-                      "total 5") != std::string::npos);
+  REQUIRE(
+      output.find("inferflux_scheduler_decode_worker_sticky_merged_requests_"
+                  "total 5") != std::string::npos);
 }
 
 TEST_CASE("MetricsRegistry records decode assembly counters", "[metrics]") {
@@ -284,28 +290,27 @@ TEST_CASE("MetricsRegistry records decode assembly counters", "[metrics]") {
   registry.RecordDecodeAssemblySnapshot("worker_sticky", 1, 1, 0, 1);
 
   auto output = registry.RenderPrometheus();
-  REQUIRE(output.find("# HELP inferflux_scheduler_decode_assembly_ready_total") !=
+  REQUIRE(
+      output.find("# HELP inferflux_scheduler_decode_assembly_ready_total") !=
+      std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_assembly_ready_total{mode="
+                      "\"unified\",bucket=\"5_8\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_assembly_selected_total{mode="
+                      "\"unified\",bucket=\"2\"} 1") != std::string::npos);
+  REQUIRE(output.find("inferflux_scheduler_decode_assembly_ready_total{mode="
+                      "\"worker_initial\",bucket=\"5_8\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_scheduler_decode_assembly_ready_total{mode=\"unified\",bucket=\"5_8\"} 1") !=
+  REQUIRE(output.find("inferflux_scheduler_decode_assembly_selected_total{mode="
+                      "\"worker_initial\",bucket=\"3_4\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_scheduler_decode_assembly_selected_total{mode=\"unified\",bucket=\"2\"} 1") !=
+  REQUIRE(output.find("inferflux_scheduler_decode_assembly_compatible_total{"
+                      "mode=\"worker_sticky\",bucket=\"2\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_scheduler_decode_assembly_ready_total{mode=\"worker_initial\",bucket=\"5_8\"} 1") !=
+  REQUIRE(output.find("inferflux_scheduler_decode_assembly_incompatible_total{"
+                      "mode=\"worker_sticky\",bucket=\"3_4\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_scheduler_decode_assembly_selected_total{mode=\"worker_initial\",bucket=\"3_4\"} 1") !=
-          std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_scheduler_decode_assembly_compatible_total{mode=\"worker_sticky\",bucket=\"2\"} 1") !=
-          std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_scheduler_decode_assembly_incompatible_total{mode=\"worker_sticky\",bucket=\"3_4\"} 1") !=
-          std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_scheduler_decode_assembly_incompatible_total{mode=\"worker_sticky\",bucket=\"1\"} 1") !=
+  REQUIRE(output.find("inferflux_scheduler_decode_assembly_incompatible_total{"
+                      "mode=\"worker_sticky\",bucket=\"1\"} 1") !=
           std::string::npos);
 }
 
@@ -337,59 +342,63 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
   registry.RecordInferfluxCudaForwardBatchSize("decode", 2);
   registry.RecordInferfluxCudaForwardBatchSize("decode", 7);
   registry.RecordInferfluxCudaFfnProjOperator("prefill", "q8_1_group_hot_q4k");
-  registry.RecordInferfluxCudaFfnProjOperator("prefill", "q8_1_group_row_pair_w4");
-  registry.RecordInferfluxCudaFfnProjOperator("prefill", "q8_1_group_row_quad_m4");
+  registry.RecordInferfluxCudaFfnProjOperator("prefill",
+                                              "q8_1_group_row_pair_w4");
+  registry.RecordInferfluxCudaFfnProjOperator("prefill",
+                                              "q8_1_group_row_quad_m4");
   registry.RecordInferfluxCudaFfnProjOperator("prefill", "q8_1_group_v2");
   registry.RecordInferfluxCudaFfnProjOperator("prefill", "q8_1_group_generic");
   registry.RecordInferfluxCudaFfnProjOperator("decode", "q8_1_group_row_pair");
   registry.RecordInferfluxCudaFfnProjOperator("decode", "q8_1_group_row_quad");
   registry.RecordInferfluxCudaFfnProjOperator("decode", "packed_group");
   registry.RecordInferfluxCudaFfnProjOperator("decode", "fallback");
-  registry.RecordInferfluxCudaFfnProjGeometry("prefill", "q8_1_group_hot_q4k", "q4_k",
-                                       2, 11008, 2048, 2);
-  registry.RecordInferfluxCudaFfnProjGeometry("prefill", "q8_1_group_generic", "q6_k", 1,
-                                       8192, 3072, 2);
-  registry.RecordInferfluxCudaFfnProjGeometry("prefill", "q8_1_group_row_quad", "q6_k", 12,
-                                       8192, 3072, 2);
-  registry.RecordInferfluxCudaFfnProjGeometry("prefill", "q8_1_group_row_quad", "q4_k", 24,
-                                       11008, 2048, 2);
-  registry.RecordInferfluxCudaFfnProjGeometry("decode", "q8_1_group_row_pair", "q4_k", 2,
-                                       8192, 3072, 2);
-  registry.RecordInferfluxCudaFfnProjGeometry("decode", "packed_group", "mixed", 2,
-                                       8192, 3072, 2);
+  registry.RecordInferfluxCudaFfnProjGeometry("prefill", "q8_1_group_hot_q4k",
+                                              "q4_k", 2, 11008, 2048, 2);
+  registry.RecordInferfluxCudaFfnProjGeometry("prefill", "q8_1_group_generic",
+                                              "q6_k", 1, 8192, 3072, 2);
+  registry.RecordInferfluxCudaFfnProjGeometry("prefill", "q8_1_group_row_quad",
+                                              "q6_k", 12, 8192, 3072, 2);
+  registry.RecordInferfluxCudaFfnProjGeometry("prefill", "q8_1_group_row_quad",
+                                              "q4_k", 24, 11008, 2048, 2);
+  registry.RecordInferfluxCudaFfnProjGeometry("decode", "q8_1_group_row_pair",
+                                              "q4_k", 2, 8192, 3072, 2);
+  registry.RecordInferfluxCudaFfnProjGeometry("decode", "packed_group", "mixed",
+                                              2, 8192, 3072, 2);
   registry.RecordInferfluxCudaDownProjOperator("prefill", "q8_1_gemv_v2");
   registry.RecordInferfluxCudaDownProjOperator("prefill", "q8_1_gemv");
-  registry.RecordInferfluxCudaDownProjOperator("prefill", "q8_1_gemv_hot_fixed");
   registry.RecordInferfluxCudaDownProjOperator("prefill",
-                                        "q8_1_gemv_row_pair_hot_fixed");
-  registry.RecordInferfluxCudaDownProjOperator("prefill", "q8_1_gemv_row_pair_v2");
+                                               "q8_1_gemv_hot_fixed");
+  registry.RecordInferfluxCudaDownProjOperator("prefill",
+                                               "q8_1_gemv_row_pair_hot_fixed");
+  registry.RecordInferfluxCudaDownProjOperator("prefill",
+                                               "q8_1_gemv_row_pair_v2");
   registry.RecordInferfluxCudaDownProjOperator("prefill", "q8_1_gemv_row_pair");
   registry.RecordInferfluxCudaDownProjOperator("decode", "q8_1_gemv_row_quad");
   registry.RecordInferfluxCudaDownProjOperator("decode", "packed_gemv");
   registry.RecordInferfluxCudaDownProjOperator("decode", "mmq");
   registry.RecordInferfluxCudaDownProjOperator("decode", "fallback");
-  registry.RecordInferfluxCudaDownProjGeometry("prefill", "q8_1_gemv", "q4_k", 12,
-                                        3072, 8192);
+  registry.RecordInferfluxCudaDownProjGeometry("prefill", "q8_1_gemv", "q4_k",
+                                               12, 3072, 8192);
   registry.RecordInferfluxCudaDownProjGeometry("prefill", "q8_1_gemv_row_quad",
-                                        "q4_k", 48, 2048, 11008);
+                                               "q4_k", 48, 2048, 11008);
   registry.RecordInferfluxCudaDownProjGeometry("prefill", "q8_1_gemv_hot_fixed",
-                                        "q4_k", 1, 2048, 11008);
-  registry.RecordInferfluxCudaDownProjGeometry("prefill",
-                                        "q8_1_gemv_row_pair_hot_fixed", "q4_k",
-                                        2, 2048, 11008);
+                                               "q4_k", 1, 2048, 11008);
+  registry.RecordInferfluxCudaDownProjGeometry(
+      "prefill", "q8_1_gemv_row_pair_hot_fixed", "q4_k", 2, 2048, 11008);
   registry.RecordInferfluxCudaDownProjGeometry("prefill", "q8_1_gemv_row_pair",
-                                        "q4_k", 2, 2048, 11008);
+                                               "q4_k", 2, 2048, 11008);
   registry.RecordInferfluxCudaDownProjGeometry("decode", "q8_1_gemv_row_quad",
-                                        "q6_k", 7, 2048, 11008);
-  registry.RecordInferfluxCudaDownProjGeometry("decode", "packed_gemv", "q4_k", 1,
-                                        2048, 11008);
+                                               "q6_k", 7, 2048, 11008);
+  registry.RecordInferfluxCudaDownProjGeometry("decode", "packed_gemv", "q4_k",
+                                               1, 2048, 11008);
   registry.RecordInferfluxCudaDownProjGeometry("decode", "mmq", "q6_k", 2, 3072,
-                                        8192);
+                                               8192);
   registry.RecordInferfluxCudaRowPairSelection("prefill",
-                                         "q8_1_group_row_pair_w4", 2);
-  registry.RecordInferfluxCudaRowPairSelection("decode",
-                                         "q8_1_group_row_pair", 2);
-  registry.RecordInferfluxCudaRowPairSelection("decode", "q8_1_gemv_row_pair", 4);
+                                               "q8_1_group_row_pair_w4", 2);
+  registry.RecordInferfluxCudaRowPairSelection("decode", "q8_1_group_row_pair",
+                                               2);
+  registry.RecordInferfluxCudaRowPairSelection("decode", "q8_1_gemv_row_pair",
+                                               4);
 
   auto output = registry.RenderPrometheus();
   REQUIRE(output.find("# HELP inferflux_cuda_forward_batch_size_total") !=
@@ -414,14 +423,15 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
                       "counter") != std::string::npos);
   REQUIRE(output.find("# HELP inferflux_cuda_rowpair_selection_total") !=
           std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_cuda_rowpair_selection_total{phase=\"prefill\",operator=\"q8_1_group_row_pair_w4\",bucket=\"2\"} 1") !=
+  REQUIRE(
+      output.find("inferflux_cuda_rowpair_selection_total{phase=\"prefill\","
+                  "operator=\"q8_1_group_row_pair_w4\",bucket=\"2\"} 1") !=
+      std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_rowpair_selection_total{phase=\"decode\","
+                      "operator=\"q8_1_group_row_pair\",bucket=\"2\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_cuda_rowpair_selection_total{phase=\"decode\",operator=\"q8_1_group_row_pair\",bucket=\"2\"} 1") !=
-          std::string::npos);
-  REQUIRE(output.find(
-              "inferflux_cuda_rowpair_selection_total{phase=\"decode\",operator=\"q8_1_gemv_row_pair\",bucket=\"3_4\"} 1") !=
+  REQUIRE(output.find("inferflux_cuda_rowpair_selection_total{phase=\"decode\","
+                      "operator=\"q8_1_gemv_row_pair\",bucket=\"3_4\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_ffn_proj_operator_total{phase="
                       "\"prefill\",operator=\"q8_1_group_hot_q4k\"} 1") !=
@@ -463,9 +473,10 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
   REQUIRE(output.find("inferflux_cuda_down_proj_operator_total{phase="
                       "\"prefill\",operator=\"q8_1_gemv_hot_fixed\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_down_proj_operator_total{phase="
-                      "\"prefill\",operator=\"q8_1_gemv_row_pair_hot_fixed\"} 1") !=
-          std::string::npos);
+  REQUIRE(
+      output.find("inferflux_cuda_down_proj_operator_total{phase="
+                  "\"prefill\",operator=\"q8_1_gemv_row_pair_hot_fixed\"} 1") !=
+      std::string::npos);
   REQUIRE(output.find("inferflux_cuda_down_proj_operator_total{phase="
                       "\"prefill\",operator=\"q8_1_gemv_row_pair_v2\"} 1") !=
           std::string::npos);
@@ -484,41 +495,46 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
                       "\"decode\",operator=\"fallback\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_down_proj_operator_total{phase="
-                      "\"prefill\",operator=\"mmq\"} 0") !=
-          std::string::npos);
+                      "\"prefill\",operator=\"mmq\"} 0") != std::string::npos);
   REQUIRE(output.find("# HELP inferflux_cuda_ffn_proj_geometry_total") !=
           std::string::npos);
   REQUIRE(output.find("# TYPE inferflux_cuda_ffn_proj_geometry_total "
                       "counter") != std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_ffn_proj_geometry_total{phase="
-                      "\"prefill\",operator=\"q8_1_group_hot_q4k\",quant=\"q4_k\","
-                      "m_bucket=\"2\",n=\"11008\",n_bucket=\"8193_16384\","
-                      "k=\"2048\",k_bucket=\"1025_2048\",grouped_outputs=\"2\"} 1") !=
+  REQUIRE(output.find(
+              "inferflux_cuda_ffn_proj_geometry_total{phase="
+              "\"prefill\",operator=\"q8_1_group_hot_q4k\",quant=\"q4_k\","
+              "m_bucket=\"2\",n=\"11008\",n_bucket=\"8193_16384\","
+              "k=\"2048\",k_bucket=\"1025_2048\",grouped_outputs=\"2\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_ffn_proj_geometry_total{phase="
-                      "\"prefill\",operator=\"q8_1_group_generic\",quant=\"q6_k\","
-                      "m_bucket=\"1\",n=\"8192\",n_bucket=\"4097_8192\","
-                      "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
+  REQUIRE(output.find(
+              "inferflux_cuda_ffn_proj_geometry_total{phase="
+              "\"prefill\",operator=\"q8_1_group_generic\",quant=\"q6_k\","
+              "m_bucket=\"1\",n=\"8192\",n_bucket=\"4097_8192\","
+              "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_ffn_proj_geometry_total{phase="
-                      "\"prefill\",operator=\"q8_1_group_row_quad\",quant=\"q6_k\","
-                      "m_bucket=\"9_16\",n=\"8192\",n_bucket=\"4097_8192\","
-                      "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
+  REQUIRE(output.find(
+              "inferflux_cuda_ffn_proj_geometry_total{phase="
+              "\"prefill\",operator=\"q8_1_group_row_quad\",quant=\"q6_k\","
+              "m_bucket=\"9_16\",n=\"8192\",n_bucket=\"4097_8192\","
+              "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_ffn_proj_geometry_total{phase="
-                      "\"prefill\",operator=\"q8_1_group_row_quad\",quant=\"q4_k\","
-                      "m_bucket=\"17_32\",n=\"11008\",n_bucket=\"8193_16384\","
-                      "k=\"2048\",k_bucket=\"1025_2048\",grouped_outputs=\"2\"} 1") !=
+  REQUIRE(output.find(
+              "inferflux_cuda_ffn_proj_geometry_total{phase="
+              "\"prefill\",operator=\"q8_1_group_row_quad\",quant=\"q4_k\","
+              "m_bucket=\"17_32\",n=\"11008\",n_bucket=\"8193_16384\","
+              "k=\"2048\",k_bucket=\"1025_2048\",grouped_outputs=\"2\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_ffn_proj_geometry_total{phase="
-                      "\"decode\",operator=\"q8_1_group_row_pair\",quant=\"q4_k\","
-                      "m_bucket=\"2\",n=\"8192\",n_bucket=\"4097_8192\","
-                      "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
+  REQUIRE(output.find(
+              "inferflux_cuda_ffn_proj_geometry_total{phase="
+              "\"decode\",operator=\"q8_1_group_row_pair\",quant=\"q4_k\","
+              "m_bucket=\"2\",n=\"8192\",n_bucket=\"4097_8192\","
+              "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_ffn_proj_geometry_total{phase="
-                      "\"decode\",operator=\"packed_group\",quant=\"mixed\","
-                      "m_bucket=\"2\",n=\"8192\",n_bucket=\"4097_8192\","
-                      "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
+  REQUIRE(output.find(
+              "inferflux_cuda_ffn_proj_geometry_total{phase="
+              "\"decode\",operator=\"packed_group\",quant=\"mixed\","
+              "m_bucket=\"2\",n=\"8192\",n_bucket=\"4097_8192\","
+              "k=\"3072\",k_bucket=\"2049_4096\",grouped_outputs=\"2\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("# HELP inferflux_cuda_down_proj_geometry_total") !=
           std::string::npos);
@@ -529,31 +545,32 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
                       "m_bucket=\"9_16\",n=\"3072\",n_bucket=\"2049_4096\","
                       "k=\"8192\",k_bucket=\"4097_8192\"} 1") !=
           std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_cuda_down_proj_geometry_total{phase="
+              "\"prefill\",operator=\"q8_1_gemv_row_quad\",quant=\"q4_k\","
+              "m_bucket=\"33_64\",n=\"2048\",n_bucket=\"1025_2048\","
+              "k=\"11008\",k_bucket=\"8193_16384\"} 1") != std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_cuda_down_proj_geometry_total{phase="
+              "\"prefill\",operator=\"q8_1_gemv_hot_fixed\",quant=\"q4_k\","
+              "m_bucket=\"1\",n=\"2048\",n_bucket=\"1025_2048\","
+              "k=\"11008\",k_bucket=\"8193_16384\"} 1") != std::string::npos);
   REQUIRE(output.find("inferflux_cuda_down_proj_geometry_total{phase="
-                      "\"prefill\",operator=\"q8_1_gemv_row_quad\",quant=\"q4_k\","
-                      "m_bucket=\"33_64\",n=\"2048\",n_bucket=\"1025_2048\","
-                      "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
-          std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_down_proj_geometry_total{phase="
-                      "\"prefill\",operator=\"q8_1_gemv_hot_fixed\",quant=\"q4_k\","
-                      "m_bucket=\"1\",n=\"2048\",n_bucket=\"1025_2048\","
-                      "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
-          std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_down_proj_geometry_total{phase="
-                      "\"prefill\",operator=\"q8_1_gemv_row_pair_hot_fixed\",quant=\"q4_k\","
+                      "\"prefill\",operator=\"q8_1_gemv_row_pair_hot_fixed\","
+                      "quant=\"q4_k\","
                       "m_bucket=\"2\",n=\"2048\",n_bucket=\"1025_2048\","
                       "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
           std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_down_proj_geometry_total{phase="
-                      "\"prefill\",operator=\"q8_1_gemv_row_pair\",quant=\"q4_k\","
-                      "m_bucket=\"2\",n=\"2048\",n_bucket=\"1025_2048\","
-                      "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
-          std::string::npos);
-  REQUIRE(output.find("inferflux_cuda_down_proj_geometry_total{phase="
-                      "\"decode\",operator=\"q8_1_gemv_row_quad\",quant=\"q6_k\","
-                      "m_bucket=\"5_8\",n=\"2048\",n_bucket=\"1025_2048\","
-                      "k=\"11008\",k_bucket=\"8193_16384\"} 1") !=
-          std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_cuda_down_proj_geometry_total{phase="
+              "\"prefill\",operator=\"q8_1_gemv_row_pair\",quant=\"q4_k\","
+              "m_bucket=\"2\",n=\"2048\",n_bucket=\"1025_2048\","
+              "k=\"11008\",k_bucket=\"8193_16384\"} 1") != std::string::npos);
+  REQUIRE(output.find(
+              "inferflux_cuda_down_proj_geometry_total{phase="
+              "\"decode\",operator=\"q8_1_gemv_row_quad\",quant=\"q6_k\","
+              "m_bucket=\"5_8\",n=\"2048\",n_bucket=\"1025_2048\","
+              "k=\"11008\",k_bucket=\"8193_16384\"} 1") != std::string::npos);
   REQUIRE(output.find("inferflux_cuda_down_proj_geometry_total{phase="
                       "\"decode\",operator=\"packed_gemv\",quant=\"q4_k\","
                       "m_bucket=\"1\",n=\"2048\",n_bucket=\"1025_2048\","
@@ -627,8 +644,9 @@ TEST_CASE("MetricsRegistry tracks recoverable distributed KV timeout streak",
           std::string::npos);
   REQUIRE(output.find("# TYPE inferflux_disagg_kv_timeout_streak gauge") !=
           std::string::npos);
-  REQUIRE(output.find("inferflux_disagg_kv_timeout_streak{backend=\"cpu\"} 0") !=
-          std::string::npos);
+  REQUIRE(
+      output.find("inferflux_disagg_kv_timeout_streak{backend=\"cpu\"} 0") !=
+      std::string::npos);
   REQUIRE(output.find("# HELP inferflux_disagg_kv_timeout_debt") !=
           std::string::npos);
   REQUIRE(output.find("# TYPE inferflux_disagg_kv_timeout_debt gauge") !=
@@ -819,6 +837,27 @@ TEST_CASE(
           std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry records native dispatch divergences", "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordInferfluxCudaDispatchDivergence(
+      "ffn", "q8_1_group_mmq3", "packed_group", "tier_mismatch");
+  registry.RecordInferfluxCudaDispatchDivergence(
+      "ffn", "q8_1_group_mmq3", "packed_group", "tier_mismatch");
+  registry.RecordInferfluxCudaDispatchDivergence("down_proj", "mmq",
+                                                 "q8_1_gemv", "tier_mismatch");
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_cuda_dispatch_divergence_total{"
+                      "layer=\"ffn\",selected=\"q8_1_group_mmq3\","
+                      "actual=\"packed_group\",reason=\"tier_mismatch\"} 2") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_dispatch_divergence_total{"
+                      "layer=\"down_proj\",selected=\"mmq\","
+                      "actual=\"q8_1_gemv\",reason=\"tier_mismatch\"} 1") !=
+          std::string::npos);
+  REQUIRE(registry.GetInferfluxCudaDispatchDivergences() == 3);
+}
+
 TEST_CASE("MetricsRegistry exports native memory accounting snapshots",
           "[metrics]") {
   inferflux::MetricsRegistry registry;
@@ -828,19 +867,18 @@ TEST_CASE("MetricsRegistry exports native memory accounting snapshots",
   total.high_water_bytes = 4096;
   total.evictable_bytes = 512;
   registry.SetInferfluxCudaModelMemorySnapshot(
-      "qwen2.5-3b",
-      total,
+      "qwen2.5-3b", total,
       {{"kv_cache", {1024, 1024, 1024, 0}},
        {"batch_ephemeral", {0, 0, 512, 0}}});
 
   registry.SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/2048,
-                                  /*active_bytes=*/1024,
-                                  /*prefix_retained_bytes=*/512,
-                                  /*free_bytes=*/512,
-                                  /*active_sequences=*/2,
-                                  /*prefix_retained_sequences=*/1,
-                                  /*free_sequences=*/1,
-                                  /*max_sequences=*/4);
+                                         /*active_bytes=*/1024,
+                                         /*prefix_retained_bytes=*/512,
+                                         /*free_bytes=*/512,
+                                         /*active_sequences=*/2,
+                                         /*prefix_retained_sequences=*/1,
+                                         /*free_sequences=*/1,
+                                         /*max_sequences=*/4);
 
   const auto model_snapshot = registry.GetInferfluxCudaModelMemorySnapshot();
   REQUIRE(model_snapshot.model_label == "qwen2.5-3b");

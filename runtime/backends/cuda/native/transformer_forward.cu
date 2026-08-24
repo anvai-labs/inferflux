@@ -2397,6 +2397,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       }
       log::Info("llama_forward",
                 "CUDA graph: cuBLAS fallback needed, running without graph");
+      GlobalMetrics().RecordInferfluxCudaDispatchDivergence(
+          "graph", "fused", "cublas", "graph_capture_abort");
       graph_enabled_ = false;
       return RunCompute();
     }

@@ -23,10 +23,15 @@
 // deploy silently.
 
 #include "runtime/backends/cuda/native/gguf_util.h"
+#include "server/logging/logger.h"
+#include "server/metrics/metrics.h"
 
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
+#include <set>
+#include <string>
 #include <string_view>
 
 namespace inferflux {
@@ -330,6 +335,35 @@ constexpr bool DownMetricLabelKnown(std::string_view label) {
     }
   }
   return false;
+}
+
+// ----------------------------------------------------------------------------
+// Divergence reporting. A tier mismatch (or a non-fallback selection
+// landing on the dense fallback) is counted once per tuple and logged once
+// per tuple with a fix hint; repeated occurrences only increment the
+// counter.
+// ----------------------------------------------------------------------------
+inline void ReportDispatchDivergence(const char *layer, const char *selected,
+                                     const char *actual, const char *reason) {
+  GlobalMetrics().RecordInferfluxCudaDispatchDivergence(layer, selected, actual,
+                                                        reason);
+  static std::mutex once_mutex;
+  static std::set<std::string> logged;
+  const std::string key =
+      std::string(layer) + "|" + selected + "|" + actual + "|" + reason;
+  {
+    std::lock_guard<std::mutex> lock(once_mutex);
+    if (logged.insert(key).second) {
+      log::Warn("dispatch",
+                std::string("operator divergence: layer=") + layer +
+                    " selected=" + selected + " actual=" + actual +
+                    " reason=" + reason +
+                    " — the selected operator did not execute; check the "
+                    "executor switch against kFfnOpTable/kDownOpTable in "
+                    "dispatch_catalog.h and the tier guards in "
+                    "native_linear_executor.h");
+    }
+  }
 }
 
 } // namespace inferflux

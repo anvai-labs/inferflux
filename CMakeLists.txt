@@ -316,15 +316,6 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   if(INFERFLUX_CUDA_USE_FAST_MATH)
     target_compile_options(inferflux_cuda_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
     target_compile_options(inferflux_core PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
-  endif()
-  # Dispatch exhaustiveness gate (top level, applies to all configurations):
-  # switches over dispatch_catalog.h enums carry no default clause, so an
-  # operator added without wiring its label switch or executor stage fails
-  # the build.
-  if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
-    target_compile_options(inferflux_core PRIVATE -Werror=switch)
-    target_compile_options(inferflux_tests PRIVATE -Werror=switch)
-  endif()
     message(STATUS "CUDA fast math enabled (--use_fast_math)")
   endif()
   target_compile_definitions(inferflux_core PUBLIC INFERFLUX_NATIVE_KERNELS_READY=1)
@@ -341,6 +332,14 @@ else()
     runtime/backends/cuda/native/gguf_model_loader_stub.cpp
   )
   set(LLAMA_CUDA OFF CACHE BOOL "" FORCE)
+endif()
+
+
+# Dispatch exhaustiveness gate (applies to all configurations): switches
+# over dispatch_catalog.h enums carry no default clause, so an operator
+# added without wiring its label switch or executor stage fails the build.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  target_compile_options(inferflux_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Werror=switch>)
 endif()
 
 if(ENABLE_MPS AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -654,6 +653,10 @@ add_executable(inferflux_tests
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
+# Dispatch exhaustiveness gate for tests: mirrors the core gate.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  target_compile_options(inferflux_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Werror=switch>)
+endif()
 target_link_libraries(inferflux_tests PRIVATE inferflux_core)
 if(ENABLE_CUDA)
   add_executable(inferflux_first_token_probe

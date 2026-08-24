@@ -99,6 +99,14 @@ bool ExecuteInferfluxCudaFfnProjectionStage(
     }
   }
 
+  if (TierOf(selected_op) != TierOf(local_summary.actual_op) ||
+      (local_summary.actual_op == FfnProjOperator::kFallback &&
+       selected_op != FfnProjOperator::kFallback)) {
+    ReportDispatchDivergence("ffn", FfnSelectionLabel(selected_op),
+                             FfnSelectionLabel(local_summary.actual_op),
+                             "tier_mismatch");
+  }
+
   const char *metric_op =
       FfnMetricLabel(local_summary.actual_op, quant_type, batch_rows);
   GlobalMetrics().RecordInferfluxCudaFfnProjOperator(phase, metric_op);
@@ -190,6 +198,14 @@ bool ExecuteInferfluxCudaDownProjStage(
     if (local_summary.used_packed) {
       local_summary.actual_op = DownProjOperator::kPackedGemv;
     }
+  }
+
+  if (TierOf(selected_op) != TierOf(local_summary.actual_op) ||
+      (local_summary.actual_op == DownProjOperator::kFallback &&
+       selected_op != DownProjOperator::kFallback)) {
+    ReportDispatchDivergence("down_proj", DownSelectionLabel(selected_op),
+                             DownSelectionLabel(local_summary.actual_op),
+                             "tier_mismatch");
   }
 
   const char *metric_op =
