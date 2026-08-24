@@ -156,7 +156,8 @@ When promoting the row-pair flag for release:
 
 Current release posture:
 * Keep the proven `Q4_K M=1` grouped hot path on by default.
-* Keep `q8_1_group_row_pair_w4` behind `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4=1` until a future implementation beats the generic grouped path on the exact live `M=2,N=11008,K=2048` envelope.
+* Prefer `q8_1_group_mmq3` for Q4_K `M>=2`; the exact live `M=2,N=11008,K=2048` benchmark now beats fused gate/up and has a dedicated row-pair parity test.
+* Retain `q8_1_group_row_pair_w4` as the M=2 fallback when MMQ3 is disabled.
 
 ## 8. Local vLLM / SGLang safetensors runs
 

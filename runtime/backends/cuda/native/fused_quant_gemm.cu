@@ -2522,7 +2522,7 @@ bool FusedQuantGemm::GemvQ8_1PairRowQuadCandidate(
 static bool GemvQ8_1PairMmq3(
     const std::array<PackedProjectionSpec, 2> &projections,
     const void *act_q8_1, int M, int K, cudaStream_t stream) {
-  if (!act_q8_1 || M < 3 || K <= 0) {
+  if (!act_q8_1 || M < 2 || K <= 0) {
     return false;
   }
 

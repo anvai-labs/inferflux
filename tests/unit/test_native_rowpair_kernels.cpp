@@ -73,8 +73,8 @@ std::vector<half> CopyDeviceHalfs(const half *device, size_t count) {
 
 #ifdef INFERFLUX_HAS_CUDA
 
-TEST_CASE("Native grouped row-pair FFN path matches generic grouping",
-          "[native_forward][cuda_runtime_contract][native_rowpair]") {
+TEST_CASE("Native grouped MMQ3 M=2 FFN path matches row-pair grouping",
+          "[native_forward][cuda_runtime_contract][native_mmq3]") {
   int device_count = 0;
   REQUIRE(cudaGetDeviceCount(&device_count) == cudaSuccess);
   if (device_count <= 0) {
@@ -97,8 +97,8 @@ TEST_CASE("Native grouped row-pair FFN path matches generic grouping",
   native::block_q4_k *d_w1 = nullptr;
   half *d_input = nullptr;
   void *d_act_q8_1 = nullptr;
-  half *d_out_generic = nullptr;
   half *d_out_rowpair = nullptr;
+  half *d_out_mmq3 = nullptr;
   cudaStream_t stream = nullptr;
   REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
 
@@ -111,10 +111,10 @@ TEST_CASE("Native grouped row-pair FFN path matches generic grouping",
   REQUIRE(cudaMalloc(&d_act_q8_1, static_cast<size_t>(kM) * (kK / QK8_1) *
                                       sizeof(native::block_q8_1)) ==
           cudaSuccess);
-  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out_generic),
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out_rowpair),
                      static_cast<size_t>(kM) * (kN0 + kN1) * sizeof(half)) ==
           cudaSuccess);
-  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out_rowpair),
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_out_mmq3),
                      static_cast<size_t>(kM) * (kN0 + kN1) * sizeof(half)) ==
           cudaSuccess);
 
@@ -127,16 +127,6 @@ TEST_CASE("Native grouped row-pair FFN path matches generic grouping",
   FusedQuantGemm::QuantizeRowQ8_1(d_input, d_act_q8_1, kM, kK, stream);
   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
 
-  const std::array<PackedProjectionSpec, 2> projections = {{
-      {{d_w0, static_cast<int>(GGUF::TensorType::Q4_K),
-        static_cast<int64_t>(kN0) * kK},
-       d_out_generic,
-       kN0},
-      {{d_w1, static_cast<int>(GGUF::TensorType::Q4_K),
-        static_cast<int64_t>(kN1) * kK},
-       d_out_generic + static_cast<size_t>(kM) * kN0,
-       kN1},
-  }};
   const std::array<PackedProjectionSpec, 2> projections_rowpair = {{
       {{d_w0, static_cast<int>(GGUF::TensorType::Q4_K),
         static_cast<int64_t>(kN0) * kK},
@@ -147,30 +137,42 @@ TEST_CASE("Native grouped row-pair FFN path matches generic grouping",
        d_out_rowpair + static_cast<size_t>(kM) * kN0,
        kN1},
   }};
+  const std::array<PackedProjectionSpec, 2> projections_mmq3 = {{
+      {{d_w0, static_cast<int>(GGUF::TensorType::Q4_K),
+        static_cast<int64_t>(kN0) * kK},
+       d_out_mmq3,
+       kN0},
+      {{d_w1, static_cast<int>(GGUF::TensorType::Q4_K),
+        static_cast<int64_t>(kN1) * kK},
+       d_out_mmq3 + static_cast<size_t>(kM) * kN0,
+       kN1},
+  }};
 
-  NativeExecutionPolicy default_policy;
   NativeExecutionPolicy rowpair_policy;
   rowpair_policy.enable_experimental_q81_grouped_rowpair_w4 = true;
+  NativeExecutionPolicy mmq3_policy;
 
-  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections, d_act_q8_1, kM, kK, stream,
-                                       &default_policy));
+  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(
+      projections_rowpair, d_act_q8_1, kM, kK, stream, &rowpair_policy,
+      FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4));
   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
-  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(projections_rowpair, d_act_q8_1, kM, kK,
-                                       stream, &rowpair_policy));
+  REQUIRE(FusedQuantGemm::GemvQ8_1Pair(
+      projections_mmq3, d_act_q8_1, kM, kK, stream, &mmq3_policy,
+      FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3));
   REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
 
-  const auto generic_output =
-      CopyDeviceHalfs(d_out_generic, static_cast<size_t>(kM) * (kN0 + kN1));
   const auto rowpair_output =
       CopyDeviceHalfs(d_out_rowpair, static_cast<size_t>(kM) * (kN0 + kN1));
-  for (size_t i = 0; i < generic_output.size(); ++i) {
-    const float diff = std::fabs(__half2float(generic_output[i]) -
-                                 __half2float(rowpair_output[i]));
+  const auto mmq3_output =
+      CopyDeviceHalfs(d_out_mmq3, static_cast<size_t>(kM) * (kN0 + kN1));
+  for (size_t i = 0; i < rowpair_output.size(); ++i) {
+    const float diff = std::fabs(__half2float(rowpair_output[i]) -
+                                 __half2float(mmq3_output[i]));
     REQUIRE(diff < 1e-3f);
   }
 
+  cudaFree(d_out_mmq3);
   cudaFree(d_out_rowpair);
-  cudaFree(d_out_generic);
   cudaFree(d_act_q8_1);
   cudaFree(d_input);
   cudaFree(d_w1);

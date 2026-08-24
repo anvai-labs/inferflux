@@ -369,6 +369,7 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
                                               "q8_1_group_row_pair_w4");
   registry.RecordInferfluxCudaFfnProjOperator("prefill",
                                               "q8_1_group_row_quad_m4");
+  registry.RecordInferfluxCudaFfnProjOperator("prefill", "q8_1_group_mmq3");
   registry.RecordInferfluxCudaFfnProjOperator("prefill", "q8_1_group_v2");
   registry.RecordInferfluxCudaFfnProjOperator("prefill", "q8_1_group_generic");
   registry.RecordInferfluxCudaFfnProjOperator("decode", "q8_1_group_row_pair");
@@ -464,6 +465,9 @@ TEST_CASE("MetricsRegistry records native down-proj operator selections",
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_ffn_proj_operator_total{phase="
                       "\"prefill\",operator=\"q8_1_group_row_quad_m4\"} 1") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_ffn_proj_operator_total{phase="
+                      "\"prefill\",operator=\"q8_1_group_mmq3\"} 1") !=
           std::string::npos);
   REQUIRE(output.find("inferflux_cuda_ffn_proj_operator_total{phase="
                       "\"prefill\",operator=\"q8_1_group_v2\"} 1") !=

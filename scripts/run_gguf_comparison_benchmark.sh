@@ -260,7 +260,7 @@ with open(out_path, "w") as f:
 prefill = summary.get("prefill", {})
 decode = summary.get("decode", {})
 ops = ("q8_1_group_hot_q4k", "q8_1_group_row_pair_w4",
-       "q8_1_group_row_quad_m4", "q8_1_group_v2",
+       "q8_1_group_row_quad_m4", "q8_1_group_mmq3", "q8_1_group_v2",
        "q8_1_group_generic", "q8_1_group_row_pair",
        "q8_1_group_row_quad", "packed_group", "fallback")
 print("prefill=" + ",".join(f"{k}:{prefill.get(k, 0)}" for k in ops))
