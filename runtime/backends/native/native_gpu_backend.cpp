@@ -816,14 +816,14 @@ std::shared_ptr<LlamaCppBackend> NativeGpuBackend::EnsureParityBackend() const {
     size_t free_bytes = 0;
     if (!ec && QueryFreeDeviceMemory(&free_bytes) &&
         free_bytes < static_cast<size_t>(model_bytes)) {
-      log::Warn(LogTag(),
-                "Skipping parity delegate load: only " +
-                    std::to_string(free_bytes / (1024 * 1024)) +
-                    " MiB free but model needs at least " +
-                    std::to_string(static_cast<size_t>(model_bytes) /
-                                   (1024 * 1024)) +
-                    " MiB; structured-output remains unavailable on native "
-                    "provider");
+      log::Warn(
+          LogTag(),
+          "Skipping parity delegate load: only " +
+              std::to_string(free_bytes / (1024 * 1024)) +
+              " MiB free but model needs at least " +
+              std::to_string(static_cast<size_t>(model_bytes) / (1024 * 1024)) +
+              " MiB; structured-output remains unavailable on native "
+              "provider");
       parity_delegate_available_ = false;
       return nullptr;
     }

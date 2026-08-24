@@ -47,14 +47,13 @@ void LogSlotEvent(std::string_view stage, const SequenceSlot &slot,
   if (!SequenceSlotDebugEnabled()) {
     return;
   }
-  std::string message =
-      "slot[" + std::string(stage) + "]: slot_id=" +
-      std::to_string(slot.slot_id) + ", request_id=" +
-      std::to_string(slot.request_id) + ", sequence_id=" +
-      std::to_string(slot.sequence_id) + ", generation=" +
-      std::to_string(slot.generation) + ", state=" +
-      SequenceStateToString(slot.state) + ", tokens=" +
-      std::to_string(slot.token_count);
+  std::string message = "slot[" + std::string(stage) +
+                        "]: slot_id=" + std::to_string(slot.slot_id) +
+                        ", request_id=" + std::to_string(slot.request_id) +
+                        ", sequence_id=" + std::to_string(slot.sequence_id) +
+                        ", generation=" + std::to_string(slot.generation) +
+                        ", state=" + SequenceStateToString(slot.state) +
+                        ", tokens=" + std::to_string(slot.token_count);
   if (!detail.empty()) {
     message += ", detail=" + std::string(detail);
   }
@@ -104,8 +103,8 @@ SequenceSlotManager::AcquireLease(int64_t request_id) {
     log::Warn("slot_manager",
               "No free slots available (request " + std::to_string(request_id) +
                   ", used: " + std::to_string(GetUsedSlotCountLocked()) + "/" +
-                  std::to_string(max_slots_) + ", retiring: " +
-                  std::to_string(retiring) + ")");
+                  std::to_string(max_slots_) +
+                  ", retiring: " + std::to_string(retiring) + ")");
     return std::nullopt;
   }
 
@@ -121,8 +120,8 @@ SequenceSlotManager::AcquireLease(int64_t request_id) {
   entry.token_count = 0;
 
   log::Debug("slot_manager",
-             "Acquired slot " + std::to_string(*slot) + " gen=" +
-                 std::to_string(entry.generation) + " for request " +
+             "Acquired slot " + std::to_string(*slot) +
+                 " gen=" + std::to_string(entry.generation) + " for request " +
                  std::to_string(request_id) + " (free slots: " +
                  std::to_string(GetFreeSlotCountLocked()) + ")");
   LogSlotEvent("acquire", entry);
@@ -178,9 +177,8 @@ bool SequenceSlotManager::RetireLease(const SequenceLease &lease,
   slot.last_access = std::chrono::steady_clock::now();
 
   log::Debug("slot_manager",
-             "Retiring lease slot=" + std::to_string(lease.slot_id) +
-                 " gen=" + std::to_string(lease.generation) +
-                 " ready_at_pending");
+             "Retiring lease slot=" + std::to_string(lease.slot_id) + " gen=" +
+                 std::to_string(lease.generation) + " ready_at_pending");
   LogSlotEvent("retire", slot);
   return true;
 }
@@ -475,8 +473,7 @@ size_t SequenceSlotManager::ReapRetiredSlotsLocked(
     std::chrono::steady_clock::time_point now) {
   size_t reaped = 0;
   for (auto &slot : slots_) {
-    if (slot.state == SequenceState::kRetiring &&
-        slot.retire_ready_at <= now) {
+    if (slot.state == SequenceState::kRetiring && slot.retire_ready_at <= now) {
       ResetSlotForReuse(slot);
       ++reaped;
     }

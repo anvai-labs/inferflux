@@ -182,7 +182,8 @@ private:
   size_t dequantized_buffer_size_{0};
   DequantizedCachePolicy dequantized_cache_policy_{
       DequantizedCachePolicy::kNone};
-  bool has_dequantized_entries_{false}; // Fast bail-out for ClearDequantizedCache
+  bool has_dequantized_entries_{
+      false}; // Fast bail-out for ClearDequantizedCache
 
   // File path
   std::filesystem::path model_path_;

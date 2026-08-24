@@ -39,9 +39,9 @@ struct SequenceRetireFence {
   }
 
   static SequenceRetireFence After(std::chrono::milliseconds grace_period) {
-    return SequenceRetireFence{std::chrono::steady_clock::now() +
-                               std::max(std::chrono::milliseconds(0),
-                                        grace_period)};
+    return SequenceRetireFence{
+        std::chrono::steady_clock::now() +
+        std::max(std::chrono::milliseconds(0), grace_period)};
   }
 
   static SequenceRetireFence Pending() {
@@ -53,9 +53,9 @@ struct SequenceRetireFence {
  * @brief Represents a single KV cache slot for one sequence
  */
 struct SequenceSlot {
-  int slot_id;        // Slot number (0 to max_slots-1)
-  int64_t request_id; // Associated request ID
-  int sequence_id;    // Backend sequence ID
+  int slot_id;         // Slot number (0 to max_slots-1)
+  int64_t request_id;  // Associated request ID
+  int sequence_id;     // Backend sequence ID
   uint64_t generation; // Monotonic acquisition generation for slot reuse safety
   SequenceState state;
   std::chrono::steady_clock::time_point last_access;
@@ -132,8 +132,9 @@ public:
    * @param fence Fence controlling when the slot may be reused
    * @return true if the live lease matched and entered retiring state
    */
-  bool RetireLease(const SequenceLease &lease,
-                   SequenceRetireFence fence = SequenceRetireFence::Immediate());
+  bool
+  RetireLease(const SequenceLease &lease,
+              SequenceRetireFence fence = SequenceRetireFence::Immediate());
 
   /**
    * @brief Release a slot when sequence completes

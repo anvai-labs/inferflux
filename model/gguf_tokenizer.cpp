@@ -20,12 +20,13 @@ bool GGUFTokenizer::Load(const std::string &model_path) {
 }
 
 bool GGUFTokenizer::InitializeFromMetadata(
-    const std::vector<std::string> &pieces, const std::vector<std::string> &merges,
+    const std::vector<std::string> &pieces,
+    const std::vector<std::string> &merges,
     const std::string &pre_tokenizer_hint, int bos_token_id, int eos_token_id,
     bool add_bos_token, const std::string &chat_template) {
   if (!inner_.InitializeFromBpeData(pieces, merges, pre_tokenizer_hint,
-                                    bos_token_id, eos_token_id,
-                                    chat_template, add_bos_token)) {
+                                    bos_token_id, eos_token_id, chat_template,
+                                    add_bos_token)) {
     return false;
   }
   chat_template_ = chat_template;

@@ -21,7 +21,8 @@ namespace inferflux {
 
 /**
  * IKvCacheGpu: non-templated base interface for sequence management.
- * Used by InferfluxCudaExecutor to call ClearSequence without knowing the dtype.
+ * Used by InferfluxCudaExecutor to call ClearSequence without knowing the
+ * dtype.
  */
 class IKvCacheGpu {
 public:

@@ -91,8 +91,8 @@ NativeBootstrapConfig::FromEnv(const std::string &kv_precision_hint) {
   if (const char *env = std::getenv("INFERFLUX_CUDA_KV_BUDGET_MB")) {
     int budget_mb = 0;
     if (ParsePositiveIntSetting(env, &budget_mb)) {
-      config.kv_budget_bytes = static_cast<std::size_t>(budget_mb) * 1024U *
-                               1024U;
+      config.kv_budget_bytes =
+          static_cast<std::size_t>(budget_mb) * 1024U * 1024U;
     } else {
       config.invalid_kv_budget_mb = env;
     }

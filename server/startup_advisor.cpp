@@ -984,11 +984,9 @@ int CheckGpuUnused(const StartupAdvisorContext &ctx) {
   if (ctx.models.empty())
     return 0;
 
-  bool all_cpu =
-      std::all_of(ctx.models.begin(), ctx.models.end(),
-                  [](const AdvisorModelInfo &m) {
-                    return UsesCpuBackend(m.backend);
-                  });
+  bool all_cpu = std::all_of(
+      ctx.models.begin(), ctx.models.end(),
+      [](const AdvisorModelInfo &m) { return UsesCpuBackend(m.backend); });
   if (!all_cpu)
     return 0;
 

@@ -24,11 +24,11 @@ struct ModelInfo {
   std::string effective_load_path;
   std::string format{"unknown"}; // Resolved model format (gguf/safetensors/hf).
   std::string requested_format{"auto"}; // Requested format hint (or auto).
-  std::string backend; // Exposed backend id ("inferflux_cuda",
-                       // "llama_cpp_cuda", "cpu", ...).
-  std::string requested_backend; // Requested backend hint ("cuda",
-                                 // "inferflux_cuda", "llama_cpp_cuda",
-                                 // "auto"...).
+  std::string backend;                  // Exposed backend id ("inferflux_cuda",
+                                        // "llama_cpp_cuda", "cpu", ...).
+  std::string requested_backend;        // Requested backend hint ("cuda",
+                                        // "inferflux_cuda", "llama_cpp_cuda",
+                                        // "auto"...).
   std::string backend_provider{"llama_cpp"}; // "inferflux" or "llama_cpp".
   bool backend_fallback{false};        // True when requested backend fell back.
   std::string backend_fallback_reason; // Optional fallback explanation.

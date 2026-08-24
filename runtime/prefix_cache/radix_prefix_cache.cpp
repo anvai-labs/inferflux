@@ -167,10 +167,9 @@ void RadixPrefixCache::SplitEdge(RadixNode *parent, const SplitEdgeSpec &spec) {
   size_++;
 }
 
-void RadixPrefixCache::Insert(const std::vector<int> &tokens,
-                              const std::vector<int> &block_table,
-                              int sequence_id,
-                              const std::shared_ptr<BackendInterface> &backend) {
+void RadixPrefixCache::Insert(
+    const std::vector<int> &tokens, const std::vector<int> &block_table,
+    int sequence_id, const std::shared_ptr<BackendInterface> &backend) {
   if (capacity_ == 0 || tokens.empty() || block_table.empty()) {
     return;
   }

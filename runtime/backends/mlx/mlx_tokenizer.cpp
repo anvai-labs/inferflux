@@ -256,8 +256,7 @@ MlxTokenizer::DetectPreTokenizerType(const std::string &pre_tokenizer_hint,
   if (hint == "bytelevel" || hint == "gpt2" || hint == "qwen" ||
       hint == "qwen2" || hint == "qwen3" || hint == "phi3" ||
       hint == "starcoder" || hint == "starcoder2" || hint == "deepseek" ||
-      hint == "deepseek-coder" || hint == "command-r" ||
-      hint == "byte_level") {
+      hint == "deepseek-coder" || hint == "command-r" || hint == "byte_level") {
     if (add_prefix_space) {
       *add_prefix_space = false;
     }
@@ -278,9 +277,9 @@ MlxTokenizer::DetectPreTokenizerType(const std::string &pre_tokenizer_hint,
 
 bool MlxTokenizer::InitializeFromBpeData(
     const std::vector<std::string> &id_to_token,
-    const std::vector<std::string> &merges, const std::string &pre_tokenizer_hint,
-    int32_t bos_id, int32_t eos_id, const std::string &chat_template,
-    bool add_bos_token,
+    const std::vector<std::string> &merges,
+    const std::string &pre_tokenizer_hint, int32_t bos_id, int32_t eos_id,
+    const std::string &chat_template, bool add_bos_token,
     const std::unordered_set<int32_t> &special_ids) {
   Reset();
   if (id_to_token.empty()) {

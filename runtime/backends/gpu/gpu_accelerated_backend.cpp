@@ -8,8 +8,8 @@ GpuAcceleratedBackend::GpuAcceleratedBackend(
     std::unique_ptr<GpuDeviceStrategy> strategy)
     : strategy_(std::move(strategy)) {}
 
-bool GpuAcceleratedBackend::InitializeDevice(
-    const LlamaBackendConfig &config, LlamaBackendConfig *tuned_out) {
+bool GpuAcceleratedBackend::InitializeDevice(const LlamaBackendConfig &config,
+                                             LlamaBackendConfig *tuned_out) {
   if (!strategy_) {
     log::Error("gpu_backend", "No device strategy configured");
     return false;

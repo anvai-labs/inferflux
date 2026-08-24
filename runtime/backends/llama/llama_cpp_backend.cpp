@@ -168,18 +168,16 @@ void LogTokenTrace(std::string_view stage, int64_t request_id, int sequence_id,
           : "client_request_id=" + std::string(client_request_id) + ", ";
   log::Info("llama_backend",
             "token_trace[" + std::string(stage) + "]: " + client_prefix +
-                "request_id=" +
-                std::to_string(request_id) + ", sequence_id=" +
-                std::to_string(sequence_id) + ", sequence_generation=" +
-                std::to_string(sequence_generation) + ", n_past=" +
-                std::to_string(n_past) + ", sampled_token=" +
+                "request_id=" + std::to_string(request_id) +
+                ", sequence_id=" + std::to_string(sequence_id) +
+                ", sequence_generation=" + std::to_string(sequence_generation) +
+                ", n_past=" + std::to_string(n_past) + ", sampled_token=" +
                 std::to_string(token_id) + ", piece=" + piece);
 }
 
 void LogTopLogits(std::string_view stage, const float *logits, int vocab_size,
                   int64_t request_id, std::string_view client_request_id,
-                  int sequence_id,
-                  uint64_t sequence_generation, int n_past) {
+                  int sequence_id, uint64_t sequence_generation, int n_past) {
   if (!LogitsDebugEnabled() || !ConsumeLogitsDebugBudget() || !logits ||
       vocab_size <= 0) {
     return;
@@ -209,8 +207,8 @@ void LogTopLogits(std::string_view stage, const float *logits, int vocab_size,
     if (!payload.empty()) {
       payload += " ";
     }
-    payload += "[" + std::to_string(top[i].second) + "]=" +
-               std::to_string(top[i].first);
+    payload += "[" + std::to_string(top[i].second) +
+               "]=" + std::to_string(top[i].first);
   }
   const std::string client_prefix =
       client_request_id.empty()
@@ -218,11 +216,10 @@ void LogTopLogits(std::string_view stage, const float *logits, int vocab_size,
           : "client_request_id=" + std::string(client_request_id) + ", ";
   log::Info("llama_backend",
             "debug_logits[" + std::string(stage) + "]: " + client_prefix +
-                "request_id=" +
-                std::to_string(request_id) + ", sequence_id=" +
-                std::to_string(sequence_id) + ", sequence_generation=" +
-                std::to_string(sequence_generation) + ", n_past=" +
-                std::to_string(n_past) + " top-5: " + payload);
+                "request_id=" + std::to_string(request_id) +
+                ", sequence_id=" + std::to_string(sequence_id) +
+                ", sequence_generation=" + std::to_string(sequence_generation) +
+                ", n_past=" + std::to_string(n_past) + " top-5: " + payload);
 }
 
 void LlamaBackendAcquire() {
@@ -612,8 +609,8 @@ std::string LlamaCppBackend::Generate(
       break;
     }
 
-    LogTopLogits("generate", llama_get_logits(context_), n_vocab_, -1, "", 0,
-                 0, static_cast<int>(position));
+    LogTopLogits("generate", llama_get_logits(context_), n_vocab_, -1, "", 0, 0,
+                 static_cast<int>(position));
     auto sample_start = std::chrono::high_resolution_clock::now();
     int token = llama_sampler_sample(active_sampler_, context_, -1);
     auto sample_end = std::chrono::high_resolution_clock::now();
@@ -1054,8 +1051,7 @@ std::string LlamaCppBackend::Decode(
   if (!IsTerminalGeneratedToken(first_token) && tokens_remaining > 0) {
     std::string piece = TokenToString(first_token);
     LogTokenTrace("decode_seed", -1, sequence_id, "", 0,
-                  static_cast<int>(position),
-                  first_token, piece);
+                  static_cast<int>(position), first_token, piece);
     if (out_logprobs) {
       out_logprobs->push_back(
           CollectLogprob(first_token, piece, logprob_top_n));
@@ -1099,8 +1095,7 @@ std::string LlamaCppBackend::Decode(
     if (IsTerminalGeneratedToken(token))
       break;
     std::string piece = TokenToString(token);
-    LogTokenTrace("decode", -1, sequence_id, "", 0,
-                  static_cast<int>(position),
+    LogTokenTrace("decode", -1, sequence_id, "", 0, static_cast<int>(position),
                   token, piece);
     if (out_logprobs) {
       out_logprobs->push_back(CollectLogprob(token, piece, logprob_top_n));
@@ -1216,8 +1211,8 @@ LlamaCppBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
       results[static_cast<std::size_t>(i)].token = tok;
       results[static_cast<std::size_t>(i)].piece = TokenToString(tok);
       LogTokenTrace("batch_decode", -1, inputs[i].sequence_id, "", 0,
-                    inputs[i].n_past,
-                    tok, results[static_cast<std::size_t>(i)].piece);
+                    inputs[i].n_past, tok,
+                    results[static_cast<std::size_t>(i)].piece);
     }
   }
   return results;
@@ -1363,8 +1358,8 @@ LlamaCppBackend::ExecuteUnifiedBatch(
       if (active_sampler_) {
         const float *logits = llama_get_logits_ith(context_, logit_indices[i]);
         LogTopLogits("unified_batch", logits, n_vocab_, inp.request_id,
-                     inp.client_request_id,
-                     inp.sequence_id, inp.sequence_generation,
+                     inp.client_request_id, inp.sequence_id,
+                     inp.sequence_generation,
                      inp.n_past + static_cast<int>(inp.tokens.size()) - 1);
         int tok =
             llama_sampler_sample(active_sampler_, context_, logit_indices[i]);
@@ -1377,8 +1372,7 @@ LlamaCppBackend::ExecuteUnifiedBatch(
           results[i].token = tok;
           results[i].piece = TokenToString(tok);
           LogTokenTrace("unified_batch", inp.request_id, inp.sequence_id,
-                        inp.client_request_id,
-                        inp.sequence_generation,
+                        inp.client_request_id, inp.sequence_generation,
                         inp.n_past + static_cast<int>(inp.tokens.size()), tok,
                         results[i].piece);
         }

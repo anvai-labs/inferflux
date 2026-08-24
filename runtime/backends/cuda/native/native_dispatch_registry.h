@@ -24,7 +24,8 @@ enum class InferfluxCudaDispatchBucket {
 };
 
 const char *InferfluxCudaDispatchPhaseName(InferfluxCudaDispatchPhase phase);
-InferfluxCudaDispatchPhase ParseInferfluxCudaDispatchPhase(std::string_view phase);
+InferfluxCudaDispatchPhase
+ParseInferfluxCudaDispatchPhase(std::string_view phase);
 
 InferfluxCudaDispatchBucket BucketBatchRows(int rows);
 InferfluxCudaDispatchBucket BucketExtent(int extent);
@@ -71,25 +72,25 @@ InferfluxCudaFfnDispatchProfile BuildInferfluxCudaFfnDispatchProfile(
     InferfluxCudaDispatchPhase phase, int quant_type0, int quant_type1,
     const FusedDispatchGeometry &geometry, bool q81_ready, bool packed_ready);
 
-InferfluxCudaFfnDispatchDecision
-SelectInferfluxCudaFfnDispatchDecision(const InferfluxCudaFfnDispatchProfile &profile,
-                                const NativeExecutionPolicy &policy);
+InferfluxCudaFfnDispatchDecision SelectInferfluxCudaFfnDispatchDecision(
+    const InferfluxCudaFfnDispatchProfile &profile,
+    const NativeExecutionPolicy &policy);
 
-std::string
-DescribeInferfluxCudaFfnDispatchDecision(const InferfluxCudaFfnDispatchProfile &profile,
-                                  std::string_view reason);
+std::string DescribeInferfluxCudaFfnDispatchDecision(
+    const InferfluxCudaFfnDispatchProfile &profile, std::string_view reason);
 
-InferfluxCudaDownProjDispatchProfile
-BuildInferfluxCudaDownProjDispatchProfile(InferfluxCudaDispatchPhase phase, int quant_type,
-                                   const FusedDispatchGeometry &geometry,
-                                   bool q81_ready, bool packed_ready,
-                                   bool mmq_ready);
+InferfluxCudaDownProjDispatchProfile BuildInferfluxCudaDownProjDispatchProfile(
+    InferfluxCudaDispatchPhase phase, int quant_type,
+    const FusedDispatchGeometry &geometry, bool q81_ready, bool packed_ready,
+    bool mmq_ready);
 
-InferfluxCudaDownProjDispatchDecision SelectInferfluxCudaDownProjDispatchDecision(
+InferfluxCudaDownProjDispatchDecision
+SelectInferfluxCudaDownProjDispatchDecision(
     const InferfluxCudaDownProjDispatchProfile &profile,
     const NativeExecutionPolicy &policy);
 
 std::string DescribeInferfluxCudaDownProjDispatchDecision(
-    const InferfluxCudaDownProjDispatchProfile &profile, std::string_view reason);
+    const InferfluxCudaDownProjDispatchProfile &profile,
+    std::string_view reason);
 
 } // namespace inferflux

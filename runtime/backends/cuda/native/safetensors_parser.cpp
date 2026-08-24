@@ -7,9 +7,9 @@
 #include <windows.h>
 #else
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <sys/mman.h>
 #endif
 
 #include <nlohmann/json.hpp>
@@ -55,9 +55,9 @@ SafetensorsParser::~SafetensorsParser() {
 bool SafetensorsParser::Parse() {
 #ifdef _WIN32
   // Open file
-  file_handle_ = CreateFileA(file_path_.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-                              nullptr);
+  file_handle_ =
+      CreateFileA(file_path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (file_handle_ == INVALID_HANDLE_VALUE) {
     log::Error("safetensors_parser", "Cannot open file: " + file_path_);
     return false;

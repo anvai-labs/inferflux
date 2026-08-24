@@ -1,7 +1,7 @@
 #pragma once
 
-#include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/inferflux_cuda_executor.h"
+#include "runtime/backends/cuda/native/model_loader.h"
 // CUDA headers when available; opaque typedefs otherwise (mirrors
 // model_loader.h) so CPU-only CI builds compile this header.
 #if defined(INFERFLUX_HAS_CUDA) ||                                             \

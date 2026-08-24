@@ -6,9 +6,9 @@
 
 namespace inferflux {
 
-inline void PrepareDecodeRequeue(
-    InferenceRequest *inference,
-    std::chrono::steady_clock::time_point enqueue_time) {
+inline void
+PrepareDecodeRequeue(InferenceRequest *inference,
+                     std::chrono::steady_clock::time_point enqueue_time) {
   if (!inference) {
     return;
   }

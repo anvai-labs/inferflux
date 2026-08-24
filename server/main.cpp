@@ -21,8 +21,8 @@
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
 #include "server/auth/rate_limiter.h"
-#include "server/http/http_server.h"
 #include "server/diagnostics/crash_handler.h"
+#include "server/http/http_server.h"
 #include "server/logging/audit_logger.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
@@ -142,7 +142,8 @@ void SignalHandler(int) { g_running = false; }
 
 int main(int argc, char **argv) {
   // Structured JSON logging: set before any log output.
-  const bool log_format_from_env = std::getenv("INFERFLUX_LOG_FORMAT") != nullptr;
+  const bool log_format_from_env =
+      std::getenv("INFERFLUX_LOG_FORMAT") != nullptr;
   if (const char *fmt = std::getenv("INFERFLUX_LOG_FORMAT")) {
     std::string s = fmt;
     inferflux::log::SetJsonMode(s == "json" || s == "JSON");
@@ -239,8 +240,8 @@ int main(int argc, char **argv) {
   std::size_t nvme_writer_queue_depth = 256;
   std::size_t prefix_cache_capacity = 256;
   int prefill_pool_size = 1;
-  int decode_pool_size =
-      1; // 0 = decode on WorkerLoop thread (legacy); 1 = single dedicated decode lane (current default)
+  int decode_pool_size = 1; // 0 = decode on WorkerLoop thread (legacy); 1 =
+                            // single dedicated decode lane (current default)
   std::size_t kv_channel_capacity = 64;
   std::string kv_transport_type = "channel"; // "channel" | "shm"
   int kv_enqueue_max_retries = 3;
@@ -513,8 +514,8 @@ int main(int argc, char **argv) {
                 std::max(0, scheduler_node["batch_accumulation_ms"].as<int>());
           }
           if (scheduler_node["decode_burst_tokens"]) {
-            scheduler_config.decode_burst_tokens = std::max(
-                0, scheduler_node["decode_burst_tokens"].as<int>());
+            scheduler_config.decode_burst_tokens =
+                std::max(0, scheduler_node["decode_burst_tokens"].as<int>());
           }
           if (scheduler_node["chunked_prefill_tokens"]) {
             scheduler_config.chunked_prefill_tokens =
@@ -1191,7 +1192,7 @@ int main(int argc, char **argv) {
               << " (none default, memory-first).\n";
     std::cout << "[server] InferFlux CUDA strict fused quantized matmul: "
               << (inferflux_cuda_require_fused_quantized_matmul ? "enabled"
-                                                        : "disabled")
+                                                                : "disabled")
               << ".\n";
   }
   if (cuda_flash_attention_enabled) {

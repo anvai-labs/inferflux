@@ -13,8 +13,9 @@ void AppendControlMetadata(KVPacket *packet) {
   }
   if (packet->ticket_id > 0) {
     packet->metadata += "|ticket=" + std::to_string(packet->ticket_id);
-    packet->metadata += "|ticket_stage=" +
-                        std::string(KVTicketStageToString(packet->ticket_stage));
+    packet->metadata +=
+        "|ticket_stage=" +
+        std::string(KVTicketStageToString(packet->ticket_stage));
   }
   if (packet->kv_page >= 0) {
     packet->metadata += "|kv_page=" + std::to_string(packet->kv_page);

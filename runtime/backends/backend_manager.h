@@ -13,10 +13,9 @@ class BackendManager {
 public:
   BackendManager() = default;
 
-  std::shared_ptr<BackendInterface> LoadBackend(const std::string &name,
-                                               const std::string &path,
-                                               const LlamaBackendConfig &config,
-                                               bool prefer_cuda = false);
+  std::shared_ptr<BackendInterface>
+  LoadBackend(const std::string &name, const std::string &path,
+              const LlamaBackendConfig &config, bool prefer_cuda = false);
   std::shared_ptr<BackendInterface> GetBackend(const std::string &name) const;
 
 private:

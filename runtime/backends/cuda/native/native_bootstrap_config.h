@@ -19,8 +19,8 @@ struct NativeBootstrapConfig {
   std::string invalid_kv_budget_mb;
   std::string invalid_kv_free_mem_ratio;
 
-  static NativeBootstrapConfig FromEnv(
-      const std::string &kv_precision_hint = "auto");
+  static NativeBootstrapConfig
+  FromEnv(const std::string &kv_precision_hint = "auto");
 
   bool ForceFp16() const { return dtype_override == "fp16"; }
   bool ForceBf16() const { return dtype_override == "bf16"; }

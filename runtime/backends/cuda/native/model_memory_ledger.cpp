@@ -85,10 +85,9 @@ void ModelMemoryLedger::UpsertItem(std::string label, MemoryDomain domain,
                                    std::size_t in_use_bytes,
                                    std::size_t high_water_bytes,
                                    std::size_t evictable_bytes) {
-  auto it = std::find_if(items_.begin(), items_.end(),
-                         [&](const MemoryLedgerItem &item) {
-                           return item.label == label;
-                         });
+  auto it = std::find_if(
+      items_.begin(), items_.end(),
+      [&](const MemoryLedgerItem &item) { return item.label == label; });
   MemoryLedgerItem next;
   next.label = std::move(label);
   next.domain = domain;
@@ -157,10 +156,9 @@ std::size_t ModelMemoryLedger::TotalEvictableBytes() const {
 
 bool ModelMemoryLedger::FindItem(std::string_view label,
                                  MemoryLedgerItem *out) const {
-  auto it = std::find_if(items_.begin(), items_.end(),
-                         [&](const MemoryLedgerItem &item) {
-                           return item.label == label;
-                         });
+  auto it = std::find_if(
+      items_.begin(), items_.end(),
+      [&](const MemoryLedgerItem &item) { return item.label == label; });
   if (it == items_.end()) {
     return false;
   }

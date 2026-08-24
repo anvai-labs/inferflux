@@ -112,12 +112,10 @@ void EnsureCpuQuantizationHandlersRegistered(
     return std::make_shared<StaticQuantizationHandler>("q8_0", 8.5, 32, 34);
   });
   registry->Register("q8_k", []() {
-    return std::make_shared<StaticQuantizationHandler>("q8_k", 9.125, 256,
-                                                       292);
+    return std::make_shared<StaticQuantizationHandler>("q8_k", 9.125, 256, 292);
   });
   registry->Register("q8_k_m", []() {
-    return std::make_shared<StaticQuantizationHandler>("q8_k", 9.125, 256,
-                                                       292);
+    return std::make_shared<StaticQuantizationHandler>("q8_k", 9.125, 256, 292);
   });
 }
 #endif

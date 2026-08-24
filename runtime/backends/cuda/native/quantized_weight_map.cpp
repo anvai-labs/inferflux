@@ -438,9 +438,9 @@ MmqWeightInfo QuantizedWeightMap::GetMmqLayerDownProj(int layer) const {
   }
 
   MmqWeightInfo layout{};
-  if (!FusedQuantGemm::BuildDownProjMmqLayout(
-          raw, static_cast<int>(dims.first), static_cast<int>(dims.second),
-          &layout, stream_)) {
+  if (!FusedQuantGemm::BuildDownProjMmqLayout(raw, static_cast<int>(dims.first),
+                                              static_cast<int>(dims.second),
+                                              &layout, stream_)) {
     return {};
   }
 

@@ -167,7 +167,9 @@ public:
 
   std::size_t ScratchReservedBytes() const;
   std::size_t ScratchInUseBytes() const;
-  std::size_t ScratchHighWaterBytes() const { return scratch_high_water_bytes_; }
+  std::size_t ScratchHighWaterBytes() const {
+    return scratch_high_water_bytes_;
+  }
   bool HasScratchBuffer() const { return scratch_buffer_ != nullptr; }
   void ReleaseScratchBuffer();
 

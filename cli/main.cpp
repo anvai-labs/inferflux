@@ -6,11 +6,11 @@
 #include <errno.h>
 #include <signal.h>
 #ifdef _WIN32
-#include <winsock2.h>
-#include <windows.h>
-#include <ws2tcpip.h>
 #include <io.h>
 #include <process.h>
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #else
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -461,31 +461,29 @@ void PrintAdminPoolsTable(const json &payload) {
                      JsonValueToText(pool.value("role", json(nullptr))));
   PrintAdminPoolsRow("Reason",
                      JsonValueToText(pool.value("reason", json(nullptr))));
-  PrintAdminPoolsRow(
-      "Model loaded",
-      JsonValueToText(pool.value("model_loaded", json(nullptr))));
+  PrintAdminPoolsRow("Model loaded", JsonValueToText(pool.value(
+                                         "model_loaded", json(nullptr))));
   PrintAdminPoolsRow(
       "Decode pool warm",
       JsonValueToText(pool.value("decode_pool_warm", json(nullptr))));
-  PrintAdminPoolsRow("Transport degraded",
-                     JsonValueToText(pool.value("disagg_transport_degraded",
-                                                json(nullptr))));
+  PrintAdminPoolsRow(
+      "Transport degraded",
+      JsonValueToText(pool.value("disagg_transport_degraded", json(nullptr))));
   PrintAdminPoolsRow(
       "Timeout debt",
-      JsonThresholdPair(pool.value("disagg_timeout_debt", json(nullptr)),
-                        pool.value("disagg_timeout_debt_threshold",
-                                   json(nullptr))));
+      JsonThresholdPair(
+          pool.value("disagg_timeout_debt", json(nullptr)),
+          pool.value("disagg_timeout_debt_threshold", json(nullptr))));
   PrintAdminPoolsRow(
       "Timeout streak",
-      JsonThresholdPair(pool.value("disagg_timeout_streak", json(nullptr)),
-                        pool.value("disagg_timeout_streak_threshold",
-                                   json(nullptr))));
+      JsonThresholdPair(
+          pool.value("disagg_timeout_streak", json(nullptr)),
+          pool.value("disagg_timeout_streak_threshold", json(nullptr))));
 
   std::cout << "\n";
   PrintAdminPoolsSectionHeader("SCHEDULER");
-  PrintAdminPoolsRow(
-      "Queue depth",
-      JsonValueToText(scheduler.value("queue_depth", json(nullptr))));
+  PrintAdminPoolsRow("Queue depth", JsonValueToText(scheduler.value(
+                                        "queue_depth", json(nullptr))));
   PrintAdminPoolsRow(
       "Prefill queue depth",
       JsonValueToText(scheduler.value("prefill_queue_depth", json(nullptr))));
@@ -501,25 +499,24 @@ void PrintAdminPoolsTable(const json &payload) {
 
   std::cout << "\n";
   PrintAdminPoolsSectionHeader("DISTRIBUTED KV");
-  PrintAdminPoolsRow("Enqueue rejections",
-                     JsonValueToText(disagg.value("enqueue_rejections_total",
-                                                  json(nullptr))));
-  PrintAdminPoolsRow("Enqueue exhausted",
-                     JsonValueToText(disagg.value("enqueue_exhausted_total",
-                                                  json(nullptr))));
-  PrintAdminPoolsRow("Tickets enqueued",
-                     JsonValueToText(disagg.value("tickets_enqueued_total",
+  PrintAdminPoolsRow(
+      "Enqueue rejections",
+      JsonValueToText(disagg.value("enqueue_rejections_total", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Enqueue exhausted",
+      JsonValueToText(disagg.value("enqueue_exhausted_total", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Tickets enqueued",
+      JsonValueToText(disagg.value("tickets_enqueued_total", json(nullptr))));
+  PrintAdminPoolsRow("Tickets acknowledged",
+                     JsonValueToText(disagg.value("tickets_acknowledged_total",
                                                   json(nullptr))));
   PrintAdminPoolsRow(
-      "Tickets acknowledged",
-      JsonValueToText(disagg.value("tickets_acknowledged_total",
-                                   json(nullptr))));
-  PrintAdminPoolsRow("Tickets committed",
-                     JsonValueToText(disagg.value("tickets_committed_total",
-                                                  json(nullptr))));
-  PrintAdminPoolsRow("Tickets timed out",
-                     JsonValueToText(disagg.value("tickets_timed_out_total",
-                                                  json(nullptr))));
+      "Tickets committed",
+      JsonValueToText(disagg.value("tickets_committed_total", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Tickets timed out",
+      JsonValueToText(disagg.value("tickets_timed_out_total", json(nullptr))));
 }
 
 void PrintUsage() {
@@ -1165,10 +1162,9 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
   sa.lpSecurityDescriptor = nullptr;
   sa.bInheritHandle = TRUE;
 
-  HANDLE log_handle = CreateFileA(
-      log_file.string().c_str(), FILE_APPEND_DATA,
-      FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_ALWAYS,
-      FILE_ATTRIBUTE_NORMAL, nullptr);
+  HANDLE log_handle = CreateFileA(log_file.string().c_str(), FILE_APPEND_DATA,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                                  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
   if (log_handle == INVALID_HANDLE_VALUE) {
     std::cerr << "Error: Failed to open log file: " << log_file << "\n";
     return 1;
@@ -1185,8 +1181,8 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
   std::string cmd_line = server_bin + " --config " + config_path;
 
   if (!CreateProcessA(nullptr, const_cast<char *>(cmd_line.c_str()), nullptr,
-                       nullptr, TRUE, DETACHED_PROCESS, nullptr, nullptr, &si,
-                       &pi)) {
+                      nullptr, TRUE, DETACHED_PROCESS, nullptr, nullptr, &si,
+                      &pi)) {
     std::cerr << "Error: Failed to start server process (error "
               << GetLastError() << ")\n";
     CloseHandle(log_handle);
@@ -2094,8 +2090,8 @@ int main(int argc, char **argv) {
                 const std::vector<std::pair<std::string, std::string>> &labels)
             -> json {
           double value = 0.0;
-          if (!ParsePrometheusLabeledMetricValue(metrics_resp.body, name, labels,
-                                                &value)) {
+          if (!ParsePrometheusLabeledMetricValue(metrics_resp.body, name,
+                                                 labels, &value)) {
             return json(nullptr);
           }
           double rounded = std::round(value);
@@ -2142,8 +2138,7 @@ int main(int argc, char **argv) {
               {"http_status", ready_resp.status},
               {"role", ready_payload.value("role", "unknown")},
               {"reason", ready_payload.value("reason", "")},
-              {"model_loaded",
-               ready_payload.value("model_loaded", false)},
+              {"model_loaded", ready_payload.value("model_loaded", false)},
               {"decode_pool_warm",
                ready_payload.value("decode_pool_warm", false)},
               {"disagg_transport_degraded",

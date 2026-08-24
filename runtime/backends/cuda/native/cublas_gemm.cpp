@@ -123,9 +123,10 @@ template bool CublasGemm::GemmTyped<__nv_bfloat16>(int, int, int,
 
 template bool CublasGemm::GemmTypedAccum<half>(int, int, int, const half *,
                                                const half *, half *);
-template bool CublasGemm::GemmTypedAccum<__nv_bfloat16>(
-    int, int, int, const __nv_bfloat16 *, const __nv_bfloat16 *,
-    __nv_bfloat16 *);
+template bool CublasGemm::GemmTypedAccum<__nv_bfloat16>(int, int, int,
+                                                        const __nv_bfloat16 *,
+                                                        const __nv_bfloat16 *,
+                                                        __nv_bfloat16 *);
 
 template bool CublasGemm::GemmBatchedTyped<half>(int, int, int, const half *,
                                                  const half *, half *,

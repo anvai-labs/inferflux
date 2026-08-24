@@ -114,8 +114,7 @@ public:
              &on_chunk = {},
          const std::function<bool()> &should_stop = {}, int logprob_top_n = 0,
          std::vector<TokenLogprob> *out_logprobs = nullptr,
-         int first_token = -1,
-         const std::vector<std::string> &stop_seqs = {}) {
+         int first_token = -1, const std::vector<std::string> &stop_seqs = {}) {
     (void)n_past;
     (void)sequence_id;
     (void)max_tokens;
@@ -173,7 +172,7 @@ public:
   }
 
   virtual bool HydrateSequence(int dest_sequence_id,
-                                const std::vector<uint8_t> &blob) {
+                               const std::vector<uint8_t> &blob) {
     (void)dest_sequence_id;
     (void)blob;
     return false;
@@ -194,7 +193,7 @@ public:
   }
 
   virtual void SetupSampler(const std::string &grammar, const std::string &root,
-                             const SamplingParams &sp) {
+                            const SamplingParams &sp) {
     (void)grammar;
     (void)root;
     (void)sp;
