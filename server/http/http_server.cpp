@@ -3,6 +3,7 @@
 #include "model/model_format.h"
 #include "runtime/backends/backend_capabilities.h"
 #include "runtime/backends/backend_factory.h"
+#include "runtime/backends/cuda/native/dispatch_operator_health.h"
 #include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "scheduler/model_selection.h"
@@ -1266,6 +1267,15 @@ HttpServer::ReadyStatus HttpServer::EvaluateReadyStatus() const {
   ReadyStatus status;
   const PoolRole role = role_.load(std::memory_order_relaxed);
   status.role = PoolRoleToString(role);
+  // Dispatch self-heal visibility (does not flip `ready`): divergences and
+  // down-ranked operators from the load-time probe / runtime telemetry.
+  status.dispatch_divergences =
+      GlobalMetrics().GetInferfluxCudaDispatchDivergences();
+  status.dispatch_degraded =
+      status.dispatch_divergences > 0 ||
+      InferfluxCudaOperatorHealth::Instance().AnyUnhealthy();
+  status.dispatch_downgraded_operators =
+      InferfluxCudaOperatorHealth::Instance().Describe();
   status.disagg_timeout_debt_threshold =
       static_cast<uint64_t>(readyz_disagg_timeout_debt_threshold_);
   status.disagg_timeout_streak_threshold =
@@ -1756,6 +1766,12 @@ void HttpServer::HandleClient(ClientSession &session) {
           ready_status.disagg_timeout_streak_threshold;
       body["disagg_transport_degraded"] =
           ready_status.disagg_transport_degraded;
+    }
+    if (ready_status.dispatch_degraded) {
+      body["dispatch_degraded"] = ready_status.dispatch_degraded;
+      body["dispatch_divergences"] = ready_status.dispatch_divergences;
+      body["dispatch_downgraded_operators"] =
+          ready_status.dispatch_downgraded_operators;
     }
     if (!ready_status.ready)
       body["reason"] = ready_status.reason;

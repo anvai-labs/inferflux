@@ -116,6 +116,7 @@ public:
   bool BatchForwardDevice(int batch_size, float *d_logits) override;
 
   void WarmWeightCaches() override;
+  std::string ProbeDispatchPaths() override;
   void SetStream(cudaStream_t stream) override;
   void SetExecutionPolicy(const NativeExecutionPolicy &policy) override;
 

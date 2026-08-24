@@ -15,8 +15,8 @@
 #include "webui/ui_renderer.h"
 #endif
 
-#include <atomic>
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <condition_variable>
 #include <cstdint>
@@ -39,10 +39,9 @@ namespace inferflux {
 inline std::string LookupHeaderValueForTest(const std::string &headers,
                                             const std::string &name) {
   auto lower_name = name;
-  std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(),
-                 [](unsigned char c) {
-                   return static_cast<char>(std::tolower(c));
-                 });
+  std::transform(
+      lower_name.begin(), lower_name.end(), lower_name.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
   std::size_t line_start = 0;
   while (line_start < headers.size()) {
@@ -52,10 +51,9 @@ inline std::string LookupHeaderValueForTest(const std::string &headers,
     const std::size_t colon = headers.find(':', line_start);
     if (colon != std::string::npos && colon < current_end) {
       std::string header_name = headers.substr(line_start, colon - line_start);
-      std::transform(header_name.begin(), header_name.end(), header_name.begin(),
-                     [](unsigned char c) {
-                       return static_cast<char>(std::tolower(c));
-                     });
+      std::transform(
+          header_name.begin(), header_name.end(), header_name.begin(),
+          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
       if (header_name == lower_name) {
         std::string value =
             headers.substr(colon + 1, current_end - (colon + 1));
@@ -91,6 +89,13 @@ public:
     uint64_t disagg_timeout_streak_threshold{0};
     std::string role{"unified"};
     std::string reason;
+    // Native dispatch self-heal state: down-ranked operators keep serving
+    // at best-available speed, visibly. Deliberately does NOT flip
+    // `ready` (unlike disagg degradation) — throughput is reduced, not
+    // broken.
+    bool dispatch_degraded{false};
+    uint64_t dispatch_divergences{0};
+    std::string dispatch_downgraded_operators;
   };
 
   struct AdminPoolsStatus {

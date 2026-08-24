@@ -106,6 +106,15 @@ public:
   virtual void WarmWeightCaches() {}
 
   /**
+   * Load-time dispatch reachability probe. Runs each selectable operator
+   * once on layer-0 weights through the production executor stages and
+   * marks divergent operators unhealthy (self-heal: the dispatch rules
+   * then skip them). Returns "" when not implemented. Must be called only
+   * at load time, after WarmWeightCaches().
+   */
+  virtual std::string ProbeDispatchPaths() { return ""; }
+
+  /**
    * Set the CUDA stream for forward passes.
    * Subclasses should propagate to cuBLAS handle and sampler.
    */

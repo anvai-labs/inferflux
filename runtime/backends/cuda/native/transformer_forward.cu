@@ -2,6 +2,7 @@
 #include "runtime/backends/cuda/kernels/flash_attention.cuh"
 #include "runtime/backends/cuda/native/cuda_copy_trace.h"
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
+#include "runtime/backends/cuda/native/dispatch_operator_health.h"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/llama_forward.h"
@@ -1582,6 +1583,78 @@ template <typename T> void LlamaForwardTyped<T>::WarmWeightCaches() {
   cudaGetLastError();
   log::Info("llama_forward", "Weight caches pre-warmed (" +
                                  std::to_string(num_layers_) + " layers)");
+}
+
+template <typename T> std::string LlamaForwardTyped<T>::ProbeDispatchPaths() {
+  auto &health = InferfluxCudaOperatorHealth::Instance();
+  if (const char *force =
+          std::getenv("INFERFLUX_CUDA_DISPATCH_PROBE_FORCE_UNHEALTHY");
+      force && *force) {
+    health.ApplyForceList(force);
+  }
+
+  // Layer-0 weights, production executor stages and lambdas — the probe
+  // exercises exactly the dispatch that decode will take, so it cannot
+  // drift from reality. Outputs land in forward scratch buffers; weights
+  // are read-only.
+  const int layer = 0;
+  const auto gate_raw = weights_->LayerGateProjRaw(layer);
+  const auto up_raw = weights_->LayerUpProjRaw(layer);
+  const auto down_raw = weights_->LayerDownProjRaw(layer);
+  int divergences = 0;
+
+  const int m_values[] = {1, 2, 4, 8, 16};
+  for (const int M : m_values) {
+    const std::array<PackedProjectionPlan<half>, 2> ffn_plans = {
+        {{gate_raw, reinterpret_cast<half *>(d_ffn_gate_), intermediate_size_},
+         {up_raw, reinterpret_cast<half *>(d_ffn_up_), intermediate_size_}}};
+    const auto selected = SelectInferfluxCudaFfnProjOperator(
+        gate_raw, up_raw, InferfluxCudaDispatchPhase::kDecode,
+        FusedDispatchGeometry{M, intermediate_size_, hidden_size_, 2, true,
+                              true},
+        true, execution_policy_);
+    NativeFfnExecutionSummary summary;
+    ExecuteInferfluxCudaFfnProjectionStage(
+        selected, "probe", "probe", gate_raw.quant_type, M, intermediate_size_,
+        hidden_size_,
+        [&]() {
+          return TryQ8_1ProjectionGroup<2>(
+              ffn_plans, reinterpret_cast<const half *>(d_residual_),
+              reinterpret_cast<const half *>(
+                  weights_->LayerPostAttnNorm(layer)),
+              d_act_q8_1_, M, hidden_size_, rms_norm_eps_, stream_,
+              &execution_policy_, selected);
+        },
+        [&]() {
+          return TryPackedProjectionGroup<2>(
+              ffn_plans, reinterpret_cast<const half *>(d_residual_),
+              reinterpret_cast<const half *>(
+                  weights_->LayerPostAttnNorm(layer)),
+              reinterpret_cast<half *>(d_norm_out_), d_packed_activation_,
+              d_packed_activation_scales_, M, hidden_size_, rms_norm_eps_,
+              stream_, &execution_policy_);
+        },
+        []() { return false; }, &summary);
+    if (TierOf(selected) != TierOf(summary.actual_op) ||
+        (summary.actual_op == FfnProjOperator::kFallback &&
+         selected != FfnProjOperator::kFallback)) {
+      ++divergences;
+      health.MarkUnhealthy(selected, "probe_divergence");
+    }
+  }
+
+  cudaStreamSynchronize(stream_);
+  cudaGetLastError();
+  if (divergences > 0 || health.AnyUnhealthy()) {
+    log::Warn("llama_forward",
+              "dispatch probe: " + std::to_string(divergences) +
+                  " divergent operator(s); down-ranked for this process: " +
+                  (health.Describe().empty() ? "(forced list)" //
+                                             : health.Describe()));
+  } else {
+    log::Info("llama_forward", "dispatch probe: all paths reachable");
+  }
+  return health.Describe();
 }
 
 template <typename T>

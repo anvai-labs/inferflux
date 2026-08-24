@@ -1,4 +1,6 @@
 #include "runtime/backends/cuda/native/native_dispatch_registry.h"
+
+#include "runtime/backends/cuda/native/dispatch_operator_health.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
 
 #include <array>
@@ -30,7 +32,8 @@ struct InferfluxCudaDownProjDispatchRule {
 
 bool MatchDecodeGroupedHotQ4K(const InferfluxCudaFfnDispatchProfile &profile,
                               const NativeExecutionPolicy &) {
-  return profile.phase == InferfluxCudaDispatchPhase::kDecode && profile.same_quant &&
+  return profile.phase == InferfluxCudaDispatchPhase::kDecode &&
+         profile.same_quant &&
          FusedQuantGemm::ShouldUseSpecializedQ8_1GroupedFastPath(
              profile.quant_type0, profile.geometry);
 }
@@ -61,12 +64,10 @@ bool MatchDecodeGroupedRowQuadM4(const InferfluxCudaFfnDispatchProfile &profile,
 bool MatchDecodeGroupedMmq3(const InferfluxCudaFfnDispatchProfile &profile,
                             const NativeExecutionPolicy &policy) {
   return profile.phase == InferfluxCudaDispatchPhase::kDecode &&
-         policy.enable_experimental_q81_grouped_mmq3 &&
-         profile.same_quant &&
+         policy.enable_experimental_q81_grouped_mmq3 && profile.same_quant &&
          profile.quant_type0 ==
              static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K) &&
-         profile.geometry.grouped_outputs == 2 &&
-         profile.geometry.M >= 3;
+         profile.geometry.grouped_outputs == 2 && profile.geometry.M >= 3;
 }
 
 bool MatchDecodeGenericQ81(const InferfluxCudaFfnDispatchProfile &profile,
@@ -105,8 +106,8 @@ GetInferfluxCudaFfnDispatchRules() {
        /*requires_q81=*/true, /*requires_packed=*/false,
        MatchDecodeGroupedRowQuadM4, "decode_q81_rowquad_m4"},
       {FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3,
-       /*requires_q81=*/true, /*requires_packed=*/false,
-       MatchDecodeGroupedMmq3, "decode_q81_mmq3"},
+       /*requires_q81=*/true, /*requires_packed=*/false, MatchDecodeGroupedMmq3,
+       "decode_q81_mmq3"},
       {FusedQuantGemm::FfnProjOperator::kQ81Group,
        /*requires_q81=*/true, /*requires_packed=*/false, MatchDecodeGenericQ81,
        "decode_q81_generic"},
@@ -134,8 +135,9 @@ bool MatchDownProjHotFixed(const InferfluxCudaDownProjDispatchProfile &profile,
       profile.quant_type, profile.geometry);
 }
 
-bool MatchDownProjRowPairHotFixed(const InferfluxCudaDownProjDispatchProfile &profile,
-                                  const NativeExecutionPolicy &) {
+bool MatchDownProjRowPairHotFixed(
+    const InferfluxCudaDownProjDispatchProfile &profile,
+    const NativeExecutionPolicy &) {
   return FusedQuantGemm::ShouldUseSpecializedQ8_1DownProjRowPairHotPath(
       profile.quant_type, profile.geometry);
 }
@@ -245,7 +247,8 @@ InferfluxCudaDispatchBucket BucketExtent(int extent) {
   return BucketBatchRows(extent);
 }
 
-const char *InferfluxCudaDispatchBucketName(InferfluxCudaDispatchBucket bucket) {
+const char *
+InferfluxCudaDispatchBucketName(InferfluxCudaDispatchBucket bucket) {
   switch (bucket) {
   case InferfluxCudaDispatchBucket::k1:
     return "1";
@@ -280,11 +283,13 @@ InferfluxCudaFfnDispatchProfile BuildInferfluxCudaFfnDispatchProfile(
   return profile;
 }
 
-InferfluxCudaFfnDispatchDecision
-SelectInferfluxCudaFfnDispatchDecision(
+InferfluxCudaFfnDispatchDecision SelectInferfluxCudaFfnDispatchDecision(
     const InferfluxCudaFfnDispatchProfile &profile,
     const NativeExecutionPolicy &policy) {
   for (const auto &rule : GetInferfluxCudaFfnDispatchRules()) {
+    if (InferfluxCudaOperatorHealth::Instance().IsUnhealthy(rule.op)) {
+      continue; // down-ranked by the probe / divergence telemetry
+    }
     if (rule.requires_q81 && !profile.q81_ready) {
       continue;
     }
@@ -299,8 +304,7 @@ SelectInferfluxCudaFfnDispatchDecision(
   return {};
 }
 
-std::string
-DescribeInferfluxCudaFfnDispatchDecision(
+std::string DescribeInferfluxCudaFfnDispatchDecision(
     const InferfluxCudaFfnDispatchProfile &profile, std::string_view reason) {
   return "phase=" + std::string(InferfluxCudaDispatchPhaseName(profile.phase)) +
          ", quant0=" +
@@ -320,8 +324,7 @@ DescribeInferfluxCudaFfnDispatchDecision(
          (reason.empty() ? std::string() : ", rule=" + std::string(reason));
 }
 
-InferfluxCudaDownProjDispatchProfile
-BuildInferfluxCudaDownProjDispatchProfile(
+InferfluxCudaDownProjDispatchProfile BuildInferfluxCudaDownProjDispatchProfile(
     InferfluxCudaDispatchPhase phase, int quant_type,
     const FusedDispatchGeometry &geometry, bool q81_ready, bool packed_ready,
     bool mmq_ready) {
@@ -338,10 +341,14 @@ BuildInferfluxCudaDownProjDispatchProfile(
   return profile;
 }
 
-InferfluxCudaDownProjDispatchDecision SelectInferfluxCudaDownProjDispatchDecision(
+InferfluxCudaDownProjDispatchDecision
+SelectInferfluxCudaDownProjDispatchDecision(
     const InferfluxCudaDownProjDispatchProfile &profile,
     const NativeExecutionPolicy &policy) {
   for (const auto &rule : GetInferfluxCudaDownProjDispatchRules()) {
+    if (InferfluxCudaOperatorHealth::Instance().IsUnhealthy(rule.op)) {
+      continue; // down-ranked by the probe / divergence telemetry
+    }
     if (rule.requires_q81 && !profile.q81_ready) {
       continue;
     }

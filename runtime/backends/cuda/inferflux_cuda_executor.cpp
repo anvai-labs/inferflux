@@ -1815,6 +1815,21 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
   // illegal cudaStreamSynchronize from lazy F32→FP16 dequantization.
   model_forward_->WarmWeightCaches();
 
+  // Dispatch reachability probe: verifies every selectable operator can
+  // actually execute and down-ranks divergent ones for the process
+  // lifetime (see dispatch_catalog.h / dispatch_operator_health.h).
+  // Opt out with INFERFLUX_CUDA_DISPATCH_PROBE=0.
+  const char *probe_env = std::getenv("INFERFLUX_CUDA_DISPATCH_PROBE");
+  const bool probe_enabled = !probe_env || (std::string(probe_env) != "0" &&
+                                            std::string(probe_env) != "false");
+  if (probe_enabled) {
+    const std::string downgraded = model_forward_->ProbeDispatchPaths();
+    if (!downgraded.empty()) {
+      GlobalMetrics().RecordInferfluxCudaDispatchDivergence(
+          "probe", "probe", "probe", "down_ranked");
+    }
+  }
+
   // 4. Initialize GPU sampler
   sampler_ = std::make_unique<GpuSampler>();
   if (!sampler_->Initialize(config.vocab_size, compute_stream_)) {
