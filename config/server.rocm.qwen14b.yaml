@@ -1,0 +1,59 @@
+# InferFlux ROCm Configuration for Qwen2.5-Coder-14B
+# Tested on AMD Radeon AI PRO R9700 (gfx1201 / RDNA 4, 32GB VRAM)
+
+server:
+  host: 0.0.0.0
+  http_port: 8080
+  max_concurrent: 1024
+  enable_metrics: true
+  enable_tracing: false
+
+models:
+  - id: qwen2.5-coder-14b
+    path: models/qwen2.5-coder-14b-instruct-q4_k_m.gguf
+    format: gguf
+    backend: rocm
+    default: true
+
+runtime:
+  backend_priority: [rocm, cpu]
+
+  rocm:
+    enabled: true
+    flash_attention:
+      enabled: true
+    device_id: 0
+
+  backend_exposure:
+    prefer_inferflux: false
+    allow_llama_cpp_fallback: true
+
+  capability_routing:
+    allow_default_fallback: true
+    require_ready_backend: true
+    fallback_scope: any_compatible
+
+  scheduler:
+    max_batch_size: 16
+    max_batch_tokens: 16384
+    min_batch_size: 1
+    batch_accumulation_ms: 2
+
+  tensor_parallel: 1
+  mps_layers: 0
+
+  paged_kv:
+    cpu_pages: 2048
+    eviction: lru
+
+adapters: []
+
+auth:
+  api_keys:
+    - key: dev-key-123
+      scopes: [generate, read, admin]
+  rate_limit_per_minute: 120
+
+logging:
+  level: info
+  format: text

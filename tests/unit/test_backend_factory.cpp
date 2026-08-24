@@ -2,14 +2,14 @@
 
 #include "runtime/backends/backend_factory.h"
 #include "runtime/backends/cuda/cuda_backend.h"
-#include "runtime/backends/cuda/native_cuda_backend.h"
+#include "runtime/backends/cuda/inferflux_cuda_backend.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 
 using namespace inferflux;
 
 namespace {
 
-class MockLoadBackend : public LlamaCPUBackend {
+class MockLoadBackend : public LlamaCppBackend {
 public:
   bool called{false};
 
@@ -25,7 +25,7 @@ public:
 TEST_CASE("LoadModel dispatches virtually through backend interface",
           "[backend_factory]") {
   auto backend = std::make_shared<MockLoadBackend>();
-  std::shared_ptr<LlamaCPUBackend> base = backend;
+  std::shared_ptr<LlamaCppBackend> base = backend;
 
   REQUIRE(base->LoadModel("/tmp/not-used", {}));
   REQUIRE(backend->called);
@@ -35,9 +35,9 @@ TEST_CASE("BackendFactory stores and returns exposure policy",
           "[backend_factory]") {
   BackendFactory::SetExposurePolicy({false, true});
   auto policy = BackendFactory::ExposurePolicy();
-  REQUIRE_FALSE(policy.prefer_native);
+  REQUIRE_FALSE(policy.prefer_inferflux);
   REQUIRE(policy.allow_llama_cpp_fallback);
-  REQUIRE_FALSE(policy.strict_native_request);
+  REQUIRE_FALSE(policy.strict_inferflux_request);
   BackendFactory::SetExposurePolicy({true, true});
 }
 
@@ -47,7 +47,7 @@ TEST_CASE("BackendFactory cpu hint resolves to CPU backend",
   auto selection = BackendFactory::Create("cpu");
 
   REQUIRE(selection.backend != nullptr);
-  REQUIRE(selection.backend_label == "cpu");
+  REQUIRE(selection.backend_label == "llama_cpp_cpu");
   REQUIRE(selection.provider == BackendProvider::kLlamaCpp);
   REQUIRE_FALSE(selection.used_fallback);
   REQUIRE(selection.config.gpu_layers == 0);
@@ -63,17 +63,18 @@ TEST_CASE("BackendFactory cuda hint resolves predictably",
 
 #ifdef INFERFLUX_HAS_CUDA
   REQUIRE(selection.backend != nullptr);
-  REQUIRE(selection.backend_label == "cuda");
-  if (NativeCudaBackend::NativeKernelsReady()) {
+  if (InferfluxCudaBackend::NativeKernelsReady()) {
+    REQUIRE(selection.backend_label == "inferflux_cuda");
     REQUIRE(selection.provider == BackendProvider::kNative);
     REQUIRE_FALSE(selection.used_fallback);
     REQUIRE(selection.fallback_reason.empty());
-    REQUIRE(dynamic_cast<NativeCudaBackend *>(selection.backend.get()) !=
+    REQUIRE(dynamic_cast<InferfluxCudaBackend *>(selection.backend.get()) !=
             nullptr);
   } else {
+    REQUIRE(selection.backend_label == "llama_cpp_cuda");
     REQUIRE(selection.provider == BackendProvider::kLlamaCpp);
     REQUIRE(selection.used_fallback);
-    REQUIRE(selection.fallback_reason.find("native backend unavailable") !=
+    REQUIRE(selection.fallback_reason.find("inferflux backend unavailable") !=
             std::string::npos);
     REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) != nullptr);
   }
@@ -81,52 +82,52 @@ TEST_CASE("BackendFactory cuda hint resolves predictably",
   REQUIRE(selection.capabilities.supports_streaming);
   REQUIRE(selection.capabilities.supports_logprobs);
 #else
-  REQUIRE(selection.backend_label == "cpu");
+  REQUIRE(selection.backend_label == "llama_cpp_cpu");
   REQUIRE(selection.config.gpu_layers == 0);
   REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
 #endif
 }
 
 TEST_CASE(
-    "BackendFactory explicit cuda_llama_cpp hint forces llama.cpp provider",
+    "BackendFactory explicit llama_cpp_cuda hint forces llama.cpp provider",
     "[backend_factory]") {
   BackendFactory::SetExposurePolicy({true, false});
-  auto selection = BackendFactory::Create("cuda_llama_cpp");
+  auto selection = BackendFactory::Create("llama_cpp_cuda");
 
   REQUIRE(selection.provider == BackendProvider::kLlamaCpp);
 #ifdef INFERFLUX_HAS_CUDA
   REQUIRE(selection.backend != nullptr);
-  REQUIRE(selection.backend_label == "cuda");
+  REQUIRE(selection.backend_label == "llama_cpp_cuda");
   REQUIRE_FALSE(selection.used_fallback);
   REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) != nullptr);
 #else
   REQUIRE(selection.backend != nullptr);
-  REQUIRE(selection.backend_label == "cpu");
+  REQUIRE(selection.backend_label == "llama_cpp_cpu");
   REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
 #endif
 
   BackendFactory::SetExposurePolicy({true, true});
 }
 
-TEST_CASE("BackendFactory explicit cuda_native hint uses native or "
+TEST_CASE("BackendFactory explicit inferflux_cuda hint uses native or "
           "deterministic fallback",
           "[backend_factory]") {
   BackendFactory::SetExposurePolicy({false, true});
-  auto selection = BackendFactory::Create("cuda_native");
+  auto selection = BackendFactory::Create("inferflux_cuda");
 
 #ifdef INFERFLUX_HAS_CUDA
-  if (NativeCudaBackend::NativeKernelsReady()) {
+  if (InferfluxCudaBackend::NativeKernelsReady()) {
     REQUIRE(selection.provider == BackendProvider::kNative);
     REQUIRE(selection.backend != nullptr);
-    REQUIRE(selection.backend_label == "cuda");
-    REQUIRE(dynamic_cast<NativeCudaBackend *>(selection.backend.get()) !=
+    REQUIRE(selection.backend_label == "inferflux_cuda");
+    REQUIRE(dynamic_cast<InferfluxCudaBackend *>(selection.backend.get()) !=
             nullptr);
     REQUIRE_FALSE(selection.used_fallback);
     REQUIRE(selection.fallback_reason.empty());
   } else {
     REQUIRE(selection.provider == BackendProvider::kLlamaCpp);
     REQUIRE(selection.backend != nullptr);
-    REQUIRE(selection.backend_label == "cuda");
+    REQUIRE(selection.backend_label == "llama_cpp_cuda");
     REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) != nullptr);
     REQUIRE(selection.used_fallback);
     REQUIRE(selection.fallback_reason.find("explicitly requested") !=
@@ -135,7 +136,7 @@ TEST_CASE("BackendFactory explicit cuda_native hint uses native or "
 #else
   REQUIRE(selection.provider == BackendProvider::kLlamaCpp);
   REQUIRE(selection.backend != nullptr);
-  REQUIRE(selection.backend_label == "cpu");
+  REQUIRE(selection.backend_label == "llama_cpp_cpu");
   REQUIRE(dynamic_cast<CudaBackend *>(selection.backend.get()) == nullptr);
   REQUIRE(selection.used_fallback);
   REQUIRE(selection.fallback_reason.find("explicitly requested") !=
@@ -144,22 +145,22 @@ TEST_CASE("BackendFactory explicit cuda_native hint uses native or "
 }
 
 TEST_CASE(
-    "BackendFactory strict native policy rejects explicit cuda_native when"
+    "BackendFactory strict inferflux policy rejects explicit inferflux_cuda when"
     " native kernels are not ready",
     "[backend_factory]") {
-  if (NativeCudaBackend::NativeKernelsReady()) {
+  if (InferfluxCudaBackend::NativeKernelsReady()) {
     SUCCEED("native kernels ready; strict rejection no longer applies");
     return;
   }
 
   BackendFactory::SetExposurePolicy({true, true, true});
-  auto selection = BackendFactory::Create("cuda_native");
+  auto selection = BackendFactory::Create("inferflux_cuda");
 
   REQUIRE(selection.provider == BackendProvider::kNative);
   REQUIRE(selection.backend == nullptr);
   REQUIRE(selection.fallback_reason.find("backend_policy_violation") !=
           std::string::npos);
-  REQUIRE(selection.fallback_reason.find("strict_native_request") !=
+  REQUIRE(selection.fallback_reason.find("strict_inferflux_request") !=
           std::string::npos);
 
   BackendFactory::SetExposurePolicy({true, true, false});
@@ -172,11 +173,15 @@ TEST_CASE("BackendFactory auto hint follows compiled accelerators",
 
   REQUIRE(selection.backend != nullptr);
 #ifdef INFERFLUX_HAS_CUDA
-  REQUIRE(selection.backend_label == "cuda");
+  if (InferfluxCudaBackend::NativeKernelsReady()) {
+    REQUIRE(selection.backend_label == "inferflux_cuda");
+  } else {
+    REQUIRE(selection.backend_label == "llama_cpp_cuda");
+  }
 #elif INFERFLUX_HAS_MLX
   REQUIRE(selection.backend_label == "mlx");
 #else
-  REQUIRE(selection.backend_label == "cpu");
+  REQUIRE(selection.backend_label == "llama_cpp_cpu");
 #endif
 }
 
@@ -189,7 +194,7 @@ TEST_CASE("MergeBackendConfig disables accelerator-only flags on CPU",
   defaults.flash_attention_tile = 64;
 
   BackendFactoryResult selection;
-  selection.backend = std::make_shared<LlamaCPUBackend>();
+  selection.backend = std::make_shared<LlamaCppBackend>();
   selection.backend_label = "cpu";
   selection.config.gpu_layers = 0;
 
@@ -210,7 +215,7 @@ TEST_CASE("MergeBackendConfig applies CUDA defaults when unset",
   BackendFactoryResult selection;
   selection.target = LlamaBackendTarget::kCuda;
   selection.traits = DescribeLlamaBackendTarget(selection.target);
-  selection.backend = std::make_shared<LlamaCPUBackend>();
+  selection.backend = std::make_shared<LlamaCppBackend>();
   selection.backend_label = "cuda";
   selection.config.gpu_layers = 99;
   selection.config.flash_attention_tile = 128;
@@ -232,7 +237,7 @@ TEST_CASE("MergeBackendConfig keeps flash attention for MPS target",
   BackendFactoryResult selection;
   selection.target = LlamaBackendTarget::kMps;
   selection.traits = DescribeLlamaBackendTarget(selection.target);
-  selection.backend = std::make_shared<LlamaCPUBackend>();
+  selection.backend = std::make_shared<LlamaCppBackend>();
   selection.backend_label = "mps";
 
   auto merged = MergeBackendConfig(defaults, selection);
@@ -320,13 +325,15 @@ TEST_CASE("BackendFactory can disable llama.cpp fallback for native policy",
   BackendFactory::SetExposurePolicy({true, false});
   auto selection = BackendFactory::Create("cuda");
 
-  if (NativeCudaBackend::NativeKernelsReady()) {
+  if (InferfluxCudaBackend::NativeKernelsReady()) {
     REQUIRE(selection.provider == BackendProvider::kNative);
     REQUIRE(selection.backend != nullptr);
+    REQUIRE(selection.backend_label == "inferflux_cuda");
     REQUIRE(selection.fallback_reason.empty());
   } else {
     REQUIRE(selection.provider == BackendProvider::kNative);
     REQUIRE(selection.backend == nullptr);
+    REQUIRE(selection.backend_label == "inferflux_cuda");
     REQUIRE(selection.fallback_reason.find("fallback disabled") !=
             std::string::npos);
   }
@@ -349,7 +356,27 @@ TEST_CASE("BackendFactory NormalizeHintList deduplicates and falls back",
 
 TEST_CASE("BackendFactory NormalizeHint keeps explicit provider hints",
           "[backend_factory]") {
-  REQUIRE(BackendFactory::NormalizeHint("CUDA_NATIVE") == "cuda_native");
-  REQUIRE(BackendFactory::NormalizeHint("CUDA_LLAMA_CPP") == "cuda_llama_cpp");
-  REQUIRE(BackendFactory::NormalizeHint("cuda_llama") == "cuda_llama");
+  REQUIRE(BackendFactory::NormalizeHint("INFERFLUX_CUDA") ==
+          "inferflux_cuda");
+  REQUIRE(BackendFactory::NormalizeHint("LLAMA_CPP_CUDA") ==
+          "llama_cpp_cuda");
+}
+
+TEST_CASE("BackendFactory NormalizeHint canonicalizes legacy aliases",
+          "[backend_factory]") {
+  REQUIRE(BackendFactory::NormalizeHint("CUDA_NATIVE") == "inferflux_cuda");
+  REQUIRE(BackendFactory::NormalizeHint("NATIVE_CUDA") == "inferflux_cuda");
+  REQUIRE(BackendFactory::NormalizeHint("CUDA_LLAMA_CPP") == "llama_cpp_cuda");
+  REQUIRE(BackendFactory::NormalizeHint("cuda_llama") == "llama_cpp_cuda");
+}
+
+TEST_CASE("BackendFactory provider labels are canonical", "[backend_factory]") {
+  REQUIRE(BackendFactory::ProviderLabel(BackendProvider::kNative) ==
+          "inferflux");
+  REQUIRE(BackendFactory::ProviderLabel(BackendProvider::kLlamaCpp) ==
+          "llama_cpp");
+  REQUIRE(BackendFactory::ParseProviderLabel("inferflux") ==
+          BackendProvider::kNative);
+  REQUIRE(BackendFactory::ParseProviderLabel("llama_cpp") ==
+          BackendProvider::kLlamaCpp);
 }

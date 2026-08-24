@@ -1,6 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "server/metrics/metrics.h"
 
 using namespace inferflux;
@@ -36,7 +36,7 @@ TEST_CASE("LlamaBackendConfig: flash_attention_tile can be customised",
 }
 
 // ---------------------------------------------------------------------------
-// LlamaCPUBackend::FlashAttentionEnabled()
+// LlamaCppBackend::FlashAttentionEnabled()
 // ---------------------------------------------------------------------------
 
 TEST_CASE(
@@ -44,7 +44,7 @@ TEST_CASE(
     "[flash_attn]") {
   // config_ is default-initialised (use_flash_attention=false) before LoadModel
   // is called.
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   REQUIRE_FALSE(backend.FlashAttentionEnabled());
 }
 

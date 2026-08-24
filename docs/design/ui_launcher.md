@@ -1,48 +1,51 @@
-# UI Launcher & Embedded WebUI Design Brief
+# UI Launcher and Embedded WebUI
 
-> Goal: deliver an Ollama-class local experience without sacrificing InferFlux’s server-centric roadmap. Scope covers the desktop launcher (litehtml-based WebView), `/ui` SPA, installer quickstart, and CLI polish.
+**Snapshot date:** March 9, 2026  
+**Status:** partial implementation, not yet a full desktop product
 
-## Objectives
+## 1) Current Shape
 
-1. **Single-binary launcher** — ship `inferfluxd` with an optional embedded WebView (litehtml/Ultralight). Users double-click or run `inferfluxd --ui` and get a native window plus the REST API.
-2. **Shared `/ui` SPA** — serve the same React/Svelte bundle over HTTP so remote operators can open `http://host:8080/ui` in a browser.
-3. **Quickstart workflow** — `inferctl quickstart llama3` writes config/server.yaml, pulls the model, and launches the UI.
-4. **Installers & CLI polish** — brew/winget/tarball packages with shell completions; CLI gains `chat`, `serve`, `profile` commands.
+```mermaid
+flowchart LR
+    A[ENABLE_WEBUI=ON] --> B[/ui served by inferfluxd]
+    C[inferctl serve --ui] --> D[passes compatibility flag]
+    B --> E[litehtml-based renderer + embedded assets]
+```
 
-## Task Breakdown
+## 2) Current Code Reality
 
-### 1. WebUI + litehtml Shell
-- [ ] Add `ENABLE_WEBUI` CMake option (default OFF). When ON:
-  - Embed litehtml (or Ultralight) into `inferfluxd`.
-  - Serve static assets from `resources/ui/` via `/ui` and load them in the WebView.
-- [ ] Implement `--ui` flag that opens a native window hosting the WebView; expose reload/devtools shortcuts for development.
-- [ ] SPA requirements:
-  - Chat playground (model selection, streaming output).
-  - Metrics dashboard (Prometheus snapshot, health status).
-  - Settings page (config editor, model pull button).
+| Area | Current state |
+|---|---|
+| Build flag | `ENABLE_WEBUI` exists in CMake |
+| Server route | `/ui` is served when the feature is compiled in |
+| Renderer | embedded HTML/CSS/JS are rendered through the litehtml-based UI renderer |
+| `--ui` flag | accepted for compatibility, but currently a runtime no-op rather than a native desktop window |
+| Quickstart | `inferctl quickstart` scaffolds config and backend choice; `inferctl serve --ui` forwards the UI flag |
 
-### 2. Installer & Quickstart
-- [ ] Brew formula / winget manifest / tarball with shell completions.
-- [ ] `inferctl quickstart <model>`:
-  - Detect GPU vs CPU profile.
-  - Write config (port, auth, storage paths).
-  - Pull model via `inferctl pull`.
-  - Launch `inferfluxd --ui`.
-- [ ] Document Docker one-liner (`docker run inferflux --ui`).
+## 3) What Is Not Shipped Yet
 
-### 3. CLI Enhancements
-- [ ] `inferctl serve --profile cpu-laptop` (reads preset config).
-- [ ] `inferctl chat --model <id>` (simple REPL, uses same API as UI).
-- [ ] `inferctl models list/pull/remove` parity with `/v1/models`.
+| Not shipped | Why it matters |
+|---|---|
+| Native desktop launcher window | Current implementation is browser-served UI, not a packaged desktop shell |
+| Full settings/metrics/operator console | `/ui` exists, but this is not yet a complete local-product experience |
+| Installer-grade packaging story | Still separate from the core runtime contract work |
 
-### 4. Docs & Support
-- [ ] Update Quickstart guide with screenshots of the new UI + installer steps.
-- [ ] Add troubleshooting FAQ (port conflicts, missing GPU drivers, auth errors).
-- [ ] Add telemetry docs (what the UI reports locally, opt-in/out).
+## 4) Design Rules
 
-## Open Questions
-- Hosting strategy (single binary vs sidecar process?) – decision pending.
-- Authentication UX: should the UI prompt for API key or auto-inject local token?
-- Packaging assets: bundle SPA into the binary vs load from disk?
+1. `/ui` should remain a thin layer over the existing authenticated API surface.
+2. UI work must not fork the control plane or introduce hidden server-only semantics.
+3. Desktop packaging is secondary to keeping the API/runtime contracts stable.
 
-Keep this document updated as tasks land; cross-link from the Ease of Local Setup scorecard entry.
+## 5) Next Gates
+
+| Priority | Gate |
+|---|---|
+| P1 | Expand `/ui` only through the existing API/admin contracts |
+| P2 | Decide whether a native launcher window is worth the maintenance cost |
+| P2 | Revisit installer and local-product polish after runtime foundations are stronger |
+
+## 6) Related Docs
+
+- [../API_SURFACE](../API_SURFACE.md)
+- [../Quickstart](../Quickstart.md)
+- [../Installer](../Installer.md)

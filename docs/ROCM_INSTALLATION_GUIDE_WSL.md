@@ -1,340 +1,184 @@
-# ROCm Installation Guide for WSL2
+# ROCm Development on WSL2
 
-## ⚠️ Critical WSL2 Limitation
+Verified on: Ubuntu 24.04 (Noble), WSL2 kernel 5.15.167.4, ROCm 7.2, AMD Radeon AI PRO R9700 (gfx1201/RDNA 4).
 
-**Important:** **ROCm/AMD GPUs DO NOT WORK directly in WSL2!**
+## Prerequisites
 
-WSL2 uses Windows' GPU drivers, which means:
-- ✅ NVIDIA GPUs work (through Windows CUDA drivers)
-- ❌ AMD GPUs do NOT work (no WDDM bridge for ROCm)
+### Windows Side
 
-**Your Options:**
-1. **Native Linux** (recommended) - Install Linux directly on hardware
-2. **Docker** - Use ROCm Docker containers
-3. **Cloud** - Rent AMD GPUs on Vast.ai/Lambda Labs
+1. **Windows 11 23H2 or later** (required for AMD GPU passthrough to WSL2)
+2. **AMD Adrenalin driver** with WSL2 support installed on Windows
+   - Download from AMD's driver page for your GPU
+   - The driver must include the WSL2/DirectX 12 compute bridge
 
----
+### WSL2 Distro
 
-## 🐧 Option 1: Native Linux (Recommended for AMD GPUs)
-
-### **For Ubuntu 22.04 on AMD Hardware:**
+Ubuntu 24.04 is the tested baseline. Other distros may work but package names will differ.
 
 ```bash
-#!/bin/bash
-# ROCm Installation on Native Linux
+# Confirm you're on WSL2 (not WSL1)
+uname -r
+# Should show: 5.15.x-microsoft-standard-WSL2 or newer
+```
 
-# 1. Update system
-sudo apt update && sudo apt upgrade -y
+## Step 1: Install ROCm 7.x
 
-# 2. Install dependencies
-sudo apt install -y wget software-properties-common
+AMD provides a WSL2-specific HSA runtime package (`hsa-runtime-rocr4wsl-amdgpu`) that
+allows GPU access without `/dev/kfd`. Standard ROCm Docker containers will NOT work
+in WSL2 because they require `/dev/kfd`.
 
-# 3. Download ROCm repository key
-wget -q -O - https://repo.radeon.com/amdgpu-install/22.04/amdgpu-install_6.0.60000-1_all.deb
-# Replace 6.0.60000 with latest version
+```bash
+# Add the ROCm apt repository (Ubuntu 24.04 / Noble)
+sudo mkdir -p /etc/apt/keyrings
+wget -q -O - https://repo.radeon.com/rocm/rocm.gpg.key | \
+  gpg --dearmor | sudo tee /etc/apt/keyrings/rocm.gpg > /dev/null
 
-# 4. Install ROCm repository
-sudo dpkg -i amdgpu-install_*.deb
+echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] \
+  https://repo.radeon.com/rocm/apt/7.2 noble main" | \
+  sudo tee /etc/apt/sources.list.d/rocm.list
 
-# 5. Update package lists
 sudo apt update
+```
 
-# 6. Install ROCm packages
+### Minimum packages (build InferFlux with ROCm)
+
+```bash
 sudo apt install -y \
-  rocm-libs \
-  rocm-hip-dev \
-  rocm-hip-runtime \
-  rocblas-dev \
-  rocblas-runtime \
+  rocm-core \
   hip-dev \
-  hip-runtime \
-  rocm-dev \
-  rocm-utils
+  hip-runtime-amd \
+  hipcc \
+  hipblas \
+  hipblas-dev \
+  rocblas \
+  rocblas-dev \
+  hsa-rocr-dev \
+  hsa-runtime-rocr4wsl-amdgpu \
+  rocm-device-libs \
+  rocminfo
+```
 
-# 7. Verify installation
+### Full developer toolkit (profiling, all math libs)
+
+```bash
+sudo apt install -y \
+  rocm \
+  rocm-developer-tools \
+  rocprofiler \
+  rocprofiler-sdk \
+  roctracer-dev \
+  miopen-hip-dev \
+  rccl-dev \
+  rocfft-dev \
+  rocsolver-dev \
+  rocsparse-dev \
+  hipfft-dev \
+  hipsparse-dev \
+  hipsolver-dev
+```
+
+### Environment setup
+
+Add to your `~/.bashrc` or `~/.zshrc`:
+
+```bash
+export ROCM_PATH=/opt/rocm
+export HIP_PATH=/opt/rocm
+export PATH=/opt/rocm/bin:$PATH
+export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+```
+
+Then `source ~/.bashrc`.
+
+## Step 2: Verify GPU Access
+
+```bash
+# Should list your AMD GPU (e.g., gfx1201 for R9700)
+rocminfo | grep -E "Name:|Marketing Name:|Device Type:"
+
+# Should report HIP version and device count
 hipcc --version
-rocminfo | head -20
+hipconfig --full
+```
 
-# 8. Set environment variables
-echo 'export PATH=$ROCM_PATH/bin:$PATH' >> ~/.bashrc
-echo 'export LD_LIBRARY_PATH=$ROCM_PATH/lib:$LD_LIBRARY_PATH' >> ~/.bashrc
-echo 'export HIP_PATH=$ROCM_PATH' >> ~/.bashrc
-source ~/.bashrc
+Expected output (R9700 example):
 
-# 9. Test HIP compilation
-cat > test_hip.cpp << 'EOF'
+```
+  Name:                    gfx1201
+  Marketing Name:          AMD Radeon AI PRO R9700
+  Device Type:             GPU
+```
+
+### Quick HIP compile test
+
+```bash
+cat > /tmp/test_hip.cpp << 'EOF'
 #include <hip/hip_runtime.h>
-#include <iostream>
+#include <cstdio>
 
-int main() {
-    int deviceCount = 0;
-    hipGetDeviceCount(&deviceCount);
-    std::cout << "Found " << deviceCount << " HIP devices" << std::endl;
-
-    if (deviceCount > 0) {
-        hipDeviceProp_t prop;
-        hipGetDeviceProperties(&prop, 0);
-        std::cout << "Device 0: " << prop.name << std::endl;
-        std::cout << "Arch: " << prop.gcnArchName << std::endl;
-        std::cout << "Memory: " << (prop.totalGlobalMem / 1024 / 1024) << " MB" << std::endl;
-    }
-
-    return 0;
-}
-EOF
-
-hipcc test_hip.cpp -o test_hip
-./test_hip
-
-echo "✅ ROCm installation complete!"
-```
-
----
-
-## 🐳 Option 2: Docker (Best for WSL2)
-
-### **Using ROCm Docker Containers:**
-
-Since WSL2 doesn't support AMD GPUs directly, Docker is your best option.
-
-```bash
-# 1. Install Docker in WSL2
-sudo apt update && sudo apt install -y docker.io
-sudo usermod -aG docker $USER
-
-# Log out and back in for group change to take effect
-
-# 2. Pull ROCm Docker image
-docker pull rocm/dev-ubuntu-22.04:latest
-
-# 3. Run container with GPU passthrough
-# Note: This requires Windows AMD GPU with proper WDDM 2.1 driver
-docker run -it --device=/dev/kfd --device=/dev/driD \
-  --group-add video \
-  rocm/dev-ubuntu-22.04:latest bash
-
-# Inside container:
-#   - ROCm is pre-installed
-#   - Build InferFlux with ROCm support
-#   - Test AMD GPU inference
-```
-
-### **Docker Compose for Development:**
-
-```yaml
-# docker-compose.yml
-version: '3'
-services:
-  inferflux-rocm:
-    image: rocm/dev-ubuntu-22.04:latest
-    container_name: inferflux-rocm
-    volumes:
-      - ./:/workspace
-    working_dir: /workspace
-    devices:
-      - /dev/kfd
-      - /dev/driD
-    group_add:
-      - video
-    environment:
-      - ROCM_PATH=/opt/rocm
-      - PATH=/opt/rocm/bin:$PATH
-    command: bash
-    stdin_open: true
-    tty: true
-
-# Run:
-# docker-compose up
-# docker-compose exec inferflux-rocm bash
-```
-
----
-
-## ☁️ Option 3: Cloud AMD GPUs (Easiest for Testing)
-
-### **Vast.ai (Recommended for Testing)**
-
-```bash
-#!/bin/bash
-# Vast.ai AMD GPU Rental for ROCm Testing
-
-# 1. Search for AMD GPUs with ROCm
-# Visit: https://vast.ai
-# Filter: GPU=MI300X or MI250X
-# Filter: rocm_version >= 6.1
-# Sort by: Price (low to high)
-
-# 2. Rent instance
-# Expected price: $2-5/hour for MI300X
-
-# 3. Connect via SSH
-ssh ubuntu@<instance-ip>
-
-# 4. Verify ROCm installation
-hipcc --version
-rocminfo
-
-# 5. Clone and build InferFlux
-git clone https://github.com/your-repo/inferflux.git
-cd inferflux
-
-# 6. Build with ROCm support
-cmake -DENABLE_ROCM=ON -B build
-cmake --build build -j$(nproc)
-
-# 7. Run server
-./build/inferfluxd --config config/server.rocm.yaml
-
-# 8. Test FlashAttention
-curl -X POST http://localhost:8080/v1/completions \
-  -H "Authorization: Bearer dev-key-123" \
-  -d '{"prompt": "Test ROCm FlashAttention", "max_tokens": 50}'
-
-# 9. Check metrics
-curl -s http://localhost:8080/metrics \
-  -H "Authorization: Bearer dev-key-123" | grep flash_attention
-
-# 10. Destroy instance when done!
-# (Remember to destroy or you'll keep getting charged)
-```
-
-### **Lambda Labs (More Expensive but Reliable)**
-
-```bash
-# Lambda Labs doesn't have AMD GPUs yet
-# They only have NVIDIA GPUs
-# For AMD GPU testing, use Vast.ai
-```
-
----
-
-## 🔍 Option 4: Check if You Have AMD GPU on Windows
-
-Before proceeding, verify your hardware:
-
-```powershell
-# In Windows PowerShell (as Administrator):
-
-# Check for NVIDIA GPUs
-Get-WmiObject Win32_VideoController | Select-Object Name, DriverVersion
-
-# Check for AMD GPUs
-# Note: Windows Device Manager will show AMD GPUs
-# But they may not be accessible from WSL2
-```
-
-**If you have AMD GPU in Windows:**
-- ❌ WSL2 cannot access it directly
-- ✅ Docker might work with WDDM 2.1
-- ✅ Native Linux is best option
-
----
-
-## 📋 Quick Decision Tree
-
-```
-Do you have AMD GPU hardware?
-├─ YES → Install native Linux (Ubuntu 22.04)
-│       Install ROCm using script above
-│       Build InferFlux with -DENABLE_ROCM=ON
-│       Test locally
-│
-├─ NO → Rent AMD GPU on Vast.ai
-│       Most cost-effective for testing
-│       Hourly rentals ($2-5/hour)
-│       No long-term commitment
-│
-└─ CANNOT USE WSL2 → AMD GPUs don't work in WSL2
-    Use native Linux or cloud
-```
-
----
-
-## 🎯 My Recommendation
-
-### **For Development/Testing:**
-**Rent on Vast.ai**
-- Cheapest option ($2-5/hour for MI300X)
-- No setup required
-- Pay only for what you use
-- Perfect for testing ROCm backend
-
-### **For Production:**
-**Native Linux with AMD GPU**
-- Best performance
-- Full control
-- No cloud overhead
-- Suitable for long-running workloads
-
-### **For WSL2 Development:**
-**Docker with ROCm image**
-- Works in WSL2 environment
-- Pre-configured ROCm
-- Easy setup
-- May have GPU passthrough limitations
-
----
-
-## 🔧 Verification Commands
-
-### **After Installation (Native Linux):**
-
-```bash
-# Verify ROCm installation
-which hipcc
-hipcc --version
-
-# Check GPU detection
-rocminfo
-
-# Test basic HIP compilation
-cat > test.cpp << 'EOF'
-#include <hip/hip_runtime.h>
 int main() {
     int count = 0;
     hipGetDeviceCount(&count);
+    printf("HIP devices: %d\n", count);
+    for (int i = 0; i < count; i++) {
+        hipDeviceProp_t prop;
+        hipGetDeviceProperties(&prop, i);
+        printf("  [%d] %s  arch=%s  mem=%zu MB\n",
+               i, prop.name, prop.gcnArchName,
+               prop.totalGlobalMem / (1024 * 1024));
+    }
     return count > 0 ? 0 : 1;
 }
 EOF
-hipcc test.cpp -o test && ./test
 
-# Test llama.cpp ROCm support
-cd external/llama.cpp
-cmake -DGGML_HIP=ON -B build
-ls -la build/ggml/src/ggml-hip/
+hipcc /tmp/test_hip.cpp -o /tmp/test_hip && /tmp/test_hip
 ```
 
-### **After Build (Verify InferFlux):**
+## Step 3: Build InferFlux with ROCm
 
 ```bash
-# Check if ROCm backend was built
-ldd build/libinferflux_core.so | grep -i hip
+cd /path/to/inferflux
 
-# Check build configuration
-grep -i "rocm\|hip" build/CMakeCache.txt
+# Init submodules (llama.cpp)
+git submodule update --init --recursive
 
-# Verify INFERFLUX_HAS_ROCM is defined
-strings build/libinferflux_core.so | grep INFERFLUX_HAS_ROCM
+# Configure with ROCm enabled, other GPU backends off
+cmake -S . -B build \
+  -DENABLE_ROCM=ON \
+  -DENABLE_CUDA=OFF \
+  -DENABLE_MPS=OFF \
+  -DENABLE_VULKAN=OFF
+
+# Build (uses all cores)
+cmake --build build -j$(nproc)
 ```
 
----
+### Verify the build linked HIP
 
-## 📝 Configuration File
+```bash
+# Should show libamdhip64 linkage
+ldd build/inferfluxd | grep -i hip
 
-Create `config/server.rocm.yaml`:
+# Check CMake detected ROCm
+grep -i "INFERFLUX_HAS_ROCM\|hip_FOUND" build/CMakeCache.txt
+```
+
+## Step 4: Run the Server
+
+Use the ROCm config or create one:
+
+```bash
+# Copy and adjust the provided ROCm config
+cp config/server.cuda.yaml config/server.rocm.yaml
+```
+
+Edit `config/server.rocm.yaml` — key fields:
 
 ```yaml
 server:
   host: 0.0.0.0
   http_port: 8080
-  max_concurrent: 1024
   enable_metrics: true
-
-model:
-  repo: TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF
-  path: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
-  format: gguf
-  quantization: q4_k_m
 
 models:
   - id: tinyllama
@@ -348,103 +192,147 @@ runtime:
   rocm:
     enabled: true
     flash_attention:
-      enabled: true
-      tile_size: 128
-    device_id: 0  # Which AMD GPU to use
+      enabled: true   # FA2 supported on gfx9/10/11/12
+    device_id: 0
 ```
 
----
-
-## 🚀 Quick Start (With AMD GPU Access)
+Start the server:
 
 ```bash
-# 1. Build with ROCm support
-cmake -DENABLE_ROCM=ON -S . -B build
-cmake --build build --target inferflux_core -j
-
-# 2. Run server
 ./build/inferfluxd --config config/server.rocm.yaml
+```
 
-# 3. Make test request
-curl -X POST http://localhost:8080/v1/completions \
+Test it:
+
+```bash
+curl -s http://localhost:8080/v1/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer dev-key-123" \
-  -d '{
-    "prompt": "Hello from AMD ROCm!",
-    "max_tokens": 50,
-    "model": "tinyllama"
-  }'
-
-# 4. Check FlashAttention metrics
-curl -s http://localhost:8080/metrics \
-  -H "Authorization: Bearer dev-key-123" | grep flash_attention
+  -d '{"prompt": "Hello from ROCm!", "max_tokens": 20, "model": "tinyllama"}'
 ```
 
----
+## Step 5: Run Tests
 
-## 💡 Cost Comparison
-
-| Option | Setup Time | Hourly Cost | Best For |
-|--------|------------|------------|----------|
-| Vast.ai MI300X | 5 min | $2-5 | Testing/Development |
-| Lambda Labs | N/A | N/A | Not available |
-| Native Linux | 2-4 hours | $0 (hardware cost) | Production |
-| Docker WSL2 | 30 min | $0 | Development (if GPU passthrough works) |
-
----
-
-## ⚠️ Troubleshooting
-
-### **"ROCm not found" error:**
 ```bash
-# Check if ROCm is installed
-dpkg -l | grep rocm
+# Unit tests
+ctest --test-dir build --output-on-failure
 
-# Check ROCm path
-echo $ROCM_PATH
-
-# Add to PATH if needed
-export ROCm_PATH=/opt/rocm
+# Smoke tests (no model required)
+bash scripts/smoke.sh gguf-native
+bash scripts/smoke.sh backend-identity
 ```
 
-### **"No HIP devices found":**
-```bash
-# Check for AMD GPUs
-lspci | grep -i vga
+## WSL2-Specific Notes
 
-# Check if kernel recognizes GPU
-dmesg | grep -i amdgpu
+### No `/dev/kfd` — This Is Normal
 
-# Verify HIP driver
-hipconfig --list
+WSL2 uses a paravirtualized GPU path through the Windows display driver, not the
+native Linux `amdgpu` kernel module. The HSA runtime communicates with the GPU
+through `/dev/dri/renderD128` and Windows' DirectX compute bridge. This means:
+
+- `rocminfo` works (uses HSA runtime)
+- `hipcc` compilation works
+- HIP runtime API works (`hipGetDeviceCount`, kernel launches, etc.)
+- `/dev/kfd` does NOT exist — this is expected
+- `rocm-smi` may show errors about missing `amdgpu` module — ignore these
+- `dmesg | grep amdgpu` will be empty — the kernel module is not loaded
+
+### Docker Does NOT Work for ROCm in WSL2
+
+Standard ROCm Docker containers (`rocm/dev-ubuntu-*`) require `/dev/kfd` for GPU
+access. Since WSL2 doesn't expose `/dev/kfd`, containers cannot see the GPU.
+Build and run natively in WSL2 instead.
+
+### Performance Expectations
+
+WSL2 adds a small overhead vs bare-metal Linux due to the paravirtualized GPU path.
+For inference workloads this is typically <5%. Profiling tools (`rocprof`, `omniperf`)
+may not work reliably — use bare-metal Linux for serious profiling.
+
+### Memory
+
+The WSL2 VM has a default memory limit (usually 50% of host RAM). If you're loading
+large models, increase it in `%UserProfile%\.wslconfig`:
+
+```ini
+[wsl2]
+memory=32GB
+swap=8GB
 ```
 
-### **"Build errors about missing hip/roc:**
-```bash
-# Install missing dependencies
-sudo apt install -y rocm-dev rocm-hip-dev rocblas-dev
+Then restart WSL: `wsl --shutdown` from PowerShell.
 
-# Reconfigure CMake
+## Supported AMD GPUs
+
+The InferFlux ROCm backend supports FlashAttention-2 on these architectures:
+
+| Architecture | GPUs | FA2 Support |
+|-------------|------|-------------|
+| GFX9 (CDNA/Vega) | MI200, MI250X, MI300X | Yes |
+| GFX10 (RDNA 2) | RX 6000 series | Yes |
+| GFX11 (RDNA 3) | RX 7000 series | Yes |
+| GFX12 (RDNA 4) | RX 9000 series, Radeon AI PRO | Yes |
+
+For GFX12 (RDNA 4) GPUs, you may need to set `HSA_OVERRIDE_GFX_VERSION` if the
+ROCm version doesn't yet have native gfx1201 support:
+
+```bash
+export HSA_OVERRIDE_GFX_VERSION=12.0.0
+```
+
+## Troubleshooting
+
+### `rocminfo` shows "ROCk module is NOT loaded"
+
+This warning appears because the `amdgpu` kernel module isn't loaded in WSL2.
+If `rocminfo` still lists your GPU after the warning, it's working via the WSL2
+HSA bridge. If no GPU appears, check that:
+
+1. Your Windows AMD driver supports WSL2
+2. The `hsa-runtime-rocr4wsl-amdgpu` package is installed
+3. You're on Windows 11 23H2+
+
+### CMake says "ENABLE_ROCM=ON but ROCm toolkit not found"
+
+```bash
+# Ensure ROCm is on your PATH
+export ROCM_PATH=/opt/rocm
+export CMAKE_PREFIX_PATH=/opt/rocm:$CMAKE_PREFIX_PATH
+
+# Verify hip cmake config exists
+ls /opt/rocm/lib/cmake/hip/
+
+# Clean and reconfigure
 rm -rf build
-cmake -DENABLE_ROCM=ON -S . -B build
+cmake -S . -B build -DENABLE_ROCM=ON -DENABLE_CUDA=OFF
 ```
 
----
+### HIP compilation errors about unsupported architecture
 
-## 🎯 Summary
+For newer GPUs (gfx1201, etc.) that your ROCm version doesn't fully support:
 
-**WSL2 cannot directly access AMD GPUs.** Your options:
+```bash
+# Override the target architecture
+export HIP_ARCHS="gfx1200"
+# Or set the HSA override
+export HSA_OVERRIDE_GFX_VERSION=12.0.0
+```
 
-1. **Best for Testing:** Rent on Vast.ai ($2-5/hour)
-2. **Best for Development:** Native Linux installation
-3. **Possible for WSL2:** Docker (may have limitations)
+### Build fails linking against hipBLAS/rocBLAS
 
-**Recommendation:** Use Vast.ai for testing ROCm backend - it's cheapest and easiest way to access AMD GPUs for development.
+```bash
+sudo apt install -y hipblas-dev rocblas-dev
+# Verify libraries exist
+ls /opt/rocm/lib/libhipblas.so /opt/rocm/lib/librocblas.so
+```
 
-**Timeline:**
-- Setup on Vast.ai: 5 minutes
-- Build & Test: 1-2 hours
-- Destroy when done: 1 minute
-- **Total cost: ~$5-15 for a full testing session**
+### Poor performance or hangs
 
-Would you like me to help you with any of these installation options?
+```bash
+# Check GPU utilization
+rocm-smi  # May error in WSL2, try:
+cat /sys/class/drm/card0/device/gpu_busy_percent 2>/dev/null
+
+# Reduce context size if OOM
+# In server config: runtime.rocm.context_size: 2048
+```

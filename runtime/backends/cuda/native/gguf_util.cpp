@@ -465,7 +465,8 @@ GGUF::TensorType StringToTensorType(const std::string &str) {
       {"q2_k", GGUF::TensorType::Q2_K}, {"q3_k", GGUF::TensorType::Q3_K},
       {"q4_k", GGUF::TensorType::Q4_K}, {"q4_k_m", GGUF::TensorType::Q4_K},
       {"q5_k", GGUF::TensorType::Q5_K}, {"q5_k_m", GGUF::TensorType::Q5_K},
-      {"q6_k", GGUF::TensorType::Q6_K}, {"q8_k", GGUF::TensorType::Q8_K},
+      {"q6_k", GGUF::TensorType::Q6_K}, {"q6_k_m", GGUF::TensorType::Q6_K},
+      {"q8_k", GGUF::TensorType::Q8_K}, {"q8_k_m", GGUF::TensorType::Q8_K},
   };
 
   auto it = map.find(str);

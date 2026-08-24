@@ -18,7 +18,7 @@
 
 namespace inferflux {
 
-class LlamaCPUBackend;
+class LlamaCppBackend;
 
 // A rank in an EP group: identifies which experts [expert_start, expert_end)
 // this worker is responsible for.

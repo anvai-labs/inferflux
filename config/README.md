@@ -32,7 +32,7 @@ Choose a config based on your hardware and model format:
 ### server.cuda.yaml
 **CUDA configuration for GGUF models (recommended)**
 
-- Backend: `cuda_llama_cpp` (llama.cpp)
+- Backend: `llama_cpp_cuda` (llama.cpp)
 - Flash Attention: **Enabled** (Rule 2)
 - Phase Overlap: **Enabled** (Rule 4)
 - Batch Size: 32 (for 1-3B models)
@@ -45,7 +45,7 @@ Choose a config based on your hardware and model format:
 ### server.cuda.safetensors.yaml
 **CUDA configuration for safetensors models**
 
-- Backend: `cuda_native`
+- Backend: `inferflux_cuda`
 - Flash Attention: **Enabled** (Rule 2)
 - Phase Overlap: **Enabled** (Rule 4)
 - Batch Size: 16 (for 3B models)
@@ -78,7 +78,7 @@ The startup advisor logs recommendations at startup when config is suboptimal.
 
 | Rule | Trigger | Recommendation | Config Fix |
 |------|---------|----------------|------------|
-| 1. Backend mismatch | safetensors + CUDA + universal | Use native backend | `backend: cuda_native` |
+| 1. Backend mismatch | safetensors + CUDA + llama.cpp | Use InferFlux CUDA backend | `backend: inferflux_cuda` |
 | 2. Attention kernel | GPU SM ≥ 8.0, FA disabled | Enable FA2 | `cuda.flash_attention.enabled: true` |
 | 3. Batch size vs VRAM | Large VRAM, small batch | Increase batch | `runtime.scheduler.max_batch_size: <higher>` |
 | 4. Phase overlap | CUDA, batch ≥ 4, disabled | Enable overlap | `cuda.phase_overlap.enabled: true` |
@@ -147,7 +147,7 @@ runtime:
 |----------|---------|---------|
 | `INFERFLUX_MODEL_PATH` | Override model path | `/models/llama3.gguf` |
 | `INFERFLUX_MODELS` | Multi-model config | `id=model1,path=/path/to/model.gguf,...` |
-| `INFERFLUX_NATIVE_CUDA_STRICT` | Strict native mode | `1` to fail if native runtime reports fallback |
+| `INFERFLUX_CUDA_STRICT` | Strict InferFlux CUDA mode | `1` to fail if the InferFlux CUDA runtime reports fallback |
 | `INFERFLUX_BACKEND_PRIORITY` | Backend selection | `cuda,cpu` or `cpu,cuda` |
 | `INFERFLUX_SESSION_HANDLES_ENABLED` | Enable optional `session_id` mapping layer | `true` |
 | `INFERFLUX_SESSION_TTL_MS` | Session handle TTL (ms) | `300000` |
@@ -174,13 +174,13 @@ INFERFLUX_DISABLE_STARTUP_ADVISOR=true ./build/inferfluxd --config config/server
 ## Format-Specific Notes
 
 ### GGUF Format
-- Uses llama.cpp backend (`cuda_llama_cpp` or `cpu`)
+- Uses llama.cpp backend (`llama_cpp_cuda` or `cpu`)
 - Well-tested, production-ready
 - Supports quantization (Q4_K_M, Q5_K_M, Q6_K, Q8_0)
 
 ### Safetensors Format
-- Requires native CUDA backend (`cuda_native`)
-- Use `backend: cuda_native`
+- Requires InferFlux CUDA backend (`inferflux_cuda`)
+- Use `backend: inferflux_cuda`
 - Supports BF16/FP16 weights
 - Better for fine-tuned models from HuggingFace
 
@@ -194,7 +194,7 @@ INFERFLUX_DISABLE_STARTUP_ADVISOR=true ./build/inferfluxd --config config/server
 Run the advisor test suite:
 
 ```bash
-./scripts/advisor_test_final.sh
+./scripts/smoke.sh backend-identity --help
 ```
 
-This will validate all 8 rules across different model formats and configurations.
+Legacy advisor batch scripts were archived under `scripts/archive/advisor/`; use the canonical smoke and benchmark entry points instead.

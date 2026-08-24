@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, develop]
   schedule:
     # Weekly Monday 02:00 UTC — catches upstream dependency drift
     - cron: '0 2 * * 1'
@@ -185,7 +185,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching failure diagnostics
         run: |
-          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=5
+          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=6
           ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_failure_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateFailureContractTests method count: expected=${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS}" ]; then
@@ -302,11 +302,18 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake libssl-dev libyaml-cpp-dev
 
-      - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.15
-        with:
-          cuda: '12.3.0'
-          method: 'network'
+      - name: Install CUDA toolkit (toolkit only, no driver metapackage)
+        run: |
+          # The cuda-12-6 metapackage (and the Jimver action's network
+          # installer) pulls nvidia-dkms/driver packages that fail to
+          # configure on GitHub runners. cuda-toolkit-12-* provides nvcc +
+          # cudart + headers without the driver.
+          wget -q -O /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cuda-toolkit-12-6
+          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
+          echo "CUDACXX=/usr/local/cuda-12.6/bin/nvcc" >> "$GITHUB_ENV"
 
       - name: Configure (CUDA=ON)
         run: |
@@ -538,6 +545,12 @@ jobs:
       - name: Build
         run: cmake --build build-cov -j$(nproc)
 
+      # StubIntegration (run by the coverage target) shells out to
+      # inferctl; its default path assumes the ./build tree this job
+      # doesn't use.
+      - name: Export coverage-tree binary paths
+        run: echo "INFERCTL_BIN=$PWD/build-cov/inferctl" >> "$GITHUB_ENV"
+
       # ------------------------------------------------------------------
       # Focused assertion: canonical OSS docs contract
       # Fails fast on missing canonical docs, broken local links, API/CLI
@@ -620,7 +633,7 @@ jobs:
       # ------------------------------------------------------------------
       - name: Assert throughput gate batching failure diagnostics
         run: |
-          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=5
+          EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS=6
           ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS=$(grep -o 'def test_' tests/integration/throughput_gate_failure_contract_test.py | wc -l | tr -d ' ')
           echo "ThroughputGateFailureContractTests method count: expected=${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS} actual=${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}"
           if [ "${ACTUAL_TP_GATE_FAILURE_CONTRACT_TESTS}" -ne "${EXPECTED_TP_GATE_FAILURE_CONTRACT_TESTS}" ]; then

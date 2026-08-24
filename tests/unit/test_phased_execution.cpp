@@ -1,6 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/disaggregated/kv_channel.h"
 #include "scheduler/request_batch.h"
 
@@ -11,19 +11,19 @@ using namespace inferflux;
 // ---------------------------------------------------------------------------
 
 TEST_CASE("PrefillResult defaults: ok=false, n_past=0", "[phased]") {
-  LlamaCPUBackend::PrefillResult r;
+  LlamaCppBackend::PrefillResult r;
   REQUIRE_FALSE(r.ok);
   REQUIRE(r.n_past == 0);
 }
 
 // ---------------------------------------------------------------------------
-// LlamaCPUBackend — unloaded-backend guard paths
+// LlamaCppBackend — unloaded-backend guard paths
 // (ForceReadyForTests() sets test_ready_=true but context_ remains null;
 //  these guard paths trigger when context_ == nullptr.)
 // ---------------------------------------------------------------------------
 
 TEST_CASE("Prefill returns ok=false when context is null", "[phased]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   // context_ is null; Prefill must return {ok=false} without crashing.
   auto pr = backend.Prefill("hello world", 0);
   REQUIRE_FALSE(pr.ok);
@@ -31,20 +31,20 @@ TEST_CASE("Prefill returns ok=false when context is null", "[phased]") {
 }
 
 TEST_CASE("Decode returns empty string when context is null", "[phased]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   std::string out = backend.Decode(4, 0, 8);
   REQUIRE(out.empty());
 }
 
 TEST_CASE("FreeSequence is a no-op when context is null", "[phased]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   // Must not crash or throw.
   REQUIRE_NOTHROW(backend.FreeSequence(0));
   REQUIRE_NOTHROW(backend.FreeSequence(15));
 }
 
 TEST_CASE("Prefill returns ok=false for empty prompt", "[phased]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   auto pr = backend.Prefill("", 1);
   REQUIRE_FALSE(pr.ok);
 }
@@ -131,19 +131,19 @@ TEST_CASE(
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SerializeSequence returns empty when context is null", "[phased]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   auto blob = backend.SerializeSequence(0);
   REQUIRE(blob.empty());
 }
 
 TEST_CASE("HydrateSequence returns false when context is null", "[phased]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   std::vector<uint8_t> dummy{1, 2, 3};
   REQUIRE_FALSE(backend.HydrateSequence(0, dummy));
 }
 
 TEST_CASE("HydrateSequence returns false for empty blob", "[phased]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   std::vector<uint8_t> empty;
   REQUIRE_FALSE(backend.HydrateSequence(0, empty));
 }
@@ -171,7 +171,7 @@ TEST_CASE(
 // ---------------------------------------------------------------------------
 
 TEST_CASE("PrefillResult first_token defaults to -1", "[phased_batch]") {
-  LlamaCPUBackend::PrefillResult r;
+  LlamaCppBackend::PrefillResult r;
   REQUIRE(r.first_token == -1);
   REQUIRE(r.first_piece.empty());
 }
@@ -184,15 +184,15 @@ TEST_CASE("InferenceRequest first_token defaults to -1", "[phased_batch]") {
 
 TEST_CASE("BatchDecodeStep returns empty when context is null",
           "[phased_batch]") {
-  LlamaCPUBackend backend; // context_ == nullptr
-  std::vector<LlamaCPUBackend::BatchDecodeInput> inputs = {{0, 4, 5}};
+  LlamaCppBackend backend; // context_ == nullptr
+  std::vector<LlamaCppBackend::BatchDecodeInput> inputs = {{0, 4, 5}};
   auto results = backend.BatchDecodeStep(inputs);
   REQUIRE(results.empty());
 }
 
 TEST_CASE("BatchDecodeStep returns empty for empty input", "[phased_batch]") {
-  LlamaCPUBackend backend;
-  std::vector<LlamaCPUBackend::BatchDecodeInput> inputs;
+  LlamaCppBackend backend;
+  std::vector<LlamaCppBackend::BatchDecodeInput> inputs;
   REQUIRE(backend.BatchDecodeStep(inputs).empty());
 }
 
@@ -209,14 +209,14 @@ TEST_CASE("InferenceRequest first_token is assignable", "[phased_batch]") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("ContextSize returns 0 when no model loaded", "[phased]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   REQUIRE(backend.ContextSize() == 0);
 }
 
 TEST_CASE("ContextSize returns 0 even after ForceReadyForTests", "[phased]") {
   // ForceReadyForTests sets test_ready_=true but leaves context_=nullptr,
   // so ContextSize() should still return 0 (no real context).
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   backend.ForceReadyForTests();
   REQUIRE(backend.ContextSize() == 0);
 }
@@ -253,21 +253,21 @@ TEST_CASE("InferenceRequest logprob fields: collect with top-5 alternatives",
 // ---------------------------------------------------------------------------
 
 TEST_CASE("CopySequencePrefix is no-op when context is null", "[kv_reuse]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   // Must not crash when no model is loaded.
   REQUIRE_NOTHROW(backend.CopySequencePrefix(0, 1, 10));
 }
 
 TEST_CASE("CopySequencePrefix is no-op after ForceReadyForTests",
           "[kv_reuse]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   backend.ForceReadyForTests(); // sets test_ready_=true but context_ stays null
   REQUIRE_NOTHROW(backend.CopySequencePrefix(0, 1, 5));
 }
 
 TEST_CASE("PrefillPartial returns ok=false when context is null",
           "[kv_reuse]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   auto pr = backend.PrefillPartial("hello world", 0, 0);
   REQUIRE_FALSE(pr.ok);
   REQUIRE(pr.n_past == 0);
@@ -275,14 +275,14 @@ TEST_CASE("PrefillPartial returns ok=false when context is null",
 }
 
 TEST_CASE("PrefillPartial returns ok=false for empty prompt", "[kv_reuse]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   auto pr = backend.PrefillPartial("", 0, 0);
   REQUIRE_FALSE(pr.ok);
 }
 
 TEST_CASE("PrefillResult kv_reuse defaults: first_token=-1, ok=false",
           "[kv_reuse]") {
-  LlamaCPUBackend::PrefillResult r;
+  LlamaCppBackend::PrefillResult r;
   REQUIRE(r.first_token == -1);
   REQUIRE(r.first_piece.empty());
   REQUIRE_FALSE(r.ok);
@@ -292,6 +292,6 @@ TEST_CASE("PrefillResult kv_reuse defaults: first_token=-1, ok=false",
 TEST_CASE("CopySequencePrefix zero n_tokens is a no-op when context null",
           "[kv_reuse]") {
   // Guard: n_tokens=0 with null context must not crash (degenerate copy).
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   REQUIRE_NOTHROW(backend.CopySequencePrefix(0, 1, 0));
 }

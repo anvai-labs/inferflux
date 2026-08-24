@@ -16,7 +16,7 @@ models:
   - id: qwen2.5-3b-instruct
     path: models/qwen2.5-3b-instruct-safetensors
     format: auto                    # Rule 7: Will be detected as safetensors
-    backend: cuda_native            # Rule 1: Use cuda_native for safetensors
+    backend: inferflux_cuda         # Rule 1: Use inferflux_cuda for safetensors
     default: true
 
 # Runtime configuration
@@ -36,7 +36,7 @@ runtime:
       prefill_replica: false
 
   backend_exposure:
-    prefer_native: true             # Rule 1: Prefer native for safetensors
+    prefer_inferflux: true             # Rule 1: Prefer InferFlux for safetensors
     allow_llama_cpp_fallback: true  # Allow fallback to llama.cpp
 
   capability_routing:

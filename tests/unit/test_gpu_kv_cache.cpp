@@ -166,14 +166,15 @@ TEST_CASE("KvCacheGpu: seq slot IDs must fit within max_batch",
           "[gpu_kv_cache][cuda]") {
   // This test validates the invariant that the scheduler's sequence slot IDs
   // (0..kMaxSequenceSlots-1) must all fit within the KV cache's max_batch.
-  // The scheduler uses kMaxSequenceSlots=16, so KV cache needs ≥16 slots.
+  // The scheduler uses kMaxSequenceSlots=128, so KV cache needs ≥128 slots.
+  // We test with a smaller value here to keep GPU memory usage low in CI.
   int device_count = 0;
   cudaGetDeviceCount(&device_count);
   if (device_count == 0) {
     SKIP("No CUDA device available");
   }
 
-  constexpr int kSchedulerMaxSlots = 16; // mirrors scheduler's kMaxSequenceSlots
+  constexpr int kSchedulerMaxSlots = 16; // subset of scheduler's kMaxSequenceSlots
 
   // Allocate with enough slots for the scheduler
   KvCacheGpu cache;

@@ -1,6 +1,8 @@
 #include "runtime/backends/mlx/mlx_tokenizer.h"
 #include "server/logging/logger.h"
 
+#include <algorithm>
+#include <cctype>
 #include <climits>
 #include <fstream>
 #include <sstream>
@@ -67,6 +69,13 @@ const ByteUnicodeTable &GetBUT() {
 
 // U+2581 ▁  (LOWER ONE EIGHTH BLOCK — used as space marker in Metaspace).
 constexpr const char *kMetaMark = "\xe2\x96\x81";
+
+std::string ToLower(std::string value) {
+  std::transform(
+      value.begin(), value.end(), value.begin(),
+      [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+  return value;
+}
 
 } // namespace
 
@@ -218,7 +227,99 @@ MlxTokenizer::BpeEncode(const std::string &word) const {
 // Load
 // ---------------------------------------------------------------------------
 
+void MlxTokenizer::Reset() {
+  loaded_ = false;
+  pre_tok_ = PreTokenizerType::Unknown;
+  add_prefix_space_ = true;
+  add_bos_token_ = true;
+  vocab_.clear();
+  id_to_token_.clear();
+  merge_rank_.clear();
+  special_ids_.clear();
+  bos_id_ = 1;
+  eos_id_ = 2;
+  vocab_size_ = 0;
+  chat_template_.clear();
+}
+
+MlxTokenizer::PreTokenizerType
+MlxTokenizer::DetectPreTokenizerType(const std::string &pre_tokenizer_hint,
+                                     bool *add_prefix_space) {
+  if (add_prefix_space) {
+    *add_prefix_space = true;
+  }
+  const std::string hint = ToLower(pre_tokenizer_hint);
+  if (hint.empty()) {
+    return PreTokenizerType::Unknown;
+  }
+
+  if (hint == "bytelevel" || hint == "gpt2" || hint == "qwen" ||
+      hint == "qwen2" || hint == "qwen3" || hint == "phi3" ||
+      hint == "starcoder" || hint == "starcoder2" || hint == "deepseek" ||
+      hint == "deepseek-coder" || hint == "command-r" || hint == "byte_level") {
+    if (add_prefix_space) {
+      *add_prefix_space = false;
+    }
+    return PreTokenizerType::ByteLevel;
+  }
+
+  if (hint == "metaspace" || hint == "sentencepiece" || hint == "spm" ||
+      hint == "llama" || hint == "mistral" || hint == "gemma" ||
+      hint == "gemma2" || hint == "gemma3") {
+    if (add_prefix_space) {
+      *add_prefix_space = true;
+    }
+    return PreTokenizerType::Metaspace;
+  }
+
+  return PreTokenizerType::Unknown;
+}
+
+bool MlxTokenizer::InitializeFromBpeData(
+    const std::vector<std::string> &id_to_token,
+    const std::vector<std::string> &merges,
+    const std::string &pre_tokenizer_hint, int32_t bos_id, int32_t eos_id,
+    const std::string &chat_template, bool add_bos_token,
+    const std::unordered_set<int32_t> &special_ids) {
+  Reset();
+  if (id_to_token.empty()) {
+    log::Error("mlx_tokenizer",
+               "InitializeFromBpeData requires a non-empty vocabulary");
+    return false;
+  }
+
+  id_to_token_ = id_to_token;
+  vocab_size_ = static_cast<int32_t>(id_to_token_.size());
+  for (int32_t id = 0; id < vocab_size_; ++id) {
+    vocab_.emplace(id_to_token_[static_cast<size_t>(id)], id);
+  }
+
+  int32_t rank = 0;
+  for (const auto &merge : merges) {
+    merge_rank_[merge] = rank++;
+  }
+
+  bool add_prefix_space = true;
+  pre_tok_ = DetectPreTokenizerType(pre_tokenizer_hint, &add_prefix_space);
+  add_prefix_space_ = add_prefix_space;
+  bos_id_ = bos_id;
+  eos_id_ = eos_id;
+  add_bos_token_ = add_bos_token;
+  chat_template_ = chat_template;
+  special_ids_ = special_ids;
+  if (bos_id_ >= 0) {
+    special_ids_.insert(bos_id_);
+  }
+  if (eos_id_ >= 0) {
+    special_ids_.insert(eos_id_);
+  }
+
+  loaded_ = true;
+  return true;
+}
+
 bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
+  Reset();
   const auto tok_path = model_dir / "tokenizer.json";
   std::ifstream f(tok_path);
   if (!f.is_open()) {
@@ -351,7 +452,7 @@ MlxTokenizerResult MlxTokenizer::Encode(const std::string &text,
   if (!loaded_)
     return result;
 
-  if (add_bos)
+  if (add_bos && add_bos_token_ && bos_id_ >= 0)
     result.ids.push_back(bos_id_);
 
   const auto pre_tokens = PreTokenize(text);

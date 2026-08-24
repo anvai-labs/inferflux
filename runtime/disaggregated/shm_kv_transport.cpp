@@ -76,27 +76,31 @@ bool ShmKVTransport::Enqueue(KVPacket packet) {
 
   int fd = ::shm_open(shm_name.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
   if (fd < 0) {
-    log::Error("shm_transport", "shm_open(write) failed for " + shm_name +
-                                    ": " + std::strerror(errno));
-    return false;
+    log::Warn("shm_transport",
+              "shm_open(write) failed for " + shm_name + ": " +
+                  std::strerror(errno) +
+                  "; falling back to inline control queue payload");
+    return control_queue_.Enqueue(std::move(packet));
   }
 
   if (::ftruncate(fd, static_cast<off_t>(blob_size)) != 0) {
-    log::Error("shm_transport",
-               std::string("ftruncate failed: ") + std::strerror(errno));
+    log::Warn("shm_transport",
+              std::string("ftruncate failed: ") + std::strerror(errno) +
+                  "; falling back to inline control queue payload");
     ::close(fd);
     ::shm_unlink(shm_name.c_str());
-    return false;
+    return control_queue_.Enqueue(std::move(packet));
   }
 
   void *ptr =
       ::mmap(nullptr, blob_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
   ::close(fd);
   if (ptr == MAP_FAILED) {
-    log::Error("shm_transport",
-               std::string("mmap(write) failed: ") + std::strerror(errno));
+    log::Warn("shm_transport",
+              std::string("mmap(write) failed: ") + std::strerror(errno) +
+                  "; falling back to inline control queue payload");
     ::shm_unlink(shm_name.c_str());
-    return false;
+    return control_queue_.Enqueue(std::move(packet));
   }
 
   std::memcpy(ptr, packet.kv_blob.data(), blob_size);
@@ -157,6 +161,15 @@ std::size_t ShmKVTransport::Capacity() const {
   return control_queue_.Capacity();
 }
 std::size_t ShmKVTransport::Size() const { return control_queue_.Size(); }
+
+bool ShmKVTransport::UpdateTicketStage(uint64_t ticket_id,
+                                       KVTicketStage stage) {
+  return control_queue_.UpdateTicketStage(ticket_id, stage);
+}
+
+KVTicketStage ShmKVTransport::GetTicketStage(uint64_t ticket_id) const {
+  return control_queue_.GetTicketStage(ticket_id);
+}
 
 } // namespace disaggregated
 } // namespace inferflux

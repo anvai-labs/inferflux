@@ -242,9 +242,9 @@ std::string ResolveHfReferenceToCachePath(const std::string &path) {
   if (repo.empty()) {
     return path;
   }
-  const auto cache_path =
+  auto cache_path =
       std::filesystem::path(InferfluxHomePath()) / "models" / repo;
-  return cache_path.string();
+  return cache_path.make_preferred().string();
 }
 
 std::string ResolveMlxLoadPath(const std::string &path,

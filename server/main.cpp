@@ -4,7 +4,7 @@
 #include "runtime/backends/backend_factory.h"
 #include "runtime/backends/backend_manager.h"
 #include "runtime/backends/cpu/cpu_backend.h"
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/disaggregated/kv_channel.h"
 #include "runtime/disaggregated/shm_kv_transport.h"
 #include "runtime/execution/parallel_context.h"
@@ -21,6 +21,7 @@
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
 #include "server/auth/rate_limiter.h"
+#include "server/diagnostics/crash_handler.h"
 #include "server/http/http_server.h"
 #include "server/logging/audit_logger.h"
 #include "server/logging/logger.h"
@@ -141,10 +142,29 @@ void SignalHandler(int) { g_running = false; }
 
 int main(int argc, char **argv) {
   // Structured JSON logging: set before any log output.
+  const bool log_format_from_env =
+      std::getenv("INFERFLUX_LOG_FORMAT") != nullptr;
   if (const char *fmt = std::getenv("INFERFLUX_LOG_FORMAT")) {
     std::string s = fmt;
     inferflux::log::SetJsonMode(s == "json" || s == "JSON");
   }
+  std::string configured_log_level = "info";
+  bool log_level_from_env = false;
+  if (const char *level = std::getenv("INFERFLUX_LOG_LEVEL")) {
+    inferflux::log::Level parsed_level;
+    if (inferflux::log::ParseLevel(level, &parsed_level)) {
+      inferflux::log::SetLevel(parsed_level);
+      configured_log_level = level;
+      log_level_from_env = true;
+    } else {
+      std::cerr << "[WARN] server: Ignoring invalid INFERFLUX_LOG_LEVEL | "
+                << level << "\n";
+    }
+  }
+
+  // Install crash signal handlers (SIGSEGV, SIGABRT, SIGBUS, SIGFPE).
+  // Writes diagnostic breadcrumbs to stderr before re-raising for core dump.
+  inferflux::diagnostics::InstallCrashHandler();
 
   // §P1e: Initialize distributed parallel environment.
   int dist_rank = 0;
@@ -198,15 +218,15 @@ int main(int argc, char **argv) {
   bool cuda_flash_attention_enabled = false;
   int cuda_flash_attention_tile = 128;
   std::string cuda_attention_kernel = "auto";
-  std::string native_kv_cache_dtype = "auto";
-  std::string native_dequantized_cache_policy = "model";
-  bool native_require_fused_quantized_matmul = false;
+  std::string inferflux_cuda_kv_cache_dtype = "auto";
+  std::string inferflux_cuda_dequantized_cache_policy = "none";
+  bool inferflux_cuda_require_fused_quantized_matmul = false;
   bool cuda_phase_overlap_scaffold = false;
   int cuda_phase_overlap_min_prefill_tokens = 256;
   bool cuda_phase_overlap_prefill_replica = false;
-  bool backend_prefer_native = true;
+  bool backend_prefer_inferflux = true;
   bool backend_allow_llama_cpp_fallback = true;
-  bool backend_strict_native_request = false;
+  bool backend_strict_inferflux_request = false;
   std::vector<std::string> backend_priority;
   bool speculative_enabled = false;
   std::string speculative_draft_model;
@@ -220,10 +240,11 @@ int main(int argc, char **argv) {
   std::size_t nvme_writer_queue_depth = 256;
   std::size_t prefix_cache_capacity = 256;
   int prefill_pool_size = 1;
-  int decode_pool_size =
-      0; // 0 = decode on WorkerLoop thread (no separate pool)
+  int decode_pool_size = 1; // 0 = decode on WorkerLoop thread (legacy); 1 =
+                            // single dedicated decode lane (current default)
   std::size_t kv_channel_capacity = 64;
   std::string kv_transport_type = "channel"; // "channel" | "shm"
+  int kv_enqueue_max_retries = 3;
   inferflux::Scheduler::Config scheduler_config;
   std::vector<ModelConfig> configured_models;
   std::string default_model_override;
@@ -350,13 +371,13 @@ int main(int argc, char **argv) {
         if (config["runtime"]["cuda"] &&
             config["runtime"]["cuda"]["kv_cache_dtype"] &&
             config["runtime"]["cuda"]["kv_cache_dtype"].IsScalar()) {
-          native_kv_cache_dtype = ToLower(
+          inferflux_cuda_kv_cache_dtype = ToLower(
               config["runtime"]["cuda"]["kv_cache_dtype"].as<std::string>());
         }
         if (config["runtime"]["cuda"] &&
             config["runtime"]["cuda"]["dequantized_cache_policy"] &&
             config["runtime"]["cuda"]["dequantized_cache_policy"].IsScalar()) {
-          native_dequantized_cache_policy =
+          inferflux_cuda_dequantized_cache_policy =
               ToLower(config["runtime"]["cuda"]["dequantized_cache_policy"]
                           .as<std::string>());
         }
@@ -364,7 +385,7 @@ int main(int argc, char **argv) {
             config["runtime"]["cuda"]["quantized_runtime"] &&
             config["runtime"]["cuda"]["quantized_runtime"]
                   ["require_fused_matmul"]) {
-          native_require_fused_quantized_matmul =
+          inferflux_cuda_require_fused_quantized_matmul =
               config["runtime"]["cuda"]["quantized_runtime"]
                     ["require_fused_matmul"]
                         .as<bool>();
@@ -392,16 +413,16 @@ int main(int argc, char **argv) {
         }
         if (config["runtime"]["backend_exposure"]) {
           const auto &exposure = config["runtime"]["backend_exposure"];
-          if (exposure["prefer_native"]) {
-            backend_prefer_native = exposure["prefer_native"].as<bool>();
+          if (exposure["prefer_inferflux"]) {
+            backend_prefer_inferflux = exposure["prefer_inferflux"].as<bool>();
           }
           if (exposure["allow_llama_cpp_fallback"]) {
             backend_allow_llama_cpp_fallback =
                 exposure["allow_llama_cpp_fallback"].as<bool>();
           }
-          if (exposure["strict_native_request"]) {
-            backend_strict_native_request =
-                exposure["strict_native_request"].as<bool>();
+          if (exposure["strict_inferflux_request"]) {
+            backend_strict_inferflux_request =
+                exposure["strict_inferflux_request"].as<bool>();
           }
         }
         if (config["runtime"]["capability_routing"]) {
@@ -470,6 +491,9 @@ int main(int argc, char **argv) {
           if (disagg["kv_channel_capacity"])
             kv_channel_capacity =
                 disagg["kv_channel_capacity"].as<std::size_t>();
+          if (disagg["kv_enqueue_max_retries"])
+            kv_enqueue_max_retries =
+                std::max(0, disagg["kv_enqueue_max_retries"].as<int>());
         }
         if (config["runtime"]["scheduler"]) {
           const auto &scheduler_node = config["runtime"]["scheduler"];
@@ -488,6 +512,34 @@ int main(int argc, char **argv) {
           if (scheduler_node["batch_accumulation_ms"]) {
             scheduler_config.batch_accumulation_ms =
                 std::max(0, scheduler_node["batch_accumulation_ms"].as<int>());
+          }
+          if (scheduler_node["decode_burst_tokens"]) {
+            scheduler_config.decode_burst_tokens =
+                std::max(0, scheduler_node["decode_burst_tokens"].as<int>());
+          }
+          if (scheduler_node["chunked_prefill_tokens"]) {
+            scheduler_config.chunked_prefill_tokens =
+                std::max(1, scheduler_node["chunked_prefill_tokens"].as<int>());
+          }
+          if (scheduler_node["mixed_prefill_budget_ratio"]) {
+            scheduler_config.mixed_prefill_budget_ratio = std::clamp(
+                scheduler_node["mixed_prefill_budget_ratio"].as<double>(), 0.0,
+                1.0);
+          }
+          if (scheduler_node["policy"]) {
+            const std::string policy_raw =
+                scheduler_node["policy"].as<std::string>();
+            if (inferflux::IsSchedulerBatchPolicyValue(policy_raw)) {
+              scheduler_config.batch_policy =
+                  inferflux::ParseSchedulerBatchPolicy(
+                      policy_raw, scheduler_config.batch_policy);
+            } else {
+              inferflux::log::Warn("server",
+                                   "Invalid runtime.scheduler.policy '" +
+                                       policy_raw + "'; keeping " +
+                                       inferflux::SchedulerBatchPolicyToString(
+                                           scheduler_config.batch_policy));
+            }
           }
           if (scheduler_node["session_handles"]) {
             const auto &session_node = scheduler_node["session_handles"];
@@ -550,8 +602,17 @@ int main(int argc, char **argv) {
       }
 
       // Logging config
-      if (config["logging"] && config["logging"]["audit_log"]) {
-        audit_log_path = config["logging"]["audit_log"].as<std::string>();
+      if (config["logging"]) {
+        if (config["logging"]["audit_log"]) {
+          audit_log_path = config["logging"]["audit_log"].as<std::string>();
+        }
+        if (!log_format_from_env && config["logging"]["format"]) {
+          const auto format = config["logging"]["format"].as<std::string>();
+          inferflux::log::SetJsonMode(format == "json" || format == "JSON");
+        }
+        if (config["logging"]["level"]) {
+          configured_log_level = config["logging"]["level"].as<std::string>();
+        }
       }
 
       // TLS config
@@ -622,6 +683,15 @@ int main(int argc, char **argv) {
   }
   if (const char *env_audit = std::getenv("INFERFLUX_AUDIT_LOG")) {
     audit_log_path = env_audit;
+  }
+  if (!log_level_from_env) {
+    inferflux::log::Level parsed_level;
+    if (inferflux::log::ParseLevel(configured_log_level, &parsed_level)) {
+      inferflux::log::SetLevel(parsed_level);
+    } else {
+      inferflux::log::Warn("server", "Ignoring invalid logging.level setting",
+                           configured_log_level);
+    }
   }
   if (const char *env_blk = std::getenv("INFERFLUX_GUARDRAIL_BLOCKLIST")) {
     std::stringstream ss(env_blk);
@@ -723,17 +793,19 @@ int main(int argc, char **argv) {
           std::getenv("INFERFLUX_CUDA_ATTENTION_KERNEL")) {
     cuda_attention_kernel = ToLower(env_cuda_attention_kernel);
   }
-  if (const char *env_native_kv_precision =
-          std::getenv("INFERFLUX_NATIVE_KV_DTYPE")) {
-    native_kv_cache_dtype = ToLower(env_native_kv_precision);
+  if (const char *env_inferflux_cuda_kv_precision =
+          std::getenv("INFERFLUX_CUDA_KV_DTYPE")) {
+    inferflux_cuda_kv_cache_dtype = ToLower(env_inferflux_cuda_kv_precision);
   }
-  if (const char *env_native_dequant_policy =
-          std::getenv("INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY")) {
-    native_dequantized_cache_policy = ToLower(env_native_dequant_policy);
+  if (const char *env_inferflux_cuda_dequant_policy =
+          std::getenv("INFERFLUX_CUDA_DEQUANT_CACHE_POLICY")) {
+    inferflux_cuda_dequantized_cache_policy =
+        ToLower(env_inferflux_cuda_dequant_policy);
   }
-  if (const char *env_native_require_fused =
-          std::getenv("INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL")) {
-    native_require_fused_quantized_matmul = ParseBool(env_native_require_fused);
+  if (const char *env_inferflux_cuda_require_fused =
+          std::getenv("INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL")) {
+    inferflux_cuda_require_fused_quantized_matmul =
+        ParseBool(env_inferflux_cuda_require_fused);
   }
   if (const char *env_cuda_overlap =
           std::getenv("INFERFLUX_CUDA_PHASE_OVERLAP")) {
@@ -751,17 +823,17 @@ int main(int argc, char **argv) {
     cuda_phase_overlap_prefill_replica =
         ParseBool(env_cuda_overlap_prefill_replica);
   }
-  if (const char *env_prefer_native =
-          std::getenv("INFERFLUX_BACKEND_PREFER_NATIVE")) {
-    backend_prefer_native = ParseBool(env_prefer_native);
+  if (const char *env_prefer_inferflux =
+          std::getenv("INFERFLUX_BACKEND_PREFER_INFERFLUX")) {
+    backend_prefer_inferflux = ParseBool(env_prefer_inferflux);
   }
   if (const char *env_allow_fallback =
           std::getenv("INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK")) {
     backend_allow_llama_cpp_fallback = ParseBool(env_allow_fallback);
   }
-  if (const char *env_strict_native =
-          std::getenv("INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST")) {
-    backend_strict_native_request = ParseBool(env_strict_native);
+  if (const char *env_strict_inferflux =
+          std::getenv("INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST")) {
+    backend_strict_inferflux_request = ParseBool(env_strict_inferflux);
   }
   if (const char *env_backend_priority =
           std::getenv("INFERFLUX_BACKEND_PRIORITY")) {
@@ -849,6 +921,44 @@ int main(int argc, char **argv) {
       scheduler_config.batch_accumulation_ms = static_cast<int>(accumulation);
     }
   }
+  if (const char *env_decode_burst_tokens =
+          std::getenv("INFERFLUX_SCHED_DECODE_BURST_TOKENS")) {
+    try {
+      int v = std::stoi(env_decode_burst_tokens);
+      if (v >= 0) {
+        scheduler_config.decode_burst_tokens = v;
+      }
+    } catch (...) {
+    }
+  }
+  if (const char *env_chunked_prefill_tokens =
+          std::getenv("INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS")) {
+    auto chunk_tokens = ParsePositiveSize(env_chunked_prefill_tokens);
+    if (chunk_tokens > 0) {
+      scheduler_config.chunked_prefill_tokens = static_cast<int>(chunk_tokens);
+    }
+  }
+  if (const char *env_prefill_budget_ratio =
+          std::getenv("INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO")) {
+    try {
+      const double ratio = std::stod(std::string(env_prefill_budget_ratio));
+      scheduler_config.mixed_prefill_budget_ratio = std::clamp(ratio, 0.0, 1.0);
+    } catch (...) {
+    }
+  }
+  if (const char *env_sched_policy = std::getenv("INFERFLUX_SCHED_POLICY")) {
+    const std::string policy_raw = env_sched_policy;
+    if (inferflux::IsSchedulerBatchPolicyValue(policy_raw)) {
+      scheduler_config.batch_policy = inferflux::ParseSchedulerBatchPolicy(
+          policy_raw, scheduler_config.batch_policy);
+    } else {
+      inferflux::log::Warn("server",
+                           "Invalid INFERFLUX_SCHED_POLICY '" + policy_raw +
+                               "'; keeping " +
+                               inferflux::SchedulerBatchPolicyToString(
+                                   scheduler_config.batch_policy));
+    }
+  }
   if (const char *env_session_handles =
           std::getenv("INFERFLUX_SESSION_HANDLES_ENABLED")) {
     scheduler_config.session_handles.enabled = ParseBool(env_session_handles);
@@ -875,6 +985,16 @@ int main(int argc, char **argv) {
   }
   if (const char *env_kv_transport = std::getenv("INFERFLUX_KV_TRANSPORT")) {
     kv_transport_type = env_kv_transport; // "channel" or "shm"
+  }
+  if (const char *env_kv_enqueue_retries =
+          std::getenv("INFERFLUX_KV_ENQUEUE_MAX_RETRIES")) {
+    try {
+      int retries = std::stoi(env_kv_enqueue_retries);
+      if (retries >= 0) {
+        kv_enqueue_max_retries = retries;
+      }
+    } catch (...) {
+    }
   }
   if (const char *env_models = std::getenv("INFERFLUX_MODELS")) {
     auto parsed = ParseModelsEnv(env_models);
@@ -938,16 +1058,32 @@ int main(int argc, char **argv) {
   std::cout << "Paged KV cache pages: " << cache_pages
             << " eviction=" << normalized_policy << std::endl;
   inferflux::BackendFactory::SetExposurePolicy(
-      {backend_prefer_native, backend_allow_llama_cpp_fallback,
-       backend_strict_native_request});
+      {backend_prefer_inferflux, backend_allow_llama_cpp_fallback,
+       backend_strict_inferflux_request});
   inferflux::log::Info(
       "server",
-      "Backend exposure policy: prefer_native=" +
-          std::string(backend_prefer_native ? "true" : "false") +
+      "Backend exposure policy: prefer_inferflux=" +
+          std::string(backend_prefer_inferflux ? "true" : "false") +
           ", allow_llama_cpp_fallback=" +
           std::string(backend_allow_llama_cpp_fallback ? "true" : "false") +
-          ", strict_native_request=" +
-          std::string(backend_strict_native_request ? "true" : "false"));
+          ", strict_inferflux_request=" +
+          std::string(backend_strict_inferflux_request ? "true" : "false"));
+  // When allow_llama_cpp_fallback=true with prefer_inferflux=true and the
+  // parity delegate is explicitly enabled, the delegate loads a second copy
+  // of the model weights via llama.cpp — lazily, on the first request that
+  // needs it (grammar-constrained output), after a free-VRAM pre-check.
+  // The delegate is OFF by default (INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE
+  // defaults true); disable fallback via allow_llama_cpp_fallback=false to
+  // avoid the duplicate weights entirely. Long-term fix: share the GGUF
+  // weight data between the two backends.
+  if (backend_prefer_inferflux && backend_allow_llama_cpp_fallback) {
+    inferflux::log::Warn(
+        "server",
+        "allow_llama_cpp_fallback=true with prefer_inferflux=true: parity "
+        "delegate may load duplicate model weights. Set "
+        "allow_llama_cpp_fallback=false or "
+        "INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE=1 to reduce GPU memory.");
+  }
   inferflux::log::Info(
       "server",
       "Capability routing policy: allow_default_fallback=" +
@@ -971,7 +1107,15 @@ int main(int argc, char **argv) {
           ", min_batch_size=" +
           std::to_string(scheduler_config.min_batch_size) +
           ", batch_accumulation_ms=" +
-          std::to_string(scheduler_config.batch_accumulation_ms) +
+          std::to_string(scheduler_config.batch_accumulation_ms) + ", policy=" +
+          inferflux::SchedulerBatchPolicyToString(
+              scheduler_config.batch_policy) +
+          ", decode_burst_tokens=" +
+          std::to_string(scheduler_config.decode_burst_tokens) +
+          ", chunked_prefill_tokens=" +
+          std::to_string(scheduler_config.chunked_prefill_tokens) +
+          ", mixed_prefill_budget_ratio=" +
+          std::to_string(scheduler_config.mixed_prefill_budget_ratio) +
           ", session_handles.enabled=" +
           std::string(scheduler_config.session_handles.enabled ? "true"
                                                                : "false") +
@@ -988,10 +1132,11 @@ int main(int argc, char **argv) {
       cuda_enabled && cuda_flash_attention_enabled;
   primary_cfg.flash_attention_tile = cuda_flash_attention_tile;
   primary_cfg.cuda_attention_kernel = cuda_attention_kernel;
-  primary_cfg.native_kv_cache_dtype = native_kv_cache_dtype;
-  primary_cfg.native_dequantized_cache_policy = native_dequantized_cache_policy;
-  primary_cfg.native_require_fused_quantized_matmul =
-      native_require_fused_quantized_matmul;
+  primary_cfg.inferflux_cuda_kv_cache_dtype = inferflux_cuda_kv_cache_dtype;
+  primary_cfg.inferflux_cuda_dequantized_cache_policy =
+      inferflux_cuda_dequantized_cache_policy;
+  primary_cfg.inferflux_cuda_require_fused_quantized_matmul =
+      inferflux_cuda_require_fused_quantized_matmul;
   primary_cfg.cuda_phase_overlap_scaffold =
       cuda_enabled && cuda_phase_overlap_scaffold;
   primary_cfg.cuda_phase_overlap_min_prefill_tokens =
@@ -1040,14 +1185,14 @@ int main(int argc, char **argv) {
   }
 #ifdef INFERFLUX_HAS_CUDA
   if (cuda_enabled) {
-    std::cout << "[server] Native CUDA KV cache precision policy: "
-              << native_kv_cache_dtype << ".\n";
-    std::cout << "[server] Native CUDA dequant cache policy: "
-              << native_dequantized_cache_policy
-              << " (model default, required for fused GEMV correctness).\n";
-    std::cout << "[server] Native CUDA strict fused quantized matmul: "
-              << (native_require_fused_quantized_matmul ? "enabled"
-                                                        : "disabled")
+    std::cout << "[server] InferFlux CUDA KV cache precision policy: "
+              << inferflux_cuda_kv_cache_dtype << ".\n";
+    std::cout << "[server] InferFlux CUDA dequant cache policy: "
+              << inferflux_cuda_dequantized_cache_policy
+              << " (none default, memory-first).\n";
+    std::cout << "[server] InferFlux CUDA strict fused quantized matmul: "
+              << (inferflux_cuda_require_fused_quantized_matmul ? "enabled"
+                                                                : "disabled")
               << ".\n";
   }
   if (cuda_flash_attention_enabled) {
@@ -1188,7 +1333,9 @@ int main(int argc, char **argv) {
 
   // §2.2: Load multimodal projector if specified.
   if (llama_backend && !mmproj_path.empty()) {
-    if (llama_backend->LoadMmproj(mmproj_path)) {
+    auto llama_backend_cast =
+        std::static_pointer_cast<inferflux::LlamaCppBackend>(llama_backend);
+    if (llama_backend_cast->LoadMmproj(mmproj_path)) {
       std::cout << "[server] Multimodal projector loaded: " << mmproj_path
                 << "\n";
     } else {
@@ -1289,7 +1436,7 @@ int main(int argc, char **argv) {
   spec_config.max_prefill_tokens = speculative_max_prefill_tokens;
   spec_config.draft_model = speculative_draft_model;
   spec_config.chunk_size = speculative_chunk_size;
-  std::shared_ptr<inferflux::LlamaCPUBackend> draft_backend = llama_backend;
+  std::shared_ptr<inferflux::BackendInterface> draft_backend = llama_backend;
   if (speculative_enabled && !speculative_draft_model.empty() &&
       speculative_draft_model != model_path) {
     auto draft_cfg = primary_cfg;
@@ -1337,6 +1484,7 @@ int main(int argc, char **argv) {
   disagg_config.prefill_pool_size = std::max(0, prefill_pool_size);
   disagg_config.decode_pool_size = std::max(0, decode_pool_size);
   disagg_config.kv_transport = kv_transport;
+  disagg_config.kv_enqueue_max_retries = std::max(0, kv_enqueue_max_retries);
   inferflux::Scheduler scheduler(tokenizer, device, cache, router,
                                  speculative_decoder, prefix_cache,
                                  fairness_config, disagg_config,
@@ -1370,7 +1518,8 @@ int main(int argc, char **argv) {
             << disagg_config.prefill_pool_size << "/"
             << disagg_config.decode_pool_size
             << " kv_transport=" << kv_transport_type
-            << " capacity=" << kv_channel_capacity
+            << " capacity=" << kv_channel_capacity << " kv_enqueue_max_retries="
+            << disagg_config.kv_enqueue_max_retries
             << " max_batch_size=" << scheduler_config.max_batch_size
             << " max_batch_tokens=" << scheduler_config.max_batch_tokens
             << std::endl;
@@ -1414,10 +1563,11 @@ int main(int argc, char **argv) {
     advisor_ctx.config.max_batch_size = scheduler_config.max_batch_size;
     advisor_ctx.config.max_batch_tokens = scheduler_config.max_batch_tokens;
     advisor_ctx.config.kv_cpu_pages = paged_kv_pages;
-    advisor_ctx.config.prefer_native = backend_prefer_native;
+    advisor_ctx.config.prefer_inferflux = backend_prefer_inferflux;
     advisor_ctx.config.allow_llama_cpp_fallback =
         backend_allow_llama_cpp_fallback;
-    advisor_ctx.config.strict_native_request = backend_strict_native_request;
+    advisor_ctx.config.strict_inferflux_request =
+        backend_strict_inferflux_request;
     advisor_ctx.config.backend_priority =
         normalized_backend_priority.empty()
             ? ""

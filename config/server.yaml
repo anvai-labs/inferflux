@@ -39,7 +39,7 @@ runtime:
     attention:
       kernel: auto                  # Rule 2: 'fa2' for SM ≥ 8.0 (Ampere+), 'auto' for auto-detect
     kv_cache_dtype: auto            # KV precision policy: auto, fp16, bf16, int8, fp8
-    dequantized_cache_policy: batch # batch (memory efficient default) | model (higher reuse)
+    dequantized_cache_policy: none  # none (memory-first default) | batch (batch-boundary cleanup) | model (higher reuse)
     quantized_runtime:
       require_fused_matmul: false   # true = fail startup unless fused quantized matmul is selected
     flash_attention:
@@ -52,9 +52,9 @@ runtime:
 
   # Backend exposure policy
   backend_exposure:
-    prefer_native: true             # Prefer native implementations (native CUDA, MLX)
+    prefer_inferflux: true             # Prefer InferFlux implementations when available
     allow_llama_cpp_fallback: true  # Allow fallback to llama.cpp backends
-    strict_native_request: false    # Fail explicit cuda_native when native kernels are not ready
+    strict_inferflux_request: false    # Fail explicit inferflux_cuda when native kernels are not ready
 
   # Capability routing for graceful degradation
   capability_routing:
@@ -67,7 +67,11 @@ runtime:
     max_batch_size: 4               # Rule 3: Increase for high VRAM (32-64 for 3B models on 20GB)
     max_batch_tokens: 8192          # Max tokens per batch
     min_batch_size: 1               # Minimum batch size before flushing
-    batch_accumulation_ms: 0        # Wait time to accumulate larger batches
+    batch_accumulation_ms: 2        # Wait time to accumulate larger batches (2ms for 4% throughput improvement at c=4)
+    policy: priority_age            # queue policy: priority_age | lpm_priority | throughput_balanced
+    decode_burst_tokens: 0      # 0 = disabled; >0 yields after N decode tokens per executor burst
+    chunked_prefill_tokens: 512     # Max tokens per prefill chunk in mixed execution
+    mixed_prefill_budget_ratio: 1.0 # Fraction (0.0-1.0) of backend token budget reserved for prefill
     session_handles:
       enabled: false                # Optional stateful layer (default API remains stateless)
       ttl_ms: 300000                # Session TTL in milliseconds
@@ -137,6 +141,6 @@ registry:
 # Environment variable overrides:
 # INFERFLUX_MODEL_PATH              - Override default model path
 # INFERFLUX_MODELS                  - Multi-model config string
-# INFERFLUX_NATIVE_CUDA_STRICT      - fail if native runtime reports fallback
+# INFERFLUX_CUDA_STRICT      - fail if InferFlux CUDA runtime reports fallback
 # INFERFLUX_BACKEND_PRIORITY        - Override backend selection order
 # INFERFLUX_DISABLE_STARTUP_ADVISOR - Disable recommendation logging

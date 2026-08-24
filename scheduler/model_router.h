@@ -8,7 +8,8 @@
 
 namespace inferflux {
 
-class LlamaCPUBackend;
+class BackendInterface;
+class LlamaCppBackend;
 
 // ModelInfo describes a loaded model for routing and management.
 struct ModelInfo {
@@ -23,10 +24,12 @@ struct ModelInfo {
   std::string effective_load_path;
   std::string format{"unknown"}; // Resolved model format (gguf/safetensors/hf).
   std::string requested_format{"auto"}; // Requested format hint (or auto).
-  std::string backend;           // Backend type: "cpu", "cuda", "mps", "rocm".
-  std::string requested_backend; // Requested backend hint ("cuda",
-                                 // "cuda_native", "cuda_llama_cpp", "auto"...).
-  std::string backend_provider{"llama_cpp"}; // "native" or "llama_cpp".
+  std::string backend;                  // Exposed backend id ("inferflux_cuda",
+                                        // "llama_cpp_cuda", "cpu", ...).
+  std::string requested_backend;        // Requested backend hint ("cuda",
+                                        // "inferflux_cuda", "llama_cpp_cuda",
+                                        // "auto"...).
+  std::string backend_provider{"llama_cpp"}; // "inferflux" or "llama_cpp".
   bool backend_fallback{false};        // True when requested backend fell back.
   std::string backend_fallback_reason; // Optional fallback explanation.
   bool ready{false}; // True when the model is loaded and serving.
@@ -45,7 +48,7 @@ struct ModelInfo {
 // It decouples the HTTP layer from the physical model topology, enabling
 // future features like model sharding, A/B serving, and per-tenant routing.
 //
-// The default implementation wraps a single LlamaCPUBackend. Future backends
+// The default implementation wraps a single LlamaCppBackend. Future backends
 // (CUDA, ROCm, disaggregated prefill/decode) implement this same interface.
 //
 // Thread safety: all methods must be safe to call concurrently.
@@ -81,7 +84,7 @@ public:
   virtual ModelInfo *ResolveExact(const std::string &model_id) = 0;
 
   // Retrieve the backend instance associated with a resolved model ID.
-  virtual std::shared_ptr<LlamaCPUBackend>
+  virtual std::shared_ptr<BackendInterface>
   GetBackend(const std::string &model_id) = 0;
 
   // Set or query the default routing target.

@@ -1,24 +1,24 @@
 # InferFlux Architecture
 
-**Status:** Canonical (OSS)
+**Status:** Canonical (OSS)  
+**Snapshot date:** March 9, 2026
 
 ## 1) One-Screen Runtime Map
 
 ```mermaid
 flowchart TD
-    A[Client / SDK] --> B[HTTP Server]
+    A[Client / SDK / inferctl] --> B[HTTP Server]
     B --> C[Auth + Scope + Rate Limit]
     C --> D[Scheduler]
-    D --> E[ModelRouter]
+    D --> E[Model Router]
     E --> F[Backend Instance]
     F --> G[Runtime Execution]
     G --> H[Prefill / Decode]
     G --> I[KV Cache / Prefix Reuse]
     G --> J[Sampling / Structured Output]
-
-    B --> K[Admin API]
-    D --> L[Metrics + Traces]
-    K --> M[Model + Routing + Cache Control]
+    D --> K[Metrics + Traces]
+    B --> L[Admin API]
+    L --> M[Model + Routing + Cache + Pools Control]
 ```
 
 ## 2) Request Lifecycle Contract
@@ -28,95 +28,107 @@ sequenceDiagram
     participant C as Client
     participant H as HTTP
     participant S as Scheduler
-    participant R as ModelRouter
+    participant R as Router
     participant B as Backend
 
     C->>H: POST /v1/chat/completions
     H->>H: Auth + scope check
+    H->>H: Optional fail-closed admission check
     H->>S: Enqueue InferenceRequest
-    S->>R: Resolve(model_id, capabilities)
-    R-->>S: backend handle
+    S->>R: Resolve(model_id, capabilities, policy)
+    R-->>S: backend handle + exposure metadata
     S->>B: Prefill phase
     S->>B: Decode phase (iterative)
     B-->>S: tokens + usage
-    S-->>H: InferenceResult
-    H-->>C: JSON or stream chunks
+    S-->>H: result or stream events
+    H-->>C: JSON / SSE
 ```
 
 ## 3) Core Contracts by Layer
 
 | Layer | Contract | Key files |
 |---|---|---|
-| HTTP + Auth | OpenAI-compatible endpoints with scope enforcement | `server/http/http_server.cpp`, `server/auth/*` |
-| Scheduler | Fair, phase-aware batch construction and execution | `scheduler/scheduler.cpp`, `scheduler/request_batch.h` |
-| Model routing | Resolve model/backend using capability and policy constraints | `scheduler/model_router.h`, `scheduler/single_model_router.cpp` |
+| HTTP + Auth | OpenAI-compatible endpoints with scope enforcement and optional fail-closed generation admission | `server/http/http_server.cpp`, `server/auth/*` |
+| Scheduler | Fair, phase-aware batch construction and execution | `scheduler/scheduler.cpp`, `runtime/execution/batch_executor.cpp` |
+| Model routing | Capability and policy-driven backend resolution | `scheduler/model_router.h`, `scheduler/single_model_router.cpp` |
 | Backend runtime | Prefill/decode execution with per-sequence state | `runtime/backends/*` |
-| Policy/admin | Guardrails, rate-limit, API keys, model lifecycle ops | `policy/*`, `/v1/admin/*` handlers |
-| Observability | Prometheus metrics + traces for queueing/runtime | `server/metrics/*`, `server/observability/*` |
+| Policy/admin | Guardrails, rate-limit, API keys, routing, models, cache, pools | `policy/*`, `/v1/admin/*` handlers |
+| Observability | Prometheus metrics + traces for queueing/runtime and distributed transport health | `server/metrics/*`, `server/observability/*` |
 
-## 4) Scheduler and Batching Semantics
+## 4) Scheduler and Runtime Execution Model
 
 | Concern | Current contract |
 |---|---|
-| Batch unit | `InferenceRequest` grouped into scheduler-owned batch slices |
-| Phase separation | Prefill and decode are explicit phases |
-| Fairness | Priority-aware scheduling with timeslice support |
-| Cancellation | Request-scoped cancellation propagated through decode loop |
-| Streaming | Token callback path from scheduler/runtime to HTTP SSE |
-| Budgeting | Batch-size and token-budget caps enforced before execution |
+| Request admission | HTTP-layer async admission into scheduler queues; optional fail-closed policy on degraded distributed transport |
+| Throughput core | Sync-first batched execution inside the runtime |
+| Phase model | Prefill and decode remain explicit |
+| Mixed workloads | Prefill/decode overlap exists for InferFlux CUDA in the sync path |
+| Batch quality | Prefix-affinity scoring and mixed-step knobs influence batch construction |
+| Async backend API | InferFlux CUDA intentionally returns `SupportsAsyncUnifiedBatch()==false` today because the sync path preserves throughput better |
+| Decode-worker mode | Optional for split prefill/decode deployments |
+| Cancellation/streaming | Request-scoped cancellation and SSE token callbacks are preserved through decode |
 
-## 5) Model Routing and Capability Contracts
+## 5) Model Routing and Capability Semantics
 
 | Contract point | Behavior |
 |---|---|
-| Explicit model ID | Resolve exact model or fail with API contract error |
-| Default model path | Use configured default, then capability fallback policy if allowed |
-| Capability gating | Reject incompatible backends early (routing stage) |
-| Identity exposure | API/CLI expose requested vs selected backend/provider metadata |
-| Admin lifecycle | load/unload/set-default are strict and contract-tested |
+| Explicit model ID | Resolve exact model or fail fast |
+| Default model path | Use configured default, then policy-governed compatible fallback if allowed |
+| Capability gating | Reject incompatible backends before execution |
+| Identity exposure | API/CLI expose requested backend, selected backend, provider, fallback, and reason |
+| Strict-native policy | Requests can require native execution and return deterministic `backend_policy_violation` errors |
 
 ## 6) Backend Identity Contract
 
 | Field | Meaning |
 |---|---|
-| `requested_backend` | backend hint from config/admin load intent |
+| `requested_backend` | backend hint from config/admin intent |
 | `exposed_backend` | backend actually selected |
-| `provider` | provider path (`native` or `llama_cpp`) |
-| `fallback` | `true` when routing/policy changed selected backend |
-| `fallback_reason` | diagnostic reason for changed selection |
+| `provider` | runtime provider path (`inferflux` or `llama_cpp`) |
+| `fallback` | `true` when routing/policy changed the selected backend |
+| `fallback_reason` | machine-visible reason for changed selection |
 
-This contract is reflected in `/v1/models`, `/v1/models/{id}`, and `inferctl models` JSON/table outputs.
+This contract is reflected in `/v1/models`, `/v1/models/{id}`, and `inferctl models`.
 
 ## 6.1) Two-CUDA-Backend Value Matrix
 
 ```mermaid
 flowchart LR
-    A[cuda hint] --> B{Native ready?}
-    B -->|yes| C[native_cuda provider]
-    B -->|no / policy fallback| D[cuda_llama_cpp provider]
+    A[cuda request] --> B{inferflux ready + policy allows?}
+    B -->|yes| C[inferflux_cuda]
+    B -->|no| D[llama_cpp_cuda]
 ```
 
-| Axis | `native_cuda` provider | `cuda_llama_cpp` provider |
+| Axis | `inferflux_cuda` provider | `llama_cpp_cuda` provider |
 |---|---|---|
-| Primary value | Throughput-core + kernel control path | Compatibility + broad feature coverage |
-| Runtime core | InferFlux native runtime (`NativeCudaRuntime`) | llama.cpp runtime (`LlamaCPUBackend` CUDA target) |
-| Model format posture | First-class safetensors; GGUF path in active maturity work | Strong GGUF compatibility path |
-| Feature surface today | Generation core + mixed decode/prefill overlap path + KV prefix/serialize contracts; endpoint parity for completion/chat/embeddings is contract-closed via native parity delegate paths when available | Full mature llama.cpp feature surface used as compatibility baseline |
-| Concurrency contract today | Async unified-batch API is intentionally disabled in native runtime (`SupportsAsyncUnifiedBatch()==false`), so overlap is currently delivered through synchronous mixed-batch execution | Async unified-batch contract is available through llama.cpp path |
-| Policy semantics | Capability routing is explicit; if native parity contract is unavailable, fallback/422 behavior is policy-driven and observable in backend exposure fields | Serves as deterministic fallback/safety net under policy and capability checks |
-| Fallback role | Preferred when ready and policy allows | Deterministic fallback when native is unavailable or policy routes to llama.cpp |
-| Operational risk profile | Faster-moving, higher upside, active maturity backlog | Lower risk, stable baseline for OSS users and production fallback |
+| Primary value | Throughput/control path owned by InferFlux | Stable compatibility baseline and deterministic fallback |
+| Runtime core | `InferfluxCudaRuntime` + InferFlux CUDA loaders + metrics | llama.cpp runtime behind InferFlux control plane |
+| Strong today | Native safetensors path, GGUF loader detection, memory-first dequant policy, KV auto-tune metrics, explicit provider identity | Mature GGUF behavior, lower operational risk, broad compatibility |
+| Current limits | Async unified batch intentionally off; quantized GGUF throughput and native-owned parity are still maturing | Lower headroom for first-party kernel/runtime innovation |
+| Operational role | Preferred when native is ready and policy allows | Compatibility/safety net when policy permits fallback |
 
-Keeping both backends is intentional: one maximizes control/performance headroom (`native_cuda`), the other maximizes compatibility/stability (`cuda_llama_cpp`).
+## 6.2) Memory and State Lifecycle Contract
 
-## 7) Prefix/KV Reuse Contract
-
-| Area | Contract |
+| Area | Current contract |
 |---|---|
-| Prefix matching | Token-aligned matching for safe reuse |
-| Sequence ownership | KV sequence state remains backend-instance scoped |
-| Slot accounting | Acquire/release behavior must remain balanced under reuse |
-| Metrics | Prefix hit/reuse and batching counters exported for tuning |
+| Model format detection | Loader is selected from artifact structure and GGUF metadata rather than filename guesses |
+| Model weights | Loaded once per model instance; treated as shared runtime state |
+| Dequantized projections | Policy-scoped as `none`, `batch`, or `model`; native quantized path defaults to memory-first `none` |
+| KV cache | Separate lifecycle from weights; precision is fixed at model-load scope |
+| KV sizing | InferFlux CUDA can auto-tune max sequence length against a VRAM budget and exports planning metrics |
+| Prefix reuse | Token-aligned reuse with balanced acquire/release accounting |
+| Session reuse | Optional `session_id` lease layer with TTL; disabled in decode-worker mode today |
+
+## 7) Distributed Runtime Status
+
+| Area | Current state |
+|---|---|
+| Topology foundation | `ParallelContext` and split prefill/decode roles exist |
+| KV transport | In-process channel path plus SHM-backed transport exist |
+| Ticket lifecycle | Enqueue, acknowledge, commit, and timeout states are tracked and exported |
+| Health semantics | Decode nodes gate on loaded model, live workers, transport timeout streak/debt, and admin pools visibility |
+| Admission semantics | Optional fail-closed generation admission can stop new work when distributed transport is degraded |
+| Missing for maturity | Sequence ownership cleanup, decode-worker session reuse, multi-process proof, and CI fault matrix |
 
 ## 8) Admin Control Plane Contract
 
@@ -128,77 +140,39 @@ Keeping both backends is intentional: one maximizes control/performance headroom
 | Model operations | `/v1/admin/models`, `/v1/admin/models/default` |
 | Routing policy | `/v1/admin/routing` |
 | Cache operations | `/v1/admin/cache`, `/v1/admin/cache/warm` |
+| Pool/runtime health | `/v1/admin/pools` |
 
-See [API Surface](API_SURFACE.md) for full method-level matrix.
+See [API Surface](API_SURFACE.md) for the full method matrix.
 
 ## 9) Operational Invariants
 
-1. No request enters backend execution without successful auth/scope checks.
-2. Scheduler must enforce token/batch limits before dispatch.
-3. Routing must reject incompatible capability requests early.
-4. Backend/provider identity must be machine-visible in API/CLI outputs.
-5. Metrics endpoints remain stable across runtime policy changes.
-6. Admin operations remain fail-fast on invalid argument combinations.
+1. No request enters backend execution before auth/scope checks pass.
+2. Scheduler enforces batch/token limits before dispatch.
+3. Capability mismatches are rejected during routing, not discovered late in streaming.
+4. Backend/provider identity remains machine-visible across API and CLI surfaces.
+5. Native throughput optimization must not rely on per-step async fragmentation.
+6. Decode-node readiness requires both loaded weights and all configured workers alive.
+7. Distributed transport degradation can surface in `/readyz`, `/v1/admin/pools`, and optionally generation admission.
 
 ## 10) Extension Points
 
-| Extension | Where to add |
+| Extension | Where to add it |
 |---|---|
 | New backend provider | `runtime/backends/` + backend factory + capability map |
-| New routing policy | model router + `/v1/admin/routing` contract |
-| New admin domain | HTTP admin handlers + `inferctl admin` command surface |
-| New metrics family | `server/metrics/*` + monitoring docs |
-| New request feature (e.g., decoding mode) | request schema + scheduler requirements + capability gating |
+| New routing policy | scheduler/router + `/v1/admin/routing` |
+| New admin domain | HTTP admin handlers + `inferctl admin` |
+| New metrics family | `server/metrics/*` + [MONITORING](MONITORING.md) |
+| New request feature | request schema + scheduler requirements + capability gating |
 
-## 11) Architecture Boundaries (What this doc does not do)
+## 11) What This Doc Does Not Do
 
-This canonical doc intentionally avoids deep experiment logs and long benchmark narratives.
-For historical evidence and snapshots, use:
+This doc is the runtime contract, not the benchmark log. Historical perf snapshots and one-off evidence belong in [ARCHIVE_INDEX](ARCHIVE_INDEX.md).
 
-- [ARCHIVE_INDEX](ARCHIVE_INDEX.md)
+## 12) Related Docs
+
+- [VISION](VISION.md)
+- [PRD](PRD.md)
 - [Roadmap](Roadmap.md)
-- [TechDebt and Competitive Roadmap](TechDebt_and_Competitive_Roadmap.md)
-
-## 12) Additional Reference Diagrams
-
-```mermaid
-graph TD
-  A[Client SDKs] --> B[HTTP/gRPC API]
-  B --> C[Auth and Rate Limiting]
-  C --> D[Scheduler]
-  D --> E[Model Manager]
-  D --> F[Runtime Core]
-  F --> G[DeviceContext CUDA/ROCm/MPS/CPU]
-  F --> H[Paged KV Cache]
-  D --> I[Telemetry]
-  I --> J[Prometheus]
-  I --> K[OpenTelemetry Collector]
-```
-
-```mermaid
-graph LR
-  subgraph Kubernetes Cluster
-    direction TB
-    CM[ConfigMap server.yaml]
-    Secret[API Keys]
-    Redis[(Redis KV)]
-    subgraph NodeGroup
-      Pod1((inferfluxd))
-      Pod2((inferfluxd))
-    end
-    CM --> Pod1
-    Secret --> Pod1
-    Redis --> Pod1
-    Redis --> Pod2
-  end
-  Prometheus --> Pod1
-  Prometheus --> Pod2
-```
-
-## 13) Related Docs
-
-- [Quickstart](Quickstart.md)
-- [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
-- [Admin Guide](AdminGuide.md)
-- [Developer Guide](DeveloperGuide.md)
-- [API Surface](API_SURFACE.md)
+- [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
+- [MONITORING](MONITORING.md)
+- [design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN](design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md)

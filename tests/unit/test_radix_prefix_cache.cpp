@@ -1,4 +1,5 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
+#include "runtime/kv_cache/paged_kv_cache.h"
 
 #include <catch2/catch_amalgamated.hpp>
 
@@ -111,4 +112,21 @@ TEST_CASE("RadixPrefixCache: sequence slot capping and eviction",
   cache.Insert({3}, {12}, 103, nullptr);
   REQUIRE(cache.LiveSequences() == 2);
   REQUIRE(evicted_seq == 101);
+}
+
+TEST_CASE("RadixPrefixCache: memory snapshot reports unique retained blocks",
+          "[radix_cache]") {
+  auto paged_kv = std::make_shared<PagedKVCache>(
+      8, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  RadixPrefixCache cache(paged_kv, [](int) {}, RadixPrefixCacheLimits{64, 12});
+
+  cache.Insert({1, 2, 3}, {10}, 1001, nullptr);
+  cache.Insert(
+      {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17},
+      {10, 20}, 1002, nullptr);
+
+  const auto snapshot = cache.MemorySnapshot();
+  REQUIRE(snapshot.unique_retained_blocks == 2);
+  REQUIRE(snapshot.retained_bytes == 2048);
+  REQUIRE(snapshot.live_sequences == 2);
 }

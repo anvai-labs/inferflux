@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -13,6 +14,7 @@ namespace scheduler {
 struct SessionHandleState {
   std::string model_id;
   int sequence_id{-1};
+  uint64_t sequence_generation{0};
   std::vector<int> prompt_tokens;
   std::vector<int> block_table;
 };

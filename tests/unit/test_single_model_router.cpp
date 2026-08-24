@@ -1,14 +1,14 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cpu/llama_backend.h"
-#include "runtime/backends/cuda/native_cuda_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
+#include "runtime/backends/cuda/inferflux_cuda_backend.h"
 #include "scheduler/single_model_router.h"
 
 namespace inferflux {
 
 namespace {
 
-class NativeContractBackendStub final : public NativeCudaBackend {
+class NativeContractBackendStub final : public InferfluxCudaBackend {
 public:
   NativeContractBackendStub(bool supports_logprobs,
                             bool supports_structured_output,
@@ -43,14 +43,14 @@ private:
 TEST_CASE("SingleModelRouter applies native capability contract",
           "[single_model_router]") {
   auto router = std::make_shared<SingleModelRouter>();
-  auto backend = std::make_shared<LlamaCPUBackend>();
+  auto backend = std::make_shared<LlamaCppBackend>();
   backend->ForceReadyForTests();
 
   ModelInfo info;
   info.id = "native-contract";
   info.path = "models/native.gguf";
   info.backend = "cuda";
-  info.backend_provider = "native";
+  info.backend_provider = "inferflux";
 
   REQUIRE(router->RegisterModel(info, backend));
   auto models = router->ListModels();
@@ -75,7 +75,7 @@ TEST_CASE("SingleModelRouter maps endpoint contracts from native backend",
   info.id = "native-explicit-contract";
   info.path = "models/native.safetensors";
   info.backend = "cuda";
-  info.backend_provider = "native";
+  info.backend_provider = "inferflux";
 
   REQUIRE(router->RegisterModel(info, backend));
   const auto models = router->ListModels();
@@ -100,7 +100,7 @@ TEST_CASE("SingleModelRouter preserves enabled native endpoint contracts",
   info.id = "native-enabled-contract";
   info.path = "models/native.gguf";
   info.backend = "cuda";
-  info.backend_provider = "native";
+  info.backend_provider = "inferflux";
 
   REQUIRE(router->RegisterModel(info, backend));
   const auto models = router->ListModels();
@@ -117,7 +117,7 @@ TEST_CASE("SingleModelRouter preserves enabled native endpoint contracts",
 TEST_CASE("SingleModelRouter keeps llama.cpp capability defaults",
           "[single_model_router]") {
   auto router = std::make_shared<SingleModelRouter>();
-  auto backend = std::make_shared<LlamaCPUBackend>();
+  auto backend = std::make_shared<LlamaCppBackend>();
   backend->ForceReadyForTests();
 
   ModelInfo info;

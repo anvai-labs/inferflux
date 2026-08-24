@@ -123,6 +123,9 @@ TEST_CASE("GGUF: String to tensor type conversion", "[gguf][gguf_util]") {
   REQUIRE(StringToTensorType("q4_k_m") == GGUF::TensorType::Q4_K);
   REQUIRE(StringToTensorType("q5_k_m") == GGUF::TensorType::Q5_K);
   REQUIRE(StringToTensorType("q6_k") == GGUF::TensorType::Q6_K);
+  REQUIRE(StringToTensorType("q6_k_m") == GGUF::TensorType::Q6_K);
+  REQUIRE(StringToTensorType("q8_k") == GGUF::TensorType::Q8_K);
+  REQUIRE(StringToTensorType("q8_k_m") == GGUF::TensorType::Q8_K);
 }
 
 TEST_CASE("GGUF: Is quantized type detection", "[gguf][gguf_util]") {
@@ -249,7 +252,10 @@ TEST_CASE("Quantization: Handler registration", "[quantization][handler]") {
   REQUIRE(registry.IsRegistered("q5_k_m"));
   REQUIRE(registry.IsRegistered("q5_k"));
   REQUIRE(registry.IsRegistered("q6_k"));
+  REQUIRE(registry.IsRegistered("q6_k_m"));
   REQUIRE(registry.IsRegistered("q8_0"));
+  REQUIRE(registry.IsRegistered("q8_k"));
+  REQUIRE(registry.IsRegistered("q8_k_m"));
 }
 
 TEST_CASE("Quantization: Handler creation", "[quantization][handler]") {
@@ -268,10 +274,25 @@ TEST_CASE("Quantization: Handler creation", "[quantization][handler]") {
   REQUIRE(handler_q6->GetType() == "q6_k");
   REQUIRE(handler_q6->GetBitsPerValue() == Catch::Approx(6.5625));
 
+  auto handler_q6_m = CreateQuantizationHandler("q6_k_m");
+  REQUIRE(handler_q6_m != nullptr);
+  REQUIRE(handler_q6_m->GetType() == "q6_k");
+  REQUIRE(handler_q6_m->GetBitsPerValue() == Catch::Approx(6.5625));
+
   auto handler_q8 = CreateQuantizationHandler("q8_0");
   REQUIRE(handler_q8 != nullptr);
   REQUIRE(handler_q8->GetType() == "q8_0");
   REQUIRE(handler_q8->GetBitsPerValue() == Catch::Approx(8.5));
+
+  auto handler_q8_k = CreateQuantizationHandler("q8_k");
+  REQUIRE(handler_q8_k != nullptr);
+  REQUIRE(handler_q8_k->GetType() == "q8_k");
+  REQUIRE(handler_q8_k->GetBitsPerValue() == Catch::Approx(9.125));
+
+  auto handler_q8_k_m = CreateQuantizationHandler("q8_k_m");
+  REQUIRE(handler_q8_k_m != nullptr);
+  REQUIRE(handler_q8_k_m->GetType() == "q8_k");
+  REQUIRE(handler_q8_k_m->GetBitsPerValue() == Catch::Approx(9.125));
 
   // Non-quantized handler
   auto handler_none = CreateQuantizationHandler("none");
@@ -297,6 +318,20 @@ TEST_CASE("Quantization: Get dequantized size", "[quantization][handler]") {
 
   // Q6_K: 210 bytes per 256 values → 512 bytes
   REQUIRE(handler_q6->GetDequantizedSize(210) == 512);
+
+  auto handler_q6_m = CreateQuantizationHandler("q6_k_m");
+  REQUIRE(handler_q6_m != nullptr);
+  REQUIRE(handler_q6_m->GetDequantizedSize(210) == 512);
+
+  auto handler_q8_k = CreateQuantizationHandler("q8_k");
+  REQUIRE(handler_q8_k != nullptr);
+
+  // Q8_K: 292 bytes per 256 values → 512 bytes
+  REQUIRE(handler_q8_k->GetDequantizedSize(292) == 512);
+
+  auto handler_q8_k_m = CreateQuantizationHandler("q8_k_m");
+  REQUIRE(handler_q8_k_m != nullptr);
+  REQUIRE(handler_q8_k_m->GetDequantizedSize(292) == 512);
 }
 
 TEST_CASE("Quantization: Block size calculation", "[quantization][handler]") {
@@ -312,6 +347,9 @@ TEST_CASE("Quantization: Block size calculation", "[quantization][handler]") {
   REQUIRE(BaseQuantizationHandler::GetBlockSize("q4_k") == 256);
   REQUIRE(BaseQuantizationHandler::GetBlockSize("q5_k") == 256);
   REQUIRE(BaseQuantizationHandler::GetBlockSize("q6_k") == 256);
+  REQUIRE(BaseQuantizationHandler::GetBlockSize("q6_k_m") == 256);
+  REQUIRE(BaseQuantizationHandler::GetBlockSize("q8_k") == 256);
+  REQUIRE(BaseQuantizationHandler::GetBlockSize("q8_k_m") == 256);
 }
 
 TEST_CASE("Quantization: Quantized size calculation",
@@ -334,11 +372,24 @@ TEST_CASE("Quantization: Quantized size calculation",
       BaseQuantizationHandler::GetQuantizedSize(num_elements, "q6_k");
   REQUIRE(q6_k_size == 210);
 
+  size_t q6_k_m_size =
+      BaseQuantizationHandler::GetQuantizedSize(num_elements, "q6_k_m");
+  REQUIRE(q6_k_m_size == 210);
+
   // Q8_0: 34 bytes per 32 values
   // For 256 values: 8 blocks * 34 bytes = 272 bytes
   size_t q8_0_size =
       BaseQuantizationHandler::GetQuantizedSize(num_elements, "q8_0");
   REQUIRE(q8_0_size == 272);
+
+  // Q8_K: 320 bytes per 256 values
+  size_t q8_k_size =
+      BaseQuantizationHandler::GetQuantizedSize(num_elements, "q8_k");
+  REQUIRE(q8_k_size == 292);
+
+  size_t q8_k_m_size =
+      BaseQuantizationHandler::GetQuantizedSize(num_elements, "q8_k_m");
+  REQUIRE(q8_k_m_size == 292);
 
   // Non-quantized should use FP16 size
   size_t fp16_size =

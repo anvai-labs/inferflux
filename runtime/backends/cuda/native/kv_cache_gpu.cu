@@ -86,7 +86,7 @@ template <typename T> void KvCacheGpuTyped<T>::ClearSequence(int seq_id) {
   if (!buffer_ || seq_id >= max_batch_size_)
     return;
   size_t bytes = slot_stride_ * sizeof(T);
-  cudaMemsetAsync(buffer_ + seq_id * slot_stride_, 0, bytes, nullptr);
+  cudaMemset(buffer_ + seq_id * slot_stride_, 0, bytes);
 }
 
 template <typename T>

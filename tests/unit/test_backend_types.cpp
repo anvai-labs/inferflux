@@ -14,6 +14,8 @@ TEST_CASE("UnifiedBatchInput defaults", "[backend_types]") {
   REQUIRE(input.request_logits == true);
   REQUIRE(input.sampling.temperature == 1.0f);
   REQUIRE(input.sampling.top_p == 1.0f);
+  REQUIRE(input.request_id == -1);
+  REQUIRE(input.sequence_generation == 0);
 }
 
 TEST_CASE("UnifiedBatchInput with values", "[backend_types]") {
@@ -22,6 +24,8 @@ TEST_CASE("UnifiedBatchInput with values", "[backend_types]") {
   input.n_past = 10;
   input.tokens = {1, 2, 3};
   input.request_logits = false;
+  input.request_id = 77;
+  input.sequence_generation = 9;
 
   REQUIRE(input.sequence_id == 42);
   REQUIRE(input.n_past == 10);
@@ -30,6 +34,8 @@ TEST_CASE("UnifiedBatchInput with values", "[backend_types]") {
   REQUIRE(input.tokens[1] == 2);
   REQUIRE(input.tokens[2] == 3);
   REQUIRE(input.request_logits == false);
+  REQUIRE(input.request_id == 77);
+  REQUIRE(input.sequence_generation == 9);
 }
 
 TEST_CASE("UnifiedBatchOutput defaults", "[backend_types]") {

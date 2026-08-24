@@ -94,7 +94,7 @@ graph TD
 | Set default model | `inferctl admin models --set-default` | `PUT /v1/admin/models/default` |
 | Routing policy | `inferctl admin routing --get/--set` | `GET/PUT /v1/admin/routing` |
 | Cache status/warm | `inferctl admin cache --status/--warm` | `GET /v1/admin/cache`, `POST /v1/admin/cache/warm` |
-| Pool health snapshot | `inferctl admin pools --get` | aggregates `/readyz` + `/metrics` |
+| Pool health snapshot | `inferctl admin pools --get` or `GET /v1/admin/pools` | canonical server payload with `pool_health` (including timeout streak/debt), `scheduler`, and `distributed_kv`; CLI falls back for older servers |
 
 Full endpoint list: [API Surface](API_SURFACE.md)
 
@@ -143,6 +143,16 @@ curl -s http://127.0.0.1:8080/healthz
 ./build/inferctl admin pools --get --api-key <ADMIN_KEY>
 curl -s http://127.0.0.1:8080/metrics | head -80
 ```
+
+### 6.6 Distributed transport fail-closed mode
+
+```bash
+export INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED=true
+curl -s http://127.0.0.1:8080/readyz
+./build/inferctl admin pools --get --table --api-key <ADMIN_KEY>
+```
+
+Use this when distributed decode transport degradation should stop new generation admission instead of only surfacing via `/readyz`.
 
 ## 7) Observability Priorities
 

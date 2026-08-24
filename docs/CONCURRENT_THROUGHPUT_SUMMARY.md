@@ -1,253 +1,180 @@
-# Concurrent Throughput Investigation Summary
+# Concurrent Throughput Investigation: Summary & Recommendations
 
-**Date**: 2026-03-05
-**Status**: ✅ Root cause identified, mitigation phase landed, kernel-level follow-up pending
+**Date**: March 10, 2026
+**Issue**: InferFlux CUDA achieves 0.83x sequential parity but only 0.50x at concurrency=4
+**Status**: Investigation complete, modest improvement identified
 
 ---
 
 ## Executive Summary
 
-### Problem
+The concurrent throughput gap (0.50x at c=4) is **NOT caused by**:
+- Scheduler `max_batch_size` limit (testing showed max_batch=4 performs BEST)
+- Insufficient batch accumulation delay (though `accum_ms=2` provides 4% improvement)
 
-Historical baseline showed concurrent throughput was **17x slower** than sequential:
-- Sequential: 35.56 tok/s ✅
-- Concurrent (8): 2.04 tok/s ❌ (historical before worker-pool fix)
-
-### Root Cause
-
-**HTTP worker pool saturation** in `server/http/http_server.cpp:2763-2764`:
-
-```cpp
-// Non-streaming path blocks worker threads
-auto future = scheduler_->Generate(std::move(req));
-auto result = future.get();  // ❌ BLOCKS until request completes
-```
-
-### Impact
-
-- Historical default had only 4 worker threads available
-- Each request takes ~50 seconds
-- 8 concurrent requests → 4 run, 4 wait → ~392 seconds total
-- Throughput: 800 tokens / 392s = **2.04 tok/s**
+**Primary bottleneck**: GPU kernel efficiency and/or decode loop architecture. The system processes 140+ decode passes for 8 concurrent requests, suggesting each decode step is processed separately rather than batching multiple sequences together.
 
 ---
 
-## Solution
+## Investigation Results
 
-### Quick Win: Use Streaming ✅
+### Test 1: Batch Size Limit (max_batch_size)
 
-**Change**: Set `"stream": true` in requests
+**Hypothesis**: Default `max_batch_size=4` limits concurrent throughput
 
-**How it works**:
-```cpp
-// Streaming path (line 2573)
-futures.push_back(scheduler_->Generate(std::move(cur)));  // ✅ Async!
-```
+**Results** (c=4, 16 requests):
+| max_batch | Tok/s | Max Batch Observed | B=1% | B=2% | B=3-4% |
+|-----------|-------|-------------------|------|------|--------|
+| 4         | **69.9** | 3 | 89.4 | 3.2 | 5.0 |
+| 8         | 66.8   | 4 | - | - | - |
+| 16        | 69.5   | 4 | 86.3 | 8.5 | 6.3 |
+| 32        | 67.1   | 4 | - | - | - |
 
-**Benefits**:
-- Worker threads **not blocked**
-- True concurrent processing
-- **Expected improvement**: 2 tok/s → **35-50 tok/s** (17-25x faster!)
+**Conclusion**: `max_batch_size=4` performs BEST. Increasing to 16 or 32 REDUCES throughput by 0.4-4.2%.
 
-**Implementation**:
-```bash
-# Just change stream: false → stream: true
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -d '{"model":"default","messages":[...],"stream":true}'
-```
+### Test 2: Batch Accumulation Delay (batch_accumulation_ms)
 
-### Request-Layer Mitigation Landed ✅
+**Hypothesis**: `accum_ms=0` causes immediate single-sequence batching
 
-**Change landed**: increase default HTTP worker pool from 4 to 16  
-**Commit**: `a18ca46`  
-**Doc**: `docs/HTTP_WORKER_POOL_INCREASE.md`
+**Results** (c=4, 8 requests):
+| accum_ms | Tok/s | Improvement | B=1% | B=2% | B=3-4% |
+|----------|-------|-------------|------|------|--------|
+| 0        | 71.7  | baseline    | 70.4 | 22.5 | 7.0 |
+| 1        | 73.9  | +3.1%       | 79.4 | 3.5  | 17.0 |
+| **2**    | **74.7** | **+4.2%**   | 61.4 | 38.6 | 0.0 |
+| 5        | 74.6  | +4.1%       | 69.5 | 23.4 | 7.1 |
 
-**Impact**:
-- Reduces non-streaming queue saturation at request layer
-- Improves concurrency headroom without changing API clients
-- Does **not** replace native CUDA kernel/overlap work
+**Conclusion**: `accum_ms=2` provides **4.2% throughput improvement** with acceptable latency trade-off (+44ms, +4.8%).
 
 ---
 
-## Implementation Plan
+## Root Cause Analysis
 
-### Phase 1: Document Streaming Best Practice ✅
+### The Real Problem: Decode Loop Inefficiency
 
-**Status**: Complete
+**Evidence**:
+- 8 concurrent requests × ~64 tokens = 512 total tokens
+- Expected: ~8 batches (one per request per decode step)
+- Actual: **140-142 decode passes** (17× more than expected!)
 
-- Root cause analysis: `docs/CONCURRENT_THROUGHPUT_ANALYSIS.md`
-- Test scripts created
-- Expected results documented
+**Implication**: The system is NOT processing multiple sequences in a single batch. Instead, it's processing each sequence's decode step separately, even when multiple sequences are ready.
 
----
+**Hypothesis**: The batched decode kernel (B=2, B=4) is NOT significantly faster than single-sequence kernels, so there's no incentive to batch. OR, the decode loop architecture prevents effective batching.
 
-### Phase 2: Increase HTTP Worker Pool ✅
+### Why Scheduler Doesn't Batch
 
-**File**: `server/main.cpp`
+Even with `max_batch_size=16` and `accum_ms=2`, we see:
+- 61-79% single-sequence batches (B=1)
+- Only 0-17% batches with 3-4 sequences
 
-**Change**: Increase worker threads from 4 to 16
-
-```cpp
-// Line ~1230
-HttpServer http_server(tls_config, 16,  // Increase from 4
-                      scheduler, &auth,
-```
-
-**Expected improvement**:
-- Non-streaming: 2 tok/s → **8 tok/s** (4x better)
-- More concurrent requests possible
-
-**Effort**: ⭐⭐ (Simple config change)  
-**Status**: ✅ Complete (`a18ca46`)
-
----
-
-### Phase 3: Make Non-Streaming Truly Async
-
-**File**: `server/http/http_server.cpp`
-
-**Change**: Remove blocking `future.get()` for non-streaming
-
-```cpp
-// Before (blocking):
-auto future = scheduler_->Generate(std::move(req));
-auto result = future.get();  // ❌ Blocks worker
-
-// After (async):
-auto future = scheduler_->Generate(std::move(req));
-// Register callback, don't block worker
-// Worker can handle other requests
-```
-
-**Expected improvement**:
-- Non-streaming scales like streaming
-- Worker threads not blocked
-- **17-25x speedup** even without streaming
-
-**Effort**: ⭐⭐⭐ (Moderate refactoring)
-
-**Status**: ⏳ TODO
-
----
-
-## Verification
-
-### Expected Results (Based on Analysis)
-
-| Configuration | Requests | Time | Throughput | Status |
-|----------------|----------|------|------------|--------|
-| **Historical baseline (non-streaming, 4 workers)** | 8 | 392s | 2.04 tok/s | ✅ Root-cause baseline |
-| **Streaming** | 8 | ~10-15s | **35-50 tok/s** | ✅ Immediate mitigation path |
-| **Current default (non-streaming, 16 workers)** | 8 | rerun pending | expected better than baseline | ⏳ needs fresh benchmark capture |
-| **+ Async non-streaming** | 8 | ~10-15s target | **35-50 tok/s** target | ⏳ planned |
-
----
-
-## Code Changes Needed
-
-### 1. HTTP Worker Pool Increase ✅
-
-**File**: `server/main.cpp`
-
-```diff
-- HttpServer http_server(tls_config, 4,
-+ HttpServer http_server(tls_config, 16,
-                       scheduler, &auth,
-```
-
-**Lines**: `server/main.cpp` (`http_workers=16`)  
-**Status**: Complete (`a18ca46`)
-
----
-
-### 2. Async Non-Streaming (Future Work)
-
-**File**: `server/http/http_server.cpp`
-
-**Function**: `HandleCompletionsRequest` (around line 2750)
-
-**Changes needed**:
-1. Don't call `future.get()` synchronously
-2. Register completion callback
-3. Handle timeout asynchronously
-4. Return response when ready
-
-**Complexity**: Moderate (requires callback mechanism)
+**Possible causes**:
+1. **Request arrival timing**: Requests don't arrive simultaneously, so scheduler can't group them
+2. **Priority/age policy**: Oldest requests are processed first, breaking up potential batches
+3. **Token budget constraints**: `max_batch_tokens=16384` may limit batch size
+4. **Decode worker isolation**: Each sequence may have its own decode worker, preventing batching
 
 ---
 
 ## Recommendations
 
-### For Users (Immediate)
+### 1. Set `batch_accumulation_ms=2` in Default Config ✅ DO THIS
 
-✅ **Use streaming mode** for concurrent workloads:
-```python
-response = client.chat.completions.create(
-    model="default",
-    messages=[...],
-    stream=True  # ✅ Enables 17-25x faster concurrent processing
-)
+**Reasoning**:
+- 4.2% throughput improvement with minimal risk
+- Low-latency trade-off (+44ms on 920ms baseline = +4.8%)
+- Helps with batch grouping without architectural changes
 
-for chunk in response:
-    print(chunk.choices[0].delta.content)
+**Implementation**: Update `config/server.yaml`:
+```yaml
+runtime:
+  scheduler:
+    batch_accumulation_ms: 2  # Up from 0 for 4% throughput improvement
 ```
 
-### For Developers (Short-term)
+**Expected impact**: 71.7 → 74.7 tok/s at c=4 (4.2% improvement)
 
-✅ **HTTP worker pool default increased to 16**:
-- Request-layer concurrency bottleneck reduced
-- Keeps client contract unchanged
-- Use `INFERFLUX_HTTP_WORKERS` to tune per host
+### 2. DO NOT Change `max_batch_size` ❌ DON'T DO THIS
 
-### For Developers (Long-term)
+**Reasoning**: Testing showed `max_batch_size=4` performs BEST at c=4. Increasing to 16 or 32 REDUCES throughput.
 
-⏳ **Implement async non-streaming**:
-- Best performance for all workloads
-- Scales to 100+ concurrent requests
-- Requires refactoring HTTP server
+### 3. Profile Batched Decode Kernel Efficiency 🔬 HIGH PRIORITY
 
----
+**Goal**: Understand why batched kernels aren't providing proportional speedup
 
-## Test Coverage
+**Test**:
+1. Use Nsight Systems to trace execution with c=4
+2. Measure kernel execution time for B=1 vs B=2 vs B=4
+3. Check if memory bandwidth or compute is the bottleneck
 
-### Manual Testing
+**Expected outcome**:
+- If B=4 is 4× faster than B=1: Problem is in scheduler/batching logic
+- If B=4 is only 1.1× faster: Problem is in kernel efficiency
 
-**Test streaming mode**:
-```bash
-# Single streaming request
-curl -X POST http://localhost:8080/v1/chat/completions \
-  -H "Authorization: Bearer dev-key-123" \
-  -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"Hello"}],"stream":true}'
-```
+### 4. Verify True Request Concurrency 🔬 HIGH PRIORITY
 
-**Expected**: SSE chunks returned immediately
+**Goal**: Confirm requests are truly concurrent at scheduler level
 
----
+**Instrumentation**:
+- Add timestamps at `Scheduler::Enqueue()`
+- Measure time between request arrivals
+- Check if HTTP server or scheduler is serializing requests
 
-## Summary
+**Expected outcome**:
+- If requests arrive simultaneously: Problem is in batch building
+- If requests arrive serially: Problem is upstream (HTTP server, connection handling)
 
-| Item | Status |
-|------|--------|
-| Root cause identified | ✅ Complete |
-| Solution documented | ✅ Complete |
-| Test scripts created | ✅ Complete |
-| Streaming best practice | ✅ Documented |
-| Worker pool increase | ✅ Complete (`a18ca46`) |
-| Async refactoring | ⏳ TODO |
+### 5. Test Higher Token Budget (Optional)
 
----
+**Current**: `max_batch_tokens=16384`
+**Test**: Increase to `32768` or `65536`
+**Rationale**: Token budget may prevent larger batches from forming
 
-## Next Steps
+### 6. Test Different Batch Policies (Optional)
 
-1. ✅ Document findings (this file)
-2. ⏳ Rerun concurrent non-streaming benchmark with worker=16 and record measured delta
-3. ⏳ Keep streaming guidance as default for high concurrency clients
-4. ⏳ Plan async non-streaming refactoring
-5. ⏳ Add throughput evidence snapshot for post-mitigation measurements
+**Current**: `policy: priority_age`
+**Alternatives**:
+- `throughput_balanced`: May batch more aggressively
+- `lpm_priority`: May improve prefix cache hits
 
 ---
 
-**Date**: 2026-03-05
-**Status**: Mitigation phase complete at request layer; core kernel work remains
-**Impact**: Streaming remains highest-confidence mitigation; worker-pool increase reduces non-streaming saturation risk
+## Expected Impact
+
+### With `batch_accumulation_ms=2`:
+- Current (c=4): 71.7 tok/s
+- Improved (c=4): 74.7 tok/s
+- **Improvement**: +4.2%
+
+### Gap to llama.cpp:
+- If llama.cpp achieves ~150 tok/s at c=4 (extrapolated)
+- Native at accum_ms=0: 71.7 tok/s (0.48x)
+- Native at accum_ms=2: 74.7 tok/s (0.50x)
+- **Remaining gap**: 50% (requires kernel optimization or architecture changes)
+
+---
+
+## Conclusion
+
+The concurrent throughput gap is **NOT a configuration issue**. The scheduler's batch size limit and accumulation delay have minimal impact (4% improvement). The primary bottleneck is in the GPU kernel efficiency or decode loop architecture.
+
+**Immediate action**: Set `batch_accumulation_ms=2` for 4% improvement.
+
+**Long-term solution**: Profile batched kernel execution and decode loop to understand why 140+ decode passes are needed for 8 concurrent requests. This likely requires:
+1. Kernel optimization to make B=4 significantly faster than 4× B=1
+2. OR architecture changes to batch multiple decode steps together
+3. OR request coordination to ensure simultaneous arrival at scheduler
+
+---
+
+**Documents Created**:
+1. `docs/CONCURRENT_THROUGHPUT_INVESTIGATION.md` - Full investigation details
+2. `docs/BATCH_ACCUMULATION_TEST_RESULTS.md` - Accumulation delay test results
+3. `scripts/archive/analysis/investigate_concurrent_batch_size.sh` - archived batch-size probe
+4. `scripts/archive/test/test_batch_accumulation.sh` - archived accumulation-delay probe
+
+**Status**: Investigation complete, ready to proceed with GPU kernel profiling
+
+---
+
+**Document Version**: 1.0
+**Last Updated**: March 10, 2026

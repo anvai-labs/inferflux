@@ -162,7 +162,12 @@ TEST_CASE("PolicyStore Load falls back to backup when primary is corrupt",
 }
 
 TEST_CASE("PolicyStore Save fails on unwritable path", "[policy]") {
+#ifdef _WIN32
+  // Windows has no /proc; use a path under a nonexistent root directory.
+  inferflux::PolicyStore store("Z:\\nonexistent_volume\\inferflux_policy_unwritable.conf");
+#else
   inferflux::PolicyStore store("/proc/inferflux_policy_unwritable.conf");
+#endif
   store.SetRateLimitPerMinute(5);
   REQUIRE(!store.Save());
 }

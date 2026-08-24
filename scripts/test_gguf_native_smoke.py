@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-GGUF Quantization Smoke Test for Native CUDA Backend
+GGUF Quantization Smoke Test for the InferFlux CUDA backend
 
 Tests each supported quantization type by:
 1. Loading pre-quantized GGUF models
-2. Running inference with native CUDA backend
+2. Running inference with the InferFlux CUDA backend
 3. Validating outputs are generated correctly
 4. Comparing performance across quantization types
 
@@ -60,7 +60,7 @@ def print_header(title: str):
 
 
 class GGUFModelTester:
-    """Test harness for GGUF models with native CUDA backend"""
+    """Test harness for GGUF models with the InferFlux CUDA backend"""
     
     def __init__(self, model_dir: Path, inferfluxd: str, inferctl: str):
         self.model_dir = model_dir
@@ -108,7 +108,7 @@ class GGUFModelTester:
                 "id": f"test-{quant_type}",
                 "path": str(model_path.absolute()),
                 "format": "gguf",
-                "backend": "cuda_native",
+                "backend": "inferflux_cuda",
                 "default": True
             }],
             "runtime": {
@@ -270,7 +270,7 @@ class GGUFModelTester:
     
     def run_all_tests(self, models: Dict[str, Path]) -> bool:
         """Test all quantization types"""
-        print_header("GGUF Native CUDA Smoke Test")
+        print_header("GGUF InferFlux CUDA Smoke Test")
         
         log_info(f"Model directory: {self.model_dir}")
         log_info(f"Test prompt: '{TEST_PROMPT}'")
@@ -351,7 +351,7 @@ class GGUFModelTester:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="GGUF Native CUDA Smoke Test",
+        description="GGUF InferFlux CUDA Smoke Test",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -406,10 +406,9 @@ Environment Variables:
     
     args = parser.parse_args()
     
-    # Update globals
-    global NUM_TOKENS, TEST_PROMPT
-    NUM_TOKENS = args.num_tokens
-    TEST_PROMPT = args.prompt
+    # Update module-level defaults used by the test harness.
+    globals()["NUM_TOKENS"] = args.num_tokens
+    globals()["TEST_PROMPT"] = args.prompt
     
     # Validate binaries
     if not Path(args.inferfluxd).exists():

@@ -35,6 +35,46 @@ TEST_CASE("KVChannel respects capacity", "[kv_channel]") {
   REQUIRE_FALSE(channel.Enqueue(another));
 }
 
+TEST_CASE("KVChannel preserves ticket protocol fields and metadata tags",
+          "[kv_channel]") {
+  inferflux::disaggregated::KVChannel channel(2);
+  inferflux::disaggregated::KVPacket packet;
+  packet.request_id = 7;
+  packet.ticket_id = 19;
+  packet.ticket_stage = inferflux::disaggregated::KVTicketStage::kEnqueued;
+  packet.kv_page = 3;
+
+  REQUIRE(channel.Enqueue(packet));
+  auto out = channel.TryDequeue();
+  REQUIRE(out.has_value());
+  REQUIRE(out->ticket_id == 19);
+  REQUIRE(out->ticket_stage ==
+          inferflux::disaggregated::KVTicketStage::kEnqueued);
+  REQUIRE(out->metadata.find("|ticket=19") != std::string::npos);
+  REQUIRE(out->metadata.find("|ticket_stage=enqueued") != std::string::npos);
+  REQUIRE(out->metadata.find("|kv_page=3") != std::string::npos);
+}
+
+TEST_CASE("KVChannel tracks ticket lifecycle stages", "[kv_channel]") {
+  inferflux::disaggregated::KVChannel channel(2);
+  inferflux::disaggregated::KVPacket packet;
+  packet.request_id = 9;
+  packet.ticket_id = 44;
+  packet.ticket_stage = inferflux::disaggregated::KVTicketStage::kEnqueued;
+
+  REQUIRE(channel.Enqueue(std::move(packet)));
+  REQUIRE(channel.GetTicketStage(44) ==
+          inferflux::disaggregated::KVTicketStage::kEnqueued);
+  REQUIRE(channel.UpdateTicketStage(
+      44, inferflux::disaggregated::KVTicketStage::kAcknowledged));
+  REQUIRE(channel.GetTicketStage(44) ==
+          inferflux::disaggregated::KVTicketStage::kAcknowledged);
+  REQUIRE(channel.UpdateTicketStage(
+      44, inferflux::disaggregated::KVTicketStage::kCommitted));
+  REQUIRE(channel.GetTicketStage(44) ==
+          inferflux::disaggregated::KVTicketStage::kCommitted);
+}
+
 TEST_CASE("KVChannel is thread-safe for simple producers/consumers",
           "[kv_channel]") {
   inferflux::disaggregated::KVChannel channel(10);

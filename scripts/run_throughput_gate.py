@@ -569,11 +569,11 @@ def fetch_metrics_snapshot(args: argparse.Namespace) -> MetricsSnapshot:
   attention_fallbacks = read_metric(
       body, "inferflux_cuda_attention_kernel_fallbacks_total")
   native_fwd_prefill = read_metric(
-      body, "inferflux_native_forward_passes_total", {"phase": "prefill"})
+      body, "inferflux_cuda_forward_passes_total", {"phase": "prefill"})
   native_fwd_decode = read_metric(
-      body, "inferflux_native_forward_passes_total", {"phase": "decode"})
+      body, "inferflux_cuda_forward_passes_total", {"phase": "decode"})
   native_fwd_batch_tokens = read_metric(
-      body, "inferflux_native_forward_batch_tokens_total")
+      body, "inferflux_cuda_forward_batch_tokens_total")
   return MetricsSnapshot(
       completion_tokens_global=completion_total_global,
       completion_tokens_model=completion_total_model,

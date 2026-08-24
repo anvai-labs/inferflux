@@ -1,0 +1,262 @@
+{
+  "suite_id": "industry_mix_32_v1",
+  "description": "Small prompt-heavy benchmark suite for throughput and latency comparisons across realistic assistant workloads.",
+  "prompts": [
+    {
+      "id": "net_tcp_udp",
+      "category": "networking",
+      "prompt_length_bucket": "short",
+      "output_mode": "text",
+      "tags": ["systems", "factual", "infra"],
+      "prompt": "Explain the difference between TCP and UDP in network programming, focusing on reliability and use cases."
+    },
+    {
+      "id": "email_validator_python",
+      "category": "code_generation",
+      "prompt_length_bucket": "long",
+      "output_mode": "code",
+      "tags": ["python", "validation", "regex"],
+      "prompt": "Write a Python function that validates email addresses according to RFC 5322 standard, including handling of quoted strings and comments."
+    },
+    {
+      "id": "web_stack_architecture",
+      "category": "architecture",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["web", "design", "infra"],
+      "prompt": "Describe the architecture of a modern web application stack, including the roles of load balancers, web servers, application servers, and databases."
+    },
+    {
+      "id": "formal_french_translation",
+      "category": "translation",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["translation", "french", "language"],
+      "prompt": "Translate the following paragraph into formal French: 'The implementation of machine learning models requires careful consideration of data preprocessing, model selection, and evaluation metrics.'"
+    },
+    {
+      "id": "bst_cpp",
+      "category": "code_generation",
+      "prompt_length_bucket": "long",
+      "output_mode": "code",
+      "tags": ["cpp", "data_structures", "algorithms"],
+      "prompt": "Implement a binary search tree in C++ with methods for insertion, deletion, and inorder traversal, handling edge cases like duplicate keys and empty trees."
+    },
+    {
+      "id": "cpp_vs_rust_memory",
+      "category": "systems_programming",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["cpp", "rust", "memory_safety"],
+      "prompt": "Compare and contrast the memory management strategies used in C++ smart pointers versus Rust ownership and borrowing, discussing safety and performance implications."
+    },
+    {
+      "id": "eventual_consistency",
+      "category": "distributed_systems",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["distributed_systems", "consistency", "cap_theorem"],
+      "prompt": "Explain the concept of eventual consistency in distributed systems, including how it relates to the CAP theorem and strategies for handling conflicts."
+    },
+    {
+      "id": "task_api_design",
+      "category": "api_design",
+      "prompt_length_bucket": "long",
+      "output_mode": "json",
+      "tags": ["api", "rest", "backend"],
+      "prompt": "Design a RESTful API for a task management system, including endpoints for creating, updating, deleting, and querying tasks with filtering and pagination support. Return the answer as compact JSON."
+    },
+    {
+      "id": "database_sharding",
+      "category": "databases",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["database", "scaling", "architecture"],
+      "prompt": "Describe the process of database sharding and explain how it differs from horizontal partitioning, including trade-offs in query performance and consistency."
+    },
+    {
+      "id": "javascript_closures",
+      "category": "web_development",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["javascript", "functions", "frontend"],
+      "prompt": "Explain how JavaScript closures work and provide examples of their practical use in web development for data encapsulation and memoization."
+    },
+    {
+      "id": "kubernetes_basics",
+      "category": "cloud_infra",
+      "prompt_length_bucket": "long",
+      "output_mode": "text",
+      "tags": ["kubernetes", "orchestration", "operations"],
+      "prompt": "Write a detailed explanation of how the Kubernetes container orchestration system handles pod scheduling, service discovery, and rolling updates."
+    },
+    {
+      "id": "graphql_vs_rest",
+      "category": "api_design",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["graphql", "rest", "backend"],
+      "prompt": "Compare GraphQL and REST APIs, discussing the advantages and disadvantages of each approach in terms of flexibility, performance, and developer experience."
+    },
+    {
+      "id": "tdd_principles",
+      "category": "software_engineering",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["testing", "tdd", "engineering_process"],
+      "prompt": "Explain the principles of test-driven development and how it impacts code quality, maintainability, and the software development lifecycle."
+    },
+    {
+      "id": "linux_virtual_memory",
+      "category": "systems_programming",
+      "prompt_length_bucket": "long",
+      "output_mode": "text",
+      "tags": ["linux", "memory", "kernel"],
+      "prompt": "Describe how the Linux kernel handles virtual memory management, including paging, swapping, and the role of the page table in address translation."
+    },
+    {
+      "id": "rust_csv_stats",
+      "category": "code_generation",
+      "prompt_length_bucket": "long",
+      "output_mode": "code",
+      "tags": ["rust", "csv", "data_processing"],
+      "prompt": "Implement a function in Rust that reads a CSV file, parses its contents, and performs aggregate calculations like sum, average, and standard deviation."
+    },
+    {
+      "id": "ml_supervised_unsupervised",
+      "category": "machine_learning",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["ml", "education", "classification"],
+      "prompt": "Explain the difference between supervised and unsupervised learning in machine learning, providing examples of algorithms and use cases for each category."
+    },
+    {
+      "id": "json_invoice_extraction",
+      "category": "structured_output",
+      "prompt_length_bucket": "medium",
+      "output_mode": "json",
+      "tags": ["json", "extraction", "documents"],
+      "prompt": "Extract the following invoice fields as compact JSON with keys vendor, invoice_number, invoice_date, currency, subtotal, tax, total: Vendor Apex Supply Co., invoice INV-2049, date 2026-02-14, currency USD, subtotal 1840.50, tax 147.24, total 1987.74."
+    },
+    {
+      "id": "sql_query_analytics",
+      "category": "data",
+      "prompt_length_bucket": "medium",
+      "output_mode": "code",
+      "tags": ["sql", "analytics", "warehousing"],
+      "prompt": "Write a SQL query that computes weekly active users, retention by cohort week, and average session duration from tables users, sessions, and events."
+    },
+    {
+      "id": "incident_postmortem",
+      "category": "operations",
+      "prompt_length_bucket": "long",
+      "output_mode": "text",
+      "tags": ["incident_response", "sre", "postmortem"],
+      "prompt": "Draft a concise incident postmortem for a production outage caused by an expired TLS certificate, including impact, timeline, root cause, remediation, and prevention items."
+    },
+    {
+      "id": "oauth2_pkce",
+      "category": "security",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["security", "oauth2", "auth"],
+      "prompt": "Explain how OAuth 2.0 with PKCE works for a public client application, including the purpose of the verifier and challenge."
+    },
+    {
+      "id": "meeting_summary_actions",
+      "category": "summarization",
+      "prompt_length_bucket": "medium",
+      "output_mode": "json",
+      "tags": ["summary", "actions", "business"],
+      "prompt": "Summarize the following meeting notes into compact JSON with keys summary, decisions, action_items: We agreed to freeze the Q2 API surface by April 5, move customer metrics to a daily batch, and assign Priya to validate the migration checklist by next Tuesday."
+    },
+    {
+      "id": "regex_log_parse",
+      "category": "code_generation",
+      "prompt_length_bucket": "short",
+      "output_mode": "code",
+      "tags": ["regex", "logs", "parsing"],
+      "prompt": "Write a regular expression that extracts timestamp, log level, request id, and message from lines formatted like 2026-03-09T14:55:11Z INFO req-17 Service started."
+    },
+    {
+      "id": "debug_segmentation_fault",
+      "category": "debugging",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["debugging", "cpp", "memory"],
+      "prompt": "Outline a systematic debugging plan for a segmentation fault in a C++ service that appears only under concurrency and disappears when compiled without optimization."
+    },
+    {
+      "id": "binary_search_reasoning",
+      "category": "algorithms",
+      "prompt_length_bucket": "short",
+      "output_mode": "text",
+      "tags": ["algorithms", "reasoning", "interview"],
+      "prompt": "Explain when binary search can be applied beyond sorted arrays, including one example involving monotonic predicates."
+    },
+    {
+      "id": "data_pipeline_design",
+      "category": "data",
+      "prompt_length_bucket": "long",
+      "output_mode": "text",
+      "tags": ["pipelines", "batch", "streaming"],
+      "prompt": "Design a data pipeline for ingesting application logs, normalizing events, computing hourly aggregates, and serving analytics dashboards with freshness under five minutes."
+    },
+    {
+      "id": "observability_plan",
+      "category": "operations",
+      "prompt_length_bucket": "medium",
+      "output_mode": "json",
+      "tags": ["observability", "metrics", "alerts"],
+      "prompt": "Return compact JSON describing an observability plan for a new inference API. Include metrics, logs, traces, alerts, and SLOs."
+    },
+    {
+      "id": "cloud_cost_reduction",
+      "category": "architecture",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["cloud", "cost", "optimization"],
+      "prompt": "List the highest-impact ways to reduce cloud infrastructure cost for a GPU inference service without causing major reliability regressions."
+    },
+    {
+      "id": "product_requirements_outline",
+      "category": "product",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["prd", "planning", "product_management"],
+      "prompt": "Create a short product requirements outline for a developer-facing model gateway that supports chat completions, embeddings, rate limiting, and audit logging."
+    },
+    {
+      "id": "json_schema_validation",
+      "category": "structured_output",
+      "prompt_length_bucket": "medium",
+      "output_mode": "json",
+      "tags": ["json_schema", "validation", "api"],
+      "prompt": "Provide a compact JSON Schema for an object with required fields user_id string, created_at string date-time, tags array of strings, and active boolean."
+    },
+    {
+      "id": "python_retry_backoff",
+      "category": "code_generation",
+      "prompt_length_bucket": "medium",
+      "output_mode": "code",
+      "tags": ["python", "retries", "resilience"],
+      "prompt": "Write a Python helper that performs HTTP retries with exponential backoff, jitter, timeout control, and a maximum total retry budget."
+    },
+    {
+      "id": "rag_tradeoffs",
+      "category": "machine_learning",
+      "prompt_length_bucket": "medium",
+      "output_mode": "text",
+      "tags": ["rag", "retrieval", "llm"],
+      "prompt": "Explain the trade-offs between retrieval augmented generation and fine-tuning for enterprise question-answering systems."
+    },
+    {
+      "id": "capacity_planning_gpu",
+      "category": "capacity_planning",
+      "prompt_length_bucket": "long",
+      "output_mode": "text",
+      "tags": ["capacity", "gpu", "performance"],
+      "prompt": "Describe how you would perform capacity planning for a GPU inference cluster, including concurrency targets, queueing effects, p95 latency, failover capacity, and headroom."
+    }
+  ]
+}

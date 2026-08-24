@@ -2,7 +2,11 @@
 
 #include <cstdint>
 #include <string>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
 #include <unordered_map>
 #include <vector>
 
@@ -35,8 +39,14 @@ public:
     ~TensorInfo() { Unmap(); }
 
     void Unmap() {
-      if (is_mapped && data_ptr && data_ptr != MAP_FAILED) {
-        munmap(data_ptr, byte_size);
+      if (is_mapped && data_ptr) {
+#ifdef _WIN32
+        UnmapViewOfFile(data_ptr);
+#else
+        if (data_ptr != MAP_FAILED) {
+          munmap(data_ptr, byte_size);
+        }
+#endif
         data_ptr = nullptr;
         is_mapped = false;
       }
@@ -79,7 +89,12 @@ private:
 
   // File handling
   std::string file_path_;
+#ifdef _WIN32
+  HANDLE file_handle_{INVALID_HANDLE_VALUE};
+  HANDLE mapping_handle_{nullptr};
+#else
   int fd_{-1};
+#endif
   size_t file_size_{0};
   void *file_data_{nullptr}; // Memory-mapped file
   bool is_mapped_{false};

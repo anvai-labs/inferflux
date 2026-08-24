@@ -1,8 +1,8 @@
 // Unit tests for §2.3 model-native chat template support.
 //
 // Covers:
-//   1. LlamaCPUBackend::FormatChatMessages — returns invalid when model absent.
-//   2. LlamaCPUBackend::ChatTemplateResult struct defaults.
+//   1. LlamaCppBackend::FormatChatMessages — returns invalid when model absent.
+//   2. LlamaCppBackend::ChatTemplateResult struct defaults.
 //   3. FormatChatMessages with empty messages list.
 //   4. FormatChatMessages with test_ready_ set but no real model_ pointer.
 //
@@ -14,7 +14,7 @@
 
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 
 #include <nlohmann/json.hpp>
 #include <string>
@@ -147,12 +147,12 @@ static ToolMatch detect_multi_format(const std::string &text) {
 }
 
 // ---------------------------------------------------------------------------
-// LlamaCPUBackend::FormatChatMessages tests
+// LlamaCppBackend::FormatChatMessages tests
 // ---------------------------------------------------------------------------
 
 TEST_CASE("FormatChatMessages: returns invalid when no model loaded",
           "[chat_template]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   // model_ is null — must return valid=false without crashing.
   auto r = backend.FormatChatMessages({{"user", "Hello"}});
   REQUIRE_FALSE(r.valid);
@@ -161,7 +161,7 @@ TEST_CASE("FormatChatMessages: returns invalid when no model loaded",
 
 TEST_CASE("FormatChatMessages: returns invalid for empty message list",
           "[chat_template]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   auto r = backend.FormatChatMessages({});
   REQUIRE_FALSE(r.valid);
 }
@@ -169,7 +169,7 @@ TEST_CASE("FormatChatMessages: returns invalid for empty message list",
 TEST_CASE("FormatChatMessages: test_ready_ alone does not enable template "
           "(model_ is null)",
           "[chat_template]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   backend.ForceReadyForTests(); // sets test_ready_ = true but model_ stays null
   auto r = backend.FormatChatMessages({{"user", "Hi"}, {"assistant", "Hello"}});
   // FormatChatMessages checks model_ first; test_ready_ does not bypass it.
@@ -178,7 +178,7 @@ TEST_CASE("FormatChatMessages: test_ready_ alone does not enable template "
 
 TEST_CASE("ChatTemplateResult: default-constructed is invalid",
           "[chat_template]") {
-  LlamaCPUBackend::ChatTemplateResult r;
+  LlamaCppBackend::ChatTemplateResult r;
   REQUIRE_FALSE(r.valid);
   REQUIRE(r.prompt.empty());
 }

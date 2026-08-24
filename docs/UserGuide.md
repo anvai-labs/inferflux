@@ -132,7 +132,7 @@ Backend identity contract fields (`--json`):
 | Batch token cap | `runtime.scheduler.max_batch_tokens` | `INFERFLUX_SCHED_MAX_BATCH_TOKENS` |
 | CUDA kernel policy | `runtime.cuda.attention.kernel` | `INFERFLUX_CUDA_ATTENTION_KERNEL` |
 | Phase overlap | `runtime.cuda.phase_overlap.enabled` | `INFERFLUX_CUDA_PHASE_OVERLAP` |
-| Native strict mode | `runtime.backend_exposure.strict_native_request` | `INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST` |
+| InferFlux strict mode | `runtime.backend_exposure.strict_inferflux_request` | `INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST` |
 
 ## 8) Quick Failure Matrix
 

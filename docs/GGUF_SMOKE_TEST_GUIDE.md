@@ -20,7 +20,7 @@ flowchart LR
 ## 2) Fast Path (Recommended)
 
 ```bash
-python3 scripts/test_gguf_native_smoke.py \
+./scripts/smoke.sh gguf-native \
   --model-dir ~/.inferflux/models/qwen-gguf \
   --num-tokens 20
 ```

@@ -13,8 +13,8 @@ graph TB
         B --> C3[MPS Backend]
         B --> C4[CPU Backend]
 
-        C1 --> D1[Native Provider]
-        C1 --> D2[Universal Provider]
+        C1 --> D1[InferFlux Engine]
+        C1 --> D2[llama.cpp Engine]
 
         D1 --> E1[Custom Kernels]
         D2 --> E2[llama.cpp Bridge]
@@ -38,7 +38,10 @@ graph TB
 
 | Component | Location | Purpose |
 |-----------|----------|---------|
+| **BackendInterface** | `runtime/backends/common/backend_interface.h` | Pure-virtual base for all backends |
+| **BackendConfig** | `runtime/backends/common/backend_config.h` | Model load configuration (no llama.h dependency) |
 | **BackendFactory** | `runtime/backends/backend_factory.cpp` | Backend registration and creation |
+| **BackendRegistry** | `runtime/backends/backend_registry.h` | Creator function registry |
 | **BackendCapabilities** | `runtime/backends/backend_capabilities.h` | Feature discovery and routing |
 | **DeviceContext** | `runtime/device_context.h` | Hardware abstraction |
 | **BackendManager** | `runtime/backends/backend_manager.cpp` | Lifecycle management |
@@ -49,11 +52,11 @@ graph TB
 mindmap
   root((InferFlux Backends))
     CUDA
-      cuda_native
+      inferflux_cuda
         Custom kernels
         FlashAttention-2
         Phase overlap
-      cuda_llama_cpp
+      llama_cpp_cuda
         llama.cpp bridge
         GGUF support
         Cross-platform
@@ -69,149 +72,137 @@ mindmap
       All model formats
 ```
 
-## Creating a New Backend
+## Creating a Standalone Backend
+
+Standalone backends inherit directly from `BackendInterface` — no llama.cpp dependency, no `LlamaCppBackend` inheritance required. All methods on `BackendInterface` have default implementations, so you only override what your backend supports.
 
 ### Step 1: Define Backend Class
 
 ```cpp
-// runtime/backends/my_backend/my_backend.h
+// runtime/backends/tensorrt/tensorrt_backend.h
 #pragma once
-#include "runtime/backends/backend_base.h"
+#include "runtime/backends/common/backend_config.h"
+#include "runtime/backends/common/backend_interface.h"
+
+#include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
 
 namespace inferflux {
 
-class MyBackend : public BackendBase {
+class TensorRtBackend : public BackendInterface {
 public:
-    MyBackend(const ModelLoadRequest &req, const BackendConfig &config);
-    ~MyBackend() override;
+  TensorRtBackend();
+  ~TensorRtBackend() override;
 
-    // Required interface methods
-    bool LoadModel() override;
-    size_t PromptTokenCount() const override;
-    std::vector<float> Embedding() const override;
+  // --- Required overrides ---
+  std::string Name() const override { return "tensorrt"; }
+  bool LoadModel(const std::filesystem::path &model_path,
+                 const LlamaBackendConfig &config = {}) override;
+  bool IsReady() const override;
 
-    // Inference methods
-    bool Prefill(const std::vector<token_id_t> &tokens) override;
-    token_id_t Decode() override;
-    void FreeSequence(sequence_id_t seq_id) override;
+  // --- Inference (override what you support) ---
+  std::vector<UnifiedBatchOutput>
+  ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
+  PrefillResult Prefill(const std::string &prompt, int sequence_id) override;
+  std::string
+  Decode(int n_past, int sequence_id, int max_tokens,
+         const std::function<bool(const std::string &, const TokenLogprob *)>
+             &on_chunk = {},
+         const std::function<bool()> &should_stop = {},
+         int logprob_top_n = 0,
+         std::vector<TokenLogprob> *out_logprobs = nullptr,
+         int first_token = -1,
+         const std::vector<std::string> &stop_seqs = {}) override;
 
-    // Capabilities
-    BackendCapabilities GetCapabilities() const override;
+  // --- Sequence lifecycle ---
+  void FreeSequence(int sequence_id) override;
+
+  // --- Capabilities ---
+  BackendCapabilities ReportCapabilities() const override;
+  int ContextSize() const override;
 
 private:
-    std::unique_ptr<DeviceContext> device_;
-    std::unique_ptr<ModelLoader> loader_;
-    // Your backend-specific state
+  // TensorRT-specific state — no llama.h types needed
+  // ...
 };
 
 } // namespace inferflux
 ```
 
-### Step 2: Implement Backend Methods
+### Step 2: Implement the Backend
 
 ```cpp
-// runtime/backends/my_backend/my_backend.cpp
-#include "runtime/backends/my_backend/my_backend.h"
+// runtime/backends/tensorrt/tensorrt_backend.cpp
+#include "runtime/backends/tensorrt/tensorrt_backend.h"
+#include "server/logging/logger.h"
 
 namespace inferflux {
 
-MyBackend::MyBackend(const ModelLoadRequest &req, const BackendConfig &config)
-    : BackendBase(req, config) {
-    // Initialize device context
-    device_ = std::make_unique<MyDeviceContext>();
+TensorRtBackend::TensorRtBackend() = default;
+TensorRtBackend::~TensorRtBackend() = default;
 
-    // Initialize model loader
-    loader_ = std::make_unique<MyModelLoader>(req.path);
+bool TensorRtBackend::LoadModel(const std::filesystem::path &model_path,
+                                const LlamaBackendConfig &config) {
+  // Load TensorRT engine — no llama.cpp involvement
+  log::Info("tensorrt", "Loading model from " + model_path.string());
+  // ...
+  return true;
 }
 
-bool MyBackend::LoadModel() {
-    if (!loader_->LoadMetadata()) {
-        log::Error("my_backend", "Failed to load model metadata");
-        return false;
-    }
-
-    if (!device_->AllocateMemory(loader_->GetModelSize())) {
-        log::Error("my_backend", "Failed to allocate device memory");
-        return false;
-    }
-
-    // Load weights onto device
-    if (!loader_->LoadWeights(device_.get())) {
-        log::Error("my_backend", "Failed to load weights");
-        return false;
-    }
-
-    log::Info("my_backend", "Model loaded successfully");
-    return true;
+BackendCapabilities TensorRtBackend::ReportCapabilities() const {
+  BackendCapabilities caps;
+  caps.supports_logprobs = true;
+  caps.supports_structured_output = false;  // See "Grammar Delegation" below
+  caps.supports_embeddings = true;
+  caps.supports_vision = false;
+  return caps;
 }
 
-BackendCapabilities MyBackend::GetCapabilities() const {
-    BackendCapabilities caps;
-    caps.supports_prefill = true;
-    caps.supports_decode = true;
-    caps.supports_embeddings = true;  // If your backend supports embeddings
-    caps.supports_multimodal = false; // If your backend doesn't support vision
-    caps.supports_speculative = false; // If your backend doesn't support speculative decoding
-    caps.max_batch_size = 32;
-    caps.max_sequence_length = 4096;
-    return caps;
-}
-
-token_id_t MyBackend::Decode() {
-    // Implement token generation
-    token_id_t token = device_->GenerateToken();
-    metrics_->IncrementTokensGenerated(1);
-    return token;
-}
-
-void MyBackend::FreeSequence(sequence_id_t seq_id) {
-    device_->FreeSequence(seq_id);
-    log::Debug("my_backend", "Freed sequence %d", seq_id);
-}
+// Implement Prefill, Decode, FreeSequence, etc.
+// Methods you don't override return safe defaults (empty results, false, 0).
 
 } // namespace inferflux
 ```
 
-### Step 3: Register Backend
+### Step 3: Register via BackendRegistry
 
 ```cpp
-// runtime/backends/backend_factory.cpp
-#include "runtime/backends/my_backend/my_backend.h"
+// In backend_factory.cpp or a dedicated registration file:
+#include "runtime/backends/backend_registry.h"
+#include "runtime/backends/tensorrt/tensorrt_backend.h"
 
-namespace inferflux {
-
-void BackendFactory::RegisterBackends() {
-    // ... existing registrations ...
-
-    RegisterBackend("my_backend", [](const ModelLoadRequest &req,
-                                      const BackendConfig &config) {
-        return std::make_unique<MyBackend>(req, config);
+// Register as a native provider for CUDA targets:
+BackendRegistry::Instance().Register(
+    LlamaBackendTarget::kCuda, BackendProvider::kNative,
+    []() -> std::shared_ptr<BackendInterface> {
+      return std::make_shared<TensorRtBackend>();
     });
-}
-
-} // namespace inferflux
 ```
 
-### Step 4: Update CMakeLists.txt
+### Step 4: Add to CMakeLists.txt
 
 ```cmake
-# CMakeLists.txt
-set(INFERFLUX_BACKEND_SOURCES
-    runtime/backends/backend_factory.cpp
-    runtime/backends/backend_manager.cpp
-    runtime/backends/cpu/backend_cpu.cpp
-    runtime/backends/cuda/cuda_backend.cpp
-    runtime/backends/my_backend/my_backend.cpp  # Add your backend
-)
-
-set(INFERFLUX_BACKEND_HEADERS
-    runtime/backends/backend_factory.h
-    runtime/backends/backend_manager.h
-    runtime/backends/cpu/backend_cpu.h
-    runtime/backends/cuda/cuda_backend.h
-    runtime/backends/my_backend/my_backend.h  # Add your backend
+# Add your source files to the INFERFLUX_CORE_SOURCES list in CMakeLists.txt
+list(APPEND INFERFLUX_CORE_SOURCES
+    runtime/backends/tensorrt/tensorrt_backend.cpp
 )
 ```
+
+### What You Get for Free
+
+Methods with sensible defaults (no override needed unless you support them):
+
+| Method | Default | Override when... |
+|--------|---------|------------------|
+| `Embed()` | Returns `{}` | Your backend produces embeddings |
+| `SupportsVision()` | `false` | Your backend handles image inputs |
+| `IsMoE()` | `false` | Your backend loads MoE architectures |
+| `SetupSampler()` / `TeardownSampler()` | No-op | You implement custom sampling |
+| `SerializeSequence()` / `HydrateSequence()` | Empty/false | You support KV cache serialization |
+| `BeginFreeSequence()` / `PollFreeSequence()` | Sync free | You need async sequence cleanup |
+| `FormatChatMessages()` | Empty | You ship a chat template |
 
 ## Backend Capabilities
 
@@ -242,32 +233,61 @@ graph TB
 ### Implementing Capabilities
 
 ```cpp
-BackendCapabilities GetCapabilities() const override {
+BackendCapabilities ReportCapabilities() const override {
     BackendCapabilities caps;
 
-    // Core inference capabilities
-    caps.supports_prefill = true;        // Can process prompts
-    caps.supports_decode = true;         // Can generate tokens
-    caps.supports_embeddings = false;    // Can generate embeddings
-
-    // Advanced features
-    caps.supports_multimodal = false;    // Can process images
-    caps.supports_speculative = false;   // Can use draft models
-    caps.supports_tensor_parallel = false; // Can shard across GPUs
-
-    // Limits
-    caps.max_batch_size = max_batch_size_;
-    caps.max_sequence_length = context_length_;
-    caps.max_total_tokens = max_total_tokens_;
-
-    // Performance hints
-    caps.recommends_batch_size = optimal_batch_size_;
-    caps.recommends_prefill_batch = optimal_prefill_batch_;
-    caps.recommends_decode_batch = optimal_decode_batch_;
+    // Feature flags — report what your backend actually supports
+    caps.supports_logprobs = true;             // Can compute token log-probabilities
+    caps.supports_structured_output = false;   // Grammar-constrained generation
+    caps.supports_embeddings = true;           // Can produce embeddings
+    caps.supports_vision = false;              // Can process image inputs
+    caps.supports_speculative_decoding = false; // Can act as draft/target
 
     return caps;
 }
 ```
+
+The router uses these capabilities to decide request routing. Backends that report `false` for a capability will not receive requests requiring it (requests are routed to a capable backend or rejected with a clear error).
+
+## Grammar and Structured Output Delegation
+
+Grammar-constrained generation (JSON schema, regex, CFG) is the **one capability that still requires llama.cpp's sampler chain** (`llama_sampler_init_grammar`). This section documents how the architecture handles it without leaking the dependency into the interface.
+
+### How It Works
+
+1. **Capability reporting**: Every backend reports `supports_structured_output` via `ReportCapabilities()`. The router checks this before dispatching grammar-constrained requests.
+
+2. **Standalone backends**: A backend that doesn't support grammar simply reports `supports_structured_output = false`. Requests requiring grammar are either rejected with a clear error or routed to a backend that supports it (via capability-based fallback in the router).
+
+3. **NativeGpuBackend parity delegation**: The InferFlux native CUDA backend (`inferflux_cuda`) handles grammar by internally delegating to a private `LlamaCppBackend` parity instance. This is a **private implementation detail** — the parity backend is created lazily, lives behind `parity_backend_mutex_`, and is never exposed through the interface.
+
+4. **Interface methods**: `SetupSampler(grammar, root, params)` and `TeardownSampler()` exist on `BackendInterface` with no-op defaults. A standalone backend that implements its own grammar engine (e.g., Outlines, lm-format-enforcer) can override these directly.
+
+### Decision Tree for New Backends
+
+```
+Does your backend need grammar/structured output?
+  |
+  +-- No --> Report supports_structured_output = false. Done.
+  |          Router will reject or fallback grammar requests.
+  |
+  +-- Yes --> Do you have your own grammar engine?
+                |
+                +-- Yes --> Override SetupSampler/TeardownSampler.
+                |           Report supports_structured_output = true.
+                |
+                +-- No  --> Ship without it. Grammar requests route
+                            to a llama.cpp backend via capability fallback.
+```
+
+### Key Files
+
+| File | Role |
+|------|------|
+| `runtime/backends/common/backend_interface.h` | `SetupSampler()`, `TeardownSampler()` defaults |
+| `runtime/backends/native/native_gpu_backend.cpp` | Parity delegation for grammar in `Decode()` |
+| `scheduler/single_model_router.cpp` | Capability-based routing, `supports_structured_output` check |
+| `runtime/backends/backend_capabilities.h` | `BackendCapabilities::supports_structured_output` field |
 
 ## Model Format Support
 
@@ -276,8 +296,8 @@ BackendCapabilities GetCapabilities() const override {
 ```mermaid
 graph LR
     subgraph "Model Format Ecosystem"
-        A[GGUF] --> D[cuda_llama_cpp, cpu, mps]
-        B[Safetensors] --> E[cuda_native]
+        A[GGUF] --> D[llama_cpp_cuda, cpu, mps]
+        B[Safetensors] --> E[inferflux_cuda]
         C[HuggingFace] --> F[Auto-detect]
     end
 
@@ -315,13 +335,13 @@ ModelFormat DetectModelFormat(const std::string &path) {
 
 ## CUDA Backend Development
 
-### Native vs Universal Providers
+### InferFlux vs llama.cpp Engines
 
 ```mermaid
 graph TB
     subgraph "CUDA Backend Paths"
-        A[cuda_native Backend] --> B{Native Provider}
-        A --> C{Universal Provider}
+        A[inferflux_cuda Backend] --> B{InferFlux Engine}
+        A --> C{llama.cpp Engine}
 
         B --> D[Custom CUDA Kernels]
         B --> E[FlashAttention-2]
@@ -342,11 +362,11 @@ graph TB
 
 ### Native Kernel Executor
 
-The native kernel executor (`runtime/backends/cuda/native_kernel_executor.cpp`) provides a framework for implementing custom CUDA kernels.
+The InferFlux CUDA executor (`runtime/backends/cuda/inferflux_cuda_executor.cpp`) provides a framework for implementing custom CUDA kernels.
 
 ```cpp
 // Example: Adding a custom attention kernel
-class NativeKernelExecutor {
+class InferfluxCudaExecutor {
 public:
     bool LaunchAttentionKernel(const AttentionParams &params) {
         // Select kernel based on hardware capability
@@ -658,8 +678,8 @@ graph LR
 
 ### Code Review Checklist
 
-- [ ] Backend implements `BackendBase` interface completely
-- [ ] `GetCapabilities()` reports correct capabilities
+- [ ] Backend inherits from `BackendInterface` (not `LlamaCppBackend`)
+- [ ] `ReportCapabilities()` reports correct capabilities
 - [ ] Prometheus metrics added and documented
 - [ ] Unit tests cover all code paths
 - [ ] Integration tests pass with real models

@@ -1,8 +1,8 @@
 #pragma once
 
 #include "model/tokenizer/simple_tokenizer.h"
+#include "runtime/backends/common/backend_interface.h"
 #include "runtime/backends/cpu/cpu_backend.h"
-#include "runtime/backends/cpu/llama_backend.h"
 
 #include <functional>
 #include <memory>
@@ -45,7 +45,7 @@ public:
   SpeculativeDecoder(SpeculativeConfig config,
                      std::shared_ptr<CPUDeviceContext> device,
                      SimpleTokenizer *tokenizer,
-                     std::shared_ptr<LlamaCPUBackend> draft_backend);
+                     std::shared_ptr<BackendInterface> draft_backend);
 
   bool Enabled() const { return config_.enabled; }
   SpeculativeConfig Config() const { return config_; }
@@ -54,7 +54,8 @@ public:
                          int max_new_tokens);
   SpeculativeValidationResult
   Validate(const std::vector<int> &prompt_tokens, const SpeculativeDraft &draft,
-           int max_new_tokens, std::shared_ptr<LlamaCPUBackend> target_backend);
+           int max_new_tokens,
+           std::shared_ptr<BackendInterface> target_backend);
 
   using ValidationOverride = std::function<std::vector<int>(
       const std::vector<int> &prompt_tokens, int max_new_tokens)>;
@@ -67,7 +68,7 @@ private:
   SpeculativeConfig config_;
   std::shared_ptr<CPUDeviceContext> device_;
   SimpleTokenizer *tokenizer_;
-  std::shared_ptr<LlamaCPUBackend> draft_backend_;
+  std::shared_ptr<BackendInterface> draft_backend_;
   ValidationOverride validation_override_;
   mutable std::mutex override_mutex_;
 };

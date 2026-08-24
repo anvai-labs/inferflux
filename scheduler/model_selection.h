@@ -30,7 +30,7 @@ struct ModelSelectionOptions {
 struct ModelSelectionResult {
   ModelSelectionStatus status{ModelSelectionStatus::kNotFound};
   ModelInfo info{};
-  std::shared_ptr<LlamaCPUBackend> backend;
+  std::shared_ptr<BackendInterface> backend;
   bool used_fallback{false};
   std::string fallback_from_backend;
   std::string fallback_feature;

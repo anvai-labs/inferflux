@@ -40,6 +40,8 @@ public:
 
   std::size_t Capacity() const override;
   std::size_t Size() const override;
+  bool UpdateTicketStage(uint64_t ticket_id, KVTicketStage stage) override;
+  KVTicketStage GetTicketStage(uint64_t ticket_id) const override;
 
 private:
   // Generate a unique SHM segment name embedding request_id and a process-

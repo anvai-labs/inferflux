@@ -112,7 +112,7 @@ req.sampling = {parsed.temperature,
                 parsed.logit_bias};  // NEW
 ```
 
-### 3. Backend Layer (runtime/backends/cpu/llama_backend.cpp)
+### 3. Backend Layer (runtime/backends/cpu/llama_cpp_backend.cpp)
 
 **Integration with llama.cpp sampler**:
 ```cpp
@@ -308,7 +308,7 @@ curl -X POST http://localhost:8080/v1/chat/completions \
 ### Core Implementation
 1. `scheduler/request_batch.h` - Added logit_bias to SamplingParams
 2. `server/http/http_server.cpp` - Parse and validate logit_bias
-3. `runtime/backends/cpu/llama_backend.cpp` - Integrate with llama.cpp sampler
+3. `runtime/backends/cpu/llama_cpp_backend.cpp` - Integrate with llama.cpp sampler
 
 ### Testing
 4. `tests/unit/test_sampling.cpp` - Added 4 test cases

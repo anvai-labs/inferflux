@@ -25,7 +25,7 @@ flowchart TD
 | Not ready | `curl -s http://127.0.0.1:8080/readyz` | model/backend not ready | fix model path/backend config; re-check logs |
 | `401` / `403` | run same request with known key | missing/invalid key or insufficient scope | pass bearer key with required scope |
 | `404 model_not_found` | `./build/inferctl models --api-key <KEY>` | wrong model id/default model missing | use valid model id or set default model |
-| `422 backend_policy_violation` | inspect routing + backend exposure | strict native request policy blocked fallback | disable strict native policy or request compatible backend |
+| `422 backend_policy_violation` | inspect routing + backend exposure | strict inferflux request policy blocked fallback | disable strict inferflux policy or request compatible backend |
 | `std::bad_alloc` / CUDA OOM | check startup advisor + slot settings + model size | FP16 or large model exceeds practical VRAM budget at current concurrency | reduce `max_parallel_sequences`/context, switch to quantized model, or use larger VRAM GPU |
 | high latency / low throughput | `curl -s .../metrics | head -120` | under-sized batches or backend mismatch | tune scheduler/KV/cuda settings in config |
 | WebUI blank/empty | verify binary + model list | UI not built or no model loaded | build with `-DENABLE_WEBUI=ON` and load model |
@@ -76,12 +76,68 @@ Look for:
 | low reuse/hit rate | cache metrics | increase KV pages and validate prefix reuse path |
 | CUDA underutilization | backend metrics + logs | enable/tune FA2 and phase overlap when supported |
 
+Sequence-slot / native decode debug capture:
+
+```bash
+INFERFLUX_DEBUG_SEQUENCE_SLOTS=1 \
+INFERFLUX_DEBUG_UNIFIED_ASSEMBLY=1 \
+INFERFLUX_DEBUG_UNIFIED_ASSEMBLY_LIMIT=256 \
+INFERFLUX_CUDA_DEBUG_DECODE_MAPPING=1 \
+INFERFLUX_CUDA_DEBUG_DECODE_MAPPING_LIMIT=256 \
+INFERFLUX_CUDA_DEBUG_OPERATOR_SELECTION=1 \
+INFERFLUX_CUDA_DEBUG_OPERATOR_SELECTION_LIMIT=128 \
+./build/inferfluxd --config config/server.cuda.yaml
+```
+
+Use this when output drift or reuse corruption is suspected.
+Expected log keys:
+- `sequence_slot[...]`: request id, slot id, sequence generation, phase, decode budget
+- `slot[...]`: acquire/retire/reuse lifecycle in the slot manager
+- `decode_mapping[...]`: request id, slot id, sequence generation, sampled token, piece
+- `unified_assembly[...]`: emitted piece/completion after phased prefill or decode resume
+- `operator_select[...]`: FFN/down-proj operator choice with exact `M/N/K` geometry
+
+Process-local native split handoff:
+- On the default in-process `KVChannel`, native decode workers now keep the same sequence slot and transfer ownership directly.
+- Blob serialize/hydrate is still expected for cross-process transports such as shared-memory handoff.
+- If a process-local native run still shows second-slot hydrate behavior, treat it as a handoff regression.
+
+Benchmark harness equivalent:
+
+```bash
+INFERFLUX_BENCH_LOG_LEVEL=info \
+INFERFLUX_BENCH_DEBUG_SEQUENCE_SLOTS=1 \
+INFERFLUX_BENCH_DEBUG_UNIFIED_ASSEMBLY=1 \
+INFERFLUX_BENCH_NATIVE_DEBUG_DECODE_MAPPING=1 \
+INFERFLUX_BENCH_NATIVE_DEBUG_OPERATOR_SELECTION=1 \
+./scripts/benchmark.sh gguf-compare
+```
+
+If benchmark exact-match regresses while native throughput rises only slightly:
+- check `decode_burst_tokens` first
+- the harness default is `0`
+- `INFERFLUX_BENCH_DECODE_BURST_TOKENS>1` is experiment-only for native today and can reduce exact-match parity before it produces a meaningful throughput win
+
+To localize the first native-vs-llama decode divergence from debug logs:
+
+```bash
+python3 scripts/compare_decode_traces.py \
+  /path/to/server_inferflux_cuda.log \
+  /path/to/server_llama_cpp_cuda.log \
+  --json
+```
+
+When the logs include stable caller tags such as the benchmark runner's
+`client_request_id=bench-<index>`, the comparator aligns on that tag first.
+That avoids false mismatches from backend-specific scheduler `request_id`
+ordering on mixed-prompt batches.
+
 ## 7) Platform-Specific Notes
 
 | Platform | Issue | Fix |
 |---|---|---|
 | macOS | Metal command queue failures | set `GGML_METAL_DISABLE=1` for CPU fallback |
-| NVIDIA CUDA | explicit `cuda_native` rejected | adjust strict mode or use `cuda_llama_cpp` until native ready |
+| NVIDIA CUDA | explicit `inferflux_cuda` rejected | adjust strict mode or use `llama_cpp_cuda` until native ready |
 | Docker | config/model persistence | mount config/models volumes and verify permissions |
 
 Docker quick commands:

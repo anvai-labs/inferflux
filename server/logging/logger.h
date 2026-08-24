@@ -2,6 +2,11 @@
 
 #include <string>
 
+// Windows headers define ERROR as 0 — undefine to avoid collision.
+#ifdef ERROR
+#undef ERROR
+#endif
+
 namespace inferflux {
 namespace log {
 
@@ -12,6 +17,9 @@ enum class Level { DEBUG, INFO, WARN, ERROR };
 // Call from main() based on INFERFLUX_LOG_FORMAT=json before any logging.
 void SetJsonMode(bool enabled);
 bool IsJsonMode();
+void SetLevel(Level level);
+Level GetLevel();
+bool ParseLevel(const std::string &text, Level *level);
 
 // Emit a log entry at the given level.  `component` identifies the subsystem
 // (e.g. "server", "scheduler", "backend").  `extra` is an optional key=value

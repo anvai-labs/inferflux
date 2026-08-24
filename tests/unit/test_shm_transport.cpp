@@ -38,12 +38,19 @@ TEST_CASE("ShmKVTransport: kv_blob roundtrips through POSIX SHM",
   ShmKVTransport transport(4);
   KVPacket pkt;
   pkt.request_id = 99;
+  pkt.ticket_id = 321;
+  pkt.ticket_stage = KVTicketStage::kEnqueued;
   pkt.kv_blob = {0x01, 0x02, 0x03, 0xAB, 0xCD, 0xEF};
   std::vector<uint8_t> expected = pkt.kv_blob;
   REQUIRE(transport.Enqueue(std::move(pkt)));
   auto result = transport.TryDequeue();
   REQUIRE(result.has_value());
   REQUIRE(result->request_id == 99);
+  REQUIRE(result->ticket_id == 321);
+  REQUIRE(result->ticket_stage == KVTicketStage::kEnqueued);
+  REQUIRE(result->metadata.find("|ticket=321") != std::string::npos);
+  REQUIRE(result->metadata.find("|ticket_stage=enqueued") !=
+          std::string::npos);
   REQUIRE(result->kv_blob == expected);
 }
 
@@ -105,6 +112,39 @@ TEST_CASE("ShmKVTransport: large kv_blob roundtrips correctly",
   auto result = transport.TryDequeue();
   REQUIRE(result.has_value());
   REQUIRE(result->kv_blob == big_blob);
+}
+
+TEST_CASE("ShmKVTransport: control-only ticket metadata roundtrips correctly",
+          "[shm_transport]") {
+  ShmKVTransport transport(2);
+  KVPacket pkt;
+  pkt.request_id = 17;
+  pkt.ticket_id = 88;
+  pkt.ticket_stage = KVTicketStage::kAcknowledged;
+  REQUIRE(transport.Enqueue(std::move(pkt)));
+  auto result = transport.TryDequeue();
+  REQUIRE(result.has_value());
+  REQUIRE(result->ticket_id == 88);
+  REQUIRE(result->ticket_stage == KVTicketStage::kAcknowledged);
+  REQUIRE(result->metadata.find("|ticket=88") != std::string::npos);
+  REQUIRE(result->metadata.find("|ticket_stage=acknowledged") !=
+          std::string::npos);
+}
+
+TEST_CASE("ShmKVTransport: ticket lifecycle tracking delegates to control queue",
+          "[shm_transport]") {
+  ShmKVTransport transport(2);
+  KVPacket pkt;
+  pkt.request_id = 23;
+  pkt.ticket_id = 501;
+  pkt.ticket_stage = KVTicketStage::kEnqueued;
+  REQUIRE(transport.Enqueue(std::move(pkt)));
+  REQUIRE(transport.GetTicketStage(501) == KVTicketStage::kEnqueued);
+  REQUIRE(
+      transport.UpdateTicketStage(501, KVTicketStage::kAcknowledged));
+  REQUIRE(transport.GetTicketStage(501) == KVTicketStage::kAcknowledged);
+  REQUIRE(transport.UpdateTicketStage(501, KVTicketStage::kCommitted));
+  REQUIRE(transport.GetTicketStage(501) == KVTicketStage::kCommitted);
 }
 
 // ---------------------------------------------------------------------------

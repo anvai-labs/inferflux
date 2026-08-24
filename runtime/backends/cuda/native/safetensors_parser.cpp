@@ -2,10 +2,15 @@
 #include "server/logging/logger.h"
 
 #include <cstring>
-#include <fcntl.h>
 #include <fstream>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 #include <nlohmann/json.hpp>
 
@@ -21,6 +26,21 @@ SafetensorsParser::SafetensorsParser(const std::string &file_path)
     : file_path_(file_path) {}
 
 SafetensorsParser::~SafetensorsParser() {
+#ifdef _WIN32
+  if (is_mapped_ && file_data_) {
+    UnmapViewOfFile(file_data_);
+    file_data_ = nullptr;
+    is_mapped_ = false;
+  }
+  if (mapping_handle_) {
+    CloseHandle(mapping_handle_);
+    mapping_handle_ = nullptr;
+  }
+  if (file_handle_ != INVALID_HANDLE_VALUE) {
+    CloseHandle(file_handle_);
+    file_handle_ = INVALID_HANDLE_VALUE;
+  }
+#else
   if (is_mapped_ && file_data_ && file_data_ != MAP_FAILED) {
     munmap(file_data_, file_size_);
     file_data_ = nullptr;
@@ -29,9 +49,48 @@ SafetensorsParser::~SafetensorsParser() {
   if (fd_ >= 0) {
     close(fd_);
   }
+#endif
 }
 
 bool SafetensorsParser::Parse() {
+#ifdef _WIN32
+  // Open file
+  file_handle_ =
+      CreateFileA(file_path_.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                  OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file_handle_ == INVALID_HANDLE_VALUE) {
+    log::Error("safetensors_parser", "Cannot open file: " + file_path_);
+    return false;
+  }
+
+  // Get file size
+  LARGE_INTEGER li;
+  if (!GetFileSizeEx(file_handle_, &li)) {
+    log::Error("safetensors_parser", "Cannot get file size: " + file_path_);
+    return false;
+  }
+  file_size_ = static_cast<size_t>(li.QuadPart);
+
+  log::Info("safetensors_parser",
+            "Parsing file: " + file_path_ + " (size: " +
+                std::to_string(file_size_ / (1024 * 1024)) + " MB)");
+
+  // Memory map the file
+  mapping_handle_ =
+      CreateFileMappingA(file_handle_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+  if (!mapping_handle_) {
+    log::Error("safetensors_parser",
+               "Failed to create file mapping: " + file_path_);
+    return false;
+  }
+  file_data_ = MapViewOfFile(mapping_handle_, FILE_MAP_READ, 0, 0, 0);
+  if (!file_data_) {
+    log::Error("safetensors_parser",
+               "Failed to map view of file: " + file_path_);
+    return false;
+  }
+  is_mapped_ = true;
+#else
   // Open file
   fd_ = open(file_path_.c_str(), O_RDONLY);
   if (fd_ < 0) {
@@ -58,6 +117,7 @@ bool SafetensorsParser::Parse() {
     return false;
   }
   is_mapped_ = true;
+#endif
 
   // Parse components
   if (!ParseHeader()) {

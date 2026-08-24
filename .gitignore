@@ -5,6 +5,7 @@ build-*/
 .DS_Store
 models/
 logs/
+Testing/
 server.log
 *.gguf
 .env.local
@@ -13,11 +14,22 @@ config/policy_store.conf.bak
 blogs/
 docs/blog/assets/
 
-# MLX external dependencies — fetched by CMake FetchContent or cloned manually;
-# never committed to the repo.
+# Local third-party source checkouts that are not part of this repo's pinned
+# vendor set and should never be committed.
 external/mlx/
 external/mlx-c/
 external/mlx-lm/
+
+# Generated artifacts under tracked vendor/source trees. Keep the actual vendor
+# sources/submodules tracked; ignore only local top-level build outputs here.
+# Submodule-internal build noise (for example `external/llama.cpp/build`) is
+# handled via `.gitmodules` so real source edits still surface in `git status`.
+external/*/build/
+external/*/.cache/
+external/*/dist/
+external/*/out/
+external/*/bin/
+external/*/lib/
 
 # Python test/runtime cache artifacts.
 __pycache__/
@@ -26,4 +38,9 @@ __pycache__/
 # Local profiling outputs and backup scratch files.
 nsys_reports/
 gguf_benchmark_results/
+multi_backend_benchmark_results/
+cuda_native_profile_*/
+llama_cpp_profile_*/
+concurrent_fix_validation_*/
+docs/archive/evidence/local-artifacts/generated/
 *.old

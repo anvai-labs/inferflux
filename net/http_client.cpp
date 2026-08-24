@@ -1,11 +1,17 @@
 #include "net/http_client.h"
 
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#pragma comment(lib, "ws2_32.lib")
+#else
 #include <arpa/inet.h>
-#include <cerrno>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#endif
+#include <cerrno>
 
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
@@ -66,19 +72,31 @@ int CreateSocket(const ParsedUrl &parsed) {
     sock = ::socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
     if (sock == -1)
       continue;
-    if (::connect(sock, rp->ai_addr, rp->ai_addrlen) == 0)
+    if (::connect(sock, rp->ai_addr, static_cast<int>(rp->ai_addrlen)) == 0)
       break;
+#ifdef _WIN32
+    ::closesocket(sock);
+#else
     ::close(sock);
+#endif
     sock = -1;
   }
   freeaddrinfo(result);
   if (sock == -1)
     throw std::runtime_error("failed to connect");
+#ifdef _WIN32
+  DWORD timeout_ms = 30000;
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO,
+             reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
+  setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO,
+             reinterpret_cast<const char *>(&timeout_ms), sizeof(timeout_ms));
+#else
   struct timeval tv;
   tv.tv_sec = 30;
   tv.tv_usec = 0;
   setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
   return sock;
 }
 
@@ -187,7 +205,8 @@ HttpClient::SendRaw(const std::string &method, const std::string &url,
     }
   } else {
     while (send_remaining > 0) {
-      ssize_t sent = ::send(conn.sock, send_ptr, send_remaining, 0);
+      ssize_t sent =
+          ::send(conn.sock, send_ptr, static_cast<int>(send_remaining), 0);
       if (sent <= 0) {
         close_connection("failed to send request");
       }
@@ -215,10 +234,16 @@ ssize_t HttpClient::RecvRaw(RawConnection &conn, char *buffer,
     }
   }
   while (true) {
-    ssize_t received = ::recv(conn.sock, buffer, length, 0);
+    ssize_t received = ::recv(conn.sock, buffer, static_cast<int>(length), 0);
+#ifdef _WIN32
+    if (received < 0 && WSAGetLastError() == WSAEINTR) {
+      continue;
+    }
+#else
     if (received < 0 && errno == EINTR) {
       continue;
     }
+#endif
     return received;
   }
 }
@@ -230,7 +255,11 @@ void HttpClient::CloseRaw(RawConnection &conn) const {
     conn.ssl = nullptr;
   }
   if (conn.sock >= 0) {
+#ifdef _WIN32
+    ::closesocket(conn.sock);
+#else
     ::close(conn.sock);
+#endif
     conn.sock = -1;
   }
 }
@@ -246,7 +275,11 @@ HttpClient::Send(const std::string &method, const std::string &url,
 
   auto close_socket = [&]() {
     if (sock != -1) {
+#ifdef _WIN32
+      ::closesocket(sock);
+#else
       ::close(sock);
+#endif
       sock = -1;
     }
   };
@@ -301,7 +334,8 @@ HttpClient::Send(const std::string &method, const std::string &url,
     const char *send_ptr = payload.c_str();
     std::size_t send_remaining = payload.size();
     while (send_remaining > 0) {
-      ssize_t sent = ::send(sock, send_ptr, send_remaining, 0);
+      ssize_t sent =
+          ::send(sock, send_ptr, static_cast<int>(send_remaining), 0);
       if (sent <= 0) {
         close_socket();
         throw std::runtime_error("failed to send request");
@@ -311,7 +345,8 @@ HttpClient::Send(const std::string &method, const std::string &url,
     }
     char buffer[4096];
     ssize_t read_bytes = 0;
-    while ((read_bytes = ::recv(sock, buffer, sizeof(buffer), 0)) > 0) {
+    while ((read_bytes = ::recv(sock, buffer, static_cast<int>(sizeof(buffer)),
+                                0)) > 0) {
       response.append(buffer, buffer + read_bytes);
     }
   }

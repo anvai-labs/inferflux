@@ -2,7 +2,6 @@
 
 #include "model/model_format.h"
 #include "runtime/backends/backend_factory.h"
-#include "runtime/backends/cuda/native_cuda_backend.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
@@ -13,16 +12,6 @@
 namespace inferflux {
 
 namespace {
-
-std::string ProviderLabel(BackendProvider provider) {
-  switch (provider) {
-  case BackendProvider::kNative:
-    return "native";
-  case BackendProvider::kLlamaCpp:
-  default:
-    return "llama_cpp";
-  }
-}
 
 bool IsMlxBackendLabel(const std::string &label) {
   return BackendFactory::NormalizeHint(label) == "mlx";
@@ -39,7 +28,7 @@ bool BackendSupportsModelFormat(const BackendFactoryResult &selection,
     if (IsMlxBackendLabel(selection.backend_label)) {
       return true;
     }
-    // Native CUDA backend supports safetensors
+    // InferFlux CUDA backend supports safetensors
     if (selection.provider == BackendProvider::kNative) {
       return normalized == "safetensors";
     }
@@ -50,30 +39,44 @@ bool BackendSupportsModelFormat(const BackendFactoryResult &selection,
 BackendCapabilities
 BuildModelCapabilities(const BackendCapabilities &base,
                        BackendProvider provider,
-                       const std::shared_ptr<LlamaCPUBackend> &backend) {
+                       const std::shared_ptr<BackendInterface> &backend) {
   BackendCapabilities caps = base;
   caps.supports_vision = backend && backend->SupportsVision();
 
-  // Native capability contracts are explicit so fallback policy can be applied
-  // endpoint-by-endpoint instead of a blanket provider-level downgrade.
-  auto native_backend = std::dynamic_pointer_cast<NativeCudaBackend>(backend);
-  if (provider == BackendProvider::kNative || native_backend != nullptr) {
-    if (native_backend) {
-      caps.supports_logprobs = native_backend->SupportsLogprobsContract();
-      caps.supports_structured_output =
-          native_backend->SupportsStructuredOutputContract();
-      caps.supports_embeddings = native_backend->SupportsEmbeddingsContract();
-      caps.supports_speculative_decoding =
-          native_backend->SupportsSpeculativeDecodingContract();
+  // When the backend reports its own capabilities (native or any future
+  // standalone backend), prefer its self-reported surface over the trait
+  // defaults. Detect native backends by checking whether Name() starts
+  // with "inferflux_" — a vanilla LlamaCppBackend registered under kNative
+  // (test/mock scenario) gets conservative defaults instead.
+  if (provider == BackendProvider::kNative) {
+    if (backend) {
+      const std::string name = backend->Name();
+      bool is_genuine_native =
+          name.size() >= 10 && name.compare(0, 10, "inferflux_") == 0;
+      if (is_genuine_native) {
+        auto reported = backend->ReportCapabilities();
+        caps.supports_logprobs = reported.supports_logprobs;
+        caps.supports_structured_output = reported.supports_structured_output;
+        caps.supports_embeddings = reported.supports_embeddings;
+        caps.supports_speculative_decoding =
+            reported.supports_speculative_decoding;
+        caps.supports_kv_prefix_transfer = reported.supports_kv_prefix_transfer;
+        caps.supports_vision = reported.supports_vision;
+      } else {
+        // Conservative default for test/mock registrations under kNative.
+        caps.supports_logprobs = false;
+        caps.supports_structured_output = false;
+        caps.supports_embeddings = false;
+        caps.supports_speculative_decoding = false;
+        caps.supports_kv_prefix_transfer = true;
+      }
     } else {
-      // Conservative default for provider-only registrations in tests/mocks.
       caps.supports_logprobs = false;
       caps.supports_structured_output = false;
       caps.supports_embeddings = false;
       caps.supports_speculative_decoding = false;
+      caps.supports_kv_prefix_transfer = true;
     }
-    // Prefix copy + KV serialization are implemented natively.
-    caps.supports_kv_prefix_transfer = true;
   }
 
   return caps;
@@ -97,10 +100,10 @@ void AppendUniqueHint(std::vector<std::string> *candidates,
 std::vector<std::string> BuildCudaFallbackCandidates() {
   std::vector<std::string> candidates;
   candidates.reserve(6);
-  // Requested chain: native CUDA -> llama.cpp CUDA -> llama.cpp ROCm -> MLX ->
-  // llama.cpp MPS -> CPU.
+  // Requested chain: InferFlux CUDA -> llama.cpp CUDA -> llama.cpp ROCm -> MLX
+  // -> llama.cpp MPS -> CPU.
   AppendUniqueHint(&candidates, "cuda");
-  AppendUniqueHint(&candidates, "cuda_llama_cpp");
+  AppendUniqueHint(&candidates, "llama_cpp_cuda");
 #ifdef INFERFLUX_HAS_ROCM
   AppendUniqueHint(&candidates, "rocm");
 #endif
@@ -142,7 +145,7 @@ void MaybePrependMlxCandidate(std::vector<std::string> *candidates,
 
 } // namespace
 
-SingleModelRouter::SingleModelRouter(std::shared_ptr<LlamaCPUBackend> backend,
+SingleModelRouter::SingleModelRouter(std::shared_ptr<BackendInterface> backend,
                                      ModelInfo info) {
   RegisterModel(info, std::move(backend));
 }
@@ -160,7 +163,7 @@ SingleModelRouter::SingleModelRouter(
           backend_priority, default_backend_hint_)) {}
 
 bool SingleModelRouter::RegisterModel(
-    const ModelInfo &info, std::shared_ptr<LlamaCPUBackend> backend) {
+    const ModelInfo &info, std::shared_ptr<BackendInterface> backend) {
   if (!backend) {
     return false;
   }
@@ -196,13 +199,15 @@ bool SingleModelRouter::RegisterModel(
           ? entry.info.backend
           : BackendFactory::NormalizeHint(info.requested_backend);
   entry.info.backend_provider =
-      info.backend_provider.empty() ? "llama_cpp" : info.backend_provider;
+      info.backend_provider.empty()
+          ? BackendFactory::ProviderLabel(BackendProvider::kLlamaCpp)
+          : BackendFactory::ProviderLabel(
+                BackendFactory::ParseProviderLabel(info.backend_provider));
   entry.info.backend_fallback = info.backend_fallback;
   entry.info.backend_fallback_reason = info.backend_fallback_reason;
   auto register_target = ParseLlamaBackendTarget(entry.info.backend);
   const BackendProvider register_provider =
-      entry.info.backend_provider == "native" ? BackendProvider::kNative
-                                              : BackendProvider::kLlamaCpp;
+      BackendFactory::ParseProviderLabel(entry.info.backend_provider);
   entry.info.capabilities = BuildModelCapabilities(
       DescribeLlamaBackendTarget(register_target).capabilities,
       register_provider, backend);
@@ -318,7 +323,7 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
         }
       } else if (candidate_selection.provider == BackendProvider::kNative &&
                  candidate_format == "safetensors") {
-        // Native CUDA backend uses safetensors directly
+        // InferFlux CUDA backend uses safetensors directly
         load_attempts[0].path = ResolveHfReferenceToCachePath(path);
       } else {
         const auto gguf_fallback = ResolveLlamaLoadPath(path, candidate_format);
@@ -341,16 +346,15 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
         continue;
       }
       if (!candidate_selection.backend->LoadModel(attempt.path, cfg)) {
-        if (candidate_selection.require_strict_native_execution &&
+        if (candidate_selection.require_strict_inferflux_execution &&
             candidate_selection.provider == BackendProvider::kNative) {
-          auto native_backend = std::dynamic_pointer_cast<NativeCudaBackend>(
-              candidate_selection.backend);
-          if (native_backend && native_backend->IsFallbackExecutor()) {
+          if (candidate_selection.backend->IsFallback()) {
             failure_reason =
-                "backend_policy_violation: strict_native_request enabled; "
-                "native backend rejected fallback runtime";
-            if (!native_backend->FallbackReason().empty()) {
-              failure_reason += " (" + native_backend->FallbackReason() + ")";
+                "backend_policy_violation: strict_inferflux_request enabled; "
+                "inferflux backend rejected fallback runtime";
+            if (!candidate_selection.backend->FallbackReason().empty()) {
+              failure_reason +=
+                  " (" + candidate_selection.backend->FallbackReason() + ")";
             }
             continue;
           }
@@ -371,18 +375,17 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
     bool native_executor_fallback = false;
     std::string native_executor_fallback_reason;
     if (candidate_selection.provider == BackendProvider::kNative) {
-      auto native_backend = std::dynamic_pointer_cast<NativeCudaBackend>(
-          candidate_selection.backend);
-      if (native_backend && native_backend->IsFallbackExecutor()) {
+      if (candidate_selection.backend->IsFallback()) {
         native_executor_fallback = true;
-        native_executor_fallback_reason = native_backend->FallbackReason();
+        native_executor_fallback_reason =
+            candidate_selection.backend->FallbackReason();
       }
     }
-    if (candidate_selection.require_strict_native_execution &&
+    if (candidate_selection.require_strict_inferflux_execution &&
         (candidate_selection.used_fallback || native_executor_fallback)) {
-      failure_reason =
-          "backend policy violation: strict native execution required for '" +
-          candidate + "'";
+      failure_reason = "backend policy violation: strict inferflux execution "
+                       "required for '" +
+                       candidate + "'";
       if (!candidate_selection.fallback_reason.empty()) {
         failure_reason += " (" + candidate_selection.fallback_reason + ")";
       } else if (!native_executor_fallback_reason.empty()) {
@@ -419,7 +422,7 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
   info.requested_backend = selected_requested_backend.empty()
                                ? selection.backend_label
                                : selected_requested_backend;
-  info.backend_provider = ProviderLabel(selection.provider);
+  info.backend_provider = BackendFactory::ProviderLabel(selection.provider);
   info.backend_fallback =
       selection.used_fallback || selected_native_executor_fallback;
   info.backend_fallback_reason = selection.fallback_reason;
@@ -527,7 +530,7 @@ ModelInfo *SingleModelRouter::ResolveExact(const std::string &model_id) {
   return &it->second.info;
 }
 
-std::shared_ptr<LlamaCPUBackend>
+std::shared_ptr<BackendInterface>
 SingleModelRouter::GetBackend(const std::string &model_id) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = models_.find(model_id);
@@ -556,7 +559,7 @@ std::string SingleModelRouter::DefaultModelId() const {
   return default_model_id_;
 }
 
-std::shared_ptr<LlamaCPUBackend> SingleModelRouter::Backend() const {
+std::shared_ptr<BackendInterface> SingleModelRouter::Backend() const {
   std::lock_guard<std::mutex> lock(mutex_);
   if (default_model_id_.empty()) {
     return nullptr;

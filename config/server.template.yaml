@@ -22,14 +22,14 @@ models:
   - id: model-name
     path: /path/to/model.gguf
     format: gguf                    # Rule 7: Set explicitly (gguf, safetensors, hf, auto)
-    backend: cuda                   # Rule 8: cuda, cpu, mps, rocm, cuda_native, cuda_llama_cpp
+    backend: cuda                   # Rule 8: cuda, cpu, mps, rocm, inferflux_cuda, llama_cpp_cuda
     default: true
 
   # Example safetensors model configuration
   # - id: safetensors-model
   #   path: /path/to/safetensors-model
   #   format: safetensors           # Rule 7: Explicit format
-  #   backend: cuda_native          # Rule 1: Use cuda_native for safetensors
+  #   backend: inferflux_cuda       # Rule 1: Use inferflux_cuda for safetensors
   #   default: false
 
 # ============================================================================
@@ -48,9 +48,9 @@ runtime:
     attention:
       kernel: auto                  # Rule 2: auto (selects FA2 on SM≥8.0), fa2, standard
 
-    # Native CUDA KV cache precision (independent from weight precision)
+    # InferFlux CUDA KV cache precision (independent from weight precision)
     kv_cache_dtype: auto            # auto, fp16, bf16, int8, fp8
-    dequantized_cache_policy: batch # batch (default, lower VRAM) | model (higher reuse, higher VRAM)
+    dequantized_cache_policy: none  # none (default, memory-first) | batch (batch-boundary cleanup) | model (higher reuse, higher VRAM)
     quantized_runtime:
       require_fused_matmul: false   # true = fail startup unless fused quantized matmul strategy is selected
 
@@ -67,9 +67,9 @@ runtime:
 
   # Backend exposure policy
   backend_exposure:
-    prefer_native: true             # Prefer native implementations
+    prefer_inferflux: true             # Prefer InferFlux implementations
     allow_llama_cpp_fallback: true  # Allow fallback to llama.cpp backends
-    strict_native_request: false    # Fail explicit cuda_native when native kernels are not ready
+    strict_inferflux_request: false    # Fail explicit inferflux_cuda when native kernels are not ready
 
   # Capability routing for graceful degradation
   capability_routing:
@@ -83,6 +83,10 @@ runtime:
     max_batch_tokens: 8192          # Max tokens per batch (affects memory)
     min_batch_size: 1               # Minimum batch size before flushing
     batch_accumulation_ms: 5        # Wait time to accumulate larger batches
+    policy: priority_age            # queue policy: priority_age | lpm_priority | throughput_balanced
+    decode_burst_tokens: 0      # 0 = disabled; >0 enforces decode bursts before requeue
+    chunked_prefill_tokens: 512     # Max tokens per prefill chunk in mixed execution
+    mixed_prefill_budget_ratio: 1.0 # Fraction (0.0-1.0) of backend token budget reserved for prefill
     session_handles:
       enabled: false                # Optional stateful layer; OpenAI flow stays stateless by default
       ttl_ms: 300000                # Session TTL in milliseconds
@@ -137,7 +141,7 @@ runtime:
 #
 # Rule 1: Backend mismatch
 #   Trigger: safetensors + CUDA + universal provider
-#   Fix: Use backend: cuda_native
+#   Fix: Use backend: inferflux_cuda
 #
 # Rule 2: Attention kernel
 #   Trigger: GPU SM ≥ 8.0, FlashAttention disabled
@@ -165,7 +169,7 @@ runtime:
 #
 # Rule 8: GPU unused
 #   Trigger: GPU available, all models on CPU
-#   Fix: Set models[*].backend to cuda/cuda_llama_cpp/cuda_native
+#   Fix: Set models[*].backend to cuda/llama_cpp_cuda/inferflux_cuda
 
 # ============================================================================
 # AUTHENTICATION
@@ -214,10 +218,10 @@ registry:
 #
 # INFERFLUX_MODEL_PATH              - Override default model path
 # INFERFLUX_MODELS                  - Multi-model config string
-# INFERFLUX_NATIVE_CUDA_STRICT      - fail if native runtime reports fallback
-# INFERFLUX_NATIVE_KV_DTYPE         - KV precision policy override (auto/fp16/bf16/int8/fp8)
-# INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY - GGUF dequant cache lifecycle (batch/model)
-# INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL - fail startup unless fused quantized matmul is selected
+# INFERFLUX_CUDA_STRICT      - fail if InferFlux CUDA runtime reports fallback
+# INFERFLUX_CUDA_KV_DTYPE         - KV precision policy override (auto/fp16/bf16/int8/fp8)
+# INFERFLUX_CUDA_DEQUANT_CACHE_POLICY - GGUF dequant cache lifecycle (none/batch/model)
+# INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL - fail startup unless fused quantized matmul is selected
 # INFERFLUX_BACKEND_PRIORITY        - Override backend selection (Rule 8)
 # INFERFLUX_DISABLE_STARTUP_ADVISOR - Disable recommendation logging
 #

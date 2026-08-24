@@ -23,6 +23,17 @@ class PagedKVCache {
 public:
   enum class EvictionPolicy { kLRU, kClock };
 
+  struct UsageSnapshot {
+    std::size_t total_blocks{0};
+    std::size_t used_blocks{0};
+    std::size_t free_blocks{0};
+    std::size_t page_size_bytes{0};
+
+    std::size_t total_bytes() const { return total_blocks * page_size_bytes; }
+    std::size_t used_bytes() const { return used_blocks * page_size_bytes; }
+    std::size_t free_bytes() const { return free_blocks * page_size_bytes; }
+  };
+
   explicit PagedKVCache(std::size_t pages, std::size_t page_size_bytes,
                         EvictionPolicy policy = EvictionPolicy::kLRU);
 
@@ -47,6 +58,7 @@ public:
 
   std::size_t NumFreeBlocks() const;
   std::size_t NumAvailableHostBlocks() const;
+  UsageSnapshot GetUsageSnapshot() const;
   void SetOffloadPath(const std::string &path);
   void SetEvictionPolicy(EvictionPolicy policy);
   void ConfigureAsyncWriter(std::size_t workers, std::size_t queue_depth);

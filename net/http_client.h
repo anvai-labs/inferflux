@@ -1,7 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <map>
 #include <string>
+
+#ifdef _WIN32
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#endif
 
 #include <openssl/ssl.h>
 

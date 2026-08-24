@@ -3,11 +3,14 @@
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/strategy_registry.h"
 
+#include <array>
+
 #ifdef INFERFLUX_HAS_CUDA
 
 namespace {
 
 using inferflux::runtime::cuda::native::DequantizedCachePolicy;
+using inferflux::runtime::cuda::native::DequantizedCachePolicyToString;
 using inferflux::runtime::cuda::native::KvPrecision;
 using inferflux::runtime::cuda::native::ParseDequantizedCachePolicy;
 using inferflux::runtime::cuda::native::ParseKvPrecision;
@@ -40,6 +43,12 @@ TEST_CASE("Kv precision parser rejects invalid values", "[quantization]") {
 TEST_CASE("Dequantized cache policy parser accepts supported values",
           "[quantization]") {
   DequantizedCachePolicy value = DequantizedCachePolicy::kModelLifetime;
+  REQUIRE(ParseDequantizedCachePolicy("none", &value));
+  CHECK(value == DequantizedCachePolicy::kNone);
+
+  REQUIRE(ParseDequantizedCachePolicy("off", &value));
+  CHECK(value == DequantizedCachePolicy::kNone);
+
   REQUIRE(ParseDequantizedCachePolicy("batch", &value));
   CHECK(value == DequantizedCachePolicy::kBatchLifetime);
 
@@ -52,6 +61,16 @@ TEST_CASE("Dequantized cache policy parser rejects invalid values",
   DequantizedCachePolicy value = DequantizedCachePolicy::kBatchLifetime;
   REQUIRE_FALSE(ParseDequantizedCachePolicy("auto", &value));
   REQUIRE_FALSE(ParseDequantizedCachePolicy("unknown", &value));
+}
+
+TEST_CASE("Dequantized cache policy string conversions cover none",
+          "[quantization]") {
+  CHECK(DequantizedCachePolicyToString(DequantizedCachePolicy::kNone) ==
+        "none");
+  CHECK(DequantizedCachePolicyToString(
+            DequantizedCachePolicy::kBatchLifetime) == "batch");
+  CHECK(DequantizedCachePolicyToString(
+            DequantizedCachePolicy::kModelLifetime) == "model");
 }
 
 TEST_CASE("Strategy registry prefers fused quantized matmul on SM80+",
@@ -68,6 +87,26 @@ TEST_CASE("Strategy registry prefers fused quantized matmul on SM80+",
   CHECK(selection.matmul->Id() == "matmul.fused.dequant_tile_gemm.v1");
 }
 
+TEST_CASE("Strategy registry keeps fused coverage for all target GGUF types on "
+          "SM80+",
+          "[quantization]") {
+  auto &registry = QuantizedRuntimeStrategyRegistry::Instance();
+  registry.RegisterDefaults();
+
+  const std::array<gguf::TensorType, 4> target_types = {
+      gguf::TensorType::Q4_K,
+      gguf::TensorType::Q6_K,
+      gguf::TensorType::Q8_0,
+      gguf::TensorType::Q8_K,
+  };
+
+  for (const auto type : target_types) {
+    const auto selection = registry.Select(type, KvPrecision::kFp16, 8, 9);
+    REQUIRE(selection.matmul != nullptr);
+    CHECK(selection.matmul->Id() == "matmul.fused.dequant_tile_gemm.v1");
+  }
+}
+
 TEST_CASE("Strategy registry falls back to compatibility matmul on pre-SM80",
           "[quantization]") {
   auto &registry = QuantizedRuntimeStrategyRegistry::Instance();
@@ -80,6 +119,26 @@ TEST_CASE("Strategy registry falls back to compatibility matmul on pre-SM80",
   CHECK(selection.matmul->Id() == "matmul.compat.dequantize_then_gemm");
 }
 
+TEST_CASE("Strategy registry falls back to compatibility matmul for target "
+          "GGUF types on pre-SM80",
+          "[quantization]") {
+  auto &registry = QuantizedRuntimeStrategyRegistry::Instance();
+  registry.RegisterDefaults();
+
+  const std::array<gguf::TensorType, 4> target_types = {
+      gguf::TensorType::Q4_K,
+      gguf::TensorType::Q6_K,
+      gguf::TensorType::Q8_0,
+      gguf::TensorType::Q8_K,
+  };
+
+  for (const auto type : target_types) {
+    const auto selection = registry.Select(type, KvPrecision::kFp16, 7, 5);
+    REQUIRE(selection.matmul != nullptr);
+    CHECK(selection.matmul->Id() == "matmul.compat.dequantize_then_gemm");
+  }
+}
+
 TEST_CASE(
     "Strategy registry keeps unsupported fused types on compatibility path",
     "[quantization]") {
@@ -88,6 +147,18 @@ TEST_CASE(
 
   const auto selection =
       registry.Select(gguf::TensorType::Q4_0, KvPrecision::kFp16, 8, 9);
+
+  REQUIRE(selection.matmul != nullptr);
+  CHECK(selection.matmul->Id() == "matmul.compat.dequantize_then_gemm");
+}
+
+TEST_CASE("Strategy registry routes GGUF F16 to compatibility matmul path",
+          "[quantization]") {
+  auto &registry = QuantizedRuntimeStrategyRegistry::Instance();
+  registry.RegisterDefaults();
+
+  const auto selection =
+      registry.Select(gguf::TensorType::F16, KvPrecision::kFp16, 8, 9);
 
   REQUIRE(selection.matmul != nullptr);
   CHECK(selection.matmul->Id() == "matmul.compat.dequantize_then_gemm");

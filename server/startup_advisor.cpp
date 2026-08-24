@@ -1,5 +1,6 @@
 #include "server/startup_advisor.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
+#include "runtime/backends/llama/llama_backend_traits.h"
 #include "server/logging/logger.h"
 
 #include <algorithm>
@@ -35,6 +36,14 @@ constexpr std::uint32_t kLoadOverheadNumerator = 11U;
 constexpr std::uint32_t kLoadOverheadDenominator = 10U;
 
 using GgufTensorType = ::inferflux::runtime::cuda::native::GGUF::TensorType;
+
+bool UsesCudaBackend(const std::string &backend) {
+  return ParseLlamaBackendTarget(backend) == LlamaBackendTarget::kCuda;
+}
+
+bool UsesCpuBackend(const std::string &backend) {
+  return ParseLlamaBackendTarget(backend) == LlamaBackendTarget::kCpu;
+}
 
 bool IsQuantizedQuantizationType(QuantizationType q) {
   switch (q) {
@@ -136,7 +145,7 @@ DetectQuantizationFromGgufMetadata(const std::filesystem::path &path) {
     return QuantizationType::kUnknown;
   }
 
-  FILE *file = fopen(gguf_path.c_str(), "rb");
+  FILE *file = fopen(gguf_path.string().c_str(), "rb");
   if (!file) {
     return QuantizationType::kUnknown;
   }
@@ -813,11 +822,11 @@ std::uint64_t CalculatePerSlotKvSize(int n_ctx, int hidden_dim, int n_layers,
 int CheckBackendMismatch(const StartupAdvisorContext &ctx) {
   int count = 0;
   for (const auto &m : ctx.models) {
-    if (m.format == "safetensors" && m.backend == "cuda" &&
+    if (m.format == "safetensors" && UsesCudaBackend(m.backend) &&
         m.backend_provider == "llama_cpp") {
       log::Info(kComponent, "[RECOMMEND] backend: Model '" + m.id +
                                 "' uses safetensors on CUDA — set "
-                                "backend to cuda_native");
+                                "backend to inferflux_cuda");
       ++count;
     }
   }
@@ -975,9 +984,9 @@ int CheckGpuUnused(const StartupAdvisorContext &ctx) {
   if (ctx.models.empty())
     return 0;
 
-  bool all_cpu =
-      std::all_of(ctx.models.begin(), ctx.models.end(),
-                  [](const AdvisorModelInfo &m) { return m.backend == "cpu"; });
+  bool all_cpu = std::all_of(
+      ctx.models.begin(), ctx.models.end(),
+      [](const AdvisorModelInfo &m) { return UsesCpuBackend(m.backend); });
   if (!all_cpu)
     return 0;
 

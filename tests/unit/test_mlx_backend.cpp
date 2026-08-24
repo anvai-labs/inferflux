@@ -11,7 +11,7 @@ using namespace inferflux;
 // ---------------------------------------------------------------------------
 // [mlx_backend] tests — use ForceReadyForTests() for null-model tests so no
 // actual model file is required.  engine_ready_ stays false, so all calls
-// fall through to the LlamaCPUBackend base class, which is also not loaded.
+// fall through to the LlamaCppBackend base class, which is also not loaded.
 // The tests verify interface contracts rather than correctness of output.
 // ---------------------------------------------------------------------------
 
@@ -93,7 +93,7 @@ TEST_CASE("MlxBackend IsReady reflects ForceReadyForTests", "[mlx_backend]") {
 // ---------------------------------------------------------------------------
 // [mlx_backend_phased] — phased execution override interface tests (INF-8).
 // engine_ready_=false (ForceReadyForTests only sets test_ready_ in base),
-// so all calls fall through to LlamaCPUBackend which has no model loaded.
+// so all calls fall through to LlamaCppBackend which has no model loaded.
 // Tests verify: no crash, sensible fallback return values.
 // ---------------------------------------------------------------------------
 
@@ -138,7 +138,7 @@ TEST_CASE("MlxBackend ExecuteUnifiedBatch returns empty without engine",
           "[mlx_backend_phased]") {
   MlxBackend backend;
   // No model loaded in base class → returns empty results.
-  std::vector<LlamaCPUBackend::UnifiedBatchInput> inputs;
+  std::vector<LlamaCppBackend::UnifiedBatchInput> inputs;
   inputs.push_back({0, 0, {1, 2, 3}, true});
   auto results = backend.ExecuteUnifiedBatch(inputs);
   // Base class returns {} (empty) when context_ is null.

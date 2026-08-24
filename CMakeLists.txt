@@ -7,6 +7,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Prevent Windows min/max macros from breaking std::min/std::max.
+if(WIN32)
+  add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 # Load dependencies from cmake/Dependencies.cmake
 include(cmake/Dependencies.cmake)
 
@@ -23,35 +28,41 @@ set(MLX_C_TAG "v0.5.0" CACHE STRING "mlx-c git tag to use when building from sou
 
 option(ENABLE_CPU "Enable CPU runtime" ON)
 option(ENABLE_MTMD "Enable multimodal (vision) support via libmtmd" OFF)
-option(INFERFLUX_USE_COMMON_BACKEND_TYPES "Use common backend types from runtime/backends/common (Phase 2 migration)" OFF)
 option(INFERFLUX_CUDA_DEVICE_LTO "Enable CUDA device LTO profile (requires custom lto gencode)" OFF)
-option(INFERFLUX_CUDA_USE_FAST_MATH "Enable --use_fast_math for CUDA kernels (precision tradeoff)" OFF)
+option(INFERFLUX_CUDA_USE_FAST_MATH "Enable --use_fast_math for CUDA kernels (default ON, matches llama.cpp)" ON)
+option(INFERFLUX_CUDA_NATIVE_ARCH "Compile CUDA kernels for local GPU only (faster builds, better codegen)" OFF)
 
-if(INFERFLUX_USE_COMMON_BACKEND_TYPES)
-  add_compile_definitions(INFERFLUX_USE_COMMON_BACKEND_TYPES)
-endif()
+# BackendInterface is the canonical base for all backends.
+add_compile_definitions(INFERFLUX_USE_COMMON_BACKEND_TYPES)
 
-add_library(inferflux_core
+add_library(inferflux_core STATIC
   runtime/device_context.h
   runtime/kv_cache/paged_kv_cache.cpp
   runtime/kv_cache/paged_kv_cache.h
   runtime/tensors/tensor.h
   runtime/backends/cpu/cpu_backend.cpp
   runtime/backends/cpu/cpu_backend.h
-  runtime/backends/cpu/llama_backend.cpp
-  runtime/backends/cpu/llama_backend.h
+  runtime/backends/cpu/llama_cpp_backend.h
+  runtime/backends/llama/llama_cpp_backend.cpp
+  runtime/backends/llama/llama_cpp_backend.h
   runtime/backends/cuda/cuda_device_context.cpp
   runtime/backends/cuda/cuda_device_context.h
   runtime/backends/cuda/cuda_backend.cpp
   runtime/backends/cuda/cuda_backend.h
-  runtime/backends/cuda/native_cuda_runtime.cpp
-  runtime/backends/cuda/native_cuda_runtime.h
-  runtime/backends/cuda/native_cuda_backend.cpp
-  runtime/backends/cuda/native_cuda_backend.h
+  runtime/backends/cuda/inferflux_cuda_runtime.cpp
+  runtime/backends/cuda/inferflux_cuda_runtime.h
+  runtime/backends/cuda/inferflux_cuda_backend.cpp
+  runtime/backends/cuda/inferflux_cuda_backend.h
+  runtime/backends/native/native_inference_runtime.h
+  runtime/backends/native/native_gpu_backend.cpp
+  runtime/backends/native/native_gpu_backend.h
   runtime/backends/cuda/native/safetensors_parser.cpp
   runtime/backends/cuda/native/safetensors_parser.h
-  runtime/backends/cuda/native_kernel_executor.cpp
-  runtime/backends/cuda/native_kernel_executor.h
+  runtime/backends/cuda/inferflux_cuda_executor.cpp
+  runtime/backends/cuda/inferflux_cuda_executor.h
+  runtime/backends/cuda/native/native_bootstrap_config.cpp
+  runtime/backends/cuda/native/dispatch_operator_health.cpp
+  runtime/backends/cuda/native/weight_map.cpp
   model/tokenizer_factory.cpp
   model/tokenizer_factory.h
   runtime/backends/backend_capabilities.cpp
@@ -59,8 +70,34 @@ add_library(inferflux_core
   runtime/backends/common/backend_types.h
   runtime/backends/common/backend_interface.h
   runtime/backends/common/batching_utils.h
+  runtime/backends/gpu/gpu_device_strategy.h
+  runtime/backends/gpu/gpu_accelerated_backend.cpp
+  runtime/backends/gpu/gpu_accelerated_backend.h
+  runtime/backends/gpu/backend_config_extensions.h
+  runtime/backends/gpu/cuda_device_strategy.cpp
+  runtime/backends/gpu/cuda_device_strategy.h
+  runtime/backends/gpu/native_cuda_device_strategy.cpp
+  runtime/backends/gpu/native_cuda_device_strategy.h
+  runtime/backends/gpu/rocm_device_strategy.cpp
+  runtime/backends/gpu/rocm_device_strategy.h
+  runtime/backends/gpu/mps_device_strategy.cpp
+  runtime/backends/gpu/mps_device_strategy.h
+  runtime/backends/gpu/vulkan_device_strategy.cpp
+  runtime/backends/gpu/vulkan_device_strategy.h
+  runtime/backends/gpu/cpu_device_strategy.cpp
+  runtime/backends/gpu/cpu_device_strategy.h
+  runtime/backends/gpu/opencl_device_strategy.cpp
+  runtime/backends/gpu/opencl_device_strategy.h
+  runtime/backends/vulkan/vulkan_backend.cpp
+  runtime/backends/vulkan/vulkan_backend.h
+  runtime/backends/mps/mps_backend.cpp
+  runtime/backends/mps/mps_backend.h
+  runtime/backends/opencl/opencl_backend.cpp
+  runtime/backends/opencl/opencl_backend.h
   runtime/backends/llama/llama_backend_traits.cpp
   runtime/backends/llama/llama_backend_traits.h
+  runtime/backends/backend_registry.cpp
+  runtime/backends/backend_registry.h
   runtime/backends/backend_factory.cpp
   runtime/backends/backend_factory.h
   runtime/backends/backend_manager.cpp
@@ -69,6 +106,8 @@ add_library(inferflux_core
   runtime/speculative/speculative_decoder.h
   runtime/execution/batch_executor.cpp
   runtime/execution/batch_executor.h
+  runtime/execution/unified_batch_lane_dispatcher.cpp
+  runtime/execution/unified_batch_lane_dispatcher.h
   runtime/execution/parallel_context.cpp
   runtime/execution/parallel_context.h
   runtime/backends/ep_dispatch.cpp
@@ -80,6 +119,8 @@ add_library(inferflux_core
   model/tokenizer/simple_tokenizer.cpp
   model/tokenizer/simple_tokenizer.h
   model/tokenizer.h
+  model/gguf_tokenizer.cpp
+  model/gguf_tokenizer.h
   model/llama_tokenizer.cpp
   model/llama_tokenizer.h
   model/hf_tokenizer.cpp
@@ -111,6 +152,8 @@ add_library(inferflux_core
   server/auth/rate_limiter.h
   server/auth/oidc_validator.cpp
   server/auth/oidc_validator.h
+  server/diagnostics/crash_handler.cpp
+  server/diagnostics/crash_handler.h
   server/logging/audit_logger.cpp
   server/logging/audit_logger.h
   server/logging/logger.cpp
@@ -144,6 +187,7 @@ add_library(inferflux_core
 # non-CUDA build paths.
 target_sources(inferflux_core PRIVATE
   runtime/backends/cuda/native/model_loader.cpp
+  runtime/backends/cuda/native/model_memory_ledger.cpp
   runtime/backends/cuda/native/quantization_handler.cpp
   runtime/backends/cuda/native/gguf_util.cpp
   runtime/backends/cuda/native/strategy_registry.cpp
@@ -160,9 +204,61 @@ find_package(CUDAToolkit QUIET)
 
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   message(STATUS "CUDA toolkit found: enabling CUDA build path")
+
+  # GCC 14+ on Ubuntu 24.04 moved cc1plus to /usr/libexec/ which nvcc cannot
+  # find.  Auto-detect a compatible host compiler if the default g++ fails.
+  if(NOT CMAKE_CUDA_HOST_COMPILER)
+    execute_process(
+      COMMAND ${CMAKE_CXX_COMPILER} -print-file-name=cc1plus
+      OUTPUT_VARIABLE _cc1plus_path OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_cc1plus_path STREQUAL "cc1plus" OR NOT EXISTS "${_cc1plus_path}"
+       OR NOT _cc1plus_path MATCHES "/usr/lib/")
+      # cc1plus is not in the standard path nvcc expects — find an older g++
+      foreach(_gxx g++-13 g++-12 g++-11)
+        find_program(_compat_gxx ${_gxx})
+        if(_compat_gxx)
+          execute_process(
+            COMMAND ${_compat_gxx} -print-file-name=cc1plus
+            OUTPUT_VARIABLE _compat_cc1plus OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+          if(EXISTS "${_compat_cc1plus}" AND _compat_cc1plus MATCHES "/usr/lib/")
+            set(CMAKE_CUDA_HOST_COMPILER "${_compat_gxx}" CACHE FILEPATH
+                "CUDA host compiler (auto-detected for nvcc compatibility)" FORCE)
+            message(STATUS "CUDA host compiler auto-set to ${_compat_gxx} (system g++ cc1plus not in nvcc search path)")
+            break()
+          endif()
+        endif()
+        unset(_compat_gxx CACHE)
+      endforeach()
+      if(NOT CMAKE_CUDA_HOST_COMPILER)
+        message(WARNING "System g++ cc1plus not found in nvcc search path and no compatible g++-{13,12,11} found. "
+                        "CUDA build may fail. Install g++-12: sudo apt install g++-12")
+      endif()
+    endif()
+  endif()
+
+  if(INFERFLUX_CUDA_NATIVE_ARCH)
+    # Keep the cache aligned with the requested mode so reconfigured dev builds
+    # do not retain an old numeric architecture list and still pass -arch=native
+    # through to nvcc, which falls back to a generic target on some hosts.
+    set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures" FORCE)
+    message(STATUS "CUDA native arch: probing local GPU architecture")
+  elseif(NOT CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING "CUDA architectures" FORCE)
+  endif()
   enable_language(CUDA)
-  if(NOT CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "70;75;80;86;89;90")
+  if(CMAKE_CUDA_ARCHITECTURES STREQUAL "native")
+    if(DEFINED CMAKE_CUDA_ARCHITECTURES_NATIVE AND
+       CMAKE_CUDA_ARCHITECTURES_NATIVE MATCHES
+         "^[0-9]+(a|f)?(-real|-virtual)?(;[0-9]+(a|f)?(-real|-virtual)?)*$")
+      set(CMAKE_CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES_NATIVE}" CACHE STRING
+          "CUDA architectures" FORCE)
+      message(STATUS "CUDA native arch resolved to ${CMAKE_CUDA_ARCHITECTURES}")
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING
+          "CUDA architectures" FORCE)
+      message(WARNING
+        "Failed to resolve native CUDA architecture; falling back to standard multi-arch build")
+    endif()
   endif()
   set(LLAMA_CUDA ON CACHE BOOL "" FORCE)
   target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_CUDA=1)
@@ -182,19 +278,24 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     CUDA_SEPARABLE_COMPILATION ON
     CUDA_RESOLVE_DEVICE_SYMBOLS ON
     POSITION_INDEPENDENT_CODE ON
+    CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   )
   target_include_directories(inferflux_cuda_kernels PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/external
   )
-  target_link_libraries(inferflux_cuda_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::curand CUDA::nvToolsExt)
+  # NVTX3 is header-only in CUDA 12+; no library linkage needed.
+  target_link_libraries(inferflux_cuda_kernels PUBLIC CUDA::cudart CUDA::cublas CUDA::curand)
+  target_include_directories(inferflux_cuda_kernels PUBLIC ${CUDAToolkit_INCLUDE_DIRS})
 
   # Add native CUDA C++ sources to inferflux_core
   target_sources(inferflux_core PRIVATE
     runtime/backends/cuda/native/cublas_gemm.cpp
-    runtime/backends/cuda/native/weight_map.cpp
+    runtime/backends/cuda/native/native_dispatch_registry.cpp
+    runtime/backends/cuda/native/native_dispatch_policy.cpp
     runtime/backends/cuda/native/model_forward_factory.cpp
     runtime/backends/cuda/native/transformer_forward.cu
+    runtime/backends/cuda/native/decode_burst.cu
     runtime/backends/cuda/native/fused_quant_gemm.cu
     # GGUF quantization support (Phase 1-5: Foundation, GGUF Parsing, Handlers, CUDA Kernels, Forward Pass)
     runtime/backends/cuda/native/safetensors_adapter.cpp
@@ -205,7 +306,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/q8_0_handler.cpp
     runtime/backends/cuda/native/q8_k_handler.cpp
   )
-  target_link_libraries(inferflux_core PUBLIC inferflux_cuda_kernels CUDA::cublas CUDA::nvToolsExt)
+  target_link_libraries(inferflux_core PUBLIC inferflux_cuda_kernels CUDA::cublas)
   set_target_properties(inferflux_core PROPERTIES CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}")
   if(INFERFLUX_CUDA_DEVICE_LTO)
     message(WARNING
@@ -232,6 +333,14 @@ else()
     runtime/backends/cuda/native/gguf_model_loader_stub.cpp
   )
   set(LLAMA_CUDA OFF CACHE BOOL "" FORCE)
+endif()
+
+
+# Dispatch exhaustiveness gate (applies to all configurations): switches
+# over dispatch_catalog.h enums carry no default clause, so an operator
+# added without wiring its label switch or executor stage fails the build.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  target_compile_options(inferflux_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Werror=switch>)
 endif()
 
 if(ENABLE_MPS AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -272,9 +381,14 @@ else()
   set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
 endif()
 
+# Multi-backend: CUDA and ROCm can be enabled simultaneously.  llama.cpp builds
+# ggml-cuda and ggml-hip as independent backends; InferFlux native kernels use
+# CUDA only.  Use --all-backends in scripts/build.sh or set both options here.
 if(ENABLE_ROCM)
-  find_package(hip 6.1 QUIET)
-  if(hip_FOUND)
+  find_package(hip QUIET CONFIG PATHS /opt/rocm)
+  find_package(rocblas QUIET CONFIG PATHS /opt/rocm)
+  find_package(hipblas QUIET CONFIG PATHS /opt/rocm)
+  if(hip_FOUND AND rocblas_FOUND AND hipblas_FOUND)
     message(STATUS "ROCm/HIP found: enabling ROCm build path")
     set(LLAMA_HIP ON CACHE BOOL "" FORCE)
     target_compile_definitions(inferflux_core PUBLIC INFERFLUX_HAS_ROCM=1)
@@ -291,6 +405,10 @@ if(ENABLE_ROCM)
     endif()
     set(LLAMA_HIP OFF CACHE BOOL "" FORCE)
   endif()
+endif()
+
+if(TARGET CUDA::cudart AND LLAMA_HIP)
+  message(STATUS "Multi-backend build: CUDA + ROCm enabled simultaneously")
 endif()
 
 if(ENABLE_WEBUI)
@@ -369,6 +487,10 @@ endif()
 set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+# Workaround: llama.cpp ggml-cuda CUDA host compiler version detection can fail
+# in WSL2, causing ggml_get_flags() to receive empty CCVER argument.
+# Disable ggml compiler warnings flags to skip the problematic detection path.
+set(GGML_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
 # NOTE: LLAMA_CUDA, LLAMA_METAL, and LLAMA_BLAS are set by the hardware-detection
 # blocks above.  Do NOT override them here — the former stale reset was a bug
 # that silently disabled GPU support even when CUDAToolkit was found.
@@ -426,10 +548,40 @@ else()
 endif()
 
 add_executable(inferfluxd server/main.cpp)
-target_link_libraries(inferfluxd PRIVATE inferflux_core)
+# Use --whole-archive to ensure static self-registration objects (backend
+# registry entries in inferflux_cuda_backend.cpp etc.) are linked even when
+# nothing else in main.cpp references them directly.
+if(MSVC)
+  target_link_libraries(inferfluxd PRIVATE inferflux_core)
+  target_link_options(inferfluxd PRIVATE /WHOLEARCHIVE:inferflux_core)
+elseif(APPLE)
+  # ld64 has no --whole-archive; -force_load achieves the same
+  # self-registration guarantee. Link the target by name so its usage
+  # requirements (PUBLIC include dirs) still propagate — embedding it in
+  # a quoted flag string makes CMake treat it as an opaque flag and drops
+  # the include paths (broke the macOS CI build at model/model_format.h).
+  target_link_libraries(inferfluxd PRIVATE inferflux_core)
+  target_link_options(inferfluxd PRIVATE
+      "LINKER:-force_load,$<TARGET_FILE:inferflux_core>")
+else()
+  target_link_libraries(inferfluxd PRIVATE
+    -Wl,--whole-archive inferflux_core -Wl,--no-whole-archive)
+endif()
 
 add_executable(inferctl cli/main.cpp)
 target_link_libraries(inferctl PRIVATE inferflux_core)
+
+if(ENABLE_CUDA AND CUDAToolkit_FOUND)
+  add_executable(benchmark_downproj_q81 tests/unit/benchmark_downproj_q81.cu)
+  target_include_directories(benchmark_downproj_q81 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(benchmark_downproj_q81 PRIVATE inferflux_core)
+  add_executable(benchmark_grouped_q81_pair
+                 tests/unit/benchmark_grouped_q81_pair.cu)
+  target_include_directories(benchmark_grouped_q81_pair PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(benchmark_grouped_q81_pair PRIVATE inferflux_core)
+endif()
 
 install(TARGETS inferfluxd inferctl
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
@@ -446,10 +598,12 @@ add_executable(inferflux_tests
   tests/unit/test_tokenizer.cpp
   tests/unit/test_api_key_auth.cpp
   tests/unit/test_rate_limiter.cpp
+  tests/unit/test_crash_handler.cpp
   tests/unit/test_guardrail.cpp
   tests/unit/test_audit_logger.cpp
   tests/unit/test_metrics.cpp
-  tests/unit/test_scheduler.cpp
+  tests/unit/test_http_server.cpp
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/unit/test_scheduler.cpp>
   tests/unit/test_session_handle_manager.cpp
   tests/unit/test_sequence_slot_manager.cpp
   tests/unit/test_policy_store.cpp
@@ -468,7 +622,9 @@ add_executable(inferflux_tests
   tests/unit/test_logger.cpp
   tests/unit/test_structured_output.cpp
   tests/unit/test_paged_kv_cache.cpp
+  tests/unit/test_http_server_admin_cache.cpp
   tests/unit/test_unified_batching.cpp
+  tests/unit/test_lane_dispatcher.cpp
   tests/unit/test_model_registry.cpp
   tests/unit/test_model_selection.cpp
   tests/unit/test_single_model_router.cpp
@@ -476,6 +632,7 @@ add_executable(inferflux_tests
   tests/unit/test_parallel_context.cpp
   tests/unit/test_ep_dispatch.cpp
   tests/unit/test_backend_factory.cpp
+  tests/unit/test_backend_registry.cpp
   tests/unit/test_backend_capabilities.cpp
   tests/unit/test_model_format.cpp
   tests/unit/test_model_info_paths.cpp
@@ -483,21 +640,68 @@ add_executable(inferflux_tests
   tests/unit/test_batch_analyzer.cpp
   tests/unit/test_backend_interface.cpp
   tests/unit/test_native_forward.cpp
+  tests/unit/test_native_rowpair_kernels.cpp
+  tests/unit/test_native_bootstrap_config.cpp
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/unit/test_native_dequant_policy.cpp>
+  tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
+  tests/unit/test_model_memory_ledger.cpp
   tests/unit/test_dtype_traits.cpp
   tests/unit/test_gpu_kv_cache.cpp
   tests/unit/test_gpu_sampler.cpp
   tests/unit/test_native_batching.cpp
+  tests/unit/test_batched_decode.cpp
   tests/unit/test_startup_advisor.cpp
+  tests/unit/test_gguf_tokenizer.cpp
   tests/unit/test_gguf_parsing.cpp
   tests/unit/test_gguf_model_loader.cpp
   tests/unit/test_quantized_weight_map.cpp
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/unit/test_quantized_weight_map_scratch.cpp>
   tests/unit/test_strategy_registry.cpp
-  tests/integration/test_gguf_quantization.cpp
+  $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:tests/integration/test_gguf_quantization.cpp>
+  tests/integration/test_http_generation_admission.cpp
   external/catch2/catch_amalgamated.cpp
 )
 target_include_directories(inferflux_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/external)
+# Dispatch exhaustiveness gate for tests: mirrors the core gate.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  target_compile_options(inferflux_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Werror=switch>)
+endif()
 target_link_libraries(inferflux_tests PRIVATE inferflux_core)
+if(ENABLE_CUDA)
+  add_executable(inferflux_first_token_probe
+    tests/tools/first_token_probe.cpp
+  )
+  target_include_directories(inferflux_first_token_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+  )
+  target_link_libraries(inferflux_first_token_probe PRIVATE inferflux_core)
+
+  add_executable(inferflux_kernel_count_probe
+    tests/tools/kernel_count_probe.cpp
+  )
+  target_include_directories(inferflux_kernel_count_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+  )
+  target_link_libraries(inferflux_kernel_count_probe PRIVATE inferflux_core)
+  find_library(CUPTI_LIBRARY cupti
+    HINTS ${CUDAToolkit_LIBRARY_DIR}
+          ${CUDA_TOOLKIT_ROOT_DIR}/extras/CUPTI/lib64
+          ${CUDA_TOOLKIT_ROOT_DIR}/lib64
+          $ENV{CUDA_PATH}/extras/CUPTI/lib64
+  )
+  find_path(CUPTI_INCLUDE_DIR cupti.h
+    HINTS ${CUDA_TOOLKIT_ROOT_DIR}/extras/CUPTI/include
+          $ENV{CUDA_PATH}/extras/CUPTI/include
+  )
+  if(CUPTI_LIBRARY AND CUPTI_INCLUDE_DIR)
+    target_link_libraries(inferflux_kernel_count_probe PRIVATE ${CUPTI_LIBRARY})
+    target_include_directories(inferflux_kernel_count_probe PRIVATE
+      ${CUPTI_INCLUDE_DIR}
+    )
+    target_compile_definitions(inferflux_kernel_count_probe PRIVATE INFERFLUX_HAS_CUPTI=1)
+  endif()
+endif()
 if(ENABLE_MLX)
   target_sources(inferflux_tests PRIVATE
     tests/unit/test_mlx_loader.cpp
@@ -529,6 +733,12 @@ add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
 set_tests_properties(FlashAttnTests PROPERTIES LABELS flash_attn)
 add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
 set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
+add_test(NAME HttpServerTests COMMAND inferflux_tests "[http_server]")
+set_tests_properties(HttpServerTests PROPERTIES LABELS http_server)
+add_test(NAME HttpGenerationAdmissionIntegrationTests
+         COMMAND inferflux_tests "[http_server][integration][admission]")
+set_tests_properties(HttpGenerationAdmissionIntegrationTests PROPERTIES
+  LABELS "http_server;integration;admission")
 add_test(NAME ChatTemplateTests COMMAND inferflux_tests "[chat_template]")
 set_tests_properties(ChatTemplateTests PROPERTIES LABELS chat_template)
 add_test(NAME SamplingTests COMMAND inferflux_tests "[sampling]")
@@ -717,6 +927,13 @@ if(Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 30)
 
+  add_test(
+    NAME IntegrationBackendIdentityContract
+    COMMAND ${Python3_EXECUTABLE} tests/integration/backend_identity_contract_test.py)
+  set_tests_properties(IntegrationBackendIdentityContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
   # Stub-mode integration tests — run without a model; always enabled.
   add_test(NAME StubIntegration
            COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py)
@@ -825,6 +1042,15 @@ if(Python3_Interpreter_FOUND)
     ENVIRONMENT
       "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
 
+  add_test(
+    NAME IntegrationCLIAdminPoolsContract
+    COMMAND ${Python3_EXECUTABLE}
+            tests/integration/inferctl_admin_pools_contract_test.py)
+  set_tests_properties(IntegrationCLIAdminPoolsContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30
+    ENVIRONMENT "INFERCTL_BIN=${CMAKE_BINARY_DIR}/inferctl")
+
   # Native CUDA backend metrics contract (stub-mode: verifies metric names + format).
   add_test(NAME IntegrationNativeMetrics
            COMMAND ${Python3_EXECUTABLE} tests/integration/native_metrics_test.py)
@@ -832,6 +1058,44 @@ if(Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
     ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
+
+  add_test(NAME IntegrationNativePhaseTimingParser
+           COMMAND ${Python3_EXECUTABLE}
+                   tests/integration/native_phase_timing_parser_test.py)
+  set_tests_properties(IntegrationNativePhaseTimingParser PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
+  add_test(NAME IntegrationBenchmarkResponseClassifier
+           COMMAND ${Python3_EXECUTABLE}
+                   tests/integration/benchmark_response_classifier_test.py)
+  set_tests_properties(IntegrationBenchmarkResponseClassifier PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
+  add_test(NAME IntegrationBenchmarkHarnessDefaults
+           COMMAND ${Python3_EXECUTABLE}
+                   tests/integration/benchmark_harness_defaults_test.py)
+  set_tests_properties(IntegrationBenchmarkHarnessDefaults PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
+  add_test(NAME IntegrationDecodeTraceParity
+           COMMAND ${Python3_EXECUTABLE}
+                   tests/integration/decode_trace_parity_test.py)
+  set_tests_properties(IntegrationDecodeTraceParity PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
+  if(ENABLE_CUDA)
+    add_test(NAME IntegrationFirstTokenParityProbe
+             COMMAND ${Python3_EXECUTABLE}
+                     tests/integration/first_token_parity_probe_test.py)
+    set_tests_properties(IntegrationFirstTokenParityProbe PROPERTIES
+      WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+      TIMEOUT 180
+      ENVIRONMENT "INFERFLUX_FIRST_TOKEN_PROBE_BIN=${CMAKE_BINARY_DIR}/inferflux_first_token_probe")
+  endif()
 
   add_test(NAME SSECancel
            COMMAND ${Python3_EXECUTABLE} tests/integration/sse_cancel_test.py)

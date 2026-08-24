@@ -79,9 +79,9 @@ struct AdvisorConfig {
   int max_batch_size{8};
   int max_batch_tokens{2048};
   std::size_t kv_cpu_pages{32};
-  bool prefer_native{true};
+  bool prefer_inferflux{true};
   bool allow_llama_cpp_fallback{true};
-  bool strict_native_request{false};
+  bool strict_inferflux_request{false};
   std::string backend_priority;
   int tp_degree{1};
   bool speculative_enabled{false};

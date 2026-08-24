@@ -1,6 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/backends/ep_dispatch.h"
 #include "scheduler/model_router.h"
 #include "scheduler/single_model_router.h"
@@ -9,21 +9,21 @@
 using namespace inferflux;
 
 // ---------------------------------------------------------------------------
-// LlamaCPUBackend MoE guard paths (model_ == nullptr → 0 / false)
+// LlamaCppBackend MoE guard paths (model_ == nullptr → 0 / false)
 // ---------------------------------------------------------------------------
 
 TEST_CASE("IsMoE returns false when model is not loaded", "[moe]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   REQUIRE_FALSE(backend.IsMoE());
 }
 
 TEST_CASE("ExpertCount returns 0 when model is not loaded", "[moe]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   REQUIRE(backend.ExpertCount() == 0);
 }
 
 TEST_CASE("ActiveExperts returns 0 when model is not loaded", "[moe]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   REQUIRE(backend.ActiveExperts() == 0);
 }
 
@@ -58,7 +58,7 @@ TEST_CASE("ModelInfo MoE fields are assignable", "[moe]") {
 
 TEST_CASE("SingleModelRouter RegisterModel populates MoE fields (no model)",
           "[moe]") {
-  auto backend = std::make_shared<LlamaCPUBackend>();
+  auto backend = std::make_shared<LlamaCppBackend>();
   ModelInfo info;
   info.id = "test-model";
   info.path = "/tmp/test.gguf";

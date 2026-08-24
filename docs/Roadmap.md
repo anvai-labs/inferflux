@@ -1,74 +1,73 @@
 # InferFlux Roadmap
 
-**Snapshot date:** March 8, 2026  
-**Current overall grade:** B (contracts substantially improved; throughput still constrained)  
-**Target overall grade:** B (2026), B+ (2027)
+**Snapshot date:** March 13, 2026
+**Current overall grade:** B-
+**Target overall grade:** B (after native/runtime maturity), B+ (after required GPU and distributed gates)
 
 ```mermaid
 flowchart LR
-    A[Now: Contract-Complete Runtime] --> B[Next: Throughput Core Maturity]
-    B --> C[Then: Enterprise Runtime]
-
-    A1[Endpoint parity closed for completion/chat/embeddings] --> A
-    A2[Strict provider identity + policy gates] --> A
-
-    B1[Heavy-batch kernel maturity] --> B
-    B2[Native async unified-batch parity] --> B
-    B3[GGUF quantized sustained perf at scale] --> B
-
-    C1[Distributed failure contracts] --> C
-    C2[Mandatory GPU release lane] --> C
+    A[Now: strong control-plane and identity contracts] --> B[Next: native quantized throughput and graph maturity]
+    B --> C[Then: distributed ownership and failure maturity]
+    C --> D[Finally: required GPU/provider release gates]
 ```
 
-## 1) Grade Scorecard (Code-Aligned)
+## 1) Grade Scorecard
 
-| Dimension | Current | Evidence in code today | Blocker to next grade | Primary issues |
-|---|---|---|---|---|
-| Throughput | B- | Native CUDA gate passes strict checks (provider=native, no fallback, lane submissions >0, overlap >0) with `scripts/run_throughput_gate.py` on Ada profile | Heavy-batch/large-model sustained perf is still below target | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#4](https://github.com/vjsingh1984/inferflux/issues/4), [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
-| Continuous batching | C+ | Mixed scheduler iterations and decode/prefill overlap execution are active in native CUDA | Native async unified-batch contract is intentionally disabled (`SupportsAsyncUnifiedBatch()==false`), so batching gains rely on synchronous overlap path | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#8](https://github.com/vjsingh1984/inferflux/issues/8) |
-| Capability identity | A- | Provider contract is explicit (`kNative`/`kLlamaCpp`), strict-native policy path is wired, and endpoint parity contracts are now closed for `/v1/completions`, `/v1/chat/completions`, and `/v1/embeddings` | Native endpoint parity currently depends on parity-delegate availability (GGUF-compatible artifact path) rather than native-first implementations for all features | [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
-| Resource efficiency | B | KV precision + dequant cache policy are load-scoped; prefix/KV reuse + session handle layer exist; GGUF overlap no longer hard-disabled (lane-local quantized lane state) | Quantized GGUF path still needs fused-kernel maturity and larger-model validation to convert this to sustained efficiency gains | [#4](https://github.com/vjsingh1984/inferflux/issues/4), [#7](https://github.com/vjsingh1984/inferflux/issues/7), [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
-| CI/TDD enforcement | B+ | Contract suites are explicit in CI logs (including CLI arg-contract blocks) | Merge-blocking GPU behavior lane is not yet universally guaranteed | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
-| Distributed runtime | C- | Split/runtime hooks exist | Failure-path contract matrix is incomplete | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
+| Dimension | Current | Evidence in code today | Blocker to next grade |
+|---|---|---|---|
+| Throughput | C+ | Native provider path is real, native forward metrics exist, and sync overlap is active | Quantized GGUF native hot paths are not yet consistently competitive under heavy-batch edge workloads |
+| Continuous batching | C | Sync-first batch execution preserves real batching; prefix-affinity and mixed-step knobs exist | Graph capture/reuse and broader native hot-path residency are still incomplete |
+| Capability identity | A- | Provider/fallback identity is explicit across API, CLI, admin, and metrics | Some critical behavior still depends on compatibility/delegate paths |
+| Resource efficiency | B- | Memory-first dequant policy, KV planner, load-scoped KV precision, prefix reuse, and session-lease foundations are real | Quantized native execution still leaves too much performance on the table |
+| CI/TDD enforcement | B+ | Focused contract suites, docs gate, and explicit CLI/admin tests exist | Required GPU/provider lane is still missing |
+| Distributed runtime | C | Split-role scheduling, SHM transport, ticket lifecycle, timeout debt, admin pools, and optional fail-closed admission are landed | Sequence ownership cleanup, decode-worker session reuse, and fault-path CI remain open |
 
-## 2) Evidence Ledger (What Was Reconciled)
+## 2) Evidence Ledger
 
 | Evidence type | Current reading | Grade impact |
 |---|---|---|
-| Provider identity contract | Runtime provider enum is `kLlamaCpp`/`kNative`; exposure policy is `prefer_native`, `allow_llama_cpp_fallback`, `strict_native_request` | Removes naming ambiguity in canonical docs and API semantics |
-| Native readiness gate | `NativeCudaBackend::NativeKernelsReady()` now auto-enables when native kernels are compiled and CUDA device is available (unless scaffold is forced via env) | `backend=cuda` can prefer native by default on ready CUDA nodes |
-| Endpoint parity contracts | Native provider now advertises endpoint contracts from explicit native methods and serves logprobs/structured-output/embeddings through parity delegate paths when available | Fallback is policy-driven instead of blanket capability-gap-driven for completion/chat/embeddings flows |
-| Scheduler parity safety | Logprobs/structured-output requests bypass phased prefill/decode split and stay on full-generate path | Prevents sequence/sampler state divergence across heterogeneous execution paths |
-| Strict-native admin contract | Explicit strict-native request rejections now preserve `backend_policy_violation` semantics on model load | Keeps admin policy behavior deterministic and scriptable |
-| API/CLI identity exposure | `/v1/models` and CLI surfaces include requested/exposed backend + provider/fallback fields | Supports deterministic automation and policy checks |
-| CUDA fallback chain | Model-load routing now uses `cuda -> cuda_llama_cpp -> rocm -> mlx -> mps -> cpu` (compiled targets only) | Improves resilience while preserving deterministic fallback ordering |
-| GGUF overlap safety | GGUF no longer short-circuits overlap initialization; lanes now use lane-local quantized map/adapter ownership | Removes a major overlap safety blocker on quantized GGUF path |
-| Throughput gate (Ada RTX 4000, Qwen2.5-3B safetensors, March 8, 2026) | Strict gate passed with `provider=native`, `fallback=false`, decode/prefill lane submissions >0, overlap duration >0, mixed scheduler iterations >0 | Throughput/continuous-batching grades move up one step; remaining blocker is heavy-batch/large-model maturity |
+| Provider identity contract | `requested_backend`, `exposed_backend`, `provider`, `fallback`, `fallback_reason` are explicit and tested | Keeps control-plane and automation grades high |
+| Native memory-economy foundation | `dequant_cache_policy=none`, KV planner, and native KV metrics are wired | Makes edge-memory work credible, but not enough to move throughput grades alone |
+| Sync-first batching stance | Native keeps `SupportsAsyncUnifiedBatch()==false` and uses sync batched execution for throughput | Correct architectural stance; async is not being mistaken for performance |
+| Session handle foundation | Optional TTL-based `session_id` reuse exists in unified mode | Enables future sticky reuse without breaking stateless default behavior |
+| Distributed transport contract | Ticket lifecycle, timeout streak/debt, readiness impact, admin pools visibility, and optional fail-closed admission are in code | Raises distributed runtime above scaffold-only status, but not yet to operations-grade maturity |
 
-## 3) Priority Order
+## 3) Grade-Movement Rule
+
+Grades move only when both are true:
+
+1. A contract or behavior gate exists in CI/integration tests.
+2. Representative runtime evidence supports the claim on the affected path.
+
+Single benchmarks, partial scaffolding, or broad aspirations do not move grades.
+
+## 4) Priority Order
 
 | Priority | Foundation | Done when |
 |---|---|---|
-| P0 | Throughput-core maturity on native CUDA | Heavy-batch and larger-model runs sustain uplift without fallback drift |
-| P1 | GPU continuous batching maturity | Iteration scheduler remains stable under burst with acceptable tail latency and no metric drift |
-| P1 | Native async unified-batch contract re-enable | `SupportsAsyncUnifiedBatch()` can be safely enabled for native without regressing batching/latency contracts |
-| P1 | Native-first parity independence | Endpoint parity does not depend on llama.cpp delegate availability for critical features |
-| P1 | GGUF quantized native maturity | Quantized native path sustains uplift without dequant-cache contention regressions |
-| P2 | Mandatory GPU CI behavior lane | Release cannot pass without GPU behavioral gate |
-| P2 | Distributed failure contracts | Fault matrix is covered by integration tests and runbooks |
+| P0 | Quantized native throughput core | Common GGUF hot paths stay native, memory-first, and performance-credible |
+| P0 | Graph capture and repeatable overlap | Stable decode/prefill envelopes reuse graph buckets with hit/fallback metrics |
+| P1 | Distributed ownership maturity | Sequence ownership, cleanup, and transport failure paths are deterministic and tested |
+| P1 | Native-first parity independence | Completion/chat/embeddings critical behavior does not silently depend on delegate fallback |
+| P1 | Mandatory GPU behavior lane | Release cannot pass without native/provider/runtime behavioral gates |
+| P2 | Decode-worker session reuse | Session reuse remains safe in split-role deployments |
+| P2 | Lightweight distribution UI | Web-based management console for model serving, backend monitoring, and multi-GPU orchestration |
+| P2 | Dual/multi-GPU orchestration | First-class support for heterogeneous GPU setups (e.g., AMD + NVIDIA concurrent serving) |
 
-## 4) Quarter Targets
+## 5) Quarter Targets
 
 | Quarter | Exit criteria |
 |---|---|
-| Q2 2026 | Endpoint parity + identity/policy contracts stable in CI |
-| Q3 2026 | Throughput-core items (#3/#4/#6/#7) show sustained heavy-batch gains |
-| Q4 2026 | Distributed failure-path contracts land |
-| Q1-Q2 2027 | SLA-oriented scale and operations maturity |
+| Q2 2026 | Canonical docs, identity contracts, transport-health semantics, and memory foundations stay aligned with code |
+| Q3 2026 | Native quantized GGUF plus graph/overlap work show sustained representative gains |
+| Q4 2026 | Distributed runtime moves from ticketed foundation to ownership-safe, fault-tested foundation |
+| 2027-H1 | Lightweight distribution UI ships: model management, backend dashboard, multi-GPU controls |
+| 2027-H2 | Required GPU/provider CI and broader runtime maturity support higher grades |
 
-## 5) Canonical References
+## 6) Canonical References
 
-- [TechDebt and Competitive Roadmap](TechDebt_and_Competitive_Roadmap.md)
-- [PRD](PRD.md)
+- [VISION](VISION.md)
 - [Architecture](Architecture.md)
-- [ARCHIVE_INDEX](ARCHIVE_INDEX.md)
+- [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md)
+- [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
+- [docs/issues/README](issues/README.md)

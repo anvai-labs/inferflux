@@ -33,6 +33,7 @@ public:
 
   std::string Detokenize(const std::vector<int> &tokens) const override;
   std::string TokenToString(int token_id) const override;
+  bool IsSpecialToken(int token_id) const override;
   int TokenCount(const std::string &text) const override;
 
   ChatResult ApplyChatTemplate(

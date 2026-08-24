@@ -1,6 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "scheduler/model_router.h"
 #include "scheduler/single_model_router.h"
 
@@ -10,8 +10,8 @@ using namespace inferflux;
 
 namespace {
 
-std::shared_ptr<LlamaCPUBackend> ReadyBackend() {
-  auto backend = std::make_shared<LlamaCPUBackend>();
+std::shared_ptr<LlamaCppBackend> ReadyBackend() {
+  auto backend = std::make_shared<LlamaCppBackend>();
   backend->ForceReadyForTests();
   return backend;
 }

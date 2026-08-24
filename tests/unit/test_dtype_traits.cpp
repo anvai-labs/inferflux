@@ -1,6 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
@@ -48,11 +48,11 @@ TEST_CASE("DtypeTraits: BF16 name is bf16", "[dtype_traits]") {
 // InferenceDtype enum tests
 // ============================================================================
 
-TEST_CASE("NativeKernelExecutor: InferenceDtype defaults to FP16",
+TEST_CASE("InferfluxCudaExecutor: InferenceDtype defaults to FP16",
           "[dtype_traits]") {
-  NativeKernelExecutor executor;
+  InferfluxCudaExecutor executor;
   REQUIRE(executor.GetInferenceDtype() ==
-          NativeKernelExecutor::InferenceDtype::kFP16);
+          InferfluxCudaExecutor::InferenceDtype::kFP16);
 }
 
 } // namespace inferflux

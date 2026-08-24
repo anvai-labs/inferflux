@@ -2,16 +2,77 @@
 
 #include "runtime/backends/cuda/native/kernels/dequantization.cuh"
 
+#include <cstdint>
 #include <cuda_fp16.h>
+#include <cuda_runtime.h>
 
 namespace inferflux {
 namespace runtime {
 namespace cuda {
 namespace native {
 
-// Single source of truth for quantized element extraction.
-// Used by both standalone dequantization kernels and fused GEMV/GEMM kernels
-// to guarantee identical dequantization math across all code paths.
+// Maximum M for fused dequant dispatch. Above this cuBLAS with tensor cores
+// is typically faster. Matches llama.cpp's MMQ_DP4A_MAX_BATCH_SIZE=64.
+constexpr int kFusedGemmMaxM = 64;
+
+// Single source of truth for quantized element extraction and dot-product
+// primitives. Used by MMVQ, MMQ, and legacy GEMV kernels.
+
+//==============================================================================
+// Dot-product and load primitives
+//==============================================================================
+
+// dp4a: signed int8x4 dot product. Computes c + dot(a, b) where a and b
+// are 4 packed signed bytes.
+__device__ __forceinline__ int Dp4aS8(int a, int b, int c) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 610)
+  return __dp4a(a, b, c);
+#else
+  const auto *ap = reinterpret_cast<const signed char *>(&a);
+  const auto *bp = reinterpret_cast<const signed char *>(&b);
+  return c + static_cast<int>(ap[0]) * static_cast<int>(bp[0]) +
+         static_cast<int>(ap[1]) * static_cast<int>(bp[1]) +
+         static_cast<int>(ap[2]) * static_cast<int>(bp[2]) +
+         static_cast<int>(ap[3]) * static_cast<int>(bp[3]);
+#endif
+}
+
+// Vectorized saturated subtraction on 4 packed signed bytes: a[i] - b[i].
+__device__ __forceinline__ int Vsubss4(int a, int b) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 300)
+  return __vsubss4(a, b);
+#else
+  const auto *ap = reinterpret_cast<const signed char *>(&a);
+  const auto *bp = reinterpret_cast<const signed char *>(&b);
+  int result;
+  auto *rp = reinterpret_cast<signed char *>(&result);
+  for (int i = 0; i < 4; ++i) {
+    int v = static_cast<int>(ap[i]) - static_cast<int>(bp[i]);
+    rp[i] = static_cast<signed char>(max(-128, min(127, v)));
+  }
+  return result;
+#endif
+}
+
+// Load 4 packed int8 values (unaligned). Use for GGUF/Q8_1 block payloads
+// whose row stride may not be 4-byte aligned.
+__device__ __forceinline__ int LoadPackedInt32Unaligned(const void *ptr) {
+  int value;
+  memcpy(&value, ptr, sizeof(value));
+  return value;
+}
+
+// Load 4 packed int8 values (aligned). Use when pointer is 4-byte aligned.
+__device__ __forceinline__ int LoadPackedInt32Aligned(const void *ptr) {
+  return *reinterpret_cast<const int *>(ptr);
+}
+
+// Parameter struct for grouped projection kernels (pair/triple).
+template <typename BlockType, int Outputs> struct PackedProjectionGroupParams {
+  const BlockType *weights[Outputs];
+  half *outputs[Outputs];
+  int output_cols[Outputs];
+};
 
 //==============================================================================
 // Q4_K helpers

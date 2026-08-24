@@ -82,10 +82,16 @@ public:
   QuantizedWeightInfo LayerDownProjRaw(int layer) const override {
     return qwm_->GetRawLayerDownProj(layer);
   }
+  MmqWeightInfo LayerDownProjMmq(int layer) const override {
+    return qwm_->GetMmqLayerDownProj(layer);
+  }
   QuantizedWeightInfo LmHeadRaw() const override {
     return qwm_->GetRawLmHead();
   }
   bool HasQuantizedWeights() const override { return qwm_->IsQuantized(); }
+  bool AllowFusedQuantizedMatmul() const override {
+    return qwm_->AllowFusedQuantizedMatmul();
+  }
 
 private:
   QuantizedWeightMap *qwm_; // Non-owning

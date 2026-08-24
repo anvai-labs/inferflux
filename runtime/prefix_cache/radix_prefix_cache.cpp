@@ -1,9 +1,10 @@
 #include "runtime/prefix_cache/radix_prefix_cache.h"
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/common/backend_interface.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 
 #include <algorithm>
 #include <cassert>
+#include <unordered_set>
 
 namespace inferflux {
 
@@ -42,8 +43,34 @@ std::size_t RadixPrefixCache::LiveSequences() const {
   return live_sequences_;
 }
 
+RadixPrefixMemorySnapshot RadixPrefixCache::MemorySnapshot() const {
+  std::shared_lock<std::shared_mutex> lock(mutex_);
+  std::vector<std::pair<uint64_t, RadixNode *>> seq_nodes;
+  CollectNodes(
+      root_.get(), [](const RadixNode *n) { return n->sequence_id >= 0; },
+      seq_nodes);
+
+  std::unordered_set<int> blocks;
+  for (const auto &[_, node] : seq_nodes) {
+    for (int block_id : node->block_table) {
+      if (block_id >= 0) {
+        blocks.insert(block_id);
+      }
+    }
+  }
+
+  RadixPrefixMemorySnapshot snapshot;
+  snapshot.unique_retained_blocks = blocks.size();
+  snapshot.live_sequences = live_sequences_;
+  if (kv_cache_) {
+    snapshot.retained_bytes =
+        snapshot.unique_retained_blocks * kv_cache_->PageSizeBytes();
+  }
+  return snapshot;
+}
+
 bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,
-                              LlamaCPUBackend *backend,
+                              BackendInterface *backend,
                               RadixLookupResult *result) {
   if (result) {
     result->block_table.clear();
@@ -140,10 +167,9 @@ void RadixPrefixCache::SplitEdge(RadixNode *parent, const SplitEdgeSpec &spec) {
   size_++;
 }
 
-void RadixPrefixCache::Insert(const std::vector<int> &tokens,
-                              const std::vector<int> &block_table,
-                              int sequence_id,
-                              const std::shared_ptr<LlamaCPUBackend> &backend) {
+void RadixPrefixCache::Insert(
+    const std::vector<int> &tokens, const std::vector<int> &block_table,
+    int sequence_id, const std::shared_ptr<BackendInterface> &backend) {
   if (capacity_ == 0 || tokens.empty() || block_table.empty()) {
     return;
   }

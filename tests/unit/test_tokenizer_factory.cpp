@@ -2,7 +2,7 @@
 
 #include "model/tokenizer_factory.h"
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-#include "runtime/backends/cuda/native_kernel_executor.h"
+#include "runtime/backends/cuda/inferflux_cuda_executor.h"
 #endif
 
 #include <cstdlib>
@@ -126,24 +126,24 @@ TEST_CASE("LlamaTokenizer satisfies ITokenizer contract",
 }
 
 // ============================================================================
-// NativeKernelExecutor integration (compile-time only without GPU)
+// InferfluxCudaExecutor integration (compile-time only without GPU)
 // ============================================================================
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
-TEST_CASE("NativeKernelExecutor: NativeFormatChat delegates to ITokenizer",
+TEST_CASE("InferfluxCudaExecutor: NativeFormatChat delegates to ITokenizer",
           "[tokenizer_factory]") {
   // Without a loaded model, NativeFormatChat should return invalid
-  NativeKernelExecutor executor;
+  InferfluxCudaExecutor executor;
   std::vector<std::pair<std::string, std::string>> messages = {
       {"user", "Hello!"}};
   auto result = executor.NativeFormatChat(messages);
   REQUIRE_FALSE(result.valid);
 }
 
-TEST_CASE("NativeKernelExecutor: NativeGetTokenizer returns nullptr before "
+TEST_CASE("InferfluxCudaExecutor: NativeGetTokenizer returns nullptr before "
           "LoadModel",
           "[tokenizer_factory]") {
-  NativeKernelExecutor executor;
+  InferfluxCudaExecutor executor;
   REQUIRE(executor.NativeGetTokenizer() == nullptr);
 }
 #endif

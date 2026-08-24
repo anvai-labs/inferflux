@@ -8,7 +8,7 @@ namespace inferflux {
 
 SpeculativeDecoder::SpeculativeDecoder(
     SpeculativeConfig config, std::shared_ptr<CPUDeviceContext> device,
-    SimpleTokenizer *tokenizer, std::shared_ptr<LlamaCPUBackend> draft_backend)
+    SimpleTokenizer *tokenizer, std::shared_ptr<BackendInterface> draft_backend)
     : config_(std::move(config)), device_(std::move(device)),
       tokenizer_(tokenizer), draft_backend_(std::move(draft_backend)) {}
 
@@ -73,7 +73,7 @@ SpeculativeDecoder::Draft(const std::vector<int> &prompt_tokens,
 SpeculativeValidationResult
 SpeculativeDecoder::Validate(const std::vector<int> &prompt_tokens,
                              const SpeculativeDraft &draft, int max_new_tokens,
-                             std::shared_ptr<LlamaCPUBackend> target_backend) {
+                             std::shared_ptr<BackendInterface> target_backend) {
   SpeculativeValidationResult result;
   result.metrics.total_chunks = draft.chunks.size();
   if (max_new_tokens <= 0) {

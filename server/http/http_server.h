@@ -15,11 +15,15 @@
 #include "webui/ui_renderer.h"
 #endif
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <condition_variable>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <thread>
@@ -30,12 +34,94 @@
 
 namespace inferflux {
 
+// Test-visible header lookup helper. Header-name matching is case-insensitive
+// per RFC 9110.
+inline std::string LookupHeaderValueForTest(const std::string &headers,
+                                            const std::string &name) {
+  auto lower_name = name;
+  std::transform(
+      lower_name.begin(), lower_name.end(), lower_name.begin(),
+      [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+  std::size_t line_start = 0;
+  while (line_start < headers.size()) {
+    const std::size_t line_end = headers.find("\r\n", line_start);
+    const std::size_t current_end =
+        line_end == std::string::npos ? headers.size() : line_end;
+    const std::size_t colon = headers.find(':', line_start);
+    if (colon != std::string::npos && colon < current_end) {
+      std::string header_name = headers.substr(line_start, colon - line_start);
+      std::transform(
+          header_name.begin(), header_name.end(), header_name.begin(),
+          [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+      if (header_name == lower_name) {
+        std::string value =
+            headers.substr(colon + 1, current_end - (colon + 1));
+        const auto s = value.find_first_not_of(" \t");
+        const auto e = value.find_last_not_of(" \t\r\n");
+        return (s == std::string::npos) ? "" : value.substr(s, e - s + 1);
+      }
+    }
+    if (line_end == std::string::npos) {
+      break;
+    }
+    line_start = line_end + 2;
+  }
+  return {};
+}
+
 class HttpServer {
 public:
   struct TlsConfig {
     bool enabled{false};
     std::string cert_path;
     std::string key_path;
+  };
+
+  struct ReadyStatus {
+    bool ready{false};
+    bool model_loaded{false};
+    bool decode_pool_warm{false};
+    bool disagg_transport_degraded{false};
+    uint64_t disagg_timeout_debt{0};
+    uint64_t disagg_timeout_debt_threshold{0};
+    uint64_t disagg_timeout_streak{0};
+    uint64_t disagg_timeout_streak_threshold{0};
+    std::string role{"unified"};
+    std::string reason;
+    // Native dispatch self-heal state: down-ranked operators keep serving
+    // at best-available speed, visibly. Deliberately does NOT flip
+    // `ready` (unlike disagg degradation) — throughput is reduced, not
+    // broken.
+    bool dispatch_degraded{false};
+    uint64_t dispatch_divergences{0};
+    std::string dispatch_downgraded_operators;
+  };
+
+  struct AdminPoolsStatus {
+    struct DistributedKVStatus {
+      std::optional<int64_t> enqueue_rejections_total;
+      std::optional<int64_t> enqueue_exhausted_total;
+      std::optional<int64_t> tickets_enqueued_total;
+      std::optional<int64_t> tickets_acknowledged_total;
+      std::optional<int64_t> tickets_committed_total;
+      std::optional<int64_t> tickets_timed_out_total;
+    };
+
+    ReadyStatus pool_health;
+    std::optional<int64_t> queue_depth;
+    std::optional<int64_t> prefill_queue_depth;
+    std::optional<int64_t> decode_queue_depth;
+    std::optional<int64_t> batch_limit_size;
+    std::optional<int64_t> batch_limit_tokens;
+    DistributedKVStatus distributed_kv;
+  };
+
+  struct AdmissionDecision {
+    bool allowed{true};
+    int http_status{200};
+    std::string error;
+    std::string reason;
   };
 
   // Disaggregated deployment role (§2.5 item 12).
@@ -61,6 +147,9 @@ public:
   void SetDecodePoolReady(bool ready) {
     decode_pool_ready_.store(ready, std::memory_order_relaxed);
   }
+  ReadyStatus EvaluateReadyStatus() const;
+  AdminPoolsStatus EvaluateAdminPoolsStatus() const;
+  AdmissionDecision EvaluateGenerationAdmissionDecision() const;
 
 private:
   struct ClientSession {
@@ -104,6 +193,9 @@ private:
   std::atomic<bool> model_ready_{false};
   std::atomic<PoolRole> role_{PoolRole::kUnified};
   std::atomic<bool> decode_pool_ready_{false};
+  bool admission_fail_closed_on_disagg_degraded_{false};
+  int readyz_disagg_timeout_debt_threshold_{0};
+  int readyz_disagg_timeout_streak_threshold_{3};
 #if INFERFLUX_ENABLE_WEBUI
   std::unique_ptr<WebUiRenderer> webui_renderer_;
 #endif

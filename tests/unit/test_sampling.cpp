@@ -1,6 +1,7 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/backend_utils.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "scheduler/request_batch.h"
 #include "scheduler/scheduler.h"
 
@@ -35,18 +36,18 @@ TEST_CASE("InferenceRequest sampling field defaults to SamplingParams{}",
 }
 
 // ---------------------------------------------------------------------------
-// LlamaCPUBackend sampler lifecycle (null-model / ForceReadyForTests)
+// LlamaCppBackend sampler lifecycle (null-model / ForceReadyForTests)
 // ---------------------------------------------------------------------------
 
 TEST_CASE("SetupSampler no-op when model not loaded", "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   // vocab_ is null — SetupSampler must not crash.
   REQUIRE_NOTHROW(backend.SetupSampler("", "root", {}));
 }
 
 TEST_CASE("TeardownSampler idempotent — double call does not crash",
           "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   REQUIRE_NOTHROW(backend.TeardownSampler());
   REQUIRE_NOTHROW(backend.TeardownSampler());
 }
@@ -54,7 +55,7 @@ TEST_CASE("TeardownSampler idempotent — double call does not crash",
 TEST_CASE(
     "SetupSampler with temperature=0 (greedy) succeeds when model not loaded",
     "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   SamplingParams sp;
   sp.temperature = 0.0f;
   // Guard: vocab_ null → early return without crash.
@@ -64,7 +65,7 @@ TEST_CASE(
 TEST_CASE("SetupSampler with temperature>0 (stochastic) succeeds when model "
           "not loaded",
           "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   SamplingParams sp;
   sp.temperature = 0.8f;
   REQUIRE_NOTHROW(backend.SetupSampler("", "root", sp));
@@ -74,11 +75,11 @@ TEST_CASE("SamplerScope RAII: TeardownSampler called on scope exit",
           "[sampling]") {
   // Without a loaded model SetupSampler is a no-op, but TeardownSampler should
   // still be callable without error when the scope exits.
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   backend.ForceReadyForTests();
   InferenceRequest req;
   {
-    auto be = std::make_shared<LlamaCPUBackend>();
+    auto be = std::make_shared<LlamaCppBackend>();
     // Verify no crash during construction + destruction of SamplerScope-like
     // pattern using the public API.
     be->SetupSampler("", "root", req.sampling);
@@ -89,7 +90,7 @@ TEST_CASE("SamplerScope RAII: TeardownSampler called on scope exit",
 
 TEST_CASE("EnableGrammarConstraint / DisableGrammarConstraint backward compat",
           "[sampling]") {
-  LlamaCPUBackend backend;
+  LlamaCppBackend backend;
   // Should delegate to SetupSampler / TeardownSampler without crashing.
   REQUIRE_NOTHROW(
       backend.EnableGrammarConstraint("root ::= \"hello\"", "root"));
@@ -281,4 +282,108 @@ TEST_CASE("InferenceRequest inherits logit_bias from sampling params",
   REQUIRE(req.sampling.logit_bias.size() == 2);
   REQUIRE(req.sampling.logit_bias.at(123) == 25.0f);
   REQUIRE(req.sampling.logit_bias.at(456) == -10.0f);
+}
+
+// =============================================================================
+// Test Suite: ComputeLogprob (native logprob computation)
+// =============================================================================
+
+TEST_CASE("ComputeLogprob produces valid log-softmax for sampled token",
+          "[sampling][logprobs]") {
+  // Vocab of 5 tokens; logits arranged so token 2 is the argmax.
+  float logits[] = {1.0f, 2.0f, 5.0f, 0.5f, -1.0f};
+  int vocab = 5;
+
+  auto id_to_str = [](int32_t id) { return "tok" + std::to_string(id); };
+  auto tlp = ComputeLogprob(logits, vocab, 2, "tok2", 0, id_to_str);
+
+  // log-softmax of the max logit should be negative and close to 0.
+  REQUIRE(tlp.token == "tok2");
+  REQUIRE(tlp.logprob < 0.0f);
+  REQUIRE(tlp.logprob > -1.0f); // 5.0 is strongly dominant
+  REQUIRE(tlp.bytes.size() == 4); // "tok2" = 4 bytes
+  REQUIRE(tlp.top_logprobs.empty()); // top_n=0 means no alternatives
+}
+
+TEST_CASE("ComputeLogprob with top_n returns sorted alternatives",
+          "[sampling][logprobs]") {
+  float logits[] = {1.0f, 3.0f, 5.0f, 2.0f, 4.0f};
+  int vocab = 5;
+
+  auto id_to_str = [](int32_t id) { return "t" + std::to_string(id); };
+  auto tlp = ComputeLogprob(logits, vocab, 2, "t2", 3, id_to_str);
+
+  REQUIRE(tlp.top_logprobs.size() == 3);
+  // Top 3 by logit value: token 2 (5.0), token 4 (4.0), token 1 (3.0)
+  REQUIRE(tlp.top_logprobs[0].first == "t2");
+  REQUIRE(tlp.top_logprobs[1].first == "t4");
+  REQUIRE(tlp.top_logprobs[2].first == "t1");
+
+  // All alternatives should have valid log probabilities (negative).
+  for (const auto &alt : tlp.top_logprobs) {
+    REQUIRE(alt.second < 0.0f);
+  }
+
+  // Top logprob should equal the sampled token logprob.
+  REQUIRE(tlp.top_logprobs[0].second == Approx(tlp.logprob));
+}
+
+TEST_CASE("ComputeLogprob log-softmax sums to ~1.0 in prob space",
+          "[sampling][logprobs]") {
+  float logits[] = {0.0f, 0.0f, 0.0f, 0.0f};
+  int vocab = 4;
+
+  auto id_to_str = [](int32_t id) { return std::to_string(id); };
+  auto tlp = ComputeLogprob(logits, vocab, 0, "0", 4, id_to_str);
+
+  // Uniform logits: each token should have logprob = log(0.25) ≈ -1.386
+  REQUIRE(tlp.logprob == Approx(-1.3863f).margin(0.01f));
+
+  // Sum of exp(logprob) for all alternatives should be ~1.0.
+  double sum = 0.0;
+  for (const auto &alt : tlp.top_logprobs) {
+    sum += std::exp(static_cast<double>(alt.second));
+  }
+  REQUIRE(sum == Approx(1.0).margin(0.001));
+}
+
+TEST_CASE("ComputeLogprob handles null/empty inputs gracefully",
+          "[sampling][logprobs]") {
+  auto id_to_str = [](int32_t) { return std::string("?"); };
+
+  // Null logits
+  auto tlp1 = ComputeLogprob(nullptr, 10, 0, "tok", 0, id_to_str);
+  REQUIRE(tlp1.logprob == 0.0f);
+
+  // Zero vocab
+  float logits[] = {1.0f};
+  auto tlp2 = ComputeLogprob(logits, 0, 0, "tok", 0, id_to_str);
+  REQUIRE(tlp2.logprob == 0.0f);
+
+  // Token ID out of range
+  auto tlp3 = ComputeLogprob(logits, 1, 5, "tok", 0, id_to_str);
+  REQUIRE(tlp3.logprob == 0.0f);
+}
+
+TEST_CASE("ComputeLogprob top_n clamped to vocab_size",
+          "[sampling][logprobs]") {
+  float logits[] = {1.0f, 2.0f, 3.0f};
+  int vocab = 3;
+
+  auto id_to_str = [](int32_t id) { return std::to_string(id); };
+  // Request top_n=10 but vocab is only 3.
+  auto tlp = ComputeLogprob(logits, vocab, 0, "0", 10, id_to_str);
+  REQUIRE(tlp.top_logprobs.size() == 3);
+}
+
+TEST_CASE("TokenLogprob bytes field matches UTF-8 encoding",
+          "[sampling][logprobs]") {
+  // Use a multi-byte UTF-8 string: "ñ" = 0xC3 0xB1
+  float logits[] = {1.0f};
+  auto id_to_str = [](int32_t) { return std::string("x"); };
+  auto tlp = ComputeLogprob(logits, 1, 0, "\xC3\xB1", 0, id_to_str);
+
+  REQUIRE(tlp.bytes.size() == 2);
+  REQUIRE(tlp.bytes[0] == 0xC3);
+  REQUIRE(tlp.bytes[1] == 0xB1);
 }

@@ -16,4 +16,10 @@ struct TokenLogprob {
   std::vector<std::pair<std::string, float>> top_logprobs;
 };
 
+// Raw top-logit entry used by parity/debug probes.
+struct TopLogitEntry {
+  std::string token;
+  float logit{0.0f};
+};
+
 } // namespace inferflux

@@ -2,7 +2,7 @@
 #include <memory>
 
 #include "runtime/backends/common/backend_interface.h"
-#include "runtime/backends/cpu/llama_backend.h" // For LlamaBackendConfig
+#include "runtime/backends/llama/llama_cpp_backend.h" // For LlamaBackendConfig
 
 using namespace inferflux;
 

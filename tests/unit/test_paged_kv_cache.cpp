@@ -74,3 +74,29 @@ TEST_CASE("PagedKVCache: capacity reporting", "[paged_kv]") {
   REQUIRE(cache.NumFreeBlocks() == 5);
   REQUIRE(cache.NumAvailableHostBlocks() == 10);
 }
+
+TEST_CASE("PagedKVCache: usage snapshot reports block and byte ownership",
+          "[paged_kv]") {
+  PagedKVCache cache(5, 1024, PagedKVCache::EvictionPolicy::kLRU);
+
+  auto snapshot = cache.GetUsageSnapshot();
+  REQUIRE(snapshot.total_blocks == 5);
+  REQUIRE(snapshot.used_blocks == 0);
+  REQUIRE(snapshot.free_blocks == 5);
+  REQUIRE(snapshot.page_size_bytes == 1024);
+  REQUIRE(snapshot.total_bytes() == 5120);
+  REQUIRE(snapshot.used_bytes() == 0);
+  REQUIRE(snapshot.free_bytes() == 5120);
+
+  auto blocks = cache.ReserveBlocks(2);
+  snapshot = cache.GetUsageSnapshot();
+  REQUIRE(snapshot.used_blocks == 2);
+  REQUIRE(snapshot.free_blocks == 3);
+  REQUIRE(snapshot.used_bytes() == 2048);
+  REQUIRE(snapshot.free_bytes() == 3072);
+
+  cache.ReleaseBlocks(blocks);
+  snapshot = cache.GetUsageSnapshot();
+  REQUIRE(snapshot.used_blocks == 0);
+  REQUIRE(snapshot.free_blocks == 5);
+}

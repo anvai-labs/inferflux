@@ -1,6 +1,6 @@
 #include "scheduler/model_selection.h"
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 
 #include <algorithm>
 #include <cctype>

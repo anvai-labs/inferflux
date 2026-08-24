@@ -1,6 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "scheduler/model_selection.h"
 
 #include <memory>
@@ -15,7 +15,7 @@ namespace {
 class StubRouter : public ModelRouter {
 public:
   void AddModel(const ModelInfo &info,
-                std::shared_ptr<LlamaCPUBackend> backend) {
+                std::shared_ptr<LlamaCppBackend> backend) {
     models_[info.id] = info;
     backends_[info.id] = std::move(backend);
     if (default_model_id_.empty()) {
@@ -65,7 +65,7 @@ public:
     return &it->second;
   }
 
-  std::shared_ptr<LlamaCPUBackend>
+  std::shared_ptr<BackendInterface>
   GetBackend(const std::string &model_id) override {
     auto it = backends_.find(model_id);
     if (it == backends_.end()) {
@@ -88,12 +88,12 @@ public:
 
 private:
   std::unordered_map<std::string, ModelInfo> models_;
-  std::unordered_map<std::string, std::shared_ptr<LlamaCPUBackend>> backends_;
+  std::unordered_map<std::string, std::shared_ptr<LlamaCppBackend>> backends_;
   std::string default_model_id_;
 };
 
-std::shared_ptr<LlamaCPUBackend> ReadyBackend() {
-  auto backend = std::make_shared<LlamaCPUBackend>();
+std::shared_ptr<LlamaCppBackend> ReadyBackend() {
+  auto backend = std::make_shared<LlamaCppBackend>();
   backend->ForceReadyForTests();
   return backend;
 }
@@ -318,7 +318,7 @@ TEST_CASE(
   primary.path = "/models/tinyllama.gguf";
   primary.backend = "cuda";
   primary.capabilities.supports_logprobs = true;
-  router.AddModel(primary, std::make_shared<LlamaCPUBackend>());
+  router.AddModel(primary, std::make_shared<LlamaCppBackend>());
 
   ModelInfo fallback;
   fallback.id = "tinyllama-cpu";
@@ -411,7 +411,7 @@ TEST_CASE("Embeddings routing falls back when default backend is unavailable",
   primary.path = "/models/default.gguf";
   primary.backend = "cuda";
   primary.capabilities.supports_embeddings = true;
-  router.AddModel(primary, std::make_shared<LlamaCPUBackend>());
+  router.AddModel(primary, std::make_shared<LlamaCppBackend>());
 
   ModelInfo fallback;
   fallback.id = "embed-cpu";

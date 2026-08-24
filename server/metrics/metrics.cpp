@@ -1,13 +1,128 @@
 #include "server/metrics/metrics.h"
 
+#include "runtime/backends/cuda/native/dispatch_catalog.h"
+#include "server/diagnostics/crash_handler.h"
+
+#include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <map>
+#include <set>
 #include <sstream>
+#include <vector>
 
 namespace inferflux {
 
 namespace {
 MetricsRegistry g_metrics;
+
+std::string NormalizeNativePhase(std::string_view phase) {
+  return phase == "decode"    ? "decode"
+         : phase == "prefill" ? "prefill"
+                              : "unknown";
+}
+
+std::string NativeForwardBatchSizeBucket(int batch_size) {
+  if (batch_size <= 1) {
+    return "1";
+  }
+  if (batch_size == 2) {
+    return "2";
+  }
+  if (batch_size <= 4) {
+    return "3_4";
+  }
+  if (batch_size <= 8) {
+    return "5_8";
+  }
+  if (batch_size <= 16) {
+    return "9_16";
+  }
+  return "17_plus";
+}
+
+std::string InferfluxCudaPrefillBatchSizeBucket(int batch_size) {
+  if (batch_size <= 1) {
+    return "1";
+  }
+  if (batch_size == 2) {
+    return "2";
+  }
+  if (batch_size <= 4) {
+    return "3_4";
+  }
+  if (batch_size <= 8) {
+    return "5_8";
+  }
+  if (batch_size <= 16) {
+    return "9_16";
+  }
+  if (batch_size <= 32) {
+    return "17_32";
+  }
+  if (batch_size <= 64) {
+    return "33_64";
+  }
+  if (batch_size <= 128) {
+    return "65_128";
+  }
+  return "129_plus";
+}
+
+std::string InferfluxCudaBatchSizeBucket(std::string_view phase,
+                                         int batch_size) {
+  const std::string phase_label = NormalizeNativePhase(phase);
+  if (phase_label == "prefill") {
+    return InferfluxCudaPrefillBatchSizeBucket(batch_size);
+  }
+  return NativeForwardBatchSizeBucket(batch_size);
+}
+
+std::string SchedulerDecodeCountBucket(std::size_t count) {
+  if (count == 0) {
+    return "0";
+  }
+  return NativeForwardBatchSizeBucket(static_cast<int>(count));
+}
+
+std::string NativeLinearDimBucket(int dim) {
+  if (dim <= 1024) {
+    return "1_1024";
+  }
+  if (dim <= 2048) {
+    return "1025_2048";
+  }
+  if (dim <= 4096) {
+    return "2049_4096";
+  }
+  if (dim <= 8192) {
+    return "4097_8192";
+  }
+  if (dim <= 16384) {
+    return "8193_16384";
+  }
+  return "16385_plus";
+}
+
+std::string NativeGroupedOutputsBucket(int grouped_outputs) {
+  if (grouped_outputs <= 1) {
+    return "1";
+  }
+  if (grouped_outputs == 2) {
+    return "2";
+  }
+  if (grouped_outputs == 3) {
+    return "3";
+  }
+  return "4_plus";
+}
+
+std::string NormalizeNativeQuant(std::string_view quant) {
+  if (quant.empty()) {
+    return "unknown";
+  }
+  return std::string(quant);
+}
 } // namespace
 
 void LatencyHistogram::Record(double ms) {
@@ -38,6 +153,10 @@ void MetricsRegistry::RecordSuccess(int prompt_tokens, int completion_tokens) {
 
 void MetricsRegistry::RecordError() {
   total_errors_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordEmptyGeneration() {
+  total_empty_generations_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void MetricsRegistry::RecordSpeculative(std::size_t total_chunks,
@@ -89,8 +208,38 @@ void MetricsRegistry::RecordSchedulerIteration(std::size_t prefill_requests,
   }
 }
 
+void MetricsRegistry::RecordSchedulerPolicyIteration(
+    const std::string &policy, std::size_t prefill_requests,
+    std::size_t decode_requests) {
+  if (prefill_requests == 0 && decode_requests == 0) {
+    return;
+  }
+  const std::string policy_label = policy.empty() ? "unknown" : policy;
+  std::string phase = "decode";
+  if (prefill_requests > 0 && decode_requests > 0) {
+    phase = "mixed";
+  } else if (prefill_requests > 0) {
+    phase = "prefill";
+  }
+  const std::string key = policy_label + "|" + phase;
+  std::lock_guard<std::mutex> lock(scheduler_policy_metrics_mutex_);
+  scheduler_policy_iterations_[key] += 1;
+}
+
 void MetricsRegistry::RecordBatchTokenBudgetSkip() {
   scheduler_batch_token_budget_skips_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordPrefixAffinityProbe(bool hit, int matched_tokens) {
+  scheduler_prefix_affinity_probes_.fetch_add(1, std::memory_order_relaxed);
+  if (!hit) {
+    return;
+  }
+  scheduler_prefix_affinity_hits_.fetch_add(1, std::memory_order_relaxed);
+  if (matched_tokens > 0) {
+    scheduler_prefix_affinity_matched_tokens_.fetch_add(
+        static_cast<uint64_t>(matched_tokens), std::memory_order_relaxed);
+  }
 }
 
 void MetricsRegistry::RecordPrefixLookup(bool hit) {
@@ -352,6 +501,38 @@ void MetricsRegistry::RecordKVTransfer(double transfer_ms) {
   kv_transfer_latency_.Record(transfer_ms);
 }
 
+void MetricsRegistry::RecordDisaggKVEnqueueRejected(bool retries_exhausted) {
+  disagg_kv_enqueue_rejections_.fetch_add(1, std::memory_order_relaxed);
+  if (retries_exhausted) {
+    disagg_kv_enqueue_exhausted_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::RecordDisaggKVTicketStage(std::string_view stage) {
+  if (stage == "enqueued") {
+    disagg_kv_tickets_enqueued_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (stage == "acknowledged") {
+    disagg_kv_tickets_acknowledged_.fetch_add(1, std::memory_order_relaxed);
+    return;
+  }
+  if (stage == "committed") {
+    disagg_kv_tickets_committed_.fetch_add(1, std::memory_order_relaxed);
+    disagg_kv_timeout_streak_.store(0, std::memory_order_relaxed);
+    uint64_t debt = disagg_kv_timeout_debt_.load(std::memory_order_relaxed);
+    while (debt > 0 && !disagg_kv_timeout_debt_.compare_exchange_weak(
+                           debt, debt - 1, std::memory_order_relaxed)) {
+    }
+    return;
+  }
+  if (stage == "timed_out") {
+    disagg_kv_tickets_timed_out_.fetch_add(1, std::memory_order_relaxed);
+    disagg_kv_timeout_debt_.fetch_add(1, std::memory_order_relaxed);
+    disagg_kv_timeout_streak_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
 void MetricsRegistry::RecordLlamaPerf(double prefill_ms, double decode_ms,
                                       int32_t prompt_tokens,
                                       int32_t generated_tokens) {
@@ -380,11 +561,13 @@ void MetricsRegistry::RecordDecodeDuration(double decode_ms) {
 }
 
 void MetricsRegistry::IncrementConnections() {
-  active_connections_.fetch_add(1, std::memory_order_relaxed);
+  int n = active_connections_.fetch_add(1, std::memory_order_relaxed) + 1;
+  diagnostics::SetActiveRequests(n);
 }
 
 void MetricsRegistry::DecrementConnections() {
-  active_connections_.fetch_sub(1, std::memory_order_relaxed);
+  int n = active_connections_.fetch_sub(1, std::memory_order_relaxed) - 1;
+  diagnostics::SetActiveRequests(n);
 }
 
 void MetricsRegistry::SetQueueDepth(int depth) {
@@ -497,34 +680,251 @@ void MetricsRegistry::SetCudaLaneQueueDepth(bool decode_lane, int depth) {
   }
 }
 
-void MetricsRegistry::RecordNativeForwardPass(bool is_decode, int batch_size,
-                                              double forward_ms) {
-  if (is_decode) {
-    native_forward_decode_total_.fetch_add(1, std::memory_order_relaxed);
+void MetricsRegistry::RecordCudaLaneEnqueueReject(bool decode_lane) {
+  if (decode_lane) {
+    cuda_decode_lane_enqueue_rejects_.fetch_add(1, std::memory_order_relaxed);
   } else {
-    native_forward_prefill_total_.fetch_add(1, std::memory_order_relaxed);
+    cuda_prefill_lane_enqueue_rejects_.fetch_add(1, std::memory_order_relaxed);
   }
-  native_forward_batch_tokens_total_.fetch_add(batch_size,
-                                               std::memory_order_relaxed);
-  native_forward_latency_.Record(forward_ms);
 }
 
-void MetricsRegistry::RecordNativeSampling(int batch_size, double sampling_ms) {
+void MetricsRegistry::RecordCudaLaneCollectTimeout(bool decode_lane) {
+  if (decode_lane) {
+    cuda_decode_lane_collect_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    cuda_prefill_lane_collect_timeouts_.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::RecordCudaLaneWorkerRestart() {
+  cuda_lane_worker_restarts_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordDecodeStepLoops(const std::string &mode,
+                                            std::size_t loops) {
+  if (loops == 0) {
+    return;
+  }
+  const std::string mode_label = mode.empty() ? "unknown" : mode;
+  std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+  scheduler_decode_step_loops_[mode_label] += loops;
+}
+
+void MetricsRegistry::RecordPrefillChunkTruncation(
+    const std::string &mode, std::size_t truncated_tokens) {
+  if (truncated_tokens == 0) {
+    return;
+  }
+  const std::string mode_label = mode.empty() ? "unknown" : mode;
+  std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+  scheduler_prefill_chunk_truncations_[mode_label] += 1;
+  scheduler_prefill_chunk_truncated_tokens_[mode_label] += truncated_tokens;
+}
+
+void MetricsRegistry::RecordDecodeWorkerBatchSize(std::size_t batch_size) {
+  const std::string key = std::to_string(batch_size);
+  std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+  scheduler_decode_worker_batch_size_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordDecodeWorkerExecutionPath(std::string_view path) {
+  const std::string key = path.empty() ? "unknown" : std::string(path);
+  std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+  scheduler_decode_worker_execution_path_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordDecodeWorkerStickyMerge(
+    std::size_t merged_requests) {
+  if (merged_requests == 0) {
+    return;
+  }
+  const std::string key = std::to_string(merged_requests);
+  std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+  scheduler_decode_worker_sticky_merge_counts_[key] += 1;
+  scheduler_decode_worker_sticky_merged_requests_total_.fetch_add(
+      static_cast<uint64_t>(merged_requests), std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordDecodeAssemblySnapshot(std::string_view mode,
+                                                   std::size_t ready,
+                                                   std::size_t selected,
+                                                   std::size_t compatible,
+                                                   std::size_t incompatible) {
+  const std::string mode_key = mode.empty() ? "unknown" : std::string(mode);
+  std::lock_guard<std::mutex> lock(scheduler_decode_worker_batch_size_mutex_);
+  scheduler_decode_assembly_ready_[mode_key + "|" +
+                                   SchedulerDecodeCountBucket(ready)] += 1;
+  scheduler_decode_assembly_selected_[mode_key + "|" +
+                                      SchedulerDecodeCountBucket(selected)] +=
+      1;
+  if (compatible > 0) {
+    scheduler_decode_assembly_compatible_[mode_key + "|" +
+                                          SchedulerDecodeCountBucket(
+                                              compatible)] += 1;
+  }
+  if (incompatible > 0 || (ready > 0 && compatible == 0)) {
+    scheduler_decode_assembly_incompatible_[mode_key + "|" +
+                                            SchedulerDecodeCountBucket(
+                                                incompatible)] += 1;
+  }
+}
+
+void MetricsRegistry::RecordInferfluxCudaForwardShape(bool is_decode,
+                                                      int batch_size) {
+  if (is_decode) {
+    inferflux_cuda_forward_decode_total_.fetch_add(1,
+                                                   std::memory_order_relaxed);
+  } else {
+    inferflux_cuda_forward_prefill_total_.fetch_add(1,
+                                                    std::memory_order_relaxed);
+  }
+  inferflux_cuda_forward_batch_tokens_total_.fetch_add(
+      batch_size, std::memory_order_relaxed);
+  RecordInferfluxCudaForwardBatchSize(is_decode ? "decode" : "prefill",
+                                      batch_size);
+}
+
+void MetricsRegistry::RecordInferfluxCudaForwardLatency(double forward_ms) {
+  inferflux_cuda_forward_latency_.Record(forward_ms);
+}
+
+void MetricsRegistry::RecordInferfluxCudaForwardPass(bool is_decode,
+                                                     int batch_size,
+                                                     double forward_ms) {
+  RecordInferfluxCudaForwardShape(is_decode, batch_size);
+  RecordInferfluxCudaForwardLatency(forward_ms);
+}
+
+void MetricsRegistry::RecordInferfluxCudaSampling(int batch_size,
+                                                  double sampling_ms) {
   (void)batch_size;
-  native_sampling_latency_.Record(sampling_ms);
+  inferflux_cuda_sampling_latency_.Record(sampling_ms);
 }
 
-void MetricsRegistry::RecordNativeBatchDecode(int batch_size, double total_ms) {
+void MetricsRegistry::RecordInferfluxCudaBatchDecode(int batch_size,
+                                                     double total_ms) {
   (void)batch_size;
   (void)total_ms;
   // Tracked via forward + sampling histograms; this is for future use.
 }
 
-void MetricsRegistry::SetNativeKvCacheOccupancy(int active_sequences,
-                                                int max_sequences) {
-  native_kv_active_sequences_.store(active_sequences,
-                                    std::memory_order_relaxed);
-  native_kv_max_sequences_.store(max_sequences, std::memory_order_relaxed);
+void MetricsRegistry::RecordInferfluxCudaForwardBatchSize(
+    std::string_view phase, int batch_size) {
+  const std::string key = NormalizeNativePhase(phase) + "|" +
+                          InferfluxCudaBatchSizeBucket(phase, batch_size);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_forward_batch_size_mutex_);
+  inferflux_cuda_forward_batch_size_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordInferfluxCudaFfnProjOperator(std::string_view phase,
+                                                         std::string_view op) {
+  const std::string phase_label = NormalizeNativePhase(phase);
+  // Labels come from dispatch_catalog.h (FfnMetricLabel) — recorded
+  // verbatim. The old hand-written allowlist mapped q8_1_group_mmq3 and
+  // the M>8 remap to "unknown", which the fixed-grid render below never
+  // exported: the exact invisibility that hid the kQ81GroupMmq3 executor
+  // bug for months.
+  const std::string op_label =
+      (op == "q8_1_group") ? "q8_1_group_generic" : std::string(op);
+  const std::string key = phase_label + "|" + op_label;
+  std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_operator_mutex_);
+  inferflux_cuda_ffn_proj_operator_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordInferfluxCudaFfnProjGeometry(
+    std::string_view phase, std::string_view op, std::string_view quant,
+    int batch_size, int n, int k, int grouped_outputs) {
+  const std::string key =
+      NormalizeNativePhase(phase) + "|" + std::string(op) + "|" +
+      NormalizeNativeQuant(quant) + "|" +
+      InferfluxCudaBatchSizeBucket(phase, batch_size) + "|" +
+      std::to_string(std::max(0, n)) + "|" + NativeLinearDimBucket(n) + "|" +
+      std::to_string(std::max(0, k)) + "|" + NativeLinearDimBucket(k) + "|" +
+      NativeGroupedOutputsBucket(grouped_outputs);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_geometry_mutex_);
+  inferflux_cuda_ffn_proj_geometry_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordInferfluxCudaDownProjOperator(
+    std::string_view phase, std::string_view op) {
+  const std::string phase_label = NormalizeNativePhase(phase);
+  const std::string op_label =
+      op == "mmq"                            ? "mmq"
+      : op == "q8_1_gemv_v2"                 ? "q8_1_gemv_v2"
+      : op == "q8_1_gemv"                    ? "q8_1_gemv"
+      : op == "q8_1_gemv_hot_fixed"          ? "q8_1_gemv_hot_fixed"
+      : op == "q8_1_gemv_row_pair_hot_fixed" ? "q8_1_gemv_row_pair_hot_fixed"
+      : op == "q8_1_gemv_row_pair_v2"        ? "q8_1_gemv_row_pair_v2"
+      : op == "q8_1_gemv_row_pair"           ? "q8_1_gemv_row_pair"
+      : op == "q8_1_gemv_row_quad"           ? "q8_1_gemv_row_quad"
+      : op == "packed_gemv"                  ? "packed_gemv"
+      : op == "fallback"                     ? "fallback"
+                                             : "unknown";
+  const std::string key = phase_label + "|" + op_label;
+  std::lock_guard<std::mutex> lock(inferflux_cuda_down_proj_operator_mutex_);
+  inferflux_cuda_down_proj_operator_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordInferfluxCudaDownProjGeometry(
+    std::string_view phase, std::string_view op, std::string_view quant,
+    int batch_size, int n, int k) {
+  const std::string key =
+      NormalizeNativePhase(phase) + "|" + std::string(op) + "|" +
+      NormalizeNativeQuant(quant) + "|" +
+      InferfluxCudaBatchSizeBucket(phase, batch_size) + "|" +
+      std::to_string(std::max(0, n)) + "|" + NativeLinearDimBucket(n) + "|" +
+      std::to_string(std::max(0, k)) + "|" + NativeLinearDimBucket(k);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_down_proj_geometry_mutex_);
+  inferflux_cuda_down_proj_geometry_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordInferfluxCudaRowPairSelection(
+    std::string_view phase, std::string_view op, int batch_rows) {
+  if (batch_rows < 2) {
+    return;
+  }
+  const std::string key = NormalizeNativePhase(phase) + "|" + std::string(op) +
+                          "|" + InferfluxCudaBatchSizeBucket(phase, batch_rows);
+  std::lock_guard<std::mutex> lock(inferflux_cuda_rowpair_selection_mutex_);
+  inferflux_cuda_rowpair_selection_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordInferfluxCudaKvAutoTunePlan(
+    int requested_max_seq, int planned_max_seq, std::size_t requested_bytes,
+    std::size_t planned_bytes, std::size_t budget_bytes) {
+  inferflux_cuda_kv_requested_max_seq_.store(std::max(0, requested_max_seq),
+                                             std::memory_order_relaxed);
+  inferflux_cuda_kv_planned_max_seq_.store(std::max(0, planned_max_seq),
+                                           std::memory_order_relaxed);
+  inferflux_cuda_kv_requested_bytes_.store(
+      static_cast<uint64_t>(requested_bytes), std::memory_order_relaxed);
+  inferflux_cuda_kv_planned_bytes_.store(static_cast<uint64_t>(planned_bytes),
+                                         std::memory_order_relaxed);
+  inferflux_cuda_kv_budget_bytes_.store(static_cast<uint64_t>(budget_bytes),
+                                        std::memory_order_relaxed);
+  if (planned_max_seq > 0 && requested_max_seq > planned_max_seq) {
+    inferflux_cuda_kv_autotune_events_total_.fetch_add(
+        1, std::memory_order_relaxed);
+  }
+}
+
+void MetricsRegistry::SetInferfluxCudaKvCacheOccupancy(int active_sequences,
+                                                       int max_sequences) {
+  inferflux_cuda_kv_active_sequences_.store(active_sequences,
+                                            std::memory_order_relaxed);
+  inferflux_cuda_kv_max_sequences_.store(max_sequences,
+                                         std::memory_order_relaxed);
+}
+
+void MetricsRegistry::SetSchedulerDeferredSequenceRetirements(int depth) {
+  scheduler_deferred_sequence_retirements_.store(std::max(0, depth),
+                                                 std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordSchedulerDeferredSequenceRetirement(double lag_ms) {
+  scheduler_sequence_retirement_latency_.Record(lag_ms);
+  scheduler_deferred_sequence_retirements_completed_.fetch_add(
+      1, std::memory_order_relaxed);
 }
 
 void MetricsRegistry::SetCudaAttentionKernel(const std::string &kernel) {
@@ -561,6 +961,22 @@ void MetricsRegistry::RecordCudaAttentionKernelSwitch(
   cuda_attention_switch_counts_[key] += 1;
 }
 
+void MetricsRegistry::RecordInferfluxCudaDispatchDivergence(
+    std::string_view layer, std::string_view selected, std::string_view actual,
+    std::string_view reason) {
+  const std::string key = std::string(layer) + "|" + std::string(selected) +
+                          "|" + std::string(actual) + "|" +
+                          std::string(reason.empty() ? "unspecified" : reason);
+  std::lock_guard<std::mutex> lock(cuda_dispatch_divergence_mutex_);
+  cuda_dispatch_divergence_counts_[key] += 1;
+  cuda_dispatch_divergence_total_ += 1;
+}
+
+uint64_t MetricsRegistry::GetInferfluxCudaDispatchDivergences() const {
+  std::lock_guard<std::mutex> lock(cuda_dispatch_divergence_mutex_);
+  return cuda_dispatch_divergence_total_;
+}
+
 MetricsRegistry::CacheMetrics MetricsRegistry::GetCacheMetrics() const {
   CacheMetrics cm;
   cm.hits = prefix_hits_.load(std::memory_order_relaxed);
@@ -570,6 +986,67 @@ MetricsRegistry::CacheMetrics MetricsRegistry::GetCacheMetrics() const {
   cm.kv_reuse_count = kv_prefix_reuse_count_.load(std::memory_order_relaxed);
   cm.kv_reuse_tokens = kv_prefix_reuse_tokens_.load(std::memory_order_relaxed);
   return cm;
+}
+
+void MetricsRegistry::SetInferfluxCudaModelMemorySnapshot(
+    std::string model_label, MemoryUsageMetrics total,
+    std::unordered_map<std::string, MemoryUsageMetrics> domains) {
+  std::lock_guard<std::mutex> lock(inferflux_cuda_model_memory_mutex_);
+  inferflux_cuda_model_memory_snapshot_.model_label = std::move(model_label);
+  inferflux_cuda_model_memory_snapshot_.total = total;
+  inferflux_cuda_model_memory_snapshot_.domains = std::move(domains);
+}
+
+MetricsRegistry::InferfluxCudaModelMemorySnapshot
+MetricsRegistry::GetInferfluxCudaModelMemorySnapshot() const {
+  std::lock_guard<std::mutex> lock(inferflux_cuda_model_memory_mutex_);
+  return inferflux_cuda_model_memory_snapshot_;
+}
+
+void MetricsRegistry::SetInferfluxCudaKvMemoryBytes(
+    uint64_t total_bytes, uint64_t active_bytes, uint64_t prefix_retained_bytes,
+    uint64_t free_bytes, int active_sequences, int prefix_retained_sequences,
+    int free_sequences, int max_sequences) {
+  inferflux_cuda_kv_memory_total_bytes_.store(total_bytes,
+                                              std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_active_bytes_.store(active_bytes,
+                                               std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_prefix_retained_bytes_.store(
+      prefix_retained_bytes, std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_free_bytes_.store(free_bytes,
+                                             std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_active_sequences_.store(
+      std::max(0, active_sequences), std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_prefix_retained_sequences_.store(
+      std::max(0, prefix_retained_sequences), std::memory_order_relaxed);
+  inferflux_cuda_kv_memory_free_sequences_.store(std::max(0, free_sequences),
+                                                 std::memory_order_relaxed);
+  inferflux_cuda_kv_max_sequences_.store(std::max(0, max_sequences),
+                                         std::memory_order_relaxed);
+}
+
+MetricsRegistry::InferfluxCudaKvMemorySnapshot
+MetricsRegistry::GetInferfluxCudaKvMemorySnapshot() const {
+  InferfluxCudaKvMemorySnapshot snapshot;
+  snapshot.total_bytes =
+      inferflux_cuda_kv_memory_total_bytes_.load(std::memory_order_relaxed);
+  snapshot.active_bytes =
+      inferflux_cuda_kv_memory_active_bytes_.load(std::memory_order_relaxed);
+  snapshot.prefix_retained_bytes =
+      inferflux_cuda_kv_memory_prefix_retained_bytes_.load(
+          std::memory_order_relaxed);
+  snapshot.free_bytes =
+      inferflux_cuda_kv_memory_free_bytes_.load(std::memory_order_relaxed);
+  snapshot.active_sequences = inferflux_cuda_kv_memory_active_sequences_.load(
+      std::memory_order_relaxed);
+  snapshot.prefix_retained_sequences =
+      inferflux_cuda_kv_memory_prefix_retained_sequences_.load(
+          std::memory_order_relaxed);
+  snapshot.free_sequences =
+      inferflux_cuda_kv_memory_free_sequences_.load(std::memory_order_relaxed);
+  snapshot.max_sequences =
+      inferflux_cuda_kv_max_sequences_.load(std::memory_order_relaxed);
+  return snapshot;
 }
 
 std::string MetricsRegistry::RenderPrometheus() const {
@@ -591,6 +1068,20 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_errors_total counter\n";
   out << "inferflux_errors_total{backend=\"" << backend << "\"} "
       << total_errors_.load() << "\n";
+
+  auto cuda_errors = diagnostics::GetCudaErrorCount();
+  if (cuda_errors > 0) {
+    out << "# HELP inferflux_cuda_errors_total Total CUDA API errors "
+           "encountered\n";
+    out << "# TYPE inferflux_cuda_errors_total counter\n";
+    out << "inferflux_cuda_errors_total " << cuda_errors << "\n";
+  }
+
+  out << "# HELP inferflux_empty_generations_total Total backend generations "
+         "that produced no completion text\n";
+  out << "# TYPE inferflux_empty_generations_total counter\n";
+  out << "inferflux_empty_generations_total{backend=\"" << backend << "\"} "
+      << total_empty_generations_.load() << "\n";
 
   out << "# HELP inferflux_prompt_tokens_total Total prompt tokens processed\n";
   out << "# TYPE inferflux_prompt_tokens_total counter\n";
@@ -667,6 +1158,161 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_scheduler_batch_token_budget_skips_total{backend=\""
       << backend << "\"} " << scheduler_batch_token_budget_skips_.load()
       << "\n";
+
+  out << "# HELP inferflux_scheduler_policy_iterations_total Scheduler "
+         "iterations by queue policy and phase composition\n";
+  out << "# TYPE inferflux_scheduler_policy_iterations_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(scheduler_policy_metrics_mutex_);
+    for (const auto &[key, count] : scheduler_policy_iterations_) {
+      auto split = key.find('|');
+      if (split == std::string::npos) {
+        continue;
+      }
+      const std::string policy = key.substr(0, split);
+      const std::string phase = key.substr(split + 1);
+      out << "inferflux_scheduler_policy_iterations_total{backend=\"" << backend
+          << "\",policy=\"" << policy << "\",phase=\"" << phase << "\"} "
+          << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_prefix_affinity_probes_total Prefix-"
+         "affinity probes performed during queue ranking\n";
+  out << "# TYPE inferflux_scheduler_prefix_affinity_probes_total counter\n";
+  out << "inferflux_scheduler_prefix_affinity_probes_total{backend=\""
+      << backend << "\"} " << scheduler_prefix_affinity_probes_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_prefix_affinity_hits_total Prefix-"
+         "affinity probes that produced reusable hits\n";
+  out << "# TYPE inferflux_scheduler_prefix_affinity_hits_total counter\n";
+  out << "inferflux_scheduler_prefix_affinity_hits_total{backend=\"" << backend
+      << "\"} " << scheduler_prefix_affinity_hits_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_prefix_affinity_matched_tokens_total "
+         "Matched tokens observed in prefix-affinity hits\n";
+  out << "# TYPE inferflux_scheduler_prefix_affinity_matched_tokens_total "
+         "counter\n";
+  out << "inferflux_scheduler_prefix_affinity_matched_tokens_total{backend=\""
+      << backend << "\"} " << scheduler_prefix_affinity_matched_tokens_.load()
+      << "\n";
+
+  out << "# HELP inferflux_scheduler_decode_step_loops_total Decode-step loop "
+         "iterations executed by mode\n";
+  out << "# TYPE inferflux_scheduler_decode_step_loops_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+    for (const auto &[mode, count] : scheduler_decode_step_loops_) {
+      out << "inferflux_scheduler_decode_step_loops_total{mode=\"" << mode
+          << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_prefill_chunk_truncations_total Number "
+         "of prefill chunks truncated by mixed-step token budgets\n";
+  out << "# TYPE inferflux_scheduler_prefill_chunk_truncations_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+    for (const auto &[mode, count] : scheduler_prefill_chunk_truncations_) {
+      out << "inferflux_scheduler_prefill_chunk_truncations_total{mode=\""
+          << mode << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_prefill_chunk_truncated_tokens_total "
+         "Total tokens deferred due to prefill chunk truncation\n";
+  out << "# TYPE inferflux_scheduler_prefill_chunk_truncated_tokens_total "
+         "counter\n";
+  {
+    std::lock_guard<std::mutex> lock(scheduler_step_metrics_mutex_);
+    for (const auto &[mode, count] :
+         scheduler_prefill_chunk_truncated_tokens_) {
+      out << "inferflux_scheduler_prefill_chunk_truncated_tokens_total{mode=\""
+          << mode << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_deferred_sequence_retirements Current "
+         "number of sequence slots waiting on backend release fences\n";
+  out << "# TYPE inferflux_scheduler_deferred_sequence_retirements gauge\n";
+  out << "inferflux_scheduler_deferred_sequence_retirements{backend=\""
+      << backend << "\"} " << scheduler_deferred_sequence_retirements_.load()
+      << "\n";
+
+  out << "# HELP "
+         "inferflux_scheduler_deferred_sequence_retirements_completed_total "
+         "Sequence slot retirements completed after backend fence polling\n";
+  out << "# TYPE "
+         "inferflux_scheduler_deferred_sequence_retirements_completed_total "
+         "counter\n";
+  out << "inferflux_scheduler_deferred_sequence_retirements_completed_total{"
+         "backend=\""
+      << backend << "\"} "
+      << scheduler_deferred_sequence_retirements_completed_.load() << "\n";
+
+  out << "# HELP inferflux_scheduler_sequence_retirement_duration_ms Time "
+         "between scheduling a deferred sequence retirement and backend "
+         "release completion\n";
+  out << "# TYPE inferflux_scheduler_sequence_retirement_duration_ms "
+         "histogram\n";
+  for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
+    out << "inferflux_scheduler_sequence_retirement_duration_ms_bucket{"
+           "backend=\""
+        << backend << "\",le=\"" << std::fixed << std::setprecision(0)
+        << LatencyHistogram::kBuckets[i] << "\"} "
+        << scheduler_sequence_retirement_latency_.counts[i].load() << "\n";
+  }
+  out << "inferflux_scheduler_sequence_retirement_duration_ms_bucket{backend=\""
+      << backend << "\",le=\"+Inf\"} "
+      << scheduler_sequence_retirement_latency_
+             .counts[LatencyHistogram::kBuckets.size()]
+             .load()
+      << "\n";
+  out << "inferflux_scheduler_sequence_retirement_duration_ms_sum{backend=\""
+      << backend << "\"} "
+      << scheduler_sequence_retirement_latency_.sum_ms.load() << "\n";
+  out << "inferflux_scheduler_sequence_retirement_duration_ms_count{backend=\""
+      << backend << "\"} "
+      << scheduler_sequence_retirement_latency_.total.load() << "\n";
+
+  out << "# HELP inferflux_disagg_kv_enqueue_rejections_total "
+         "Prefill-to-decode "
+         "KV transport enqueue rejections\n";
+  out << "# TYPE inferflux_disagg_kv_enqueue_rejections_total counter\n";
+  out << "inferflux_disagg_kv_enqueue_rejections_total{backend=\"" << backend
+      << "\"} " << disagg_kv_enqueue_rejections_.load() << "\n";
+
+  out << "# HELP inferflux_disagg_kv_enqueue_exhausted_total Requests that "
+         "failed after distributed KV enqueue retries were exhausted\n";
+  out << "# TYPE inferflux_disagg_kv_enqueue_exhausted_total counter\n";
+  out << "inferflux_disagg_kv_enqueue_exhausted_total{backend=\"" << backend
+      << "\"} " << disagg_kv_enqueue_exhausted_.load() << "\n";
+
+  out << "# HELP inferflux_disagg_kv_tickets_total Distributed KV ticket "
+         "lifecycle transitions by stage\n";
+  out << "# TYPE inferflux_disagg_kv_tickets_total counter\n";
+  out << "inferflux_disagg_kv_tickets_total{backend=\"" << backend
+      << "\",stage=\"enqueued\"} " << disagg_kv_tickets_enqueued_.load()
+      << "\n";
+  out << "inferflux_disagg_kv_tickets_total{backend=\"" << backend
+      << "\",stage=\"acknowledged\"} " << disagg_kv_tickets_acknowledged_.load()
+      << "\n";
+  out << "inferflux_disagg_kv_tickets_total{backend=\"" << backend
+      << "\",stage=\"committed\"} " << disagg_kv_tickets_committed_.load()
+      << "\n";
+  out << "inferflux_disagg_kv_tickets_total{backend=\"" << backend
+      << "\",stage=\"timed_out\"} " << disagg_kv_tickets_timed_out_.load()
+      << "\n";
+  out << "# HELP inferflux_disagg_kv_timeout_streak Consecutive distributed KV "
+         "ticket timeouts since the last committed handoff\n";
+  out << "# TYPE inferflux_disagg_kv_timeout_streak gauge\n";
+  out << "inferflux_disagg_kv_timeout_streak{backend=\"" << backend << "\"} "
+      << disagg_kv_timeout_streak_.load() << "\n";
+  out << "# HELP inferflux_disagg_kv_timeout_debt Distributed KV timeout debt "
+         "(timeouts minus debt-repaying committed handoffs)\n";
+  out << "# TYPE inferflux_disagg_kv_timeout_debt gauge\n";
+  out << "inferflux_disagg_kv_timeout_debt{backend=\"" << backend << "\"} "
+      << disagg_kv_timeout_debt_.load() << "\n";
 
   out << "# HELP inferflux_fairness_preemptions_total Scheduler swaps "
          "triggered by fairness\n";
@@ -1161,66 +1807,588 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_scheduler_batch_limit_tokens "
       << scheduler_batch_limit_tokens_.load() << "\n";
 
-  // --- Native CUDA backend metrics ---
-  out << "# HELP inferflux_native_forward_passes_total Native CUDA forward "
+  out << "# HELP inferflux_scheduler_decode_worker_batch_size_total Decode "
+         "worker "
+         "batch-size distribution\n";
+  out << "# TYPE inferflux_scheduler_decode_worker_batch_size_total counter\n";
+  {
+    std::vector<std::string> buckets;
+    {
+      std::lock_guard<std::mutex> lock(
+          scheduler_decode_worker_batch_size_mutex_);
+      buckets.reserve(scheduler_decode_worker_batch_size_counts_.size());
+      for (const auto &entry : scheduler_decode_worker_batch_size_counts_) {
+        buckets.push_back(entry.first);
+      }
+    }
+    std::sort(buckets.begin(), buckets.end(),
+              [](const std::string &a, const std::string &b) {
+                return std::stoll(a) < std::stoll(b);
+              });
+    for (const auto &bucket : buckets) {
+      uint64_t count = 0;
+      {
+        std::lock_guard<std::mutex> lock(
+            scheduler_decode_worker_batch_size_mutex_);
+        const auto it = scheduler_decode_worker_batch_size_counts_.find(bucket);
+        if (it != scheduler_decode_worker_batch_size_counts_.end()) {
+          count = it->second;
+        }
+      }
+      out << "inferflux_scheduler_decode_worker_batch_size_total{bucket=\""
+          << bucket << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_decode_worker_execution_path_total Decode "
+         "worker execution-path selections\n";
+  out << "# TYPE inferflux_scheduler_decode_worker_execution_path_total "
+         "counter\n";
+  {
+    std::vector<std::string> paths;
+    {
+      std::lock_guard<std::mutex> lock(
+          scheduler_decode_worker_batch_size_mutex_);
+      paths.reserve(scheduler_decode_worker_execution_path_counts_.size());
+      for (const auto &entry : scheduler_decode_worker_execution_path_counts_) {
+        paths.push_back(entry.first);
+      }
+    }
+    std::sort(paths.begin(), paths.end());
+    for (const auto &path : paths) {
+      uint64_t count = 0;
+      {
+        std::lock_guard<std::mutex> lock(
+            scheduler_decode_worker_batch_size_mutex_);
+        const auto it =
+            scheduler_decode_worker_execution_path_counts_.find(path);
+        if (it != scheduler_decode_worker_execution_path_counts_.end()) {
+          count = it->second;
+        }
+      }
+      out << "inferflux_scheduler_decode_worker_execution_path_total{path=\""
+          << path << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_decode_worker_sticky_merge_total "
+         "Compatible decode requests merged into an active sticky cohort by "
+         "merge size\n";
+  out << "# TYPE inferflux_scheduler_decode_worker_sticky_merge_total "
+         "counter\n";
+  {
+    std::vector<std::string> merge_sizes;
+    {
+      std::lock_guard<std::mutex> lock(
+          scheduler_decode_worker_batch_size_mutex_);
+      merge_sizes.reserve(scheduler_decode_worker_sticky_merge_counts_.size());
+      for (const auto &entry : scheduler_decode_worker_sticky_merge_counts_) {
+        merge_sizes.push_back(entry.first);
+      }
+    }
+    std::sort(merge_sizes.begin(), merge_sizes.end(),
+              [](const std::string &a, const std::string &b) {
+                return std::stoll(a) < std::stoll(b);
+              });
+    for (const auto &merge_size : merge_sizes) {
+      uint64_t count = 0;
+      {
+        std::lock_guard<std::mutex> lock(
+            scheduler_decode_worker_batch_size_mutex_);
+        const auto it =
+            scheduler_decode_worker_sticky_merge_counts_.find(merge_size);
+        if (it != scheduler_decode_worker_sticky_merge_counts_.end()) {
+          count = it->second;
+        }
+      }
+      out << "inferflux_scheduler_decode_worker_sticky_merge_total{merged=\""
+          << merge_size << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_scheduler_decode_worker_sticky_merged_requests_"
+         "total Total compatible decode requests merged into active sticky "
+         "cohorts\n";
+  out << "# TYPE inferflux_scheduler_decode_worker_sticky_merged_requests_"
+         "total counter\n";
+  out << "inferflux_scheduler_decode_worker_sticky_merged_requests_total "
+      << scheduler_decode_worker_sticky_merged_requests_total_.load(
+             std::memory_order_relaxed)
+      << "\n";
+
+  auto render_decode_assembly_counter =
+      [&](const char *metric_name, const char *help,
+          const std::unordered_map<std::string, uint64_t> &counts) {
+        out << "# HELP " << metric_name << " " << help << "\n";
+        out << "# TYPE " << metric_name << " counter\n";
+        std::vector<std::pair<std::string, uint64_t>> entries;
+        {
+          std::lock_guard<std::mutex> lock(
+              scheduler_decode_worker_batch_size_mutex_);
+          entries.reserve(counts.size());
+          for (const auto &entry : counts) {
+            entries.push_back(entry);
+          }
+        }
+        std::sort(
+            entries.begin(), entries.end(),
+            [](const auto &a, const auto &b) { return a.first < b.first; });
+        for (const auto &[key, count] : entries) {
+          const auto sep = key.find('|');
+          const std::string mode =
+              sep == std::string::npos ? "unknown" : key.substr(0, sep);
+          const std::string bucket =
+              sep == std::string::npos ? key : key.substr(sep + 1);
+          out << metric_name << "{mode=\"" << mode << "\",bucket=\"" << bucket
+              << "\"} " << count << "\n";
+        }
+      };
+
+  render_decode_assembly_counter(
+      "inferflux_scheduler_decode_assembly_ready_total",
+      "Decode-ready request depth observed while assembling decode cohorts",
+      scheduler_decode_assembly_ready_);
+  render_decode_assembly_counter(
+      "inferflux_scheduler_decode_assembly_selected_total",
+      "Decode requests selected into the active cohort while assembling decode "
+      "work",
+      scheduler_decode_assembly_selected_);
+  render_decode_assembly_counter(
+      "inferflux_scheduler_decode_assembly_compatible_total",
+      "Decode-ready requests compatible with the active sticky cohort",
+      scheduler_decode_assembly_compatible_);
+  render_decode_assembly_counter(
+      "inferflux_scheduler_decode_assembly_incompatible_total",
+      "Decode-ready requests incompatible with the active sticky cohort",
+      scheduler_decode_assembly_incompatible_);
+
+  // --- InferFlux CUDA backend metrics ---
+  out << "# HELP inferflux_cuda_forward_passes_total InferFlux CUDA forward "
          "passes by phase\n";
-  out << "# TYPE inferflux_native_forward_passes_total counter\n";
-  out << "inferflux_native_forward_passes_total{phase=\"prefill\"} "
-      << native_forward_prefill_total_.load() << "\n";
-  out << "inferflux_native_forward_passes_total{phase=\"decode\"} "
-      << native_forward_decode_total_.load() << "\n";
+  out << "# TYPE inferflux_cuda_forward_passes_total counter\n";
+  out << "inferflux_cuda_forward_passes_total{phase=\"prefill\"} "
+      << inferflux_cuda_forward_prefill_total_.load() << "\n";
+  out << "inferflux_cuda_forward_passes_total{phase=\"decode\"} "
+      << inferflux_cuda_forward_decode_total_.load() << "\n";
 
-  out << "# HELP inferflux_native_forward_batch_tokens_total Total tokens "
-         "processed by native forward passes\n";
-  out << "# TYPE inferflux_native_forward_batch_tokens_total counter\n";
-  out << "inferflux_native_forward_batch_tokens_total "
-      << native_forward_batch_tokens_total_.load() << "\n";
+  out << "# HELP inferflux_cuda_forward_batch_tokens_total Total tokens "
+         "processed by InferFlux CUDA forward passes\n";
+  out << "# TYPE inferflux_cuda_forward_batch_tokens_total counter\n";
+  out << "inferflux_cuda_forward_batch_tokens_total "
+      << inferflux_cuda_forward_batch_tokens_total_.load() << "\n";
 
-  out << "# HELP inferflux_native_forward_duration_ms Native forward pass "
+  out << "# HELP inferflux_cuda_forward_batch_size_total InferFlux CUDA "
+         "forward "
+         "batch-size distribution by phase\n";
+  out << "# TYPE inferflux_cuda_forward_batch_size_total counter\n";
+  {
+    static constexpr const char *kPrefillBuckets[] = {
+        "1", "2", "3_4", "5_8", "9_16", "17_32", "33_64", "65_128", "129_plus"};
+    static constexpr const char *kDecodeBuckets[] = {"1",   "2",    "3_4",
+                                                     "5_8", "9_16", "17_plus"};
+    std::lock_guard<std::mutex> lock(inferflux_cuda_forward_batch_size_mutex_);
+    for (const char *bucket : kPrefillBuckets) {
+      const std::string key = std::string("prefill|") + bucket;
+      const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
+      const uint64_t count =
+          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0
+                                                                : it->second;
+      out << "inferflux_cuda_forward_batch_size_total{phase=\"prefill\",bucket="
+             "\""
+          << bucket << "\"} " << count << "\n";
+    }
+    for (const char *bucket : kDecodeBuckets) {
+      const std::string key = std::string("decode|") + bucket;
+      const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
+      const uint64_t count =
+          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0
+                                                                : it->second;
+      out << "inferflux_cuda_forward_batch_size_total{phase=\"decode\",bucket="
+             "\""
+          << bucket << "\"} " << count << "\n";
+    }
+    for (const char *bucket : kDecodeBuckets) {
+      const std::string key = std::string("unknown|") + bucket;
+      const auto it = inferflux_cuda_forward_batch_size_counts_.find(key);
+      const uint64_t count =
+          it == inferflux_cuda_forward_batch_size_counts_.end() ? 0
+                                                                : it->second;
+      out << "inferflux_cuda_forward_batch_size_total{phase=\"unknown\",bucket="
+             "\""
+          << bucket << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_cuda_ffn_proj_operator_total InferFlux CUDA FFN "
+         "gate+up projection operator selections by phase and operator\n";
+  out << "# TYPE inferflux_cuda_ffn_proj_operator_total counter\n";
+  {
+    static constexpr const char *kPhases[] = {"prefill", "decode"};
+    // Operator universe derived from dispatch_catalog.h — plus any key
+    // observed at runtime, so a new label can never be silently dropped
+    // from exposition again.
+    std::set<std::string> ops;
+    for (const char *label : kFfnMetricLabels) {
+      ops.insert(label);
+    }
+    {
+      std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_operator_mutex_);
+      for (const auto &kv : inferflux_cuda_ffn_proj_operator_counts_) {
+        const std::string::size_type bar = kv.first.find('|');
+        if (bar != std::string::npos) {
+          ops.insert(kv.first.substr(bar + 1));
+        }
+      }
+    }
+    std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_operator_mutex_);
+    for (const char *phase : kPhases) {
+      for (const auto &op : ops) {
+        const std::string key = std::string(phase) + "|" + op;
+        const auto it = inferflux_cuda_ffn_proj_operator_counts_.find(key);
+        const uint64_t count =
+            it == inferflux_cuda_ffn_proj_operator_counts_.end() ? 0
+                                                                 : it->second;
+        out << "inferflux_cuda_ffn_proj_operator_total{phase=\"" << phase
+            << "\",operator=\"" << op << "\"} " << count << "\n";
+      }
+    }
+  }
+
+  out << "# HELP inferflux_cuda_down_proj_operator_total InferFlux CUDA "
+         "down-proj "
+         "operator selections by phase and operator\n";
+  out << "# TYPE inferflux_cuda_down_proj_operator_total counter\n";
+  {
+    static constexpr const char *kPhases[] = {"prefill", "decode"};
+    // Operator universe derived from dispatch_catalog.h plus any runtime
+    // observed key — a new label can never be silently unexported.
+    std::set<std::string> ops;
+    for (const char *label : kDownMetricLabels) {
+      ops.insert(label);
+    }
+    {
+      std::lock_guard<std::mutex> lock(
+          inferflux_cuda_down_proj_operator_mutex_);
+      for (const auto &kv : inferflux_cuda_down_proj_operator_counts_) {
+        const std::string::size_type bar = kv.first.find('|');
+        if (bar != std::string::npos) {
+          ops.insert(kv.first.substr(bar + 1));
+        }
+      }
+    }
+    std::lock_guard<std::mutex> lock(inferflux_cuda_down_proj_operator_mutex_);
+    for (const char *phase : kPhases) {
+      for (const auto &op : ops) {
+        const std::string key = std::string(phase) + "|" + op;
+        const auto it = inferflux_cuda_down_proj_operator_counts_.find(key);
+        const uint64_t count =
+            it == inferflux_cuda_down_proj_operator_counts_.end() ? 0
+                                                                  : it->second;
+        out << "inferflux_cuda_down_proj_operator_total{phase=\"" << phase
+            << "\",operator=\"" << op << "\"} " << count << "\n";
+      }
+    }
+  }
+
+  out << "# HELP inferflux_cuda_ffn_proj_geometry_total InferFlux CUDA FFN "
+         "gate+up "
+         "projection geometry selections by phase, operator, quant, and M/N/K "
+         "shape buckets\n";
+  out << "# TYPE inferflux_cuda_ffn_proj_geometry_total counter\n";
+  {
+    std::vector<std::pair<std::string, uint64_t>> entries;
+    {
+      std::lock_guard<std::mutex> lock(inferflux_cuda_ffn_proj_geometry_mutex_);
+      entries.assign(inferflux_cuda_ffn_proj_geometry_counts_.begin(),
+                     inferflux_cuda_ffn_proj_geometry_counts_.end());
+    }
+    std::sort(
+        entries.begin(), entries.end(),
+        [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+    for (const auto &entry : entries) {
+      std::istringstream key(entry.first);
+      std::string phase, op, quant, m_bucket, n_exact, n_bucket, k_exact,
+          k_bucket, grouped_bucket;
+      if (!std::getline(key, phase, '|') || !std::getline(key, op, '|') ||
+          !std::getline(key, quant, '|') || !std::getline(key, m_bucket, '|') ||
+          !std::getline(key, n_exact, '|') ||
+          !std::getline(key, n_bucket, '|') ||
+          !std::getline(key, k_exact, '|') ||
+          !std::getline(key, k_bucket, '|') ||
+          !std::getline(key, grouped_bucket, '|')) {
+        continue;
+      }
+      out << "inferflux_cuda_ffn_proj_geometry_total{phase=\"" << phase
+          << "\",operator=\"" << op << "\",quant=\"" << quant
+          << "\",m_bucket=\"" << m_bucket << "\",n=\"" << n_exact
+          << "\",n_bucket=\"" << n_bucket << "\",k=\"" << k_exact
+          << "\",k_bucket=\"" << k_bucket << "\",grouped_outputs=\""
+          << grouped_bucket << "\"} " << entry.second << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_cuda_down_proj_geometry_total InferFlux CUDA "
+         "down-proj "
+         "geometry selections by phase, operator, quant, and M/N/K shape "
+         "buckets\n";
+  out << "# TYPE inferflux_cuda_down_proj_geometry_total counter\n";
+  {
+    std::vector<std::pair<std::string, uint64_t>> entries;
+    {
+      std::lock_guard<std::mutex> lock(
+          inferflux_cuda_down_proj_geometry_mutex_);
+      entries.assign(inferflux_cuda_down_proj_geometry_counts_.begin(),
+                     inferflux_cuda_down_proj_geometry_counts_.end());
+    }
+    std::sort(
+        entries.begin(), entries.end(),
+        [](const auto &lhs, const auto &rhs) { return lhs.first < rhs.first; });
+    for (const auto &entry : entries) {
+      std::istringstream key(entry.first);
+      std::string phase, op, quant, m_bucket, n_exact, n_bucket, k_exact,
+          k_bucket;
+      if (!std::getline(key, phase, '|') || !std::getline(key, op, '|') ||
+          !std::getline(key, quant, '|') || !std::getline(key, m_bucket, '|') ||
+          !std::getline(key, n_exact, '|') ||
+          !std::getline(key, n_bucket, '|') ||
+          !std::getline(key, k_exact, '|') ||
+          !std::getline(key, k_bucket, '|')) {
+        continue;
+      }
+      out << "inferflux_cuda_down_proj_geometry_total{phase=\"" << phase
+          << "\",operator=\"" << op << "\",quant=\"" << quant
+          << "\",m_bucket=\"" << m_bucket << "\",n=\"" << n_exact
+          << "\",n_bucket=\"" << n_bucket << "\",k=\"" << k_exact
+          << "\",k_bucket=\"" << k_bucket << "\"} " << entry.second << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_cuda_rowpair_selection_total Row-pair kernel "
+         "dispatch counts for multi-row batches\n";
+  out << "# TYPE inferflux_cuda_rowpair_selection_total counter\n";
+  static constexpr const char *kRowPairPhases[] = {"prefill", "decode"};
+  static constexpr const char *kRowPairOps[] = {
+      "q8_1_group_row_pair_w4",       "q8_1_group_row_pair",
+      "q8_1_gemv_row_pair",           "q8_1_gemv_row_pair_v2",
+      "q8_1_gemv_row_pair_hot_fixed",
+  };
+  std::lock_guard<std::mutex> rowpair_lock(
+      inferflux_cuda_rowpair_selection_mutex_);
+  for (const char *phase : kRowPairPhases) {
+    const std::vector<const char *> buckets =
+        std::string_view(phase) == "prefill"
+            ? std::vector<const char *>{"1",     "2",      "3_4",
+                                        "5_8",   "9_16",   "17_32",
+                                        "33_64", "65_128", "129_plus"}
+            : std::vector<const char *>{"1",   "2",    "3_4",
+                                        "5_8", "9_16", "17_plus"};
+    for (const char *op : kRowPairOps) {
+      for (const char *bucket : buckets) {
+        const std::string key = std::string(phase) + "|" + op + "|" + bucket;
+        const auto it = inferflux_cuda_rowpair_selection_counts_.find(key);
+        const uint64_t count =
+            it == inferflux_cuda_rowpair_selection_counts_.end() ? 0
+                                                                 : it->second;
+        out << "inferflux_cuda_rowpair_selection_total{phase=\"" << phase
+            << "\",operator=\"" << op << "\",bucket=\"" << bucket << "\"} "
+            << count << "\n";
+      }
+    }
+  }
+
+  out << "# HELP inferflux_cuda_forward_duration_ms InferFlux CUDA forward "
+         "pass "
          "latency in milliseconds\n";
-  out << "# TYPE inferflux_native_forward_duration_ms histogram\n";
+  out << "# TYPE inferflux_cuda_forward_duration_ms histogram\n";
   for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
-    out << "inferflux_native_forward_duration_ms_bucket{le=\"" << std::fixed
+    out << "inferflux_cuda_forward_duration_ms_bucket{le=\"" << std::fixed
         << std::setprecision(0) << LatencyHistogram::kBuckets[i] << "\"} "
-        << native_forward_latency_.counts[i].load() << "\n";
+        << inferflux_cuda_forward_latency_.counts[i].load() << "\n";
   }
-  out << "inferflux_native_forward_duration_ms_bucket{le=\"+Inf\"} "
-      << native_forward_latency_.counts[LatencyHistogram::kBuckets.size()]
+  out << "inferflux_cuda_forward_duration_ms_bucket{le=\"+Inf\"} "
+      << inferflux_cuda_forward_latency_
+             .counts[LatencyHistogram::kBuckets.size()]
              .load()
       << "\n";
-  out << "inferflux_native_forward_duration_ms_sum "
-      << native_forward_latency_.sum_ms.load() << "\n";
-  out << "inferflux_native_forward_duration_ms_count "
-      << native_forward_latency_.total.load() << "\n";
+  out << "inferflux_cuda_forward_duration_ms_sum "
+      << inferflux_cuda_forward_latency_.sum_ms.load() << "\n";
+  out << "inferflux_cuda_forward_duration_ms_count "
+      << inferflux_cuda_forward_latency_.total.load() << "\n";
 
-  out << "# HELP inferflux_native_sampling_duration_ms Native sampling latency "
+  out << "# HELP inferflux_cuda_sampling_duration_ms InferFlux CUDA sampling "
+         "latency "
          "in milliseconds\n";
-  out << "# TYPE inferflux_native_sampling_duration_ms histogram\n";
+  out << "# TYPE inferflux_cuda_sampling_duration_ms histogram\n";
   for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
-    out << "inferflux_native_sampling_duration_ms_bucket{le=\"" << std::fixed
+    out << "inferflux_cuda_sampling_duration_ms_bucket{le=\"" << std::fixed
         << std::setprecision(0) << LatencyHistogram::kBuckets[i] << "\"} "
-        << native_sampling_latency_.counts[i].load() << "\n";
+        << inferflux_cuda_sampling_latency_.counts[i].load() << "\n";
   }
-  out << "inferflux_native_sampling_duration_ms_bucket{le=\"+Inf\"} "
-      << native_sampling_latency_.counts[LatencyHistogram::kBuckets.size()]
+  out << "inferflux_cuda_sampling_duration_ms_bucket{le=\"+Inf\"} "
+      << inferflux_cuda_sampling_latency_
+             .counts[LatencyHistogram::kBuckets.size()]
              .load()
       << "\n";
-  out << "inferflux_native_sampling_duration_ms_sum "
-      << native_sampling_latency_.sum_ms.load() << "\n";
-  out << "inferflux_native_sampling_duration_ms_count "
-      << native_sampling_latency_.total.load() << "\n";
+  out << "inferflux_cuda_sampling_duration_ms_sum "
+      << inferflux_cuda_sampling_latency_.sum_ms.load() << "\n";
+  out << "inferflux_cuda_sampling_duration_ms_count "
+      << inferflux_cuda_sampling_latency_.total.load() << "\n";
 
-  out << "# HELP inferflux_native_kv_active_sequences Active KV cache "
-         "sequences in native backend\n";
-  out << "# TYPE inferflux_native_kv_active_sequences gauge\n";
-  out << "inferflux_native_kv_active_sequences "
-      << native_kv_active_sequences_.load() << "\n";
+  out << "# HELP inferflux_cuda_kv_active_sequences Active KV cache "
+         "sequences in the InferFlux CUDA backend\n";
+  out << "# TYPE inferflux_cuda_kv_active_sequences gauge\n";
+  out << "inferflux_cuda_kv_active_sequences "
+      << inferflux_cuda_kv_active_sequences_.load() << "\n";
 
-  out << "# HELP inferflux_native_kv_max_sequences Maximum KV cache sequences "
-         "in native backend\n";
-  out << "# TYPE inferflux_native_kv_max_sequences gauge\n";
-  out << "inferflux_native_kv_max_sequences " << native_kv_max_sequences_.load()
+  out << "# HELP inferflux_cuda_kv_max_sequences Maximum KV cache sequences "
+         "in the InferFlux CUDA backend\n";
+  out << "# TYPE inferflux_cuda_kv_max_sequences gauge\n";
+  out << "inferflux_cuda_kv_max_sequences "
+      << inferflux_cuda_kv_max_sequences_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_kv_autotune_events_total Number of times "
+         "InferFlux CUDA KV auto-tuning reduced max_seq during pipeline "
+         "planning\n";
+  out << "# TYPE inferflux_cuda_kv_autotune_events_total counter\n";
+  out << "inferflux_cuda_kv_autotune_events_total "
+      << inferflux_cuda_kv_autotune_events_total_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_kv_requested_max_seq Requested InferFlux CUDA "
+         "KV "
+         "max_seq before auto-tune\n";
+  out << "# TYPE inferflux_cuda_kv_requested_max_seq gauge\n";
+  out << "inferflux_cuda_kv_requested_max_seq "
+      << inferflux_cuda_kv_requested_max_seq_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_kv_planned_max_seq Planned InferFlux CUDA KV "
+         "max_seq after auto-tune\n";
+  out << "# TYPE inferflux_cuda_kv_planned_max_seq gauge\n";
+  out << "inferflux_cuda_kv_planned_max_seq "
+      << inferflux_cuda_kv_planned_max_seq_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_kv_requested_bytes Requested InferFlux CUDA KV "
+         "reservation bytes before auto-tune\n";
+  out << "# TYPE inferflux_cuda_kv_requested_bytes gauge\n";
+  out << "inferflux_cuda_kv_requested_bytes "
+      << inferflux_cuda_kv_requested_bytes_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_kv_planned_bytes Planned InferFlux CUDA KV "
+         "reservation bytes after auto-tune\n";
+  out << "# TYPE inferflux_cuda_kv_planned_bytes gauge\n";
+  out << "inferflux_cuda_kv_planned_bytes "
+      << inferflux_cuda_kv_planned_bytes_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_kv_budget_bytes InferFlux CUDA KV budget bytes "
+         "used "
+         "for auto-tune planning\n";
+  out << "# TYPE inferflux_cuda_kv_budget_bytes gauge\n";
+  out << "inferflux_cuda_kv_budget_bytes "
+      << inferflux_cuda_kv_budget_bytes_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_kv_memory_total_bytes InferFlux CUDA KV bytes "
+         "partitioned by slot state accounting\n";
+  out << "# TYPE inferflux_cuda_kv_memory_total_bytes gauge\n";
+  out << "inferflux_cuda_kv_memory_total_bytes "
+      << inferflux_cuda_kv_memory_total_bytes_.load(std::memory_order_relaxed)
       << "\n";
+
+  out << "# HELP inferflux_cuda_kv_memory_active_bytes InferFlux CUDA KV bytes "
+         "held "
+         "by active slots\n";
+  out << "# TYPE inferflux_cuda_kv_memory_active_bytes gauge\n";
+  out << "inferflux_cuda_kv_memory_active_bytes "
+      << inferflux_cuda_kv_memory_active_bytes_.load(std::memory_order_relaxed)
+      << "\n";
+
+  out << "# HELP inferflux_cuda_kv_memory_prefix_retained_bytes InferFlux CUDA "
+         "KV "
+         "bytes retained for session/prefix reuse\n";
+  out << "# TYPE inferflux_cuda_kv_memory_prefix_retained_bytes gauge\n";
+  out << "inferflux_cuda_kv_memory_prefix_retained_bytes "
+      << inferflux_cuda_kv_memory_prefix_retained_bytes_.load(
+             std::memory_order_relaxed)
+      << "\n";
+
+  out << "# HELP inferflux_cuda_kv_memory_free_bytes InferFlux CUDA KV bytes "
+         "available for new slots\n";
+  out << "# TYPE inferflux_cuda_kv_memory_free_bytes gauge\n";
+  out << "inferflux_cuda_kv_memory_free_bytes "
+      << inferflux_cuda_kv_memory_free_bytes_.load(std::memory_order_relaxed)
+      << "\n";
+
+  out << "# HELP inferflux_cuda_kv_memory_sequences Native KV slot counts by "
+         "state partition\n";
+  out << "# TYPE inferflux_cuda_kv_memory_sequences gauge\n";
+  out << "inferflux_cuda_kv_memory_sequences{state=\"active\"} "
+      << inferflux_cuda_kv_memory_active_sequences_.load(
+             std::memory_order_relaxed)
+      << "\n";
+  out << "inferflux_cuda_kv_memory_sequences{state=\"prefix_retained\"} "
+      << inferflux_cuda_kv_memory_prefix_retained_sequences_.load(
+             std::memory_order_relaxed)
+      << "\n";
+  out << "inferflux_cuda_kv_memory_sequences{state=\"free\"} "
+      << inferflux_cuda_kv_memory_free_sequences_.load(
+             std::memory_order_relaxed)
+      << "\n";
+
+  {
+    const auto snapshot = GetInferfluxCudaModelMemorySnapshot();
+
+    out << "# HELP inferflux_cuda_model_memory_reserved_bytes Native model "
+           "memory reserved bytes by scope\n";
+    out << "# TYPE inferflux_cuda_model_memory_reserved_bytes gauge\n";
+    out << "inferflux_cuda_model_memory_reserved_bytes{scope=\"total\",model=\""
+        << snapshot.model_label << "\"} " << snapshot.total.reserved_bytes
+        << "\n";
+    for (const auto &entry : snapshot.domains) {
+      out << "inferflux_cuda_model_memory_reserved_bytes{scope=\"domain\","
+             "model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first << "\"} "
+          << entry.second.reserved_bytes << "\n";
+    }
+
+    out << "# HELP inferflux_cuda_model_memory_in_use_bytes Native model "
+           "memory in-use bytes by scope\n";
+    out << "# TYPE inferflux_cuda_model_memory_in_use_bytes gauge\n";
+    out << "inferflux_cuda_model_memory_in_use_bytes{scope=\"total\",model=\""
+        << snapshot.model_label << "\"} " << snapshot.total.in_use_bytes
+        << "\n";
+    for (const auto &entry : snapshot.domains) {
+      out << "inferflux_cuda_model_memory_in_use_bytes{scope=\"domain\",model="
+             "\""
+          << snapshot.model_label << "\",domain=\"" << entry.first << "\"} "
+          << entry.second.in_use_bytes << "\n";
+    }
+
+    out << "# HELP inferflux_cuda_model_memory_high_water_bytes Native model "
+           "memory high-water bytes by scope\n";
+    out << "# TYPE inferflux_cuda_model_memory_high_water_bytes gauge\n";
+    out << "inferflux_cuda_model_memory_high_water_bytes{scope=\"total\",model="
+           "\""
+        << snapshot.model_label << "\"} " << snapshot.total.high_water_bytes
+        << "\n";
+    for (const auto &entry : snapshot.domains) {
+      out << "inferflux_cuda_model_memory_high_water_bytes{scope=\"domain\","
+             "model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first << "\"} "
+          << entry.second.high_water_bytes << "\n";
+    }
+
+    out << "# HELP inferflux_cuda_model_memory_evictable_bytes Native model "
+           "memory evictable bytes by scope\n";
+    out << "# TYPE inferflux_cuda_model_memory_evictable_bytes gauge\n";
+    out << "inferflux_cuda_model_memory_evictable_bytes{scope=\"total\",model="
+           "\""
+        << snapshot.model_label << "\"} " << snapshot.total.evictable_bytes
+        << "\n";
+    for (const auto &entry : snapshot.domains) {
+      out << "inferflux_cuda_model_memory_evictable_bytes{scope=\"domain\","
+             "model=\""
+          << snapshot.model_label << "\",domain=\"" << entry.first << "\"} "
+          << entry.second.evictable_bytes << "\n";
+    }
+  }
 
   out << "# HELP inferflux_cuda_lane_submissions_total Unified-batch lane "
          "submissions in CUDA runtime\n";
@@ -1245,6 +2413,28 @@ std::string MetricsRegistry::RenderPrometheus() const {
       << cuda_decode_lane_queue_depth_.load() << "\n";
   out << "inferflux_cuda_lane_queue_depth{lane=\"prefill\"} "
       << cuda_prefill_lane_queue_depth_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_enqueue_rejects_total Unified-batch lane "
+         "enqueue rejects in CUDA runtime\n";
+  out << "# TYPE inferflux_cuda_lane_enqueue_rejects_total counter\n";
+  out << "inferflux_cuda_lane_enqueue_rejects_total{lane=\"decode\"} "
+      << cuda_decode_lane_enqueue_rejects_.load() << "\n";
+  out << "inferflux_cuda_lane_enqueue_rejects_total{lane=\"prefill\"} "
+      << cuda_prefill_lane_enqueue_rejects_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_collect_timeouts_total Unified-batch lane "
+         "collection timeouts in CUDA runtime\n";
+  out << "# TYPE inferflux_cuda_lane_collect_timeouts_total counter\n";
+  out << "inferflux_cuda_lane_collect_timeouts_total{lane=\"decode\"} "
+      << cuda_decode_lane_collect_timeouts_.load() << "\n";
+  out << "inferflux_cuda_lane_collect_timeouts_total{lane=\"prefill\"} "
+      << cuda_prefill_lane_collect_timeouts_.load() << "\n";
+
+  out << "# HELP inferflux_cuda_lane_worker_restarts_total CUDA lane worker "
+         "dispatcher restarts\n";
+  out << "# TYPE inferflux_cuda_lane_worker_restarts_total counter\n";
+  out << "inferflux_cuda_lane_worker_restarts_total "
+      << cuda_lane_worker_restarts_.load() << "\n";
 
   out << "# HELP inferflux_cuda_lane_overlap_events_total CUDA lane execution "
          "windows where decode/prefill overlapped\n";
@@ -1312,6 +2502,31 @@ std::string MetricsRegistry::RenderPrometheus() const {
       out << "inferflux_cuda_attention_kernel_fallbacks_total{requested=\""
           << requested << "\",selected=\"" << selected << "\",reason=\""
           << reason << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_cuda_dispatch_divergence_total Selected vs "
+         "executed native dispatch operator divergences (layer|selected|"
+         "actual|reason)\n";
+  out << "# TYPE inferflux_cuda_dispatch_divergence_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(cuda_dispatch_divergence_mutex_);
+    std::map<std::string, uint64_t> sorted(
+        cuda_dispatch_divergence_counts_.begin(),
+        cuda_dispatch_divergence_counts_.end());
+    for (const auto &kv : sorted) {
+      const std::string::size_type b1 = kv.first.find('|');
+      const std::string::size_type b2 = kv.first.find('|', b1 + 1);
+      const std::string::size_type b3 = kv.first.find('|', b2 + 1);
+      if (b1 == std::string::npos || b2 == std::string::npos ||
+          b3 == std::string::npos) {
+        continue;
+      }
+      out << "inferflux_cuda_dispatch_divergence_total{layer=\""
+          << kv.first.substr(0, b1) << "\",selected=\""
+          << kv.first.substr(b1 + 1, b2 - b1 - 1) << "\",actual=\""
+          << kv.first.substr(b2 + 1, b3 - b2 - 1) << "\",reason=\""
+          << kv.first.substr(b3 + 1) << "\"} " << kv.second << "\n";
     }
   }
 

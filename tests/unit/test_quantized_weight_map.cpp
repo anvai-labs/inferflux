@@ -2,6 +2,7 @@
 
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/quantized_weight_map.h"
+#include "runtime/backends/cuda/native/quantized_weight_map_adapter.h"
 
 #include <memory>
 #include <vector>
@@ -112,6 +113,21 @@ TEST_CASE("QuantizedWeightMap: Non-copyable and non-movable",
   // weight_map4 = weight_map1; // COMPILE ERROR
 
   (void)weight_map1; // Suppress unused warning
+}
+
+TEST_CASE("QuantizedWeightMap: strategy-driven fused matmul policy is mutable",
+          "[quantized][weight_map]") {
+  QuantizedWeightMap weight_map;
+  REQUIRE(weight_map.AllowFusedQuantizedMatmul());
+
+  weight_map.SetAllowFusedQuantizedMatmul(false);
+  REQUIRE_FALSE(weight_map.AllowFusedQuantizedMatmul());
+
+  QuantizedWeightMapAdapter adapter(&weight_map);
+  REQUIRE_FALSE(adapter.AllowFusedQuantizedMatmul());
+
+  weight_map.SetAllowFusedQuantizedMatmul(true);
+  REQUIRE(adapter.AllowFusedQuantizedMatmul());
 }
 
 // =============================================================================
@@ -399,6 +415,19 @@ TEST_CASE("QuantizedWeightMap: Works with Q8_0", "[quantized][weight_map]") {
   QuantizedWeightMap weight_map;
 
   auto accessor = std::make_shared<MockWeightAccessor>(768, 768, "q8_0");
+  loader.SetMockAccessor("layers.0.attention.wq.weight", accessor);
+
+  cudaStream_t stream = nullptr;
+  bool result = weight_map.Build(&loader, loader.GetModelInfo(), stream);
+
+  (void)result;
+}
+
+TEST_CASE("QuantizedWeightMap: Works with Q8_K", "[quantized][weight_map]") {
+  MockModelLoader loader;
+  QuantizedWeightMap weight_map;
+
+  auto accessor = std::make_shared<MockWeightAccessor>(768, 768, "q8_k");
   loader.SetMockAccessor("layers.0.attention.wq.weight", accessor);
 
   cudaStream_t stream = nullptr;

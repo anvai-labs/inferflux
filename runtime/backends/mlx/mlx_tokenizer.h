@@ -31,6 +31,13 @@ public:
   // Load tokenizer.json (and optionally tokenizer_config.json) from model_dir.
   // Returns true on success.
   bool Load(const std::filesystem::path &model_dir);
+  bool
+  InitializeFromBpeData(const std::vector<std::string> &id_to_token,
+                        const std::vector<std::string> &merges,
+                        const std::string &pre_tokenizer_hint, int32_t bos_id,
+                        int32_t eos_id, const std::string &chat_template = "",
+                        bool add_bos_token = true,
+                        const std::unordered_set<int32_t> &special_ids = {});
   bool Loaded() const { return loaded_; }
 
   // Encode text to a vector of token IDs. Prepends BOS when add_bos=true.
@@ -54,6 +61,11 @@ public:
 private:
   enum class PreTokenizerType { Metaspace, ByteLevel, Unknown };
 
+  void Reset();
+  static PreTokenizerType
+  DetectPreTokenizerType(const std::string &pre_tokenizer_hint,
+                         bool *add_prefix_space);
+
   bool loaded_{false};
   PreTokenizerType pre_tok_{PreTokenizerType::Unknown};
   bool add_prefix_space_{true}; // Metaspace: prepend ▁ to first token
@@ -69,6 +81,7 @@ private:
   int32_t bos_id_{1};
   int32_t eos_id_{2};
   int32_t vocab_size_{0};
+  bool add_bos_token_{true};
 
   std::string chat_template_; // Jinja2 template string, empty if absent
 

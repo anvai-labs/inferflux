@@ -82,7 +82,7 @@ ctest --test-dir build -R ThroughputGateFailureContractTests --output-on-failure
 ### Throughput gate harness
 
 ```bash
-./scripts/run_throughput_gate.py \
+./scripts/benchmark.sh throughput-gate \
   --server-bin ./build/inferfluxd \
   --config config/server.cuda.yaml \
   --backend cuda \

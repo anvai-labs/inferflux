@@ -2,15 +2,27 @@
 
 #include <cstddef>
 #include <cstdint>
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
 #include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 #include <vector>
 
 namespace inferflux {
 
 /**
  * IKvCacheGpu: non-templated base interface for sequence management.
- * Used by NativeKernelExecutor to call ClearSequence without knowing the dtype.
+ * Used by InferfluxCudaExecutor to call ClearSequence without knowing the
+ * dtype.
  */
 class IKvCacheGpu {
 public:
@@ -65,6 +77,12 @@ public:
    */
   void GetBatchKVPtrs(int layer, const int *seq_ids, int batch_size,
                       const T **h_k_ptrs, const T **h_v_ptrs) const;
+
+  T *Buffer() const { return buffer_; }
+  size_t SlotStride() const { return slot_stride_; }
+  size_t LayerStride() const { return layer_stride_; }
+  size_t KvStride() const { return kv_stride_; }
+  int KvDim() const { return kv_dim_; }
 
   void ClearSequence(int seq_id) override;
   void ClearSequenceAsync(int seq_id, cudaStream_t stream) override;

@@ -1,53 +1,53 @@
 # Session Handle Layer (Phase 1)
 
-## Contract Snapshot
+**Snapshot date:** March 9, 2026  
+**Status:** implemented in unified scheduler mode
+
+## 1) Contract Snapshot
 
 | Item | Contract |
 |---|---|
 | Default API mode | Stateless (OpenAI-compatible) |
-| Optional stateful mode | `session_id` on request + `runtime.scheduler.session_handles.enabled=true` |
-| Session mapping | `session_id -> {sequence_slot, sequence_id, block_table, prompt_tokens}` |
-| TTL | Configurable (`ttl_ms`), with background expiry cleanup |
-| KV precision | Server/model-load scoped (`runtime.cuda.kv_cache_dtype`), never per-session |
-| Scope | Unified scheduler mode (decode-worker pool path is out-of-scope for Phase 1) |
+| Optional stateful mode | `session_id` + `runtime.scheduler.session_handles.enabled=true` |
+| Session mapping | `session_id -> {model_id, sequence_id, prompt_tokens, block_table}` |
+| TTL | Configurable (`ttl_ms`) with expiry cleanup |
+| Scope | Unified scheduler mode only; decode-worker mode remains out of scope |
+| KV precision | Fixed at model-load scope, never per session |
 
-## Flow
+## 2) Flow
 
 ```mermaid
 flowchart LR
-    A[HTTP request] --> B{session_id provided?}
-    B -->|No| C[Stateless scheduling path]
-    B -->|Yes + feature enabled| D[Acquire session lease]
-    D --> E{existing compatible state?}
-    E -->|Yes| F[Reuse sequence slot + suffix prefill]
-    E -->|No| G[Fresh prefill + new slot]
+    A[HTTP request] --> B{session_id present?}
+    B -->|no| C[Stateless path]
+    B -->|yes| D[Acquire lease]
+    D --> E{retained compatible state?}
+    E -->|yes| F[Reuse slot + suffix prefill]
+    E -->|no| G[Fresh slot]
     F --> H[Decode]
     G --> H
-    H --> I{request success?}
-    I -->|Yes| J[Commit lease state + refresh TTL]
-    I -->|No| K[Release lease + free sequence resources]
+    H --> I{success?}
+    I -->|yes| J[Commit lease + refresh TTL]
+    I -->|no| K[Release/discard lease]
 ```
 
-## Lease State Machine
+## 3) Current Code Reality
 
-```mermaid
-stateDiagram-v2
-    [*] --> Missing
-    Missing --> Leased: AcquireLease(session_id)
-    Leased --> Stored: CommitLease(state)
-    Leased --> Missing: ReleaseLease(no state)
-    Stored --> Leased: AcquireLease(session_id)
-    Stored --> Expired: ttl elapsed
-    Expired --> Missing: Cleanup/free sequence
-```
+| Area | Implemented now |
+|---|---|
+| Request surface | `session_id` accepted in JSON body or `x-inferflux-session-id` header |
+| Lease semantics | single in-flight lease per session |
+| Retained state | model ID, sequence ID, prompt tokens, block table |
+| Cleanup | TTL expiry, capacity eviction, and drain-on-shutdown paths exist |
+| Test coverage | focused manager and scheduler unit tests exist |
 
-## Request Contract
+## 4) Current Limits
 
-- `session_id` may be passed in JSON body (`session_id`) or header (`x-inferflux-session-id`).
-- If omitted, server behavior is unchanged and fully stateless.
-- Phase 1 expects prompt continuity semantics (new prompt extends previous prompt token prefix for reuse).
+1. Disabled when decode-worker mode is enabled.
+2. Not a distributed session ownership protocol.
+3. Meant to preserve optional sticky reuse, not to redefine the API as stateful.
 
-## Config
+## 5) Config
 
 ```yaml
 runtime:
@@ -63,3 +63,9 @@ Environment overrides:
 - `INFERFLUX_SESSION_HANDLES_ENABLED`
 - `INFERFLUX_SESSION_TTL_MS`
 - `INFERFLUX_SESSION_MAX`
+
+## 6) Related Docs
+
+- [SEQUENCE_SLOT_MANAGER_PLAN](SEQUENCE_SLOT_MANAGER_PLAN.md)
+- [../Architecture](../Architecture.md)
+- [../MODERNIZATION_AUDIT](../MODERNIZATION_AUDIT.md)

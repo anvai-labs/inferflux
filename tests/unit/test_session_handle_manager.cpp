@@ -22,6 +22,7 @@ TEST_CASE("SessionHandleManager commit and reacquire existing state",
   scheduler::SessionHandleState state;
   state.model_id = "model-a";
   state.sequence_id = 7;
+  state.sequence_generation = 3;
   state.prompt_tokens = {1, 2, 3};
   state.block_table = {10, 11};
   manager.CommitLease("sess-a", state);
@@ -32,6 +33,7 @@ TEST_CASE("SessionHandleManager commit and reacquire existing state",
   REQUIRE(second.has_state);
   REQUIRE(second.state.model_id == "model-a");
   REQUIRE(second.state.sequence_id == 7);
+  REQUIRE(second.state.sequence_generation == 3);
   REQUIRE(second.state.prompt_tokens == std::vector<int>{1, 2, 3});
   REQUIRE(second.state.block_table == std::vector<int>{10, 11});
 }
@@ -68,6 +70,7 @@ TEST_CASE("SessionHandleManager collects expired sessions",
   scheduler::SessionHandleState state;
   state.model_id = "model-c";
   state.sequence_id = 3;
+  state.sequence_generation = 9;
   state.block_table = {4, 5};
   manager.CommitLease("sess-c", state);
 
@@ -76,6 +79,7 @@ TEST_CASE("SessionHandleManager collects expired sessions",
   REQUIRE(expired.size() == 1);
   REQUIRE(expired[0].model_id == "model-c");
   REQUIRE(expired[0].sequence_id == 3);
+  REQUIRE(expired[0].sequence_generation == 9);
 }
 
 TEST_CASE("SessionHandleManager returns cleanup state on capacity eviction",
@@ -92,6 +96,7 @@ TEST_CASE("SessionHandleManager returns cleanup state on capacity eviction",
   scheduler::SessionHandleState state;
   state.model_id = "model-d";
   state.sequence_id = 9;
+  state.sequence_generation = 4;
   state.block_table = {99};
   manager.CommitLease("sess-d", state);
 
@@ -101,6 +106,7 @@ TEST_CASE("SessionHandleManager returns cleanup state on capacity eviction",
   REQUIRE(next.cleanup_states.size() == 1);
   REQUIRE(next.cleanup_states[0].model_id == "model-d");
   REQUIRE(next.cleanup_states[0].sequence_id == 9);
+  REQUIRE(next.cleanup_states[0].sequence_generation == 4);
 }
 
 TEST_CASE("SessionHandleManager drain all returns retained states",
@@ -113,10 +119,12 @@ TEST_CASE("SessionHandleManager drain all returns retained states",
   scheduler::SessionHandleState state;
   state.model_id = "model-f";
   state.sequence_id = 17;
+  state.sequence_generation = 12;
   manager.CommitLease("sess-f", state);
 
   auto drained = manager.DrainAll();
   REQUIRE(drained.size() == 1);
   REQUIRE(drained[0].model_id == "model-f");
+  REQUIRE(drained[0].sequence_generation == 12);
   REQUIRE(manager.SessionCount() == 0);
 }

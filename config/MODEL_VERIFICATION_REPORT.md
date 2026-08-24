@@ -14,11 +14,11 @@
 
 | Model | Size | Format | Backend | Config | Advisor Recs |
 |-------|------|--------|---------|--------|--------------|
-| TinyLlama 1.1B | 638 MB | GGUF Q4 | cuda_llama_cpp | server.cuda.yaml | 1 (batch_size) |
-| Qwen2.5 3B | 2.0 GB | GGUF Q4 | cuda_llama_cpp | server.cuda.yaml | 1 (batch_size) |
-| Qwen2.5 3B | 5.8 GB | GGUF FP16 | cuda_llama_cpp | server.cuda.yaml | 0-1 ✨ |
-| Qwen2.5 Coder 14B | 8.4 GB | GGUF Q4 | cuda_llama_cpp | server.cuda.qwen14b.yaml | 0-1 ✨ |
-| Qwen2.5 3B | 5.8 GB | Safetensors BF16 | cuda_native | server.cuda.safetensors.yaml | **0 ✨** |
+| TinyLlama 1.1B | 638 MB | GGUF Q4 | llama_cpp_cuda | server.cuda.yaml | 1 (batch_size) |
+| Qwen2.5 3B | 2.0 GB | GGUF Q4 | llama_cpp_cuda | server.cuda.yaml | 1 (batch_size) |
+| Qwen2.5 3B | 5.8 GB | GGUF FP16 | llama_cpp_cuda | server.cuda.yaml | 0-1 ✨ |
+| Qwen2.5 Coder 14B | 8.4 GB | GGUF Q4 | llama_cpp_cuda | server.cuda.qwen14b.yaml | 0-1 ✨ |
+| Qwen2.5 3B | 5.8 GB | Safetensors BF16 | inferflux_cuda | server.cuda.safetensors.yaml | **0 ✨** |
 
 ✨ = Well-tuned configuration
 
@@ -26,7 +26,7 @@
 
 ### Rule 1: Backend Mismatch
 - ✅ **Status:** PASS
-- **Config:** Safetensors use `cuda_native`
+- **Config:** Safetensors use `inferflux_cuda`
 - **Result:** Safetensors BF16 model loads successfully with native kernel executor
 
 ### Rule 2: Attention Kernel
@@ -95,10 +95,10 @@
 
 | Format | Backend | Runtime | Works | Notes |
 |--------|---------|---------|-------|-------|
-| GGUF Q4 | cuda_llama_cpp | llama.cpp | ✅ | Best performance |
-| GGUF FP16 | cuda_llama_cpp | llama.cpp | ✅ | Good quality |
-| Safetensors BF16 | cuda_native | native CUDA | ✅ | No executor env required |
-| Safetensors | cuda_llama_cpp | llama.cpp | ❌ | Not supported |
+| GGUF Q4 | llama_cpp_cuda | llama.cpp | ✅ | Best performance |
+| GGUF FP16 | llama_cpp_cuda | llama.cpp | ✅ | Good quality |
+| Safetensors BF16 | inferflux_cuda | InferFlux CUDA | ✅ | No executor env required |
+| Safetensors | llama_cpp_cuda | llama.cpp | ❌ | Not supported |
 
 ## Removed Placeholder Files
 
@@ -109,10 +109,13 @@ The following 0-byte placeholder files were removed:
 
 ## Scripts Created
 
-1. **scripts/verify_all_models.sh** - Automated model verification
-2. **scripts/final_model_test.sh** - Production config testing
-3. **scripts/advisor_test_final.sh** - Advisor rule testing
-4. **scripts/benchmark_simple.sh** - FP16 vs Q4 benchmarking
+These one-off verification scripts were archived under `scripts/archive/verify/`,
+`scripts/archive/advisor/`, and `scripts/archive/benchmark/` during the script
+surface consolidation. Use the maintained entry points instead:
+
+1. **`scripts/smoke.sh gguf-native`** - canonical GGUF smoke path
+2. **`scripts/benchmark.sh gguf-compare`** - backend comparison benchmark
+3. **`scripts/benchmark.sh multi-backend`** - concurrency scaling benchmark
 
 ## Conclusion
 

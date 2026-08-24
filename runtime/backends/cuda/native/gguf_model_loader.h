@@ -3,8 +3,20 @@
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/quantization_handler.h"
+
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -100,8 +112,16 @@ public:
   const std::vector<std::string> &TokenizerPieces() const {
     return tokenizer_pieces_;
   }
+  const std::vector<std::string> &TokenizerMerges() const {
+    return tokenizer_merges_;
+  }
+  const std::string &TokenizerPreTokenizer() const { return tokenizer_pre_; }
+  const std::string &TokenizerChatTemplate() const {
+    return tokenizer_chat_template_;
+  }
   int TokenizerEosTokenId() const { return tokenizer_eos_token_id_; }
   int TokenizerBosTokenId() const { return tokenizer_bos_token_id_; }
+  bool TokenizerAddBosToken() const { return tokenizer_add_bos_token_; }
 
   /**
    * @brief Get GGUF to internal tensor name mapping
@@ -141,8 +161,12 @@ private:
   size_t alignment_{32};
   size_t data_section_offset_{0};
   std::vector<std::string> tokenizer_pieces_;
+  std::vector<std::string> tokenizer_merges_;
+  std::string tokenizer_pre_;
+  std::string tokenizer_chat_template_;
   int tokenizer_eos_token_id_{-1};
   int tokenizer_bos_token_id_{-1};
+  bool tokenizer_add_bos_token_{true};
 
   // Tensors (keyed by GGUF name)
   std::unordered_map<std::string, GGUFTensorData> tensors_;
@@ -157,7 +181,9 @@ private:
   size_t quantized_buffer_size_{0};
   size_t dequantized_buffer_size_{0};
   DequantizedCachePolicy dequantized_cache_policy_{
-      DequantizedCachePolicy::kModelLifetime};
+      DequantizedCachePolicy::kNone};
+  bool has_dequantized_entries_{
+      false}; // Fast bail-out for ClearDequantizedCache
 
   // File path
   std::filesystem::path model_path_;
@@ -175,7 +201,8 @@ private:
  */
 class GGUFWeightAccessor : public IWeightAccessor {
 public:
-  explicit GGUFWeightAccessor(GGUFTensorData *tensor);
+  explicit GGUFWeightAccessor(GGUFTensorData *tensor,
+                              bool *dequant_dirty_flag = nullptr);
 
   // IWeightAccessor interface
   std::pair<size_t, size_t> GetDimensions() const override;
@@ -187,6 +214,7 @@ public:
 
 private:
   GGUFTensorData *tensor_;
+  bool *dequant_dirty_flag_{nullptr};
 };
 
 } // namespace native

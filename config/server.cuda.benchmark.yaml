@@ -16,11 +16,11 @@ models:
   - id: qwen2.5-3b-f16
     path: "models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-f16.gguf"
     format: gguf
-    backend: cuda_llama_cpp  # Use llama.cpp CUDA backend
+    backend: llama_cpp_cuda  # Use llama.cpp CUDA backend
     default: true
 
 runtime:
-  backend_priority: "cuda,cuda_llama_cpp,cpu"
+  backend_priority: "cuda,llama_cpp_cuda,cpu"
   capability_routing:
     enabled: true
 

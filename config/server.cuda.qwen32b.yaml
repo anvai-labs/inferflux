@@ -13,7 +13,7 @@ models:
   - id: qwen3-coder-tools-30b
     path: models/qwen3-coder-tools-30b.gguf
     format: gguf                    # Rule 7: Explicit format (gguf for this model)
-    backend: cuda_llama_cpp         # Uses llama.cpp CUDA backend
+    backend: llama_cpp_cuda         # Uses llama.cpp CUDA backend
     default: true
 
 runtime:
@@ -32,7 +32,7 @@ runtime:
       prefill_replica: false
 
   backend_exposure:
-    prefer_native: true
+    prefer_inferflux: true
     allow_llama_cpp_fallback: true
 
   capability_routing:

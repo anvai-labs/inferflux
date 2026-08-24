@@ -7,7 +7,7 @@
 # Key benefits:
 # - 3-4x lower memory usage vs safetensors (Q4_K_M)
 # - Phase overlap support (1.5-2x throughput on mixed workloads)
-# - Native CUDA kernels with FlashAttention-2
+# - InferFlux CUDA kernels with FlashAttention-2
 # - Compatible with llama.cpp GGUF models
 
 # Server configuration
@@ -37,27 +37,27 @@ models:
   - id: tinyllama
     path: "models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"
     format: gguf                    # Explicitly specify GGUF format
-    backend: cuda_native            # Use native CUDA kernels (fused dequant-GEMV)
+    backend: inferflux_cuda         # Use InferFlux CUDA kernels (fused dequant-GEMV)
     default: true
 
   # Example for multiple GGUF models
   # - id: qwen2.5-7b-gguf
   #   path: "models/qwen2.5-7b-instruct-q5_k_m.gguf"
   #   format: gguf
-  #   backend: cuda_native
+  #   backend: inferflux_cuda
   #   default: false
 
   # Example for mixing GGUF and safetensors
   # - id: tinyllama-safetensors
   #   path: "models/tinyllama-safetensors"
   #   format: auto  # Auto-detect from directory
-  #   backend: cuda_native
+  #   backend: inferflux_cuda
   #   default: false
 
 # Runtime configuration
 runtime:
   # Backend selection
-  backend_priority: "cuda_native,cuda_llama_cpp,cpu"
+  backend_priority: "inferflux_cuda,llama_cpp_cuda,cpu"
   capability_routing:
     enabled: true
 

@@ -1,7 +1,7 @@
 #pragma once
 
 #include "runtime/backends/backend_capabilities.h"
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 
 #include <string>
 
@@ -13,6 +13,7 @@ enum class LlamaBackendTarget {
   kMps,
   kRocm,
   kVulkan,
+  kOpenCL,
 };
 
 struct LlamaBackendTraits {

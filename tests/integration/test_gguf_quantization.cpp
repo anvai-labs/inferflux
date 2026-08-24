@@ -18,8 +18,10 @@
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/quantization_handler.h"
 
-#include <cstring>
+#ifdef INFERFLUX_HAS_CUDA
 #include <cuda_runtime_api.h>
+#endif
+#include <cstring>
 #include <fstream>
 #include <numeric>
 #include <vector>
@@ -197,6 +199,9 @@ TEST_CASE("GGUF Integration: Handler registry", "[gguf][integration]") {
     REQUIRE(registry.IsRegistered("q5_k_m"));
     REQUIRE(registry.IsRegistered("q5_k"));
     REQUIRE(registry.IsRegistered("q6_k"));
+    REQUIRE(registry.IsRegistered("q6_k_m"));
+    REQUIRE(registry.IsRegistered("q8_k"));
+    REQUIRE(registry.IsRegistered("q8_k_m"));
   }
 
   SECTION("Implemented quantizations registered") {
@@ -244,6 +249,15 @@ TEST_CASE("GGUF Integration: Handler creation and basic functionality",
     REQUIRE(handler->GetDequantizedSize(210) == 512);
   }
 
+  SECTION("Create and validate Q6_K_M alias handler") {
+    auto handler = registry.Create("q6_k_m");
+    REQUIRE(handler != nullptr);
+
+    REQUIRE(handler->GetType() == "q6_k");
+    REQUIRE(handler->GetBitsPerValue() == Catch::Approx(6.5625));
+    REQUIRE(handler->GetDequantizedSize(210) == 512);
+  }
+
   SECTION("Create and validate Q8_0 handler") {
     auto handler = registry.Create("q8_0");
     REQUIRE(handler != nullptr);
@@ -253,6 +267,20 @@ TEST_CASE("GGUF Integration: Handler creation and basic functionality",
 
     // 34 bytes (Q8_0) → 64 bytes (FP16)
     REQUIRE(handler->GetDequantizedSize(34) == 64);
+  }
+
+  SECTION("Create and validate Q8_K and Q8_K_M alias handlers") {
+    auto handler_q8_k = registry.Create("q8_k");
+    REQUIRE(handler_q8_k != nullptr);
+    REQUIRE(handler_q8_k->GetType() == "q8_k");
+    REQUIRE(handler_q8_k->GetBitsPerValue() == Catch::Approx(9.125));
+    REQUIRE(handler_q8_k->GetDequantizedSize(292) == 512);
+
+    auto handler_q8_k_m = registry.Create("q8_k_m");
+    REQUIRE(handler_q8_k_m != nullptr);
+    REQUIRE(handler_q8_k_m->GetType() == "q8_k");
+    REQUIRE(handler_q8_k_m->GetBitsPerValue() == Catch::Approx(9.125));
+    REQUIRE(handler_q8_k_m->GetDequantizedSize(292) == 512);
   }
 
   SECTION("Handler creation for unknown type returns nullptr") {
@@ -499,6 +527,64 @@ TEST_CASE("GGUF Integration: Type string conversions", "[gguf][integration]") {
   }
 }
 
+TEST_CASE("GGUF Integration: F16 accessor returns direct GPU pointer without "
+          "dequant cache",
+          "[gguf][integration][f16_contract]") {
+#ifdef INFERFLUX_HAS_CUDA
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping F16 GGUF accessor contract.");
+    return;
+  }
+
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
+          cudaSuccess);
+
+  GGUFModelLoader loader;
+  const std::string gguf_name = "blk.0.attn_q.weight";
+  const std::string internal_name = "model.layers.0.self_attn.q_proj.weight";
+  const std::vector<uint64_t> shape = {64, 64};
+  const size_t f16_bytes = shape[0] * shape[1] * sizeof(half);
+
+  GGUFTensorData tensor;
+  tensor.info.name = gguf_name;
+  tensor.info.shape = shape;
+  tensor.info.type = GGUF::TensorType::F16;
+  tensor.info.offset = 0;
+  tensor.info.byte_size = f16_bytes;
+  tensor.cpu_data.assign(f16_bytes, 0U);
+
+  REQUIRE(cudaMalloc(&loader.d_quantized_buffer_, f16_bytes) == cudaSuccess);
+  loader.quantized_buffer_size_ = f16_bytes;
+  REQUIRE(cudaMemset(loader.d_quantized_buffer_, 0, f16_bytes) == cudaSuccess);
+
+  tensor.gpu_data = loader.d_quantized_buffer_;
+  tensor.gpu_offset = 0;
+  loader.tensors_.emplace(gguf_name, std::move(tensor));
+  loader.gguf_to_internal_name_map_[gguf_name] = internal_name;
+  loader.internal_to_gguf_name_map_[internal_name] = gguf_name;
+
+  auto accessor = loader.GetWeightAccessor(internal_name);
+  REQUIRE(accessor != nullptr);
+  REQUIRE_FALSE(accessor->IsQuantized());
+
+  const void *raw_ptr = accessor->GetGpuWeights(stream);
+  half *f16_ptr = accessor->GetDequantizedGpuWeights(stream);
+  REQUIRE(raw_ptr != nullptr);
+  REQUIRE(reinterpret_cast<const void *>(f16_ptr) == raw_ptr);
+
+  const auto *tensor_after = loader.GetTensorByGGUFName(gguf_name);
+  REQUIRE(tensor_after != nullptr);
+  REQUIRE(tensor_after->dequantized_gpu == nullptr);
+
+  loader.FreeGPUMemory();
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+#else
+  SUCCEED("Built without CUDA; skipping F16 GGUF accessor contract.");
+#endif
+}
+
 //==============================================================================
 // Batch Dequant Cache Lifecycle Contract Test
 //==============================================================================
@@ -513,90 +599,174 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
     return;
   }
 
-  cudaStream_t stream = nullptr;
-  REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
-          cudaSuccess);
+  auto run_policy_contract = [](DequantizedCachePolicy policy) {
+    cudaStream_t stream = nullptr;
+    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
+            cudaSuccess);
 
-  GGUFModelLoader loader;
-  loader.SetDequantizedCachePolicy(DequantizedCachePolicy::kBatchLifetime);
+    GGUFModelLoader loader;
+    loader.SetDequantizedCachePolicy(policy);
 
-  const std::string gguf_name = "blk.0.attn_q.weight";
-  const std::string internal_name = "model.layers.0.self_attn.q_proj.weight";
-  const std::vector<uint64_t> shape = {4096, 2048}; // 8,388,608 elements
-  const size_t dequantized_bytes =
-      shape[0] * shape[1] * sizeof(half); // ~16 MiB
-  const size_t quantized_bytes = CalcTensorSize(GGUF::TensorType::Q8_0, shape);
-  REQUIRE(quantized_bytes > 0);
+    const std::string gguf_name = "blk.0.attn_q.weight";
+    const std::string internal_name =
+        "model.layers.0.self_attn.q_proj.weight";
+    const std::vector<uint64_t> shape = {4096, 2048}; // 8,388,608 elements
+    const size_t dequantized_bytes =
+        shape[0] * shape[1] * sizeof(half); // ~16 MiB
+    const size_t quantized_bytes =
+        CalcTensorSize(GGUF::TensorType::Q8_0, shape);
+    REQUIRE(quantized_bytes > 0);
 
-  GGUFTensorData tensor;
-  tensor.info.name = gguf_name;
-  tensor.info.shape = shape;
-  tensor.info.type = GGUF::TensorType::Q8_0;
-  tensor.info.offset = 0;
-  tensor.info.byte_size = quantized_bytes;
-  tensor.cpu_data.assign(quantized_bytes, 0U); // Valid all-zero quant blocks
+    GGUFTensorData tensor;
+    tensor.info.name = gguf_name;
+    tensor.info.shape = shape;
+    tensor.info.type = GGUF::TensorType::Q8_0;
+    tensor.info.offset = 0;
+    tensor.info.byte_size = quantized_bytes;
+    tensor.cpu_data.assign(quantized_bytes, 0U); // Valid all-zero quant blocks
 
-  REQUIRE(cudaMalloc(&loader.d_quantized_buffer_, quantized_bytes) ==
-          cudaSuccess);
-  loader.quantized_buffer_size_ = quantized_bytes;
-  REQUIRE(cudaMemcpy(loader.d_quantized_buffer_, tensor.cpu_data.data(),
-                     quantized_bytes, cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(cudaMalloc(&loader.d_quantized_buffer_, quantized_bytes) ==
+            cudaSuccess);
+    loader.quantized_buffer_size_ = quantized_bytes;
+    REQUIRE(cudaMemcpy(loader.d_quantized_buffer_, tensor.cpu_data.data(),
+                       quantized_bytes, cudaMemcpyHostToDevice) ==
+            cudaSuccess);
 
-  tensor.gpu_data = loader.d_quantized_buffer_;
-  tensor.gpu_offset = 0;
-  loader.tensors_.emplace(gguf_name, std::move(tensor));
-  loader.gguf_to_internal_name_map_[gguf_name] = internal_name;
-  loader.internal_to_gguf_name_map_[internal_name] = gguf_name;
+    tensor.gpu_data = loader.d_quantized_buffer_;
+    tensor.gpu_offset = 0;
+    loader.tensors_.emplace(gguf_name, std::move(tensor));
+    loader.gguf_to_internal_name_map_[gguf_name] = internal_name;
+    loader.internal_to_gguf_name_map_[internal_name] = gguf_name;
 
-  auto accessor = loader.GetWeightAccessor(internal_name);
-  REQUIRE(accessor != nullptr);
+    auto accessor = loader.GetWeightAccessor(internal_name);
+    REQUIRE(accessor != nullptr);
 
-  size_t free_before = 0;
-  size_t total_mem = 0;
-  REQUIRE(cudaMemGetInfo(&free_before, &total_mem) == cudaSuccess);
+    size_t free_before = 0;
+    size_t total_mem = 0;
+    REQUIRE(cudaMemGetInfo(&free_before, &total_mem) == cudaSuccess);
 
-  // Request 1: dequant cache must be materialized.
-  half *req1_ptr = accessor->GetDequantizedGpuWeights(stream);
-  REQUIRE(req1_ptr != nullptr);
-  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
-  const auto *tensor_after_req1 = loader.GetTensorByGGUFName(gguf_name);
-  REQUIRE(tensor_after_req1 != nullptr);
-  REQUIRE(tensor_after_req1->dequantized_gpu != nullptr);
+    // Request 1: dequant cache must be materialized.
+    half *req1_ptr = accessor->GetDequantizedGpuWeights(stream);
+    REQUIRE(req1_ptr != nullptr);
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+    const auto *tensor_after_req1 = loader.GetTensorByGGUFName(gguf_name);
+    REQUIRE(tensor_after_req1 != nullptr);
+    REQUIRE(tensor_after_req1->dequantized_gpu != nullptr);
 
-  size_t free_after_req1 = 0;
-  REQUIRE(cudaMemGetInfo(&free_after_req1, &total_mem) == cudaSuccess);
+    size_t free_after_req1 = 0;
+    REQUIRE(cudaMemGetInfo(&free_after_req1, &total_mem) == cudaSuccess);
 
-  // Batch-lifetime policy boundary: scheduler/runtime clears cache post-batch.
-  if (loader.GetDequantizedCachePolicy() ==
-      DequantizedCachePolicy::kBatchLifetime) {
-    loader.ClearDequantizedCache();
+    // Runtime batch boundary: clear cache for memory-first policies.
+    if (loader.GetDequantizedCachePolicy() !=
+        DequantizedCachePolicy::kModelLifetime) {
+      loader.ClearDequantizedCache();
+    }
+    const auto *tensor_after_clear = loader.GetTensorByGGUFName(gguf_name);
+    REQUIRE(tensor_after_clear != nullptr);
+    REQUIRE(tensor_after_clear->dequantized_gpu == nullptr);
+
+    size_t free_after_clear = 0;
+    REQUIRE(cudaMemGetInfo(&free_after_clear, &total_mem) == cudaSuccess);
+
+    // Require visible recovery to catch regressions that retain dequant
+    // buffers.
+    const size_t min_recovered_bytes = dequantized_bytes / 8; // conservative
+    REQUIRE(free_after_clear >= free_after_req1 + min_recovered_bytes);
+
+    // Request 2: cache is rebuilt (new request after boundary).
+    half *req2_ptr = accessor->GetDequantizedGpuWeights(stream);
+    REQUIRE(req2_ptr != nullptr);
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+    const auto *tensor_after_req2 = loader.GetTensorByGGUFName(gguf_name);
+    REQUIRE(tensor_after_req2 != nullptr);
+    REQUIRE(tensor_after_req2->dequantized_gpu != nullptr);
+
+    size_t free_after_req2 = 0;
+    REQUIRE(cudaMemGetInfo(&free_after_req2, &total_mem) == cudaSuccess);
+    REQUIRE(free_after_req2 + min_recovered_bytes <= free_after_clear);
+    REQUIRE(free_after_req1 + min_recovered_bytes <= free_before);
+
+    loader.FreeGPUMemory();
+    REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+  };
+
+  auto run_model_policy_contract = []() {
+    cudaStream_t stream = nullptr;
+    REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
+            cudaSuccess);
+
+    GGUFModelLoader loader;
+    loader.SetDequantizedCachePolicy(DequantizedCachePolicy::kModelLifetime);
+
+    const std::string gguf_name = "blk.0.attn_q.weight";
+    const std::string internal_name =
+        "model.layers.0.self_attn.q_proj.weight";
+    const std::vector<uint64_t> shape = {4096, 2048}; // 8,388,608 elements
+    const size_t quantized_bytes =
+        CalcTensorSize(GGUF::TensorType::Q8_0, shape);
+    REQUIRE(quantized_bytes > 0);
+
+    GGUFTensorData tensor;
+    tensor.info.name = gguf_name;
+    tensor.info.shape = shape;
+    tensor.info.type = GGUF::TensorType::Q8_0;
+    tensor.info.offset = 0;
+    tensor.info.byte_size = quantized_bytes;
+    tensor.cpu_data.assign(quantized_bytes, 0U);
+
+    REQUIRE(cudaMalloc(&loader.d_quantized_buffer_, quantized_bytes) ==
+            cudaSuccess);
+    loader.quantized_buffer_size_ = quantized_bytes;
+    REQUIRE(cudaMemcpy(loader.d_quantized_buffer_, tensor.cpu_data.data(),
+                       quantized_bytes, cudaMemcpyHostToDevice) ==
+            cudaSuccess);
+
+    tensor.gpu_data = loader.d_quantized_buffer_;
+    tensor.gpu_offset = 0;
+    loader.tensors_.emplace(gguf_name, std::move(tensor));
+    loader.gguf_to_internal_name_map_[gguf_name] = internal_name;
+    loader.internal_to_gguf_name_map_[internal_name] = gguf_name;
+
+    auto accessor = loader.GetWeightAccessor(internal_name);
+    REQUIRE(accessor != nullptr);
+
+    half *req1_ptr = accessor->GetDequantizedGpuWeights(stream);
+    REQUIRE(req1_ptr != nullptr);
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+    const auto *tensor_after_req1 = loader.GetTensorByGGUFName(gguf_name);
+    REQUIRE(tensor_after_req1 != nullptr);
+    REQUIRE(tensor_after_req1->dequantized_gpu != nullptr);
+
+    // Model-lifetime policy: runtime boundary must not clear cache.
+    if (loader.GetDequantizedCachePolicy() !=
+        DequantizedCachePolicy::kModelLifetime) {
+      loader.ClearDequantizedCache();
+    }
+    const auto *tensor_after_boundary = loader.GetTensorByGGUFName(gguf_name);
+    REQUIRE(tensor_after_boundary != nullptr);
+    REQUIRE(tensor_after_boundary->dequantized_gpu != nullptr);
+
+    half *req2_ptr = accessor->GetDequantizedGpuWeights(stream);
+    REQUIRE(req2_ptr != nullptr);
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+    REQUIRE(req2_ptr == req1_ptr);
+
+    loader.FreeGPUMemory();
+    REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+  };
+
+  SECTION("batch policy clears dequantized buffers at request boundary") {
+    run_policy_contract(DequantizedCachePolicy::kBatchLifetime);
   }
-  const auto *tensor_after_clear = loader.GetTensorByGGUFName(gguf_name);
-  REQUIRE(tensor_after_clear != nullptr);
-  REQUIRE(tensor_after_clear->dequantized_gpu == nullptr);
 
-  size_t free_after_clear = 0;
-  REQUIRE(cudaMemGetInfo(&free_after_clear, &total_mem) == cudaSuccess);
+  SECTION("none policy clears dequantized buffers at request boundary") {
+    run_policy_contract(DequantizedCachePolicy::kNone);
+  }
 
-  // Require visible recovery to catch regressions that retain dequant buffers.
-  const size_t min_recovered_bytes = dequantized_bytes / 8; // conservative
-  REQUIRE(free_after_clear >= free_after_req1 + min_recovered_bytes);
-
-  // Request 2: cache is rebuilt (new request after boundary).
-  half *req2_ptr = accessor->GetDequantizedGpuWeights(stream);
-  REQUIRE(req2_ptr != nullptr);
-  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
-  const auto *tensor_after_req2 = loader.GetTensorByGGUFName(gguf_name);
-  REQUIRE(tensor_after_req2 != nullptr);
-  REQUIRE(tensor_after_req2->dequantized_gpu != nullptr);
-
-  size_t free_after_req2 = 0;
-  REQUIRE(cudaMemGetInfo(&free_after_req2, &total_mem) == cudaSuccess);
-  REQUIRE(free_after_req2 + min_recovered_bytes <= free_after_clear);
-  REQUIRE(free_after_req1 + min_recovered_bytes <= free_before);
-
-  loader.FreeGPUMemory();
-  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+  SECTION("model policy retains dequantized buffers across request boundaries") {
+    run_model_policy_contract();
+  }
 #else
   SUCCEED("Built without CUDA; skipping memory-contract gate.");
 #endif

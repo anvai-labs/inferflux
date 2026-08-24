@@ -1,9 +1,19 @@
 #pragma once
 
 #include <cublas_v2.h>
-#include <cuda_bf16.h>
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
 #include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 
 namespace inferflux {
 
@@ -45,6 +55,14 @@ public:
    */
   template <typename T>
   bool GemmTyped(int M, int N, int K, const T *A, const T *B, T *C);
+
+  /**
+   * Typed GEMM with accumulation: C = A * B^T + C (beta = 1.0)
+   * Eliminates the need for a separate ResidualAdd kernel when the output
+   * buffer already contains the residual to accumulate into.
+   */
+  template <typename T>
+  bool GemmTypedAccum(int M, int N, int K, const T *A, const T *B, T *C);
 
   /**
    * Strided batched GEMM for GQA attention.

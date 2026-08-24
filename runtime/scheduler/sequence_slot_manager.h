@@ -18,20 +18,49 @@ enum class SequenceState {
   kIdle,       // Available for new requests
   kPrefilling, // Processing prompt (prefill phase)
   kDecoding,   // Generating tokens (decode phase)
+  kRetiring,   // Backend cleanup fence pending before reuse
   kCompleted,  // Finished, waiting for cleanup
   kEvicted     // Timed out and evicted
+};
+
+/**
+ * @brief Fence metadata for deferred slot reuse.
+ *
+ * The initial implementation is time-based so the scheduler can prove
+ * generation-safe delayed reuse in tests. Future native/backend integrations
+ * can replace the ready_at contract with CUDA/backend completion signals while
+ * keeping the same slot-manager state machine.
+ */
+struct SequenceRetireFence {
+  std::chrono::steady_clock::time_point ready_at{};
+
+  static SequenceRetireFence Immediate() {
+    return SequenceRetireFence{std::chrono::steady_clock::now()};
+  }
+
+  static SequenceRetireFence After(std::chrono::milliseconds grace_period) {
+    return SequenceRetireFence{
+        std::chrono::steady_clock::now() +
+        std::max(std::chrono::milliseconds(0), grace_period)};
+  }
+
+  static SequenceRetireFence Pending() {
+    return SequenceRetireFence{std::chrono::steady_clock::time_point::max()};
+  }
 };
 
 /**
  * @brief Represents a single KV cache slot for one sequence
  */
 struct SequenceSlot {
-  int slot_id;        // Slot number (0 to max_slots-1)
-  int64_t request_id; // Associated request ID
-  int sequence_id;    // Backend sequence ID
+  int slot_id;         // Slot number (0 to max_slots-1)
+  int64_t request_id;  // Associated request ID
+  int sequence_id;     // Backend sequence ID
+  uint64_t generation; // Monotonic acquisition generation for slot reuse safety
   SequenceState state;
   std::chrono::steady_clock::time_point last_access;
   std::chrono::steady_clock::time_point acquired_at;
+  std::chrono::steady_clock::time_point retire_ready_at;
   int token_count; // Tokens processed in this sequence
 
   /**
@@ -48,7 +77,21 @@ struct SequenceSlot {
 };
 
 /**
- * @brief Manages KV cache slots for both cuda_native and cuda_llama_cpp
+ * @brief Logical lease for a physical sequence slot.
+ *
+ * Generation is bumped on every acquisition so higher layers can distinguish a
+ * newly acquired slot from stale references to the same physical slot_id.
+ */
+struct SequenceLease {
+  int slot_id{-1};
+  uint64_t generation{0};
+  int64_t request_id{-1};
+
+  bool IsValid() const { return slot_id >= 0; }
+};
+
+/**
+ * @brief Manages KV cache slots for both inferflux_cuda and llama_cpp_cuda
  * backends
  *
  * This provides universal sequence slot management at the orchestration layer,
@@ -70,6 +113,13 @@ public:
   explicit SequenceSlotManager(size_t max_slots = 128);
 
   /**
+   * @brief Acquire a generation-stamped lease for a request.
+   * @param request_id Request ID for tracking
+   * @return Lease if available, nullopt if all slots in use
+   */
+  std::optional<SequenceLease> AcquireLease(int64_t request_id);
+
+  /**
    * @brief Acquire a slot for a request
    * @param request_id Request ID for tracking
    * @return Slot ID if available, nullopt if all slots in use
@@ -77,10 +127,40 @@ public:
   std::optional<int> AcquireSlot(int64_t request_id);
 
   /**
+   * @brief Mark a lease as retiring until its fence is ready.
+   * @param lease Lease to retire
+   * @param fence Fence controlling when the slot may be reused
+   * @return true if the live lease matched and entered retiring state
+   */
+  bool
+  RetireLease(const SequenceLease &lease,
+              SequenceRetireFence fence = SequenceRetireFence::Immediate());
+
+  /**
    * @brief Release a slot when sequence completes
    * @param slot_id Slot ID to release
    */
   void ReleaseSlot(int slot_id);
+
+  /**
+   * @brief Release a generation-validated lease when sequence completes
+   * @param lease Lease to release
+   * @return true if the live lease matched and was released, false otherwise
+   */
+  bool ReleaseLease(const SequenceLease &lease);
+
+  /**
+   * @brief Complete a lease already in retiring state and make it reusable
+   * @param lease Lease to complete
+   * @return true if the retiring lease matched and was reset to idle
+   */
+  bool CompleteRetiredLease(const SequenceLease &lease);
+
+  /**
+   * @brief Reap retiring slots whose fence is now ready.
+   * @return Number of slots transitioned back to idle
+   */
+  size_t ReapRetiredSlots();
 
   /**
    * @brief Evict idle sequences based on timeout
@@ -104,6 +184,26 @@ public:
   void UpdateTokenCount(int slot_id, int token_count);
 
   /**
+   * @brief Get the current generation for a slot
+   * @param slot_id Slot ID to inspect
+   * @return Generation if slot exists, nullopt otherwise
+   */
+  std::optional<uint64_t> CurrentGeneration(int slot_id) const;
+
+  /**
+   * @brief Check whether a lease still matches the live slot owner
+   * @param lease Lease to validate
+   * @return true if the slot is still owned by this generation
+   */
+  bool IsLiveLease(const SequenceLease &lease) const;
+
+  /**
+   * @brief Get number of retiring slots that are fenced from reuse
+   * @return Retiring slot count
+   */
+  size_t GetRetiringSlotCount() const;
+
+  /**
    * @brief Get number of currently used slots
    * @return Used slot count
    */
@@ -120,6 +220,25 @@ public:
    * @return Vector of slot status copies
    */
   std::vector<SequenceSlot> GetSlotStatus() const;
+
+  /**
+   * @brief Mark a live lease as retained for session/prefix reuse.
+   * @param lease Lease to mark completed
+   * @param token_count Tokens currently resident in the sequence
+   * @return true if the lease matched and was updated
+   */
+  bool MarkCompleted(const SequenceLease &lease, int token_count);
+
+  /**
+   * @brief Restore a completed retained lease for a new request.
+   * @param lease Existing retained lease
+   * @param request_id New request ID to bind
+   * @param sequence_id Backend sequence ID for the retained slot
+   * @param token_count Tokens already resident in the retained sequence
+   * @return true if the retained lease matched and was reactivated
+   */
+  bool RestoreLease(const SequenceLease &lease, int64_t request_id,
+                    int sequence_id, int token_count);
 
   /**
    * @brief Set maximum slot count (requires reinitialization)
@@ -195,6 +314,19 @@ private:
    */
   std::vector<std::pair<int, int>>
   EvictIdleSlotsLocked(std::chrono::milliseconds timeout);
+
+  /**
+   * @brief Internal retire reap (assumes lock already held)
+   * @param now Time used to evaluate ready fences
+   * @return Number of slots transitioned back to idle
+   */
+  size_t ReapRetiredSlotsLocked(std::chrono::steady_clock::time_point now);
+
+  /**
+   * @brief Reset a slot to idle/reusable state
+   * @param slot Slot to clear
+   */
+  void ResetSlotForReuse(SequenceSlot &slot);
 
   /**
    * @brief Internal free slot count (assumes lock already held)

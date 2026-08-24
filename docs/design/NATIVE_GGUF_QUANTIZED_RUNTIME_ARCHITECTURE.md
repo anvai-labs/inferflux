@@ -1,93 +1,69 @@
-# Native GGUF Quantized Runtime (Foundational Design)
+# Native GGUF Quantized Runtime Architecture
 
-Status: active design + foundational scaffolding merged
+**Snapshot date:** March 9, 2026
+**Status:** active foundation, broad fused kernel coverage, throughput gap remaining
+**See also:** [../GEMV_KERNEL_ARCHITECTURE](../GEMV_KERNEL_ARCHITECTURE.md) for kernel geometry and TDD details.
 
-## 1) Why this architecture
-
-```mermaid
-flowchart LR
-    A[Current pain]
-    A --> A1[Full dequantized caches inflate VRAM]
-    A --> A2[Weight precision tied to KV choices]
-    A --> A3[No explicit strategy contract by GGUF type + SM]
-
-    B[Target]
-    B --> B1[Quantized weights remain immutable + shared]
-    B --> B2[Paged KV has separate lifecycle]
-    B --> B3[Strategy registry selects runtime policy deterministically]
-
-    A --> B
-```
-
-## 2) Core runtime split
+## 1) Core Architecture
 
 ```mermaid
 flowchart TD
-    W[Model Weights]
-    W --> W1[GGUF quantized tensors on GPU]
-    W --> W2[Immutable, shared across requests]
-
-    K[KV Cache]
-    K --> K1[Paged allocation]
-    K --> K2[Prefix reuse + ref-counted blocks]
-    K --> K3[Eviction/offload lifecycle]
-
-    S[Session Layer]
-    S --> S1[API remains stateless by default]
-    S --> S2[Optional sticky session handle maps to sequence slot]
-
-    W --- K
-    K --- S
+    A[GGUF tensor metadata] --> B[Strategy registry]
+    B --> C[Weight layout strategy]
+    B --> D[Matmul strategy]
+    B --> E[Attention strategy]
+    C --> F[Native CUDA executor]
+    D --> F
+    E --> F
+    G[KV policy] --> F
 ```
 
-## 3) Strategy contracts (implemented foundation)
+## 2) Runtime Contract
 
-- `IWeightLayoutStrategy`: tensor layout policy per GGUF tensor type (`Q4_K`, `Q6_K`, `Q8_0`, `F16`, ...).
-- `IMatmulStrategy`: compute policy (`fused dequantize-tile+GEMM` vs compatibility path).
-- `IAttentionStrategy`: paged-KV attention policy keyed by KV precision + GPU SM capability.
-- `QuantizedRuntimeStrategyRegistry`: deterministic selection by `(tensor_type, kv_precision, sm_major/minor)`.
+| Plane | Contract |
+|---|---|
+| Weights | Stay in GGUF-native precision/layout as the source of truth |
+| Dequant policy | `none`, `batch`, or `model`; native quantized default is memory-first `none` |
+| KV cache | Separate lifecycle from weights; precision is fixed at model-load scope |
+| Strategy selection | Deterministic by tensor type, KV precision, and GPU capability |
+| API model | Stateless by default; optional session lease sits above the runtime |
 
-```mermaid
-sequenceDiagram
-    participant Loader as GGUF Loader
-    participant Registry as Strategy Registry
-    participant Runtime as Native Runtime
+## 3) Current Code Reality
 
-    Loader->>Registry: select(tensor_type, kv_precision, sm)
-    Registry-->>Runtime: weight_layout + matmul + attention strategies
-    Runtime->>Runtime: enforce/trace selected policy at startup
-```
-
-## 4) Precision policy contract
-
-| Plane | Policy | Current implementation |
+| Area | Implemented now | Still missing |
 |---|---|---|
-| Weights | From GGUF tensor metadata | Enabled |
-| KV cache | `auto|fp16|bf16|int8|fp8` | `auto/fp16/bf16` active; `int8/fp8` declared + guarded fallback |
-| Dequantized temp cache | `batch|model` | `batch` default (memory-efficient), `model` opt-in |
+| Loader selection | Loader detected from artifact structure/metadata | None at the contract level |
+| GEMV kernel coverage | 50+ fused kernels: v1 column-major (standard, dp4a, RmsNorm-fused, packed int8, Q8_1 single/pair/triple/rowpair/rowquad/colpair, MMQ) + v2 cooperative-warp (Q4_K/Q6_K/Q8_0/Q8_K single, grouped, rowpair). V2 default for K≥1024: 4 warps collaborate on 1 output for L2-coherent weight access. Env control: `INFERFLUX_GEMV_V1=1`/`INFERFLUX_GEMV_V2=1`. | V2 awaiting GPU benchmark validation (target ≥55% bandwidth) |
+| Activation quantization | Q8_1 pre-quantized path (per-32-element blocks matching llama.cpp format). Fused RmsNorm+Quantize kernels for norm groups. Activation reuse across sibling projections via L2 cache. | No persistent thread GEMV or kernel fusion across projections |
+| Batched decode | BatchedRoPE, BatchedKvAppend, FlashDecodeMultiSeq default-on. CUDA graphs captured for B=1-4. Row-pair/quad dispatch active. Opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1`. | None — promoted to default |
+| Native logprobs | GPU logits D2H + `ComputeLogprob()`. `SupportsLogprobsContract() = true`. OpenAI `logprobs`/`top_logprobs` spec. | None — no parity delegate needed |
+| Native embeddings | Full forward + final RmsNorm + `MeanPool` kernel. `SupportsEmbeddingsContract() = true`. `/v1/embeddings` on native path. | Delegate fallback only if native fails |
+| Dispatch policy | Adaptive threshold `base_threshold(SM) * 16/bpw` with geometry-aware boosts. Priority: Q8_1 > packed > fused RmsNorm+GEMV > standard GEMV > cuBLAS. | Threshold tuning is empirical, not auto-calibrated |
+| Memory policy | `dequant_cache_policy=none` is the default. Q8_1 path needs zero dequantized caches. | None at the policy level |
+| KV policy | KV precision is load-scoped; planner auto-tunes sequence budget against VRAM. `INFERFLUX_CUDA_KV_MAX_BATCH` / `INFERFLUX_CUDA_KV_MAX_SEQ` for explicit sizing. | Lower-precision KV needs proof |
+| TDD coverage | 100+ kernel correctness tests, 15+ dispatch geometry tests, 7 batched decode tests, 8 metrics tests | GPU CI lane not yet required |
 
-Decision: KV precision is fixed at model-load (server lifecycle), not per request.
+## 4) Design Rules
 
-Rationale:
-- avoids mixed-page ABI fragmentation,
-- avoids per-request kernel graph churn,
-- keeps scheduler admission deterministic.
+1. Do not pre-dequantize whole models by default.
+2. Keep weight precision and KV precision decoupled.
+3. Treat batching quality as the throughput lever; async is not the design target here.
+4. Use GGUF metadata, not filenames, as the source of truth for behavior.
+5. Mirror vendored `llama.cpp` at the operator-family level: keep a small-envelope path and a tiled path, then select explicitly by geometry.
 
-## 5) Stateless API + sessions
+## 5) Next Gates
 
-Default request model remains stateless.
+| Priority | Gate | Status |
+|---|---|---|
+| ~~P0~~ | ~~Close weight bandwidth gap~~ | **Done**: V1 column-major GEMV achieves 0.83x sequential parity on Qwen2.5-3B Q4_K_M. V2 cooperative-warp available via `INFERFLUX_GEMV_V2=1` for experimentation. |
+| ~~P0~~ | ~~Promote batched decode to default-on~~ | **Done**: default-on, opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1` |
+| ~~P0~~ | ~~Enable CUDA graph capture by default for batched decode~~ | **Done**: graphs captured and replayed for B=1-4, active alongside batched decode |
+| P1 | Keep memory-first dequant as the default | Done: Q8_1 path needs zero dequant caches |
+| P1 | Promote lower-precision KV only after quality proof | Not started |
 
-Session-capable behavior is layered above it:
-- request without session handle => ephemeral sequence slot,
-- request with session handle => stable slot mapping + TTL/eviction policy,
-- KV pages remain shared infra, while ownership/refcount controls lifecycle.
+## 6) Related Docs
 
-This keeps OpenAI-compatible APIs simple while enabling stateful optimization paths.
-
-## 6) Rollout phases
-
-1. Foundation (this change): strategy contracts + registry + KV precision policy decoupling.
-2. Runtime enforcement: strict gate to reject unsupported quantized paths when fused kernels required.
-3. Kernel progression: replace compatibility matmul path with fused dequantize-tile GEMM by GGUF type.
-4. Session layer: optional sticky-session contract with TTL + observability.
-5. KV quantization: add INT8/FP8 KV as opt-in once quality/perf gates pass.
+- [../GEMV_KERNEL_ARCHITECTURE](../GEMV_KERNEL_ARCHITECTURE.md)
+- [NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN](NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md)
+- [../GGUF_NATIVE_KERNEL_IMPLEMENTATION](../GGUF_NATIVE_KERNEL_IMPLEMENTATION.md)
+- [../MODERNIZATION_AUDIT](../MODERNIZATION_AUDIT.md)

@@ -4,12 +4,20 @@
 #include <nlohmann/json.hpp>
 
 #include <errno.h>
-#include <fcntl.h>
 #include <signal.h>
+#ifdef _WIN32
+#include <io.h>
+#include <process.h>
+#include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -117,6 +125,58 @@ bool ParsePrometheusMetricValue(const std::string &metrics_body,
       continue;
     }
     std::string value_str = Trim(line.substr(sep + 1));
+    try {
+      *value_out = std::stod(value_str);
+      return true;
+    } catch (...) {
+      continue;
+    }
+  }
+  return false;
+}
+
+bool ParsePrometheusLabeledMetricValue(
+    const std::string &metrics_body, const std::string &metric_name,
+    const std::vector<std::pair<std::string, std::string>> &labels,
+    double *value_out) {
+  if (!value_out || metric_name.empty()) {
+    return false;
+  }
+  std::stringstream ss(metrics_body);
+  std::string line;
+  while (std::getline(ss, line)) {
+    line = Trim(line);
+    if (line.empty() || line.front() == '#') {
+      continue;
+    }
+    if (line.rfind(metric_name, 0) != 0) {
+      continue;
+    }
+    if (line.size() <= metric_name.size() || line[metric_name.size()] != '{') {
+      continue;
+    }
+    const std::size_t labels_end = line.find('}', metric_name.size() + 1);
+    if (labels_end == std::string::npos) {
+      continue;
+    }
+    const std::string label_blob = line.substr(
+        metric_name.size() + 1, labels_end - metric_name.size() - 1);
+    bool labels_match = true;
+    for (const auto &[key, value] : labels) {
+      const std::string needle = key + "=\"" + value + "\"";
+      if (label_blob.find(needle) == std::string::npos) {
+        labels_match = false;
+        break;
+      }
+    }
+    if (!labels_match) {
+      continue;
+    }
+    const std::size_t sep = line.find_last_of(" \t");
+    if (sep == std::string::npos || sep + 1 >= line.size()) {
+      continue;
+    }
+    const std::string value_str = Trim(line.substr(sep + 1));
     try {
       *value_out = std::stod(value_str);
       return true;
@@ -350,6 +410,115 @@ void PrintAdminModelsTable(const json &payload) {
   }
 }
 
+std::string JsonValueToText(const json &value) {
+  if (value.is_null()) {
+    return "n/a";
+  }
+  if (value.is_boolean()) {
+    return value.get<bool>() ? "yes" : "no";
+  }
+  if (value.is_string()) {
+    return value.get<std::string>();
+  }
+  return value.dump();
+}
+
+std::string JsonThresholdPair(const json &value, const json &threshold) {
+  if (value.is_null() && threshold.is_null()) {
+    return "n/a";
+  }
+  if (threshold.is_null()) {
+    return JsonValueToText(value);
+  }
+  return JsonValueToText(value) + " / " + JsonValueToText(threshold);
+}
+
+void PrintAdminPoolsSectionHeader(const std::string &title) {
+  std::cout << title << "\n" << std::string(title.size(), '-') << "\n";
+}
+
+void PrintAdminPoolsRow(const std::string &label, const std::string &value) {
+  constexpr int kLabelW = 27;
+  std::cout << std::left << std::setw(kLabelW) << label << value << "\n";
+}
+
+void PrintAdminPoolsTable(const json &payload) {
+  if (!payload.is_object() || !payload.contains("pool_health") ||
+      !payload.contains("scheduler") || !payload.contains("distributed_kv")) {
+    std::cout << payload.dump() << std::endl;
+    return;
+  }
+
+  const json &pool = payload["pool_health"];
+  const json &scheduler = payload["scheduler"];
+  const json &disagg = payload["distributed_kv"];
+
+  PrintAdminPoolsSectionHeader("POOL HEALTH");
+  PrintAdminPoolsRow("Ready", JsonValueToText(pool.value("ready", false)));
+  PrintAdminPoolsRow("HTTP status",
+                     JsonValueToText(pool.value("http_status", json(nullptr))));
+  PrintAdminPoolsRow("Role",
+                     JsonValueToText(pool.value("role", json(nullptr))));
+  PrintAdminPoolsRow("Reason",
+                     JsonValueToText(pool.value("reason", json(nullptr))));
+  PrintAdminPoolsRow("Model loaded", JsonValueToText(pool.value(
+                                         "model_loaded", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Decode pool warm",
+      JsonValueToText(pool.value("decode_pool_warm", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Transport degraded",
+      JsonValueToText(pool.value("disagg_transport_degraded", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Timeout debt",
+      JsonThresholdPair(
+          pool.value("disagg_timeout_debt", json(nullptr)),
+          pool.value("disagg_timeout_debt_threshold", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Timeout streak",
+      JsonThresholdPair(
+          pool.value("disagg_timeout_streak", json(nullptr)),
+          pool.value("disagg_timeout_streak_threshold", json(nullptr))));
+
+  std::cout << "\n";
+  PrintAdminPoolsSectionHeader("SCHEDULER");
+  PrintAdminPoolsRow("Queue depth", JsonValueToText(scheduler.value(
+                                        "queue_depth", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Prefill queue depth",
+      JsonValueToText(scheduler.value("prefill_queue_depth", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Decode queue depth",
+      JsonValueToText(scheduler.value("decode_queue_depth", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Batch limit size",
+      JsonValueToText(scheduler.value("batch_limit_size", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Batch limit tokens",
+      JsonValueToText(scheduler.value("batch_limit_tokens", json(nullptr))));
+
+  std::cout << "\n";
+  PrintAdminPoolsSectionHeader("DISTRIBUTED KV");
+  PrintAdminPoolsRow(
+      "Enqueue rejections",
+      JsonValueToText(disagg.value("enqueue_rejections_total", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Enqueue exhausted",
+      JsonValueToText(disagg.value("enqueue_exhausted_total", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Tickets enqueued",
+      JsonValueToText(disagg.value("tickets_enqueued_total", json(nullptr))));
+  PrintAdminPoolsRow("Tickets acknowledged",
+                     JsonValueToText(disagg.value("tickets_acknowledged_total",
+                                                  json(nullptr))));
+  PrintAdminPoolsRow(
+      "Tickets committed",
+      JsonValueToText(disagg.value("tickets_committed_total", json(nullptr))));
+  PrintAdminPoolsRow(
+      "Tickets timed out",
+      JsonValueToText(disagg.value("tickets_timed_out_total", json(nullptr))));
+}
+
 void PrintUsage() {
   std::cout
       << "Usage:\n"
@@ -398,7 +567,8 @@ void PrintUsage() {
          "                         [--fallback-scope any_compatible|"
          "same_path_only]]\n"
          "                        [--host ... --port ... --api-key KEY]\n"
-      << "  inferctl admin pools --get [--host ... --port ... --api-key KEY]\n"
+      << "  inferctl admin pools --get [--json|--table] [--host ... --port "
+         "... --api-key KEY]\n"
       << "  inferctl admin models --list | --load PATH [--backend TYPE] [--id "
          "NAME] [--default] [--json]\n"
          "                       | --unload ID | --set-default ID [--host ... "
@@ -891,6 +1061,19 @@ std::filesystem::path ServerLogFile() {
   return InferfluxHome() / "logs" / "server.log";
 }
 
+#ifdef _WIN32
+// Windows helper: check if a process with the given PID is still running.
+bool IsProcessRunning(DWORD pid) {
+  HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+  if (h == nullptr)
+    return false;
+  DWORD exit_code = 0;
+  bool running = GetExitCodeProcess(h, &exit_code) && exit_code == STILL_ACTIVE;
+  CloseHandle(h);
+  return running;
+}
+#endif
+
 bool IsServerRunning() {
   auto pid_file = ServerPidFile();
   if (!std::filesystem::exists(pid_file)) {
@@ -902,6 +1085,11 @@ bool IsServerRunning() {
     return false;
   }
 
+#ifdef _WIN32
+  DWORD pid;
+  pid_file_stream >> pid;
+  return IsProcessRunning(pid);
+#else
   pid_t pid;
   pid_file_stream >> pid;
 
@@ -910,6 +1098,7 @@ bool IsServerRunning() {
     return true; // Process exists
   }
   return false; // Process doesn't exist
+#endif
 }
 
 int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
@@ -926,6 +1115,22 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
   std::filesystem::create_directories(log_file.parent_path());
 
   // Build server binary path
+#ifdef _WIN32
+  std::string server_bin = ".\\build\\inferfluxd.exe";
+  if (!std::filesystem::exists(server_bin)) {
+    // Try relative path from inferctl
+    char exe_path[MAX_PATH];
+    DWORD len = GetModuleFileNameA(nullptr, exe_path, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+      std::filesystem::path exe_dir =
+          std::filesystem::path(exe_path).parent_path();
+      server_bin = (exe_dir / "inferfluxd.exe").string();
+      if (!std::filesystem::exists(server_bin)) {
+        server_bin = (exe_dir / "..\\inferfluxd.exe").string();
+      }
+    }
+  }
+#else
   std::string server_bin = "./build/inferfluxd";
   if (!std::filesystem::exists(server_bin)) {
     // Try relative path from inferctl
@@ -935,12 +1140,13 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
       exe_path[len] = '\0';
       std::filesystem::path exe_dir =
           std::filesystem::path(exe_path).parent_path();
-      server_bin = exe_dir / "inferfluxd";
+      server_bin = (exe_dir / "inferfluxd").string();
       if (!std::filesystem::exists(server_bin)) {
-        server_bin = exe_dir / "../inferfluxd";
+        server_bin = (exe_dir / "../inferfluxd").string();
       }
     }
   }
+#endif
 
   if (!std::filesystem::exists(server_bin)) {
     std::cerr << "Error: Server binary not found at " << server_bin << "\n";
@@ -949,6 +1155,111 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
     return 1;
   }
 
+#ifdef _WIN32
+  // Start server as a detached process with output redirected to log file
+  SECURITY_ATTRIBUTES sa;
+  sa.nLength = sizeof(sa);
+  sa.lpSecurityDescriptor = nullptr;
+  sa.bInheritHandle = TRUE;
+
+  HANDLE log_handle = CreateFileA(log_file.string().c_str(), FILE_APPEND_DATA,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, &sa,
+                                  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (log_handle == INVALID_HANDLE_VALUE) {
+    std::cerr << "Error: Failed to open log file: " << log_file << "\n";
+    return 1;
+  }
+
+  STARTUPINFOA si = {};
+  si.cb = sizeof(si);
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdInput = INVALID_HANDLE_VALUE;
+  si.hStdOutput = log_handle;
+  si.hStdError = log_handle;
+
+  PROCESS_INFORMATION pi = {};
+  std::string cmd_line = server_bin + " --config " + config_path;
+
+  if (!CreateProcessA(nullptr, const_cast<char *>(cmd_line.c_str()), nullptr,
+                      nullptr, TRUE, DETACHED_PROCESS, nullptr, nullptr, &si,
+                      &pi)) {
+    std::cerr << "Error: Failed to start server process (error "
+              << GetLastError() << ")\n";
+    CloseHandle(log_handle);
+    return 1;
+  }
+
+  DWORD pid = pi.dwProcessId;
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  CloseHandle(log_handle);
+
+  // Write PID file
+  {
+    std::ofstream pid_file_stream(ServerPidFile());
+    pid_file_stream << pid << "\n";
+  }
+
+  std::cout << "Starting InferFlux server (PID: " << pid << ")...\n";
+  std::cout << "Config: " << config_path << "\n";
+  std::cout << "Logs: " << log_file << "\n";
+
+  if (wait_for_ready) {
+    std::cout << "Waiting for server to be ready...";
+    std::cout.flush();
+
+    auto start = std::chrono::steady_clock::now();
+    bool ready = false;
+
+    while (std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::steady_clock::now() - start)
+               .count() < timeout_sec) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      std::cout << ".";
+      std::cout.flush();
+
+      // Check if process is still running
+      if (!IsProcessRunning(pid)) {
+        std::cout << "\n";
+        std::cerr << "Error: Server process died unexpectedly\n";
+        std::filesystem::remove(ServerPidFile());
+        return 1;
+      }
+
+      // Try health endpoint
+      try {
+        inferflux::HttpClient client;
+        auto headers = AuthHeaders("");
+        auto resp =
+            client.Get(BuildUrl("127.0.0.1", 8080, "/healthz"), headers);
+        if (resp.status == 200) {
+          ready = true;
+          break;
+        }
+      } catch (...) {
+        // Server not ready yet
+      }
+    }
+
+    std::cout << "\n";
+
+    if (ready) {
+      std::cout << "Server is ready!\n";
+      std::cout << "  API: http://127.0.0.1:8080\n";
+      std::cout << "  Health: http://127.0.0.1:8080/healthz\n";
+      std::cout << "  Metrics: http://127.0.0.1:8080/metrics\n";
+      return 0;
+    } else {
+      std::cerr << "Error: Server failed to become ready after " << timeout_sec
+                << " seconds\n";
+      std::cerr << "Check logs at: " << log_file << "\n";
+      return 1;
+    }
+  }
+
+  return 0;
+}
+#else
   // Start server in background
   pid_t pid = fork();
   if (pid < 0) {
@@ -1044,6 +1355,7 @@ int CmdServerStart(const std::string &config_path, bool wait_for_ready = true,
 
   return 0;
 }
+#endif
 
 int CmdServerStop(bool wait = true, int timeout_sec = 10) {
   auto pid_file = ServerPidFile();
@@ -1058,6 +1370,43 @@ int CmdServerStop(bool wait = true, int timeout_sec = 10) {
     return 1;
   }
 
+#ifdef _WIN32
+  DWORD pid;
+  pid_file_stream >> pid;
+
+  // Check if process is running
+  if (!IsProcessRunning(pid)) {
+    std::cerr << "Server process (PID " << pid << ") is not running\n";
+    std::filesystem::remove(pid_file);
+    return 0;
+  }
+
+  std::cout << "Stopping server (PID: " << pid << ")...";
+  std::cout.flush();
+
+  // Terminate the process
+  HANDLE proc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+  if (proc == nullptr) {
+    std::cerr << "\nError: Failed to open server process (error "
+              << GetLastError() << ")\n";
+    return 1;
+  }
+
+  if (!TerminateProcess(proc, 0)) {
+    std::cerr << "\nError: Failed to terminate server process (error "
+              << GetLastError() << ")\n";
+    CloseHandle(proc);
+    return 1;
+  }
+
+  if (wait) {
+    WaitForSingleObject(proc, timeout_sec * 1000);
+  }
+
+  CloseHandle(proc);
+
+  std::cout << "\nServer stopped\n";
+#else
   pid_t pid;
   pid_file_stream >> pid;
 
@@ -1103,6 +1452,7 @@ int CmdServerStop(bool wait = true, int timeout_sec = 10) {
   }
 
   std::cout << "\n✓ Server stopped\n";
+#endif
 
   // Clean up PID file
   std::filesystem::remove(pid_file);
@@ -1125,10 +1475,18 @@ int CmdServerStatus(bool verbose = false) {
     return 1;
   }
 
+#ifdef _WIN32
+  DWORD pid;
+#else
   pid_t pid;
+#endif
   pid_file_stream >> pid;
 
+#ifdef _WIN32
+  if (!IsProcessRunning(pid)) {
+#else
   if (kill(pid, 0) != 0) {
+#endif
     std::cout << "Server: " << "\033[31m" << "CRASHED" << "\033[0m"
               << " (PID file exists but process not running)\n";
     std::cout << "Cleaning up stale PID file...\n";
@@ -1200,8 +1558,14 @@ int CmdServerLogs(int tail_lines = 100) {
     return 1;
   }
 
+#ifdef _WIN32
+  std::string command = "powershell -Command \"Get-Content -Path '" +
+                        log_file.string() + "' -Tail " +
+                        std::to_string(tail_lines) + " -Wait\"";
+#else
   std::string command =
       "tail -n " + std::to_string(tail_lines) + " -f " + log_file.string();
+#endif
   int result = std::system(command.c_str());
 
   return (result == 0) ? 0 : 1;
@@ -1631,14 +1995,51 @@ int main(int argc, char **argv) {
       }
       if (target == "pools") {
         bool get = false;
+        bool output_json = false;
+        bool output_table = false;
         for (int i = 3; i < argc; ++i) {
           std::string arg = argv[i];
           if (arg == "--get") {
             get = true;
+          } else if (arg == "--json") {
+            output_json = true;
+          } else if (arg == "--table") {
+            output_table = true;
           }
         }
         if (!get) {
           std::cerr << "inferctl admin pools: --get is required" << std::endl;
+          return 1;
+        }
+        if (output_json && output_table) {
+          std::cerr << "inferctl admin pools: choose at most one of --json, "
+                       "--table"
+                    << std::endl;
+          return 1;
+        }
+        const bool render_table = output_table;
+
+        auto pools_resp =
+            client.Get(BuildUrl(host, port, "/v1/admin/pools"), headers);
+        if (pools_resp.status == 401 || pools_resp.status == 403) {
+          std::cerr << "inferctl admin pools --get: authentication required "
+                       "(set --api-key or INFERCTL_API_KEY)\n";
+          return 1;
+        }
+        if (IsHttpSuccess(pools_resp.status)) {
+          if (render_table) {
+            try {
+              PrintAdminPoolsTable(json::parse(pools_resp.body));
+            } catch (const json::exception &) {
+              std::cout << pools_resp.body << std::endl;
+            }
+          } else {
+            std::cout << pools_resp.body << std::endl;
+          }
+          return 0;
+        }
+        if (pools_resp.status != 404) {
+          std::cout << pools_resp.body << std::endl;
           return 1;
         }
 
@@ -1684,6 +2085,21 @@ int main(int argc, char **argv) {
           }
           return json(value);
         };
+        auto labeled_metric_or_null =
+            [&](const std::string &name,
+                const std::vector<std::pair<std::string, std::string>> &labels)
+            -> json {
+          double value = 0.0;
+          if (!ParsePrometheusLabeledMetricValue(metrics_resp.body, name,
+                                                 labels, &value)) {
+            return json(nullptr);
+          }
+          double rounded = std::round(value);
+          if (std::fabs(value - rounded) < 1e-9) {
+            return json(static_cast<int64_t>(rounded));
+          }
+          return json(value);
+        };
 
         json scheduler_metrics{
             {"queue_depth", metric_or_null("inferflux_scheduler_queue_depth")},
@@ -1696,6 +2112,24 @@ int main(int argc, char **argv) {
             {"batch_limit_tokens",
              metric_or_null("inferflux_scheduler_batch_limit_tokens")},
         };
+        json distributed_kv{
+            {"enqueue_rejections_total",
+             metric_or_null("inferflux_disagg_kv_enqueue_rejections_total")},
+            {"enqueue_exhausted_total",
+             metric_or_null("inferflux_disagg_kv_enqueue_exhausted_total")},
+            {"tickets_enqueued_total",
+             labeled_metric_or_null("inferflux_disagg_kv_tickets_total",
+                                    {{"stage", "enqueued"}})},
+            {"tickets_acknowledged_total",
+             labeled_metric_or_null("inferflux_disagg_kv_tickets_total",
+                                    {{"stage", "acknowledged"}})},
+            {"tickets_committed_total",
+             labeled_metric_or_null("inferflux_disagg_kv_tickets_total",
+                                    {{"stage", "committed"}})},
+            {"tickets_timed_out_total",
+             labeled_metric_or_null("inferflux_disagg_kv_tickets_total",
+                                    {{"stage", "timed_out"}})},
+        };
 
         json payload{
             {"status", "ok"},
@@ -1703,10 +2137,36 @@ int main(int argc, char **argv) {
              {{"ready", ready_payload.value("status", "") == "ready"},
               {"http_status", ready_resp.status},
               {"role", ready_payload.value("role", "unknown")},
-              {"reason", ready_payload.value("reason", "")}}},
+              {"reason", ready_payload.value("reason", "")},
+              {"model_loaded", ready_payload.value("model_loaded", false)},
+              {"decode_pool_warm",
+               ready_payload.value("decode_pool_warm", false)},
+              {"disagg_transport_degraded",
+               ready_payload.value("disagg_transport_degraded", false)},
+              {"disagg_timeout_debt",
+               ready_payload.contains("disagg_timeout_debt")
+                   ? ready_payload["disagg_timeout_debt"]
+                   : metric_or_null("inferflux_disagg_kv_timeout_debt")},
+              {"disagg_timeout_debt_threshold",
+               ready_payload.contains("disagg_timeout_debt_threshold")
+                   ? ready_payload["disagg_timeout_debt_threshold"]
+                   : json(nullptr)},
+              {"disagg_timeout_streak",
+               ready_payload.contains("disagg_timeout_streak")
+                   ? ready_payload["disagg_timeout_streak"]
+                   : json(nullptr)},
+              {"disagg_timeout_streak_threshold",
+               ready_payload.contains("disagg_timeout_streak_threshold")
+                   ? ready_payload["disagg_timeout_streak_threshold"]
+                   : json(nullptr)}}},
             {"scheduler", scheduler_metrics},
+            {"distributed_kv", distributed_kv},
         };
-        std::cout << payload.dump() << std::endl;
+        if (render_table) {
+          PrintAdminPoolsTable(payload);
+        } else {
+          std::cout << payload.dump() << std::endl;
+        }
         return 0;
       }
       if (target == "models") {

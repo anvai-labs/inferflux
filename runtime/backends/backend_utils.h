@@ -1,6 +1,6 @@
 #pragma once
 
-// Shared utilities used by multiple backends (LlamaCPUBackend, MlxBackend).
+// Shared utilities used by multiple backends (LlamaCppBackend, MlxBackend).
 // Keep this header dependency-free: no llama.h, no mlx headers.
 
 #include "runtime/logprob.h"
@@ -91,6 +91,29 @@ ComputeLogprob(const float *logits, int vocab_size, int32_t token_id,
     }
   }
   return tlp;
+}
+
+// Collect the top-k raw logits without applying softmax.
+inline std::vector<TopLogitEntry>
+ComputeTopLogits(const float *logits, int vocab_size, int top_n,
+                 const std::function<std::string(int32_t)> &id_to_token) {
+  if (!logits || vocab_size <= 0 || top_n <= 0) {
+    return {};
+  }
+
+  const int k = std::min(top_n, vocab_size);
+  std::vector<int> indices(vocab_size);
+  std::iota(indices.begin(), indices.end(), 0);
+  std::partial_sort(indices.begin(), indices.begin() + k, indices.end(),
+                    [&](int a, int b) { return logits[a] > logits[b]; });
+
+  std::vector<TopLogitEntry> out;
+  out.reserve(k);
+  for (int i = 0; i < k; ++i) {
+    const int token_id = indices[i];
+    out.push_back({id_to_token(token_id), logits[token_id]});
+  }
+  return out;
 }
 
 } // namespace inferflux

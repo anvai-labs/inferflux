@@ -1,4 +1,4 @@
-# InferFlux Native CUDA Configuration
+# InferFlux CUDA Configuration
 # DEPRECATED: Use server.cuda.safetensors.yaml instead
 # This file is kept for backwards compatibility
 
@@ -13,7 +13,7 @@ models:
   - id: qwen2.5-3b-native
     path: models/qwen2.5-3b-instruct-safetensors
     format: safetensors
-    backend: cuda_native            # Fixed: was "cuda"
+    backend: inferflux_cuda         # Fixed: was "cuda"
     default: true
 
 runtime:
@@ -31,7 +31,7 @@ runtime:
       prefill_replica: false
 
   backend_exposure:
-    prefer_native: true
+    prefer_inferflux: true
     allow_llama_cpp_fallback: true   # Fixed: was false (allow fallback for resilience)
 
   capability_routing:
@@ -90,6 +90,6 @@ registry:
   poll_interval_ms: 5000
 
 # NOTE: This config requires:
-#   backend: cuda_native
+#   backend: inferflux_cuda
 #
 # For a better-documented version, see server.cuda.safetensors.yaml

@@ -1,89 +1,97 @@
 # InferFlux Tech Debt and Competitive Roadmap
 
-**Snapshot date:** March 8, 2026  
-**Current overall grade:** B (contract maturity improved; throughput remains the main limiter)  
-**Purpose:** Debt heatmap tied to issue-backed retirement gates.
+**Snapshot date:** March 9, 2026
+**Current overall grade:** B
+**Purpose:** Rank the debt that most directly blocks best-in-class runtime credibility.
 
 ```mermaid
 flowchart TB
     A[Current B] --> B[Strengths]
-    A --> C[Debt Hotspots]
-
-    B --> B1[API/Admin contract rigor]
-    B --> B2[Security + policy posture]
-    B --> B3[Backend identity surfaced]
-
-    C --> C1[GPU batching maturity]
-    C --> C2[Native parity dependency debt]
-    C --> C3[GPU CI enforcement gap]
-    C --> C4[Distributed failure coverage]
+    A --> C[Debt hotspots]
+    B --> B1[Control-plane rigor]
+    B --> B2[Explicit backend identity]
+    B --> B3[Native feature ownership]
+    C --> C1[Quantized native throughput]
+    C --> C2[Distributed ownership maturity]
+    C --> C3[Required GPU release enforcement]
 ```
 
 ## 1) Dimension Grades
 
 | Dimension | Grade | Strong today | Weak today |
 |---|---|---|---|
-| Vision/product coherence | B+ | OSS control-plane direction is backed by native behavior-gate evidence and strict provider identity | Heavy-batch narrative still trails enterprise target |
-| Capabilities | B+ | Strong model/admin/CLI contracts, machine-visible backend identity metadata, and endpoint parity contracts for completion/chat/embeddings | Native parity is currently delegate-coupled for some model-format combinations |
-| Scalability/economy | B- | Fairness + phased execution + prefix-cache + active mixed scheduler iterations | GPU iteration policy/tail-latency tuning still immature |
-| Resource efficiency | B | KV/dequant lifecycle controls are load-scoped; GGUF overlap no longer hard-disabled | Quantized GGUF path still needs fused maturity and larger-model validation |
-| Design/implementation | B+ | Clear provider split (`llama_cpp` compatibility vs `native` performance core), deterministic fallback policy, and explicit endpoint capability contracts | Native async unified-batch contract remains disabled; parity path still has delegate complexity |
-| TDD/CI maturity | B+ | Focused contract gates explicitly visible in CI and coverage jobs | Mandatory GPU behavior lane still environment-dependent |
-| OSS docs/operator clarity | B+ | Canonical docs consolidated and contract-checked | Some non-canonical references still carry legacy wording |
+| Vision/product coherence | B+ | Clear server-first product shape and explicit dual-CUDA strategy | Native-throughput story still runs ahead of proof on quantized GGUF |
+| Capabilities | A- | Logprobs (native), embeddings (native), streaming, structured output (delegate), strong API/admin/CLI contracts | Structured output still delegates to llama.cpp fallback |
+| Scalability/economy | C+ | Fairness, phased execution, prefix reuse, split roles, batched decode default-on, and transport-health semantics | Distributed ownership/cleanup semantics are still shallow |
+| Resource efficiency | A- | KV planner, load-scoped precision, memory-first dequant, 50+ fused GEMV kernels, batched decode default-on with CUDA graph capture, execution policy refactor. Sequential parity 0.83x llama.cpp on Qwen2.5-3B Q4_K_M (P0 gate met). | Concurrent throughput gap remains (0.50x at concurrency=4); memory overhead ~1.6 GB vs llama.cpp |
+| Design/implementation | B | Clean provider split, bounded session-state model, native-owned logprobs and embeddings | Transitional complexity remains until throughput and structured output close |
+| TDD/CI maturity | B+ | 100+ kernel tests, 25+ sampling/logprob tests, contract suites explicit | Required GPU/provider lane is still missing |
+| OSS docs/operator clarity | A- | Canonical docs are compact and code-aligned | None significant |
 
-## 2) Revalidated Evidence (Code + Latest Gates)
+## 2) Revalidated Evidence
 
 | Evidence | Result | Implication |
 |---|---|---|
-| Backend provider contract (`runtime/backends/backend_factory.*`) | Explicit provider enum + exposure policy (`allow_llama_cpp_fallback`, `strict_native_request`) | Identity semantics are now source-aligned |
-| Router/API exposure surfaces (`scheduler/single_model_router.cpp`, `server/http/http_server.cpp`) | Backend provider/fallback fields are machine-visible | Automation-facing identity checks are robust |
-| Endpoint parity routing contract (`scheduler/single_model_router.cpp`, `runtime/backends/cuda/native_cuda_backend.cpp`) | Native capability map is explicit per endpoint and no longer blanket-gated for completion/chat/embeddings | Fallback decisions are policy-driven rather than capability-gap-driven when parity path is available |
-| Scheduler parity safety (`scheduler/scheduler.cpp`) | Logprobs/structured-output requests stay on full-generate path instead of phased prefill/decode split | Avoids cross-path sequence/sampler state divergence |
-| Native readiness gate (`runtime/backends/cuda/native_cuda_backend.cpp`) | Native readiness auto-detects compiled kernels + CUDA device availability (with env override to force scaffold) | Default CUDA requests can opt into native path without manual executor hints |
-| CUDA fallback chain (`scheduler/single_model_router.cpp`) | Ordered chain: `cuda -> cuda_llama_cpp -> rocm -> mlx -> mps -> cpu` (unsupported targets skipped) | Improves survivability and keeps fallback behavior predictable |
-| Native concurrency contract (`runtime/backends/cuda/native_kernel_executor.cpp`) | Decode/prefill overlap path is active in synchronous execution; async unified-batch contract is intentionally disabled | Throughput gains exist, but contract-level async parity remains open |
-| GGUF overlap safety (`runtime/backends/cuda/native_kernel_executor.cpp`) | GGUF overlap initialization now uses lane-local quantized map/adapter ownership | Removes prior hard disablement and dequant-scratch sharing risk in overlap mode |
-| Throughput gate evidence (Ada RTX 4000, Qwen2.5-3B safetensors, March 8, 2026) | Strict gate passes with native provider, no fallback, active decode/prefill lanes, active overlap, and mixed scheduler iterations | Confirms native CUDA path is now materially active in real gate workloads |
-| Strict-native admin contract (`scheduler/single_model_router.cpp`, `server/http/http_server.cpp`) | Strict native load rejection now surfaces `422 backend_policy_violation` consistently | Preserves fail-fast policy semantics for automation and operations |
-| Contract suites + docs contract | Focused identity/arg-contract/docs checks are present | CI confidence improved on control-plane correctness |
+| Backend/provider contract | Explicit provider/fallback semantics in runtime, API, CLI, admin, and metrics | Strong automation and policy posture |
+| Native logprobs | Logprobs computed natively (GPU logits D2H + log-softmax + top-N). `SupportsLogprobsContract() = true`. No parity delegate needed. | OpenAI logprobs/top_logprobs spec fully supported on native path |
+| InferFlux CUDA embeddings | Mean-pooled embedding extraction via full forward + final RmsNorm + MeanPool kernel. `SupportsEmbeddingsContract() = true`. Falls back to delegate only if InferFlux CUDA extraction fails. | `/v1/embeddings` works on InferFlux CUDA without llama.cpp delegate |
+| Batched decode default-on | Batched kernels (BatchedRoPE, KvAppend, FlashDecodeMultiSeq) are now default-on. Opt-out via `INFERFLUX_DISABLE_BATCHED_DECODE=1`. Verified with 8 concurrent Qwen2.5-3B requests + CUDA graphs for B=1-4. | 40% throughput gain for concurrent workloads without operator action |
+| Native memory-economy foundation | `dequant_cache_policy=none`, KV planner, and native KV metrics are wired | Good edge-device direction; Q8_1 path improved TinyLlama throughput 49% (161 -> 240 tok/s) |
+| Native kernel maturity | 50+ fused GEMV kernels (v1 column-major + v2 cooperative-warp), 3 batched decode kernels, adaptive dispatch geometry, 100+ TDD test cases, execution policy refactor (env vars centralized into `NativeExecutionPolicy`) | Kernel coverage is broad; v2 cooperative-warp architecture targets L2 bandwidth gap |
+| Session handle foundation | Optional TTL-based session leases exist in unified scheduler mode | Correct contract direction without changing default stateless behavior |
+| Distributed transport foundation | Ticket lifecycle, timeout streak/debt, readiness impact, admin pools visibility, and optional fail-closed generation admission are implemented | Moves distributed runtime beyond scaffold-only claims, but not yet to robust ownership maturity |
 
-## 3) Debt Register (Actionable)
+## 3) Debt Register
 
-| Priority | Debt item | Impact | Retirement gate | Issue |
+| Priority | Debt item | Why it matters | Retirement gate | Status |
 |---|---|---|---|---|
-| P0 | Native heavy-batch/quantized throughput maturity | Enterprise throughput/cost lag | Sustained uplift on larger models and bursty batches with strict native policy intact | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
-| P1 | GPU continuous batching maturity | Throughput/cost lag | Iteration scheduler + non-regression gates | [#3](https://github.com/vjsingh1984/inferflux/issues/3) |
-| P1 | GPU KV page allocator/reuse maturity | Recompute overhead and weaker token economy | Correctness + reuse metrics + stable throughput uplift | [#4](https://github.com/vjsingh1984/inferflux/issues/4) |
-| P1 | Native attention/quantized kernel maturity | Performance ceiling on large/quantized workloads | Fused native kernels + validated GGUF quantized overlap path with benchmark/regression coverage | [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
-| P1 | Native-first endpoint parity independence | Delegate coupling can hide parity fragility on some model-format layouts | Core parity features operate without llama.cpp delegate dependence | [#6](https://github.com/vjsingh1984/inferflux/issues/6), [#7](https://github.com/vjsingh1984/inferflux/issues/7) |
-| P1 | Native async unified-batch contract parity | Scheduler/backends cannot yet rely on uniform async behavior from native path | Re-enable native async contract with latency and correctness non-regression gates | [#3](https://github.com/vjsingh1984/inferflux/issues/3), [#8](https://github.com/vjsingh1984/inferflux/issues/8) |
-| P1 | Scheduler lock contention | Queue latency under load | Lock partitioning + contention regressions | [#8](https://github.com/vjsingh1984/inferflux/issues/8) |
-| P1 | Economy metrics for autoscaling | Cost/SLO blind spots | Metrics integrated into policy and runbooks | [#9](https://github.com/vjsingh1984/inferflux/issues/9) |
-| P2 | Mandatory GPU CI behavioral lane | Regressions can slip by infra variance | Merge-blocking GPU behavior lane | [#5](https://github.com/vjsingh1984/inferflux/issues/5), [#10](https://github.com/vjsingh1984/inferflux/issues/10) |
-| P2 | Distributed failure-path contracts | Enterprise resilience risk | Fault-injection matrix in integration CI | [#11](https://github.com/vjsingh1984/inferflux/issues/11) |
+| ~~P0~~ | ~~Quantized GGUF native throughput parity~~ | **Done**: V1 column-major GEMV achieves 0.83x llama.cpp sequential on Qwen2.5-3B Q4_K_M (72.8 vs 88.6 tok/s). V2 cooperative-warp available via `INFERFLUX_GEMV_V2=1` but slower on Ada (0.79x). | ~~Native sequential decode reaches >= 0.8x llama.cpp~~ | **Done** |
+| P1 | Distributed sequence ownership cleanup | Transport signaling without deterministic cleanup still limits real distributed credibility | Eviction, timeout, and worker-loss cleanup are explicit and tested | Not started |
+| P1 | Native structured output | Delegate coupling remains for grammar-constrained generation | Grammar constraint sampler runs natively on CUDA | Not started |
+| P1 | GPU KV/page allocator maturity | Memory economy must hold under concurrency, not only at load time | Stable reuse metrics and predictable planner behavior under load | Not started |
+| P1 | Mandatory GPU behavior lane | Native regressions should block merges, not be discovered later | Required CI block for native/provider/runtime gates | Not started |
 
-## 4) Two CUDA Backend Value Split
+## 4) Retired Debt (This Session)
 
-| Axis | `native_cuda` provider | `cuda_llama_cpp` provider |
+| Item | What changed |
+|---|---|
+| Batched decode default-on | Promoted from opt-in to default-on. `INFERFLUX_DISABLE_BATCHED_DECODE=1` for opt-out. |
+| Native logprobs | Implemented natively — GPU logits copy + `ComputeLogprob()`. No parity delegate needed. |
+| Native embeddings | Mean-pooled embedding extraction via `EmbedForward()` + `MeanPool` kernel. Delegate fallback only if native fails. |
+| Native-first parity independence | Logprobs and embeddings are now native-owned. Only structured output still delegates. |
+
+## 5) Outdated Patterns To Retire
+
+| Pattern | Better practice |
+|---|---|
+| Treating async support as proof of throughput | Measure batch quality, graph residency, and native hot-path residency instead |
+| Static VRAM reservations | Plan KV sizing against budget and publish the decision |
+| Treating `/readyz` as passive-only observability | Allow transport-health to influence admission where operators choose fail-closed mode |
+| Claiming distributed readiness from topology scaffolding alone | Require ticket lifecycle, ownership semantics, and failure-path tests |
+
+See [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) for the migration table.
+
+## 6) Two-CUDA-Backend Value Split
+
+| Axis | `inferflux_cuda` provider | `llama_cpp_cuda` provider |
 |---|---|---|
-| Why it exists | Throughput/control headroom with first-party kernel/runtime ownership | Compatibility baseline with mature llama.cpp feature surface |
-| Strength now | Native identity/policy contracts, endpoint parity contracts for completion/chat/embeddings, active mixed overlap path | Broad feature coverage and lower operational risk as stable compatibility baseline |
-| Current gap | Quantized heavy-batch maturity, async contract parity, and remaining delegate coupling for parity surfaces | Lower ceiling for InferFlux-specific kernel innovation |
-| Operational role | Preferred when ready and policy allows | Deterministic fallback and compatibility safety net |
+| Why it exists | Native performance/control path | Stable compatibility and fallback path |
+| What it does well now | Policy-visible identity, native loaders, memory-economy foundation, 50+ fused GEMV kernels, batched decode default-on, native logprobs, native embeddings, CUDA graph capture, execution policy refactor, 0.83x sequential parity, 100+ TDD tests | Mature GGUF compatibility |
+| What still lags | Concurrent throughput (0.50x at 4x concurrency); memory overhead (~1.6 GB); structured output still delegates | InferFlux-specific kernel/runtime headroom |
+| Why both stay | They solve different operational risks today | They keep the control plane stable while native matures |
 
-## 5) Competitive Direction (Short)
+## 7) Competitive Direction
 
-| Area | Current | Direction |
+| Area | Keep | Close next |
 |---|---|---|
-| Enterprise controls | Strong | Preserve lead via strict contracts + observability |
-| Hardware/format breadth | Strong baseline | Maintain while throughput core matures |
-| Raw GPU throughput | Behind leaders | Close via #3/#4/#6/#7 |
-| CI enforceability | Moderate | Raise with mandatory GPU lane |
-| Distributed resilience | Early | Mature via #11 + runbooks |
+| Control plane | API/admin/CLI rigor, routing policy, observability, admin pools | Keep current lead |
+| Native runtime | Loader detection, memory policy, provider identity, native logprobs/embeddings, batched decode, CUDA graphs, 0.83x sequential parity, execution policy refactor | Close concurrent throughput gap (0.50x → ≥0.7x), native structured output, arena scratch allocator |
+| Distributed runtime | Honest bounded claims plus transport-health semantics | Close ownership cleanup, worker-loss handling, and failure CI before broadening claims |
 
-## 6) Canonical References
+## 8) Canonical References
 
 - [Roadmap](Roadmap.md)
-- [PRD](PRD.md)
 - [Architecture](Architecture.md)
-- [ARCHIVE_INDEX](ARCHIVE_INDEX.md)
+- [GEMV_KERNEL_ARCHITECTURE](GEMV_KERNEL_ARCHITECTURE.md)
+- [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md)
+- [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md)

@@ -357,6 +357,20 @@ std::size_t PagedKVCache::NumFreeBlocks() const {
   return free_count;
 }
 
+PagedKVCache::UsageSnapshot PagedKVCache::GetUsageSnapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  UsageSnapshot snapshot;
+  snapshot.total_blocks = pages_.size();
+  snapshot.page_size_bytes = page_size_bytes_;
+  for (const auto &page : pages_) {
+    if (page.in_use) {
+      ++snapshot.used_blocks;
+    }
+  }
+  snapshot.free_blocks = snapshot.total_blocks - snapshot.used_blocks;
+  return snapshot;
+}
+
 void PagedKVCache::AcquireBlocks(const std::vector<int> &blocks) {
   std::lock_guard<std::mutex> lock(mutex_);
   for (int page_id : blocks) {

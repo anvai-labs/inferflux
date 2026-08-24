@@ -34,10 +34,10 @@ flowchart TD
 ```mermaid
 flowchart LR
     A[Safetensors Model] --> B{Backend}
-    B -->|cuda_llama_cpp| C[⚠️ Mismatch]
-    B -->|cuda_native| D[✅ Correct]
+    B -->|llama_cpp_cuda| C[⚠️ Mismatch]
+    B -->|inferflux_cuda| D[✅ Correct]
 
-    C --> E[Recommendation:<br/>Set backend: cuda_native]
+    C --> E[Recommendation:<br/>Set backend: inferflux_cuda]
     D --> F[No action needed]
 
     style C fill:#ff6b6b
@@ -50,17 +50,17 @@ flowchart LR
 **Recommendation:**
 ```
 [RECOMMEND] backend: Model 'qwen2.5-3b' uses safetensors on CUDA —
-set backend to cuda_native
+set backend to inferflux_cuda
 ```
 
-**Why it matters:** The llama.cpp backend doesn't support safetensors. The native CUDA backend must be used explicitly.
+**Why it matters:** The llama.cpp backend doesn't support safetensors. The InferFlux CUDA backend must be used explicitly.
 
 **Fix:**
 ```yaml
 models:
   - id: qwen2.5-3b
     path: /models/qwen2.5-3b-safetensors/
-    backend: cuda_native        # Use cuda_native
+    backend: inferflux_cuda        # Use inferflux_cuda
     format: auto
 ```
 

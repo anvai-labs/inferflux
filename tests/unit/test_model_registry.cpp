@@ -49,7 +49,7 @@ public:
 
   ModelInfo *Resolve(const std::string &) override { return nullptr; }
   ModelInfo *ResolveExact(const std::string &) override { return nullptr; }
-  std::shared_ptr<LlamaCPUBackend> GetBackend(const std::string &) override {
+  std::shared_ptr<BackendInterface> GetBackend(const std::string &) override {
     return nullptr;
   }
   bool SetDefaultModel(const std::string &) override { return false; }

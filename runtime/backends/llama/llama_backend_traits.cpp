@@ -39,7 +39,10 @@ std::string NormalizeCudaAttentionKernel(const std::string &value) {
 
 LlamaBackendTarget ParseLlamaBackendTarget(const std::string &hint) {
   const std::string lowered = NormalizeHint(hint);
-  if (lowered == "cuda") {
+  if (lowered == "cuda" || lowered == "inferflux_cuda" ||
+      lowered == "llama_cpp_cuda" || lowered == "cuda_native" ||
+      lowered == "native_cuda" || lowered == "cuda_llama_cpp" ||
+      lowered == "cuda_llama") {
     return LlamaBackendTarget::kCuda;
   }
   if (lowered == "mps") {
@@ -50,6 +53,9 @@ LlamaBackendTarget ParseLlamaBackendTarget(const std::string &hint) {
   }
   if (lowered == "vulkan") {
     return LlamaBackendTarget::kVulkan;
+  }
+  if (lowered == "opencl") {
+    return LlamaBackendTarget::kOpenCL;
   }
   return LlamaBackendTarget::kCpu;
 }
@@ -72,10 +78,15 @@ LlamaBackendTraits DescribeLlamaBackendTarget(LlamaBackendTarget target) {
   case LlamaBackendTarget::kRocm:
     traits.label = "rocm";
     traits.gpu_accelerated = true;
-    traits.supports_flash_attention = false;
+    traits.supports_flash_attention = true;
     return traits;
   case LlamaBackendTarget::kVulkan:
     traits.label = "vulkan";
+    traits.gpu_accelerated = true;
+    traits.supports_flash_attention = false;
+    return traits;
+  case LlamaBackendTarget::kOpenCL:
+    traits.label = "opencl";
     traits.gpu_accelerated = true;
     traits.supports_flash_attention = false;
     return traits;
@@ -115,6 +126,19 @@ LlamaBackendConfig TuneLlamaBackendConfig(LlamaBackendTarget target,
     if (tuned.cuda_phase_overlap_min_prefill_tokens <= 0) {
       tuned.cuda_phase_overlap_min_prefill_tokens = 256;
     }
+
+    // Populate structured CudaConfigExtension from flat fields.
+    tuned.cuda_ext.attention_kernel = tuned.cuda_attention_kernel;
+    tuned.cuda_ext.phase_overlap_scaffold = tuned.cuda_phase_overlap_scaffold;
+    tuned.cuda_ext.phase_overlap_min_prefill_tokens =
+        tuned.cuda_phase_overlap_min_prefill_tokens;
+    tuned.cuda_ext.phase_overlap_prefill_replica =
+        tuned.cuda_phase_overlap_prefill_replica;
+    tuned.cuda_ext.kv_cache_dtype = tuned.inferflux_cuda_kv_cache_dtype;
+    tuned.cuda_ext.dequantized_cache_policy =
+        tuned.inferflux_cuda_dequantized_cache_policy;
+    tuned.cuda_ext.require_fused_quantized_matmul =
+        tuned.inferflux_cuda_require_fused_quantized_matmul;
   } else {
     tuned.cuda_attention_kernel = "standard";
     tuned.cuda_phase_overlap_scaffold = false;

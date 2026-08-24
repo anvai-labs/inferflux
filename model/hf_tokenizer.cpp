@@ -42,6 +42,10 @@ std::string HFTokenizer::TokenToString(int token_id) const {
                        /*skip_special=*/false);
 }
 
+bool HFTokenizer::IsSpecialToken(int token_id) const {
+  return inner_.IsSpecial(static_cast<int32_t>(token_id));
+}
+
 int HFTokenizer::TokenCount(const std::string &text) const {
   return static_cast<int>(Tokenize(text, false).size());
 }

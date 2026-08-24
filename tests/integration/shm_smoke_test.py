@@ -204,6 +204,16 @@ class ShmSmokeTests(unittest.TestCase):
         self.assertIn("inferflux_requests_total", body)
         self.assertIn("inferflux_scheduler_queue_depth", body)
 
+    def test_metrics_exposes_disagg_ticket_counters(self):
+        """/metrics contains distributed KV ticket lifecycle counters."""
+        resp, body = self._get("/metrics")
+        self.assertEqual(resp.status, 200)
+        self.assertIn("inferflux_disagg_kv_tickets_total", body)
+        self.assertIn('stage="enqueued"', body)
+        self.assertIn('stage="acknowledged"', body)
+        self.assertIn('stage="committed"', body)
+        self.assertIn('stage="timed_out"', body)
+
     def test_auth_rejected_without_key(self):
         """Requests without Authorization header receive 401."""
         conn = http.client.HTTPConnection("127.0.0.1", SERVER_PORT, timeout=5)

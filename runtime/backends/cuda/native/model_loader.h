@@ -25,6 +25,7 @@ namespace cuda {
 namespace native {
 
 enum class DequantizedCachePolicy {
+  kNone,
   kModelLifetime,
   kBatchLifetime,
 };
@@ -174,9 +175,9 @@ public:
   /**
    * @brief Configure lifecycle for dequantized temporary GPU weights
    *
-   * Model-lifetime caches maximize reuse but can significantly increase VRAM.
-   * Batch-lifetime caches prioritize memory efficiency and are reclaimed after
-   * each batch.
+   * none: memory-first, reclaimed at request boundary in runtime cleanup.
+   * batch: reclaimed at batch boundary.
+   * model: maximize reuse, highest VRAM.
    */
   virtual void SetDequantizedCachePolicy(DequantizedCachePolicy policy) = 0;
 

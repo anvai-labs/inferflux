@@ -17,7 +17,8 @@ graph TD
     C --> C1[Architecture]
     C --> C2[Config Reference]
     C --> C3[Developer Guide]
-    C --> C4[PRD + Roadmap + TechDebt]
+    C --> C4[Vision + PRD + Roadmap + TechDebt]
+    C --> C5[Modernization Audit]
 
     D --> D1[User Guide]
     D --> D2[Troubleshooting]
@@ -39,13 +40,18 @@ graph TD
 
 | Domain | Doc |
 |---|---|
+| Vision and product direction | [VISION](VISION.md), [PRD](PRD.md) |
 | Runtime architecture | [Architecture](Architecture.md) |
 | API surface | [API_SURFACE](API_SURFACE.md) |
 | Configuration | [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
+| **Benchmark results (validated vs Ollama)** | **[benchmarks](benchmarks.md)** ⭐ |
 | Monitoring and tuning | [MONITORING](MONITORING.md) |
+| Archived throughput investigations | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) |
 | Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |
-| Product requirements | [PRD](PRD.md) |
 | Grades and execution plan | [Roadmap](Roadmap.md), [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
+| Modernization migration guide | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
+| Maintenance simplification review | [MAINTENANCE_REVIEW](MAINTENANCE_REVIEW.md) |
+| Competitive positioning | [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md) |
 | GGUF runtime contract | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md) |
 | FP16 status | [FP16_STATUS](FP16_STATUS.md) |
 
@@ -66,6 +72,7 @@ graph TD
 | Policy surface | [Policy](Policy.md) |
 | Backend parity design | [design/Backend_Parity_LlamaCpp_CUDA_MLX](design/Backend_Parity_LlamaCpp_CUDA_MLX.md) |
 | Native GGUF quantized runtime design | [design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE](design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md) |
+| InferFlux CUDA + distributed uplift plan | [design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN](design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md) |
 | Session handle layer (Phase 1) | [design/SESSION_HANDLE_LAYER_PHASE1](design/SESSION_HANDLE_LAYER_PHASE1.md) |
 | EP/TP scaling design | [design_ep_tp](design_ep_tp.md) |
 
@@ -82,3 +89,7 @@ Use these two docs for current scoring and grade movement rationale:
 
 - [Roadmap](Roadmap.md)
 - [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
+
+Use this doc for old-practice -> modern-practice migration guidance:
+
+- [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md)

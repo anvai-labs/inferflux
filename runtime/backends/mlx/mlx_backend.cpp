@@ -64,16 +64,16 @@ bool MlxBackend::LoadModel(const std::filesystem::path &model_path,
   }
 
   // GGUF file path: delegate to the llama.cpp backend.
-  return LlamaCPUBackend::LoadModel(model_path, config);
+  return LlamaCppBackend::LoadModel(model_path, config);
 #endif
 }
 
 // ---------------------------------------------------------------------------
-// LlamaCPUBackend virtual overrides
+// LlamaCppBackend virtual overrides
 // ---------------------------------------------------------------------------
 
 bool MlxBackend::IsReady() const {
-  return engine_ready_ || LlamaCPUBackend::IsReady();
+  return engine_ready_ || LlamaCppBackend::IsReady();
 }
 
 int MlxBackend::TokenCount(const std::string &text) const {
@@ -81,7 +81,7 @@ int MlxBackend::TokenCount(const std::string &text) const {
     auto enc = tokenizer_.Encode(text, /*add_bos=*/false);
     return enc.ok ? static_cast<int>(enc.ids.size()) : 0;
   }
-  return LlamaCPUBackend::TokenCount(text);
+  return LlamaCppBackend::TokenCount(text);
 }
 
 void MlxBackend::SetupSampler(const std::string &grammar,
@@ -92,7 +92,7 @@ void MlxBackend::SetupSampler(const std::string &grammar,
     mlx_grammar_ = grammar;
     return;
   }
-  LlamaCPUBackend::SetupSampler(grammar, root, sp);
+  LlamaCppBackend::SetupSampler(grammar, root, sp);
 }
 
 void MlxBackend::TeardownSampler() {
@@ -101,16 +101,16 @@ void MlxBackend::TeardownSampler() {
     mlx_grammar_.clear();
     return;
   }
-  LlamaCPUBackend::TeardownSampler();
+  LlamaCppBackend::TeardownSampler();
 }
 
-LlamaCPUBackend::PerfSnapshot MlxBackend::TakePerf() {
+LlamaCppBackend::PerfSnapshot MlxBackend::TakePerf() {
   if (engine_ready_) {
     auto snap = mlx_perf_;
     mlx_perf_ = {};
     return snap;
   }
-  return LlamaCPUBackend::TakePerf();
+  return LlamaCppBackend::TakePerf();
 }
 
 std::vector<int> MlxBackend::TokenizeForCache(const std::string &prompt) const {
@@ -120,10 +120,10 @@ std::vector<int> MlxBackend::TokenizeForCache(const std::string &prompt) const {
       return std::vector<int>(enc.ids.begin(), enc.ids.end());
     }
   }
-  return LlamaCPUBackend::TokenizeForCache(prompt);
+  return LlamaCppBackend::TokenizeForCache(prompt);
 }
 
-LlamaCPUBackend::ChatTemplateResult MlxBackend::FormatChatMessages(
+LlamaCppBackend::ChatTemplateResult MlxBackend::FormatChatMessages(
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) {
   // When the HF tokenizer has a chat template, apply it via llama.cpp's
@@ -164,7 +164,7 @@ LlamaCPUBackend::ChatTemplateResult MlxBackend::FormatChatMessages(
   }
   // Fall back to base class (requires a loaded llama model; returns
   // valid=false when no model is loaded).
-  return LlamaCPUBackend::FormatChatMessages(messages, add_assistant_prefix);
+  return LlamaCppBackend::FormatChatMessages(messages, add_assistant_prefix);
 }
 
 std::string MlxBackend::Generate(
@@ -176,7 +176,7 @@ std::string MlxBackend::Generate(
     const std::vector<std::string> &stop_seqs) {
   // Not engine-ready: delegate to the llama.cpp base (GGUF path).
   if (!engine_ready_) {
-    return LlamaCPUBackend::Generate(prompt, max_tokens, on_chunk, should_stop,
+    return LlamaCppBackend::Generate(prompt, max_tokens, on_chunk, should_stop,
                                      logprob_top_n, out_logprobs, stop_seqs);
   }
   if (!tokenizer_.Loaded()) {
@@ -262,10 +262,10 @@ std::string MlxBackend::Generate(
 // Phased prefill/decode overrides (INF-8)
 // ---------------------------------------------------------------------------
 
-LlamaCPUBackend::PrefillResult MlxBackend::Prefill(const std::string &prompt,
+LlamaCppBackend::PrefillResult MlxBackend::Prefill(const std::string &prompt,
                                                    int sequence_id) {
   if (!engine_ready_)
-    return LlamaCPUBackend::Prefill(prompt, sequence_id);
+    return LlamaCppBackend::Prefill(prompt, sequence_id);
   if (!tokenizer_.Loaded())
     return {0, false, -1, ""};
 
@@ -286,11 +286,11 @@ LlamaCPUBackend::PrefillResult MlxBackend::Prefill(const std::string &prompt,
   return {n_past, true, first_tok, first_piece};
 }
 
-LlamaCPUBackend::PrefillResult
+LlamaCppBackend::PrefillResult
 MlxBackend::PrefillPartial(const std::string &prompt, int sequence_id,
                            int n_past_start) {
   if (!engine_ready_)
-    return LlamaCPUBackend::PrefillPartial(prompt, sequence_id, n_past_start);
+    return LlamaCppBackend::PrefillPartial(prompt, sequence_id, n_past_start);
   if (!tokenizer_.Loaded())
     return {0, false, -1, ""};
 
@@ -325,7 +325,7 @@ std::string MlxBackend::Decode(
     std::vector<TokenLogprob> *out_logprobs, int first_token,
     const std::vector<std::string> &stop_seqs) {
   if (!engine_ready_)
-    return LlamaCPUBackend::Decode(0, sequence_id, max_tokens, on_chunk,
+    return LlamaCppBackend::Decode(0, sequence_id, max_tokens, on_chunk,
                                    should_stop, logprob_top_n, out_logprobs,
                                    first_token, stop_seqs);
   if (!tokenizer_.Loaded())
@@ -376,7 +376,7 @@ void MlxBackend::FreeSequence(int sequence_id) {
     engine_.FreeSlot(sequence_id);
     return;
   }
-  LlamaCPUBackend::FreeSequence(sequence_id);
+  LlamaCppBackend::FreeSequence(sequence_id);
 }
 
 void MlxBackend::CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) {
@@ -384,13 +384,13 @@ void MlxBackend::CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) {
     engine_.CopySlotPrefix(src_seq, dst_seq, n_tokens);
     return;
   }
-  LlamaCPUBackend::CopySequencePrefix(src_seq, dst_seq, n_tokens);
+  LlamaCppBackend::CopySequencePrefix(src_seq, dst_seq, n_tokens);
 }
 
-std::vector<LlamaCPUBackend::UnifiedBatchOutput>
+std::vector<LlamaCppBackend::UnifiedBatchOutput>
 MlxBackend::ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) {
   if (!engine_ready_)
-    return LlamaCPUBackend::ExecuteUnifiedBatch(inputs);
+    return LlamaCppBackend::ExecuteUnifiedBatch(inputs);
   if (!tokenizer_.Loaded() || inputs.empty())
     return std::vector<UnifiedBatchOutput>(inputs.size());
 

@@ -23,7 +23,7 @@ models:
   - id: tinyllama
     path: models/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf
     format: gguf                    # Rule 7: Set format explicitly (gguf, safetensors, hf)
-    backend: cuda_llama_cpp         # Uses llama.cpp CUDA backend (well-tested)
+    backend: llama_cpp_cuda         # Uses llama.cpp CUDA backend (well-tested)
     default: true
 
 # Runtime configuration
@@ -46,7 +46,7 @@ runtime:
 
   # Backend exposure policy
   backend_exposure:
-    prefer_native: true             # Prefer native implementations when available
+    prefer_inferflux: true             # Prefer InferFlux implementations when available
     allow_llama_cpp_fallback: true  # Allow fallback to universal llama.cpp backends
 
   # Capability routing for graceful degradation

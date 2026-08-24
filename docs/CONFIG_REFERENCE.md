@@ -114,7 +114,7 @@ models:
   - id: llama3-8b
     path: models/Meta-Llama-3-8B-Instruct.Q4_K_M.gguf
     format: gguf
-    backend: cuda_llama_cpp
+    backend: llama_cpp_cuda
     default: true
 
 runtime:
@@ -144,23 +144,23 @@ models:
   - id: qwen2.5-3b
     path: models/qwen2.5-3b-safetensors/
     format: safetensors
-    backend: cuda_native
+    backend: inferflux_cuda
     default: true
 
 runtime:
   backend_priority: [cuda, cpu]
   backend_exposure:
-    prefer_native: true
+    prefer_inferflux: true
     allow_llama_cpp_fallback: true
-    strict_native_request: false
+    strict_inferflux_request: false
 ```
 
 ## 5) Model Format / Backend Contract
 
 | Model format | Recommended backend | Notes |
 |---|---|---|
-| `gguf` | `cuda_llama_cpp` or `cpu` | strongest compatibility path |
-| `safetensors` | `cuda_native` | native provider path |
+| `gguf` | `llama_cpp_cuda` or `cpu` | strongest compatibility path |
+| `safetensors` | `inferflux_cuda` | inferflux provider path |
 | `hf` | `cuda` or `cpu` | resolved to local model format |
 | `auto` | `cuda`/`cpu` | format inferred from path |
 
@@ -169,21 +169,23 @@ runtime:
 ```yaml
 runtime:
   backend_exposure:
-    prefer_native: true
+    prefer_inferflux: true
     allow_llama_cpp_fallback: true
-    strict_native_request: false
+    strict_inferflux_request: false
 ```
 
 | Key | Behavior |
 |---|---|
-| `prefer_native` | choose native provider when eligible |
-| `allow_llama_cpp_fallback` | allow fallback to llama.cpp path when native unavailable |
-| `strict_native_request` | explicit `cuda_native` requests fail fast if native path is not ready |
+| `prefer_inferflux` | choose inferflux provider when eligible |
+| `allow_llama_cpp_fallback` | allow fallback to llama.cpp path when inferflux is unavailable |
+| `strict_inferflux_request` | explicit `inferflux_cuda` requests fail fast if the inferflux path is not ready |
+
+Legacy backend ids still canonicalize to `inferflux_cuda` and `llama_cpp_cuda`, but legacy backend-exposure keys have been removed. Use `prefer_inferflux` and `strict_inferflux_request` in active configs.
 
 When strict mode is enabled, unsupported explicit native requests fail with `422 backend_policy_violation`.
 
 For `backend: cuda` requests, runtime fallback order is:
-`cuda(native)` -> `cuda_llama_cpp` -> `rocm` (if compiled) -> `mlx` (if compiled) -> `mps` (if compiled) -> `cpu`.
+`inferflux_cuda` -> `llama_cpp_cuda` -> `rocm` (if compiled) -> `mlx` (if compiled) -> `mps` (if compiled) -> `cpu`.
 
 ## 7) Runtime Tuning Cheat Sheet
 
@@ -195,6 +197,11 @@ For `backend: cuda` requests, runtime fallback order is:
 | `runtime.scheduler.max_batch_tokens` | 8192 | cap per-batch token memory pressure |
 | `runtime.scheduler.min_batch_size` | 1 | keep low for responsiveness |
 | `runtime.scheduler.batch_accumulation_ms` | 0-5 | small wait to form better batches |
+| `runtime.scheduler.policy` | `priority_age` | queue ranking policy (`priority_age`, `lpm_priority`, `throughput_balanced`) |
+| `runtime.scheduler.decode_burst_tokens` | `0` | decode burst cap per executor pass (`0` disables burst slicing) |
+| `runtime.scheduler.decode_pool_size` | `1` | dedicated decode lane count (0 = inline on worker loop, 1+ = decode threads; 1 is default/arch recommendation) |
+| `runtime.scheduler.chunked_prefill_tokens` | `512` | max tokens submitted per prefill chunk in mixed execution |
+| `runtime.scheduler.mixed_prefill_budget_ratio` | `1.0` | fraction (`0.0-1.0`) of token budget reserved for prefill in mixed steps |
 | `runtime.scheduler.session_handles.enabled` | `false` | optional `session_id -> sequence slot` mapping layer |
 | `runtime.scheduler.session_handles.ttl_ms` | `300000` | TTL for idle session mappings |
 | `runtime.scheduler.session_handles.max_sessions` | `1024` | upper bound on concurrently tracked sessions |
@@ -203,6 +210,8 @@ Session handle contract:
 - API behavior remains stateless by default.
 - `session_id` support is opt-in and only active when `session_handles.enabled=true`.
 - KV dtype stays server/model-load scoped (`runtime.cuda.kv_cache_dtype`), not per request/session.
+- `runtime.scheduler.policy` can be overridden with `INFERFLUX_SCHED_POLICY`.
+- Scheduler mixed-step env overrides: `INFERFLUX_SCHED_DECODE_BURST_TOKENS`, `INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS`, `INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO`.
 
 ### KV cache
 
@@ -219,10 +228,15 @@ Session handle contract:
 | `runtime.cuda.attention.kernel` | `auto` | kernel selection policy |
 | `runtime.cuda.flash_attention.enabled` | `true` on SM>=8.0 | throughput uplift on supported GPUs |
 | `runtime.cuda.kv_cache_dtype` | `auto` | KV precision policy (`auto`, `fp16`, `bf16`, `int8`, `fp8`) |
-| `runtime.cuda.dequantized_cache_policy` | `batch` | GGUF dequant cache lifecycle (`batch` memory-efficient default, `model` reuse-heavy) |
+| `runtime.cuda.dequantized_cache_policy` | `none` | GGUF dequant cache lifecycle (`none` memory-first default, `batch` batch-boundary cleanup, `model` reuse-heavy) |
 | `runtime.cuda.quantized_runtime.require_fused_matmul` | `false` | fail startup unless fused quantized matmul strategy is selected |
 | `runtime.cuda.phase_overlap.enabled` | `true` for mixed workloads | prefill/decode overlap |
 | `runtime.cuda.phase_overlap.min_prefill_tokens` | `256` | overlap trigger threshold |
+
+InferFlux CUDA KV sizing defaults:
+- startup defaults are `max_batch=16` and `max_seq=4096` (before clamps/overrides).
+- `max_batch` is clamped to scheduler slot floor (`>=16`).
+- `max_seq` can auto-tune downward for memory-constrained GPUs unless explicitly overridden.
 
 ### HTTP Server
 
@@ -284,14 +298,22 @@ Scope contract:
 |---|---|
 | `INFERFLUX_MODEL_PATH` | default model path |
 | `INFERFLUX_MODELS` | multi-model config string |
-| `INFERFLUX_NATIVE_CUDA_STRICT` | fail model load if native CUDA runtime reports fallback |
-| `INFERFLUX_DISABLE_NATIVE_CUDA` | force native CUDA runtime readiness to false |
-| `INFERFLUX_NATIVE_DEQUANT_CACHE_POLICY` | `runtime.cuda.dequantized_cache_policy` |
-| `INFERFLUX_NATIVE_REQUIRE_FUSED_MATMUL` | `runtime.cuda.quantized_runtime.require_fused_matmul` |
+| `INFERFLUX_CUDA_STRICT` | fail model load if InferFlux CUDA runtime reports fallback |
+| `INFERFLUX_DISABLE_INFERFLUX_CUDA` | force InferFlux CUDA runtime readiness to false |
+| `INFERFLUX_CUDA_DEQUANT_CACHE_POLICY` | `runtime.cuda.dequantized_cache_policy` |
+| `INFERFLUX_CUDA_KV_MAX_BATCH` | InferFlux CUDA KV cache `max_batch` hard override |
+| `INFERFLUX_CUDA_KV_MAX_SEQ` | InferFlux CUDA KV cache `max_seq` hard override (disables seq auto-tune) |
+| `INFERFLUX_CUDA_KV_AUTO_TUNE` | enable/disable InferFlux CUDA KV seq auto-tuning (`true` default) |
+| `INFERFLUX_CUDA_KV_BUDGET_MB` | explicit KV budget in MiB for auto-tuning |
+| `INFERFLUX_CUDA_KV_FREE_MEM_RATIO` | fraction of free VRAM used as KV budget when explicit budget is unset (`0.30` default) |
+| `INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL` | `runtime.cuda.quantized_runtime.require_fused_matmul` |
+| `INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED` | reject generation admission with `503` when distributed KV transport is degraded (`false` default) |
+| `INFERFLUX_READYZ_DISAGG_TIMEOUT_DEBT_THRESHOLD` | distributed KV timeout debt threshold that forces `/readyz` to `503` (`6` default when streak threshold is enabled, `0` disables) |
+| `INFERFLUX_READYZ_DISAGG_TIMEOUT_STREAK_THRESHOLD` | consecutive distributed KV ticket timeouts that force `/readyz` to `503` (`3`, `0` disables) |
 | `INFERFLUX_BACKEND_PRIORITY` | runtime backend priority chain |
-| `INFERFLUX_BACKEND_PREFER_NATIVE` | `runtime.backend_exposure.prefer_native` |
+| `INFERFLUX_BACKEND_PREFER_INFERFLUX` | `runtime.backend_exposure.prefer_inferflux` |
 | `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` | `runtime.backend_exposure.allow_llama_cpp_fallback` |
-| `INFERFLUX_BACKEND_STRICT_NATIVE_REQUEST` | `runtime.backend_exposure.strict_native_request` |
+| `INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST` | `runtime.backend_exposure.strict_inferflux_request` |
 | `INFERFLUX_DISABLE_STARTUP_ADVISOR` | suppress startup recommendations |
 | `INFERFLUX_HTTP_WORKERS` | HTTP server thread pool size (default: 16) |
 | `INFERCTL_API_KEY` | CLI auth token |
@@ -322,7 +344,8 @@ The startup advisor evaluates config quality at boot and emits recommendations f
 | Symptom | First check |
 |---|---|
 | model load failure | model `path`, `format`, `backend` compatibility |
-| `422 backend_policy_violation` | strict native request policy + backend readiness |
+| `422 backend_policy_violation` | strict inferflux request policy + backend readiness |
+| `/readyz` says `distributed kv transport degraded` | inspect `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt`, distributed KV ticket counters, and whether `INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED` is enabled |
 | low throughput | batch settings, KV pages, CUDA/FA2 enablement |
 | auth failures | API key scopes and bearer header |
 | no metrics | `server.enable_metrics` and `/metrics` reachability |

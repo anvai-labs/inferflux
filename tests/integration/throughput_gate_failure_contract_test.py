@@ -120,7 +120,7 @@ class ThroughputGateFailureContractTests(unittest.TestCase):
                               model_id="tinyllama",
                               requested_backend="cuda",
                               exposed_backend="cuda",
-                              provider="native",
+                              provider="inferflux",
                               fallback=False,
                               fallback_reason="",
                           )), \

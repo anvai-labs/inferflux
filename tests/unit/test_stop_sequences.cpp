@@ -1,4 +1,4 @@
-#include "runtime/backends/cpu/llama_backend.h"
+#include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/execution/batch_executor.h"
 #include "scheduler/single_model_router.h"
 #include <catch2/catch_amalgamated.hpp>
@@ -7,7 +7,7 @@
 
 using namespace inferflux;
 
-class MockStopBackend : public LlamaCPUBackend {
+class MockStopBackend : public LlamaCppBackend {
 public:
   std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override {

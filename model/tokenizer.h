@@ -31,6 +31,21 @@ public:
   /** Convert a single token ID to its text piece. */
   virtual std::string TokenToString(int token_id) const = 0;
 
+  /** True when token_id is a non-user-visible control/special token. */
+  virtual bool IsSpecialToken(int token_id) const {
+    return token_id == BosTokenId() || token_id == EosTokenId();
+  }
+
+  /**
+   * True when generation should stop on this token.
+   *
+   * Default policy is conservative for server-side generation: any
+   * tokenizer-defined special/control token ends generation.
+   */
+  virtual bool IsTerminalGeneratedToken(int token_id) const {
+    return token_id < 0 || IsSpecialToken(token_id);
+  }
+
   /** Count tokens in text (convenience — defaults to Tokenize().size()). */
   virtual int TokenCount(const std::string &text) const {
     return static_cast<int>(Tokenize(text, false).size());

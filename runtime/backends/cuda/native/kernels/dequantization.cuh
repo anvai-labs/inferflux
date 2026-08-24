@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
 
@@ -122,6 +123,19 @@ typedef struct {
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(unsigned short) + QK8_0,
               "block_q8_0 size mismatch with GGML");
+
+// Q8_1 block: activation quantization format (matches llama.cpp block_q8_1)
+// Per-32-element block with packed scale+sum for efficient dot products.
+// ds.x = d (scale = max|x| / 127), ds.y = s (d * sum(qs))
+// The pre-computed sum field eliminates dp4a(0x01010101, x, 0) for Q4_K dmin
+// correction terms.
+#define QK8_1 32
+typedef struct {
+  half2 ds;            // {d=scale, s=d*sum(qs)} packed as half2
+  int8_t qs[QK8_1];   // 32 quantized int8 activation values
+} block_q8_1;
+static_assert(sizeof(block_q8_1) == sizeof(half2) + QK8_1,
+              "block_q8_1 size mismatch with llama.cpp");
 
 /**
  * @brief CUDA kernel for Q8_0 dequantization
