@@ -6829,8 +6829,8 @@ TEST_CASE("FusedQuantGemm: FFN grouped selector keeps the proven "
   REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
               q4k, q4k, FusedDispatchGeometry{2, 11008, 2048, 2, true, true},
               true, true,
-              &policy) == FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4);
-  // M>=3 Q4_K decode uses MMQ3 (default-ON via
+              &policy) == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3);
+  // M>=2 Q4_K decode uses MMQ3 (default-ON via
   // enable_experimental_q81_grouped_mmq3)
   REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
               q4k, q4k, FusedDispatchGeometry{3, 11008, 2048, 2, true, true},
@@ -6841,12 +6841,19 @@ TEST_CASE("FusedQuantGemm: FFN grouped selector keeps the proven "
               true, true,
               &policy) == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3);
 
+  policy.enable_experimental_q81_grouped_mmq3 = false;
+  REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
+              q4k, q4k, FusedDispatchGeometry{2, 11008, 2048, 2, true, true},
+              true, true,
+              &policy) == FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4);
+
   policy.enable_experimental_q81_grouped_rowpair_w4 = false;
   REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
               q4k, q4k, FusedDispatchGeometry{2, 11008, 2048, 2, true, true},
               true, true,
               &policy) == FusedQuantGemm::FfnProjOperator::kQ81Group);
 
+  policy.enable_experimental_q81_grouped_mmq3 = true;
   policy.enable_experimental_q81_grouped_rowquad_m4 = true;
   REQUIRE(FusedQuantGemm::SelectFfnProjOperator(
               q4k, q4k, FusedDispatchGeometry{4, 11008, 2048, 2, true, true},
@@ -6932,8 +6939,13 @@ TEST_CASE(
               FusedDispatchGeometry{1, 11008, 2048, 2, true, true},
               /*allow_fused_quantized_matmul=*/true,
               policy) == FusedQuantGemm::FfnProjOperator::kQ81Group);
-  // M>=3 Q4_K decode uses MMQ3 (default-ON via
+  // M>=2 Q4_K decode uses MMQ3 (default-ON via
   // enable_experimental_q81_grouped_mmq3)
+  REQUIRE(SelectInferfluxCudaFfnProjOperator(
+              raw, raw, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{2, 11008, 2048, 2, true, true},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3);
   REQUIRE(SelectInferfluxCudaFfnProjOperator(
               raw, raw, InferfluxCudaDispatchPhase::kDecode,
               FusedDispatchGeometry{3, 11008, 2048, 2, true, true},

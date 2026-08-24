@@ -65,7 +65,7 @@ bool MatchDecodeGroupedMmq3(const InferfluxCudaFfnDispatchProfile &profile,
          policy.enable_experimental_q81_grouped_mmq3 && profile.same_quant &&
          profile.quant_type0 ==
              static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K) &&
-         profile.geometry.grouped_outputs == 2 && profile.geometry.M >= 3;
+         profile.geometry.grouped_outputs == 2 && profile.geometry.M >= 2;
 }
 
 bool MatchDecodeGenericQ81(const InferfluxCudaFfnDispatchProfile &profile,
@@ -97,15 +97,15 @@ GetInferfluxCudaFfnDispatchRules() {
       {FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K,
        /*requires_q81=*/true, /*requires_packed=*/false,
        MatchDecodeGroupedHotQ4K, "decode_q81_hot_q4k"},
-      {FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4,
-       /*requires_q81=*/true, /*requires_packed=*/false,
-       MatchDecodeGroupedRowPairW4, "decode_q81_rowpair_w4"},
       {FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4,
        /*requires_q81=*/true, /*requires_packed=*/false,
        MatchDecodeGroupedRowQuadM4, "decode_q81_rowquad_m4"},
       {FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3,
        /*requires_q81=*/true, /*requires_packed=*/false, MatchDecodeGroupedMmq3,
        "decode_q81_mmq3"},
+      {FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4,
+       /*requires_q81=*/true, /*requires_packed=*/false,
+       MatchDecodeGroupedRowPairW4, "decode_q81_rowpair_w4"},
       {FusedQuantGemm::FfnProjOperator::kQ81Group,
        /*requires_q81=*/true, /*requires_packed=*/false, MatchDecodeGenericQ81,
        "decode_q81_generic"},

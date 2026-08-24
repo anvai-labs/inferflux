@@ -2818,7 +2818,7 @@ bool LlamaForwardTyped<T>::BatchForward(const std::vector<int> &token_ids,
         // matrices and applies SiLU activation at write-back, halving
         // weight memory traffic vs separate gate+up projections. However,
         // measured decode throughput on the live grouped FFN path shows the
-        // MMQ3/row-quad grouped kernels overtaking fusion at M>=4, so keep
+        // MMQ3/row-quad grouped kernels overtaking fusion at M>=2, so keep
         // those specialized grouped operators on the critical path.
         if constexpr (std::is_same_v<T, half>) {
           const bool prefer_grouped_q81_pair_fast_path =
