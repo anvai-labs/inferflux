@@ -555,9 +555,14 @@ if(MSVC)
   target_link_libraries(inferfluxd PRIVATE inferflux_core)
   target_link_options(inferfluxd PRIVATE /WHOLEARCHIVE:inferflux_core)
 elseif(APPLE)
-  # ld64 has no --whole-archive; -force_load per object archive achieves
-  # the same self-registration guarantee.
-  target_link_libraries(inferfluxd PRIVATE "-Wl,-force_load,$<TARGET_FILE:inferflux_core>")
+  # ld64 has no --whole-archive; -force_load achieves the same
+  # self-registration guarantee. Link the target by name so its usage
+  # requirements (PUBLIC include dirs) still propagate — embedding it in
+  # a quoted flag string makes CMake treat it as an opaque flag and drops
+  # the include paths (broke the macOS CI build at model/model_format.h).
+  target_link_libraries(inferfluxd PRIVATE inferflux_core)
+  target_link_options(inferfluxd PRIVATE
+      "LINKER:-force_load,$<TARGET_FILE:inferflux_core>")
 else()
   target_link_libraries(inferfluxd PRIVATE
     -Wl,--whole-archive inferflux_core -Wl,--no-whole-archive)
