@@ -534,7 +534,7 @@ int main() {
       cudaFuncSetAttribute(native::InferfluxMmqQ6KMma<16>,
                            cudaFuncAttributeMaxDynamicSharedMemorySize,
                            (int)smem);
-      const dim3 mma_block(32, native::kMmqWarps, 1);
+      const dim3 mma_block(32, native::kMmqMmaWarps, 1);
       for (int ks : {1, 2, 3, 4, 6}) {
         if (ks > 1) {
           if (!d_part) cudaMalloc(&d_part, 6 * mn * sizeof(float));

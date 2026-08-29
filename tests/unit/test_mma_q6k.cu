@@ -141,7 +141,7 @@ std::vector<half> RunKernel(const std::vector<block_q6_k> &w,
   cudaFuncSetAttribute(InferfluxMmqQ6KMma<16>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
                        static_cast<int>(smem));
-  InferfluxMmqQ6KMma<16><<<grid, dim3(32, kMmqWarps, 1), smem, buf.s>>>(
+  InferfluxMmqQ6KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, buf.s>>>(
       reinterpret_cast<const char *>(buf.w), buf.a, buf.out, N, K, M,
       buf.partials, ksplits);
   if (ksplits > 1) {
