@@ -5,6 +5,7 @@
 #include "runtime/backends/cuda/native/dispatch_operator_health.h"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
+#include "runtime/backends/cuda/native/kernels/mmq_mma.cuh"
 #include "runtime/backends/cuda/native/llama_forward.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/native_dispatch_policy.h"
@@ -603,6 +604,83 @@ bool TryMmqSiluMulGemv<half>(const MmqWeightInfo &weight, const half *gate,
   return ok;
 }
 
+// MMA tensor-core down-proj (S7): Q6_K only, raw row-major weights, D4
+// activations. Returns false (unchanged dispatch) unless
+// INFERFLUX_CUDA_MMQ_MMA=1 — callers fall through to the dp4a MMQ tier.
+template <typename T>
+bool TryMmqMmaSiluMul(const QuantizedWeightInfo &, const T *, const T *, T *,
+                      void *, float *, int, int, int, cudaStream_t,
+                      const char * = nullptr,
+                      const NativeExecutionPolicy * = nullptr) {
+  return false;
+}
+
+template <>
+bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
+                            const half *up, half *output, void *act_mmq,
+                            float *partials, int M, int N, int K,
+                            cudaStream_t stream, const char *proj_name,
+                            const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+  if (!policy_ref.enable_mmq_mma || !weight.data || !gate || !up || !output ||
+      !act_mmq || !partials || M <= 0 || N <= 0 || K <= 0 ||
+      static_cast<size_t>(N) * K !=
+          static_cast<size_t>(weight.num_elements) ||
+      weight.quant_type !=
+          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
+    return false;
+  }
+
+  FusedQuantGemm::SiluMulQuantizeQ8_1Mmq(
+      gate, up, static_cast<runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq), M,
+      K, stream);
+  const bool ok = FusedQuantGemm::DownProjMmqMma(
+      weight, static_cast<const runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq),
+      output, M, N, K, partials, stream, policy);
+  if (ok && proj_name) {
+    LogPackedGemmPath(proj_name, "using MMA tensor-core Q6_K down-proj");
+  }
+  return ok;
+}
+
+// MMA down-proj for already-activated input (the fused gate+up+SiLU
+// kernel produced d_ffn_gate_): quantize to D4 then MMA. Q6_K only,
+// INFERFLUX_CUDA_MMQ_MMA=1, M <= mmq_mma_max_batch.
+template <typename T>
+bool TryMmqMmaGemv(const QuantizedWeightInfo &, const T *, T *, void *,
+                   float *, int, int, int, cudaStream_t, const char * = nullptr,
+                   const NativeExecutionPolicy * = nullptr) {
+  return false;
+}
+
+template <>
+bool TryMmqMmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
+                         half *output, void *act_mmq, float *partials, int M,
+                         int N, int K, cudaStream_t stream, const char *proj_name,
+                         const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+  if (!policy_ref.enable_mmq_mma || !weight.data || !input || !output ||
+      !act_mmq || !partials || M <= 0 || N <= 0 || K <= 0 ||
+      M > policy_ref.mmq_mma_max_batch ||
+      static_cast<size_t>(N) * K !=
+          static_cast<size_t>(weight.num_elements) ||
+      weight.quant_type !=
+          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
+    return false;
+  }
+
+  FusedQuantGemm::QuantizeRowQ8_1Mmq(
+      input, static_cast<runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq), M, K,
+      stream);
+  const bool ok = FusedQuantGemm::DownProjMmqMma(
+      weight, static_cast<const runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq),
+      output, M, N, K, partials, stream, policy);
+  if (ok && proj_name) {
+    LogPackedGemmPath(proj_name, "using MMA tensor-core Q6_K down-proj");
+  }
+  return ok;
+}
+
 template <typename T>
 bool TryQ8_1Gemv(const QuantizedWeightInfo &, const T *, T *, void *, int, int,
                  int, cudaStream_t, const char * = nullptr,
@@ -779,6 +857,28 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
       return false;
     device_workspace_bytes_ += rows * blocks_per_row * q8_1_block_size;
   }
+  // MMA down-proj (S7) buffers: group-major D4 activations sized for the
+  // larger projection K, and fp32 partials for the deterministic K-split
+  // reduce (kMmqMmaMaxSplits x rows x hidden floats). Only touched when
+  // INFERFLUX_CUDA_MMQ_MMA=1.
+  {
+    using namespace runtime::cuda::native;
+    const int max_dim = std::max(hidden_size_, intermediate_size_);
+    err = cudaMalloc(&d_act_q8_1_mmq_,
+                     static_cast<size_t>(max_dim / 128) * rows *
+                         sizeof(BlockQ8_1Mmq));
+    if (err != cudaSuccess)
+      return false;
+    device_workspace_bytes_ += static_cast<size_t>(max_dim / 128) * rows *
+                               sizeof(BlockQ8_1Mmq);
+    err = cudaMalloc(&d_mma_partials_,
+                     static_cast<size_t>(kMmqMmaMaxSplits) * rows *
+                         hidden_size_ * sizeof(float));
+    if (err != cudaSuccess)
+      return false;
+    device_workspace_bytes_ += static_cast<size_t>(kMmqMmaMaxSplits) * rows *
+                               hidden_size_ * sizeof(float);
+  }
   // Logits buffer sized for batched decode: [max_batch_size, vocab_size]
   if (!alloc(&d_logits_typed_,
              static_cast<size_t>(max_batch_size_) * vocab_size_))
@@ -843,6 +943,14 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
   if (d_act_q8_1_) {
     cudaFree(d_act_q8_1_);
     d_act_q8_1_ = nullptr;
+  }
+  if (d_act_q8_1_mmq_) {
+    cudaFree(d_act_q8_1_mmq_);
+    d_act_q8_1_mmq_ = nullptr;
+  }
+  if (d_mma_partials_) {
+    cudaFree(d_mma_partials_);
+    d_mma_partials_ = nullptr;
   }
 
   if (d_token_ids_) {
@@ -1384,10 +1492,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
               down_selected_op, ffn_phase, ProjectionQuantLabel(down_raw),
               down_raw.quant_type, seq_len, hidden_size_, intermediate_size_,
               [&]() {
-                return TryMmqSiluMulGemv<T>(
-                    down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-                    seq_len, hidden_size_, intermediate_size_, stream_,
-                    "down_proj", &execution_policy_);
+                return TryMmqMmaSiluMul<T>(
+                           down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                           d_act_q8_1_mmq_, d_mma_partials_, seq_len,
+                           hidden_size_, intermediate_size_, stream_,
+                           "down_proj", &execution_policy_) ||
+                       TryMmqSiluMulGemv<T>(
+                           down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                           d_act_q8_1_, seq_len, hidden_size_,
+                           intermediate_size_, stream_, "down_proj",
+                           &execution_policy_);
               },
               [&]() {
                 return TryQ8_1SiluMulGemv<T>(
@@ -2281,9 +2395,15 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         if (fused_gate_up_silu) {
           // SiLU already applied by fused kernel — d_ffn_gate_ has the
           // post-activation FP16 result.  Just quantize and run down GEMV.
-          bool down_ok = TryQ8_1Gemv<T>(
-              down_raw, d_ffn_gate_, d_ffn_down_, d_act_q8_1_, B, hidden_size_,
-              intermediate_size_, stream_, "down_proj", active_policy);
+          bool down_ok = TryMmqMmaGemv<T>(
+              down_raw, d_ffn_gate_, d_ffn_down_, d_act_q8_1_mmq_,
+              d_mma_partials_, B, hidden_size_, intermediate_size_, stream_,
+              "down_proj", active_policy);
+          if (!down_ok) {
+            down_ok = TryQ8_1Gemv<T>(
+                down_raw, d_ffn_gate_, d_ffn_down_, d_act_q8_1_, B, hidden_size_,
+                intermediate_size_, stream_, "down_proj", active_policy);
+          }
           if (!down_ok) {
             down_ok =
                 TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_, d_act_q8_1_,
@@ -2312,10 +2432,16 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                   down_selected_op, "decode", ProjectionQuantLabel(down_raw),
                   down_raw.quant_type, B, hidden_size_, intermediate_size_,
                   [&]() {
-                    return TryMmqSiluMulGemv<T>(
-                        down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-                        d_act_q8_1_, B, hidden_size_, intermediate_size_,
-                        stream_, "down_proj", active_policy);
+                    return TryMmqMmaSiluMul<T>(
+                               down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                               d_act_q8_1_mmq_, d_mma_partials_, B,
+                               hidden_size_, intermediate_size_, stream_,
+                               "down_proj", active_policy) ||
+                           TryMmqSiluMulGemv<T>(
+                               down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                               d_act_q8_1_, B, hidden_size_,
+                               intermediate_size_, stream_, "down_proj",
+                               active_policy);
                   },
                   [&]() {
                     return TryQ8_1SiluMulGemv<T>(

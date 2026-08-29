@@ -50,8 +50,9 @@ constexpr int kMmqTileYK =
 constexpr int kMmqMmaTileXKQ6K = 76;
 static_assert(kMmqMmaTileXKQ6K % 8 == 4, "pitch must be 4 mod 8");
 constexpr int kMmqIterK = 256;
-constexpr int kMmqY = 128; // weight rows per block (sm >= Volta)
-constexpr int kMmqWarps = 8;
+constexpr int kMmqY = 128;    // weight rows per block (sm >= Volta)
+constexpr int kMmqMmaWarps = 8;  // warps per block (blockDim = dim3(32, 8))
+constexpr int kMmqMmaMaxSplits = 8; // K-split cap (partials buffer sizing)
 
 // Dynamic shared-memory requirement (ints) for the mmq_x=16 kernel.
 constexpr int MmqSmemInts(int mmq_x) {
@@ -65,7 +66,7 @@ constexpr int MmqSmemInts(int mmq_x) {
 // handles 4 values, scale reduced across the 8 lanes of its 32-value
 // sub-group.
 // ---------------------------------------------------------------------------
-__global__ void QuantizeRowQ8_1MmqKernel(const half *__restrict__ x,
+static __global__ void QuantizeRowQ8_1MmqKernel(const half *__restrict__ x,
                                           BlockQ8_1Mmq *__restrict__ y, int K,
                                           int total_rows) {
   const int row = blockIdx.y;
@@ -115,6 +116,60 @@ __global__ void QuantizeRowQ8_1MmqKernel(const half *__restrict__ x,
   }
 }
 
+// Fused SwiGLU producer: silu(gate) * up quantized straight to D4, same
+// thread mapping and group-major layout as QuantizeRowQ8_1MmqKernel.
+static __global__ void SiluMulQuantizeQ8_1MmqKernel(const half *__restrict__ gate,
+                                             const half *__restrict__ up,
+                                             BlockQ8_1Mmq *__restrict__ y,
+                                             int K, int total_rows) {
+  const int row = blockIdx.y;
+  if (row >= total_rows)
+    return;
+  const int t = threadIdx.x; // 0..127
+  const int groups_per_row = K / 128;
+  const int group = blockIdx.x * 4 + t / 32;
+  if (group >= groups_per_row) {
+    return;
+  }
+  BlockQ8_1Mmq &grp = y[static_cast<size_t>(group) * total_rows + row];
+  const int lane = t % 32;
+
+  const int base = row * K + group * 128 + 4 * lane;
+  float vals[4];
+#pragma unroll
+  for (int j = 0; j < 4; j += 2) {
+    const half2 g2 = *reinterpret_cast<const half2 *>(&gate[base + j]);
+    const half2 u2 = *reinterpret_cast<const half2 *>(&up[base + j]);
+    const float g0 = __half2float(__low2half(g2));
+    const float g1 = __half2float(__high2half(g2));
+    vals[j] = g0 * __half2float(__low2half(u2)) /
+              (1.0f + __expf(-g0));
+    vals[j + 1] = g1 * __half2float(__high2half(u2)) /
+                  (1.0f + __expf(-g1));
+  }
+
+  float amax = fabsf(vals[0]);
+  amax = fmaxf(amax, fabsf(vals[1]));
+  amax = fmaxf(amax, fabsf(vals[2]));
+  amax = fmaxf(amax, fabsf(vals[3]));
+#pragma unroll
+  for (int off = 4; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, off));
+  }
+
+  const float d_inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+  char4 q;
+  q.x = __float2int_rn(vals[0] * d_inv);
+  q.y = __float2int_rn(vals[1] * d_inv);
+  q.z = __float2int_rn(vals[2] * d_inv);
+  q.w = __float2int_rn(vals[3] * d_inv);
+  reinterpret_cast<char4 *>(grp.qs)[lane] = q;
+
+  if (lane % 8 == 0) {
+    grp.d4[lane / 8] = amax > 0.0f ? 1.0f / d_inv : 0.0f;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Weight staging: Q6_K -> int8 x_qs tile + float x_df + packed int scales.
 // Port of load_tiles_q6_K (mmq.cuh:2289-2360), MMA branch.
@@ -137,7 +192,7 @@ LoadTilesQ6KMma(const char *__restrict__ x, int *__restrict__ x_tile,
   const int txi = threadIdx.x % threads_per_row;
 
 #pragma unroll
-  for (int i0 = 0; i0 < mmq_y; i0 += nrows * kMmqWarps) {
+  for (int i0 = 0; i0 < mmq_y; i0 += nrows * kMmqMmaWarps) {
     const int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y * nrows +
                                              threadIdx.x / threads_per_row);
     if (i > i_max) {
@@ -166,7 +221,7 @@ LoadTilesQ6KMma(const char *__restrict__ x, int *__restrict__ x_tile,
   }
 
 #pragma unroll
-  for (int i0 = 0; i0 < mmq_y; i0 += kMmqWarps * warp_size) {
+  for (int i0 = 0; i0 < mmq_y; i0 += kMmqMmaWarps * warp_size) {
     const int i = (i0 + threadIdx.y * warp_size + threadIdx.x) % mmq_y;
     if (i > i_max) {
       break;
@@ -181,7 +236,7 @@ LoadTilesQ6KMma(const char *__restrict__ x, int *__restrict__ x_tile,
 
   constexpr int rows_per_warp = warp_size / 4;
 #pragma unroll
-  for (int i0 = 0; i0 < mmq_y; i0 += kMmqWarps * rows_per_warp) {
+  for (int i0 = 0; i0 < mmq_y; i0 += kMmqMmaWarps * rows_per_warp) {
     const int i = (i0 + threadIdx.y * rows_per_warp +
                    threadIdx.x / (kMmqTileNeK / 8)) %
                   mmq_y;
@@ -321,7 +376,7 @@ VecDotQ6KQ8_1Mma(const int *__restrict__ x, const int *__restrict__ y,
 // ---------------------------------------------------------------------------
 // Deterministic K-split reduce: partials[S][M][N] fp32 -> half[M][N],
 // summed in fixed z order (no atomics, bit-stable across runs).
-__global__ void ReduceMmqKSplit(const float *__restrict__ partials,
+static __global__ void ReduceMmqKSplit(const float *__restrict__ partials,
                                 half *__restrict__ out, int splits,
                                 size_t mn) {
   const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -336,7 +391,7 @@ __global__ void ReduceMmqKSplit(const float *__restrict__ partials,
 }
 
 template <int mmq_x>
-__global__ void __launch_bounds__(kMmqWarps * 32, 1)
+__global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
     InferfluxMmqQ6KMma(const char *__restrict__ w,
                        const BlockQ8_1Mmq *__restrict__ act, half *__restrict__ out,
                        int N, int K, int M, float *__restrict__ partials,
@@ -357,7 +412,7 @@ __global__ void __launch_bounds__(kMmqWarps * 32, 1)
   const int tile_x_max_i = N - it * kMmqY - 1;
   const int tile_y_max_j = M - jt * mmq_x - 1;
 
-  float sum[mmq_x * kMmqY / (kMmqWarps * warp_size)] = {0};
+  float sum[mmq_x * kMmqY / (kMmqMmaWarps * warp_size)] = {0};
 
   const char *x = w + static_cast<size_t>(it) * kMmqY * blocks_per_row *
                           sizeof(block_q6_k);
@@ -387,7 +442,7 @@ __global__ void __launch_bounds__(kMmqWarps * 32, 1)
                 sz;
 #pragma unroll
         for (int l0 = 0; l0 < mmq_x * kMmqTileYK;
-             l0 += kMmqWarps * warp_size) {
+             l0 += kMmqMmaWarps * warp_size) {
           const int l = l0 + threadIdx.y * warp_size + threadIdx.x;
           if (l < mmq_x * kMmqTileYK) {
             tile_y[l] = src[l];

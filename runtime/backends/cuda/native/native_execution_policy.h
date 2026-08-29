@@ -67,6 +67,11 @@ struct NativeExecutionPolicy {
   bool enable_experimental_q81_grouped_mmq3{true};
   bool enable_downproj_mmq{false};
   int downproj_mmq_min_batch_override{-1};
+  // mma.sync Q6_K down-projection (S7): int8 tensor-core MMQ with
+  // deterministic K-split. Default off; A/B gate pending. When on, the
+  // down-proj MMQ tier prefers the MMA kernel for Q6_K weights.
+  bool enable_mmq_mma{false};
+  int mmq_mma_max_batch{16};
   bool use_vectorized_loads{false};
   bool enable_fused_gate_up_silu{true};
   bool enable_adaptive_mmvq_threads{true};
@@ -157,6 +162,10 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", false);
     policy.downproj_mmq_min_batch_override =
         ParseIntEnv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", -1, 1, 64);
+    policy.enable_mmq_mma =
+        ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", false);
+    policy.mmq_mma_max_batch =
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH", 16, 1, 64);
     policy.use_vectorized_loads =
         ParseBoolEnv("INFERFLUX_USE_VECTORIZED_LOADS", false);
     policy.enable_fused_gate_up_silu =
