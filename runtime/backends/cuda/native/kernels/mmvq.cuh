@@ -2,6 +2,8 @@
 
 #include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 
+#include <array>
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
