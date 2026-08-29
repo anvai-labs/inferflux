@@ -173,6 +173,11 @@ private:
   int8_t *d_packed_activation_{nullptr};
   float *d_packed_activation_scales_{nullptr};
   void *d_act_q8_1_{nullptr}; // Pre-quantized Q8_1 activation buffer
+  // Group-major D4 activations + fp32 K-split partials for the MMA
+  // down-proj path (S7); allocated unconditionally, used only when
+  // INFERFLUX_CUDA_MMQ_MMA=1.
+  void *d_act_q8_1_mmq_{nullptr}; // BlockQ8_1Mmq (D4) activations
+  float *d_mma_partials_{nullptr};
   int *d_token_ids_{nullptr};
   T *d_logits_typed_{nullptr};
 

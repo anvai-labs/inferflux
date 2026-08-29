@@ -25,6 +25,16 @@ typedef __half half;
 
 namespace inferflux {
 
+// Defined in kernels/mmq_mma.cuh (CUDA-only header): forward-declared here
+// so CPU-only TUs can compile this header without device intrinsics.
+namespace runtime {
+namespace cuda {
+namespace native {
+struct BlockQ8_1Mmq;
+} // namespace native
+} // namespace cuda
+} // namespace runtime
+
 struct PackedActivationInfo {
   const int8_t *data{nullptr};
   const float *row_scales{nullptr};
@@ -193,6 +203,44 @@ public:
 
   static bool
   IsDownProjMmqEnabled(const NativeExecutionPolicy *policy = nullptr);
+
+  // -----------------------------------------------------------------------
+  // MMA tensor-core path (S7): Q6_K down-projection via mma.sync int8
+  // tensor cores with deterministic K-split. Consumes the RAW row-major
+  // weight layout (no MmqWeightInfo transform) and the group-major D4
+  // activation buffer produced by QuantizeRowQ8_1Mmq /
+  // SiluMulQuantizeQ8_1Mmq. Gated on NativeExecutionPolicy::enable_mmq_mma
+  // (INFERFLUX_CUDA_MMQ_MMA, default off).
+  // -----------------------------------------------------------------------
+
+  /**
+   * Quantize FP16 activation rows to the D4 (BlockQ8_1Mmq) layout:
+   * group-major [K/128][M] blocks of 128 values with four float scales.
+   */
+  static void QuantizeRowQ8_1Mmq(const half *input,
+                                 runtime::cuda::native::BlockQ8_1Mmq *output,
+                                 int M, int K, cudaStream_t stream);
+
+  /** Fused SwiGLU + D4 quantization for down-projection input. */
+  static void
+  SiluMulQuantizeQ8_1Mmq(const half *gate, const half *up,
+                         runtime::cuda::native::BlockQ8_1Mmq *output, int M,
+                         int K, cudaStream_t stream);
+
+  /**
+   * MMA down-projection: out[M, N] = act[M, K] x W[N, K]^T for Q6_K W in
+   * raw row-major super-block layout. K-split fills the SM array when the
+   * N-tile grid alone under-occupies the device; partials must have room
+   * for kMmqMmaMaxSplits * M * N floats.
+   *
+   * @return true if the kernel launched, false when unsupported (caller
+   * falls back to the dp4a MMQ / Q8_1 tiers).
+   */
+  static bool DownProjMmqMma(const QuantizedWeightInfo &weight,
+                             const runtime::cuda::native::BlockQ8_1Mmq *act_mmq,
+                             half *output, int M, int N, int K, float *partials,
+                             cudaStream_t stream,
+                             const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * Build a tile-major MMQ layout for a quantized tensor.

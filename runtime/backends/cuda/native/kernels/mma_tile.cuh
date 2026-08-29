@@ -89,8 +89,7 @@ struct Tile<I_, J_, int, kJMajor> {
   }
 };
 
-// Element-wise fragment load via the lane mapping (no ldmatrix). Sufficient
-// for the MMQ path — llama's vec_dot_*_mma loads A/B this way.
+// Element-wise fragment load via the lane mapping.
 template <int I, int J, typename T, DataLayout DL>
 __device__ __forceinline__ void LoadGeneric(Tile<I, J, T, DL> &t,
                                             const T *__restrict__ xs,
@@ -101,35 +100,50 @@ __device__ __forceinline__ void LoadGeneric(Tile<I, J, T, DL> &t,
   }
 }
 
-// D = A(16x8) x B(16x8) -> C(16x16) on int8 fragments, accumulate int32.
-// sm_80+ (our sm_89 target): single m16n8k16 instruction. The operand
-// register mapping matches the Tile<16,8> layout above — a and b each hold
-// 4 registers (ne = 16*8/32 = 4), c holds 8 (16*16/32).
-__device__ __forceinline__ void MmaS8(Tile<16, 16, int, kJMajor> &c, const Tile<16, 8, int> &a,
-      const Tile<16, 8, int> &b) {
-  static_assert(a.ne == 4 && b.ne == 4 && c.ne == 8, "fragment sizes");
+// ldmatrix load for the A operand fragment (m8n8.x2 form used by the
+// <16,4,int> tile). Falls back to element-wise loads pre-Turing.
+template <typename T>
+__device__ __forceinline__ void LoadLdmatrix(Tile<16, 4, T> &t,
+                                              const T *__restrict__ xs,
+                                              int stride) {
+#ifdef INFERFLUX_TURING_MMA
+  int *xi = reinterpret_cast<int *>(t.x);
+  const int *xs32 = reinterpret_cast<const int *>(xs) +
+                     (threadIdx.x % t.I) * stride;
+  asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
+               : "=r"(xi[0]), "=r"(xi[1])
+               : "l"(xs32));
+#else
+  LoadGeneric(t, xs, stride);
+#endif
+}
+
+// D(16x8) = A(16x4) x B(8x4) on int8 fragments, accumulate int32 —
+// mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32. Register counts:
+// a.ne=2, b.ne=1, c.ne=4 (the PTX fragment layout for m16n8k16).
+__device__ __forceinline__ void MmaS8(Tile<16, 8, int> &c,
+                                      const Tile<16, 4, int> &a,
+                                      const Tile<8, 4, int> &b) {
+  static_assert(a.ne == 2 && b.ne == 1 && c.ne == 4, "fragment sizes");
 #ifdef INFERFLUX_TURING_MMA
 #if __CUDA_ARCH__ >= 800
   asm volatile(
       "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 "
-      "{%0, %1, %2, %3, %4, %5, %6, %7}, {%8, %9, %10, %11}, {%12, %13, %14, "
-      "%15}, {%0, %1, %2, %3, %4, %5, %6, %7};"
-      : "+r"(c.x[0]), "+r"(c.x[1]), "+r"(c.x[2]), "+r"(c.x[3]), "+r"(c.x[4]),
-        "+r"(c.x[5]), "+r"(c.x[6]), "+r"(c.x[7])
-      : "r"(a.x[0]), "r"(a.x[1]), "r"(a.x[2]), "r"(a.x[3]), "r"(b.x[0]),
-        "r"(b.x[1]), "r"(b.x[2]), "r"(b.x[3]));
+      "{%0, %1, %2, %3}, {%4, %5}, {%6}, {%0, %1, %2, %3};"
+      : "+r"(c.x[0]), "+r"(c.x[1]), "+r"(c.x[2]), "+r"(c.x[3])
+      : "r"(a.x[0]), "r"(a.x[1]), "r"(b.x[0]));
 #else
   // sm_75: two m8n8k16 instructions.
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0, %1, %2, %3}, {%4}, {%5}, {%0, %1, %2, %3};"
-      : "+r"(c.x[0]), "+r"(c.x[1]), "+r"(c.x[2]), "+r"(c.x[3])
+      "{%0, %1}, {%2}, {%3}, {%0, %1};"
+      : "+r"(c.x[0]), "+r"(c.x[1])
       : "r"(a.x[0]), "r"(b.x[0]));
   asm volatile(
       "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
-      "{%0, %1, %2, %3}, {%4}, {%5}, {%0, %1, %2, %3};"
-      : "+r"(c.x[4]), "+r"(c.x[5]), "+r"(c.x[6]), "+r"(c.x[7])
-      : "r"(a.x[2]), "r"(b.x[0]));
+      "{%0, %1}, {%2}, {%3}, {%0, %1};"
+      : "+r"(c.x[2]), "+r"(c.x[3])
+      : "r"(a.x[1]), "r"(b.x[0]));
 #endif
 #else
   (void)c;

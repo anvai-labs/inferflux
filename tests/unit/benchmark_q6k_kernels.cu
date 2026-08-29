@@ -8,6 +8,8 @@
 //   warp — llama.cpp mul_mat_vec_q structure: one warp per (row, batch),
 //          full K loop serially, no cross-warp reduction
 #include "runtime/backends/cuda/native/kernels/dequantization.cuh"
+#include "runtime/backends/cuda/native/kernels/mma_tile.cuh"
+#include "runtime/backends/cuda/native/kernels/mmq_mma.cuh"
 #include "runtime/backends/cuda/native/kernels/mmvq.cuh"
 #include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 
@@ -279,6 +281,12 @@ __global__ void q6k_llama_mmvq(const block_q6_k *__restrict__ w,
   }
 }
 
+std::vector<half> CopyDeviceHalfs(const half *device, size_t count) {
+  std::vector<half> host(count);
+  cudaMemcpy(host.data(), device, count * sizeof(half), cudaMemcpyDeviceToHost);
+  return host;
+}
+
 float BenchUs(cudaEvent_t a, cudaEvent_t b, int iters) {
   float ms;
   cudaEventElapsedTime(&ms, a, b);
@@ -476,6 +484,144 @@ int main() {
     printf("\n");
     cudaFree(d_a);
     cudaFree(d_out);
+  }
+  // ===================================================================
+  // MMA validation ladder
+  // ===================================================================
+  {
+    using native::BlockQ8_1Mmq;
+    printf("\n--- MMA validation (vs FPU reference) ---\n");
+    for (int M : {1, 8, 16}) {
+      auto acts = MakeActs(M);
+      // Quantize to D4 on host.
+      // Kernel layout is group-major [K/128][M]; host reference below uses a
+      // row-major view hq_row for readability, transposed on upload.
+      std::vector<BlockQ8_1Mmq> hq(static_cast<size_t>(M) * (kK / 128));
+      auto hq_at = [&](int r, int grp) -> BlockQ8_1Mmq & {
+        return hq[static_cast<size_t>(grp) * M + r];
+      };
+      for (int r = 0; r < M; ++r) {
+        for (int grp = 0; grp < kK / 128; ++grp) {
+          auto &g = hq_at(r, grp);
+          for (int sub = 0; sub < 4; ++sub) {
+            float amax = 0;
+            float vals[32];
+            for (int i = 0; i < 32; ++i) {
+              const float v = __half2float(
+                  acts[static_cast<size_t>(r) * kK + grp * 128 + sub * 32 + i]);
+              vals[i] = v;
+              amax = std::fmax(amax, std::fabs(v));
+            }
+            const float d_inv = amax > 0 ? 127.0f / amax : 0.0f;
+            g.d4[sub] = amax > 0 ? 1.0f / d_inv : 0.0f;
+            for (int i = 0; i < 32; ++i)
+              g.qs[sub * 32 + i] =
+                  static_cast<int8_t>(std::lround(vals[i] * d_inv));
+          }
+        }
+      }
+      BlockQ8_1Mmq *d_a;
+      cudaMalloc(&d_a, hq.size() * sizeof(BlockQ8_1Mmq));
+      cudaMemcpy(d_a, hq.data(), hq.size() * sizeof(BlockQ8_1Mmq),
+                 cudaMemcpyHostToDevice);
+      half *d_out_mma;
+      cudaMalloc(&d_out_mma, static_cast<size_t>(M) * kN * sizeof(half));
+      const size_t mn = static_cast<size_t>(M) * kN;
+      float *d_part = nullptr;
+
+      const dim3 grid((kN + native::kMmqY - 1) / native::kMmqY, (M + 15) / 16);
+      const size_t smem = native::MmqSmemInts(16) * sizeof(int);
+      cudaFuncSetAttribute(native::InferfluxMmqQ6KMma<16>,
+                           cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           (int)smem);
+      const dim3 mma_block(32, native::kMmqMmaWarps, 1);
+      for (int ks : {1, 2, 3, 4, 6}) {
+        if (ks > 1) {
+          if (!d_part) cudaMalloc(&d_part, 6 * mn * sizeof(float));
+          cudaMemset(d_out_mma, 0, mn * sizeof(half));
+        }
+        dim3 g = grid;
+        g.z = ks;
+        for (int i = 0; i < kWarmup; ++i) {
+          native::InferfluxMmqQ6KMma<16>
+              <<<g, mma_block, smem, s>>>(
+                  reinterpret_cast<const char *>(d_w), d_a, d_out_mma, kN, kK, M,
+                  d_part, ks);
+          if (ks > 1) {
+            const int rthreads = 256;
+            const size_t rblocks = (mn + rthreads - 1) / rthreads;
+            native::ReduceMmqKSplit<<<rblocks, rthreads, 0, s>>>(
+                d_part, d_out_mma, ks, mn);
+          }
+        }
+        cudaEventRecord(start, s);
+        for (int i = 0; i < kIters; ++i) {
+          native::InferfluxMmqQ6KMma<16>
+              <<<g, mma_block, smem, s>>>(
+                  reinterpret_cast<const char *>(d_w), d_a, d_out_mma, kN, kK, M,
+                  d_part, ks);
+          if (ks > 1) {
+            const int rthreads = 256;
+            const size_t rblocks = (mn + rthreads - 1) / rthreads;
+            native::ReduceMmqKSplit<<<rblocks, rthreads, 0, s>>>(
+                d_part, d_out_mma, ks, mn);
+          }
+        }
+        cudaEventRecord(stop, s);
+        cudaEventSynchronize(stop);
+        printf("M=%-2d  mma q6k s=%d : %7.1f us (%d blocks)\n", M, ks,
+               BenchUs(start, stop, kIters), grid.x * ks);
+      }
+
+      // Correctness vs FPU reference
+      {
+        auto out = CopyDeviceHalfs(d_out_mma, static_cast<size_t>(M) * kN);
+        // FPU ref: for each row n, col m: sum_k deq(w[n][k]) * act[m][k]
+        const auto &wv = w;
+        double max_rel = 0;
+        int n_checked = 0;
+        for (int n = 0; n < kN; n += 97) { // sample rows
+          const auto &b0 = wv[static_cast<size_t>(n) * kBlocksPerRow];
+          (void)b0;
+          for (int m = 0; m < M; ++m) {
+            double ref = 0;
+            for (int blk = 0; blk < kBlocksPerRow; ++blk) {
+              const auto &b = wv[static_cast<size_t>(n) * kBlocksPerRow + blk];
+              const float d = __half2float(*reinterpret_cast<const half *>(&b.d));
+              for (int e = 0; e < 256; ++e) {
+                const int g2 = e / 128;
+                const int sub = (e % 128) / 32;
+                const int l2 = e % 32;
+                const int ql_idx = g2 * 64 + ((sub & 1) ? 32 : 0) + l2;
+                const int ql_val = (sub >= 2) ? (b.ql[ql_idx] >> 4)
+                                              : (b.ql[ql_idx] & 0xF);
+                const int h = (b.qh[g2 * 32 + l2] >> (sub * 2)) & 0x03;
+                const int q = ((ql_val | (h << 4)) - 32);
+                const float sc = static_cast<float>(
+                    b.scales[g2 * 8 + sub * 2 + l2 / 16]);
+                const int k = blk * 256 + e;
+                const auto &g = hq_at(m, k / 128);
+                const int8_t aq = g.qs[k % 128];
+                const float ad = g.d4[(k % 128) / 32];
+                ref += static_cast<double>(d) * sc * q * ad * aq;
+              }
+            }
+            const float got = __half2float(
+                out[static_cast<size_t>(m) * kN + n]);
+            const double rel = std::fabs(ref) > 1e-9 ? std::fabs((got - ref) / ref) : std::fabs(got - ref);
+            max_rel = std::fmax(max_rel, rel);
+            ++n_checked;
+            if (n_checked >= 64)
+              break;
+          }
+          if (n_checked >= 64)
+            break;
+        }
+        printf("M=%-2d  max rel err (64 samples): %.3e\n", M, max_rel);
+      }
+      cudaFree(d_a);
+      cudaFree(d_out_mma);
+    }
   }
   return 0;
 }

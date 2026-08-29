@@ -585,6 +585,12 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_include_directories(benchmark_grouped_q81_pair PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_grouped_q81_pair PRIVATE inferflux_core)
+  add_executable(test_mma_q6k tests/unit/test_mma_q6k.cu)
+  target_include_directories(test_mma_q6k PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(test_mma_q6k PRIVATE CUDA::cudart)
+  add_test(NAME MmaQ6KTests COMMAND test_mma_q6k)
+  set_tests_properties(MmaQ6KTests PROPERTIES LABELS "mma_q6k")
 endif()
 
 install(TARGETS inferfluxd inferctl
