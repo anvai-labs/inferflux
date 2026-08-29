@@ -100,8 +100,8 @@ FusedQuantGemm::DownProjOperator SelectInferfluxCudaDownProjOperator(
       policy.enable_mmq_mma && raw.data != nullptr &&
       raw.quant_type ==
           static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K) &&
-      geometry.M >= 2 && geometry.M <= policy.mmq_mma_max_batch &&
-      geometry.K % 256 == 0;
+      geometry.M >= policy.mmq_mma_min_batch &&
+      geometry.M <= policy.mmq_mma_max_batch && geometry.K % 256 == 0;
   const bool mmq_ready =
       mma_ready ||
       (mmq_weight.data != nullptr &&

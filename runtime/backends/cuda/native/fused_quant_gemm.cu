@@ -1748,7 +1748,8 @@ bool FusedQuantGemm::DownProjMmqMma(
   }
   if (static_cast<GGUF::TensorType>(weight.quant_type) !=
           GGUF::TensorType::Q6_K ||
-      K % QK_K != 0 || M > p.mmq_mma_max_batch) {
+      K % QK_K != 0 || M < p.mmq_mma_min_batch ||
+      M > p.mmq_mma_max_batch) {
     return false;
   }
 

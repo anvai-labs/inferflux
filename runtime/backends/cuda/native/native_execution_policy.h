@@ -71,6 +71,10 @@ struct NativeExecutionPolicy {
   // deterministic K-split. Default off; A/B gate pending. When on, the
   // down-proj MMQ tier prefers the MMA kernel for Q6_K weights.
   bool enable_mmq_mma{false};
+  // MMA only wins where the dp4a MMVQ tier stops being at the bandwidth
+  // floor: measured -13% at c4 (M=4) vs the incumbent MMVQ, so the floor
+  // M is 9 (the same batch range the dp4a MMQ threshold targets).
+  int mmq_mma_min_batch{9};
   int mmq_mma_max_batch{16};
   bool use_vectorized_loads{false};
   bool enable_fused_gate_up_silu{true};
@@ -162,8 +166,9 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", false);
     policy.downproj_mmq_min_batch_override =
         ParseIntEnv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", -1, 1, 64);
-    policy.enable_mmq_mma =
-        ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", false);
+    policy.enable_mmq_mma = ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", false);
+    policy.mmq_mma_min_batch =
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 9, 1, 64);
     policy.mmq_mma_max_batch =
         ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH", 16, 1, 64);
     policy.use_vectorized_loads =

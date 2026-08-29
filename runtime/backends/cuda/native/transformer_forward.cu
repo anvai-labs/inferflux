@@ -624,6 +624,7 @@ bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_mmq_mma || !weight.data || !gate || !up || !output ||
       !act_mmq || !partials || M <= 0 || N <= 0 || K <= 0 ||
+      M < policy_ref.mmq_mma_min_batch ||
       static_cast<size_t>(N) * K !=
           static_cast<size_t>(weight.num_elements) ||
       weight.quant_type !=
@@ -661,6 +662,7 @@ bool TryMmqMmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_mmq_mma || !weight.data || !input || !output ||
       !act_mmq || !partials || M <= 0 || N <= 0 || K <= 0 ||
+      M < policy_ref.mmq_mma_min_batch ||
       M > policy_ref.mmq_mma_max_batch ||
       static_cast<size_t>(N) * K !=
           static_cast<size_t>(weight.num_elements) ||
