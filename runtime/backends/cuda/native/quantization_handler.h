@@ -3,7 +3,19 @@
 #include "runtime/backends/cuda/native/model_loader.h"
 
 #ifdef INFERFLUX_HAS_CUDA
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
+#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 #endif
 
 #include <functional>

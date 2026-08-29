@@ -421,6 +421,27 @@ has_fatal_runtime_signature() {
     grep -Eqi 'double free|corruption \(|segmentation fault|addresssanitizer|terminate called after throwing|fatal glibc error|aborted \(core dumped\)|INFERFLUX CRASH DIAGNOSTIC' "$log_file"
 }
 
+# Dispatch trace summary: parse dispatch_trace lines (emitted when
+# INFERFLUX_BENCH_DISPATCH_TRACE=true) and surface any tier mismatch.
+capture_dispatch_trace_summary() {
+    local log_file=$1
+    local backend=$2
+    [ -f "$log_file" ] || return 0
+    if ! grep -q '\[dispatch_trace\]' "$log_file"; then
+        return 0
+    fi
+    local trace_file="$OUTPUT_DIR/dispatch_trace_${backend}.txt"
+    grep '\[dispatch_trace\]' "$log_file" > "$trace_file" 2>/dev/null || true
+    if [ -s "$trace_file" ]; then
+        log "  Dispatch trace summary ($backend):"
+        if python3 "$SCRIPT_DIR/parse_dispatch_trace.py" "$trace_file" | sed 's/^/    /'; then
+            :
+        else
+            log_err "  DISPATCH DIVERGENCE DETECTED ($backend) — see $trace_file"
+        fi
+    fi
+}
+
 # Extract and display crash diagnostics from server log if present.
 report_crash_diagnostics() {
     local log_file=$1
@@ -646,6 +667,7 @@ start_server() {
         INFERFLUX_CUDA_STRICT=$([ "$backend" = "inferflux_cuda" ] && echo "1" || echo "0") \
         INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE=$([ "$backend" = "inferflux_cuda" ] && echo "1" || echo "0") \
         INFERFLUX_DISABLE_CUDA_GRAPH=$([ "$backend" = "inferflux_cuda" ] && echo "${INFERFLUX_DISABLE_CUDA_GRAPH:-0}" || echo "0") \
+        INFERFLUX_CUDA_DISPATCH_TRACE=$([ "$backend" = "inferflux_cuda" ] && echo "${INFERFLUX_BENCH_DISPATCH_TRACE:-0}" || echo "0") \
         "$BUILD_DIR/inferfluxd" --config "$config_file" \
         > "$log_file" 2>&1 &
     local pid=$!
@@ -980,6 +1002,9 @@ EOF
         fi
         local bucket_winner_summary
         bucket_winner_summary=$(capture_inferflux_cuda_bucket_winners "$backend" "$concurrency" 2>/dev/null || true)
+        if [ "$backend" = "inferflux_cuda" ]; then
+            capture_dispatch_trace_summary "$OUTPUT_DIR/server_${backend}.log" "$backend" || true
+        fi
         if [ -n "${bucket_winner_summary:-}" ]; then
             log "  Native dispatch bucket winners:"
             printf '%s\n' "$bucket_winner_summary" | sed 's/^/    /'

@@ -68,7 +68,10 @@ bool ProjectionHasGraphSafeKernel(const QuantizedWeightInfo &raw,
     return true;
   }
 
-  return true;
+  // Both activation tiers are policy-disabled: no fused kernel can run,
+  // so the projection is not graph-safe (it would hit the cuBLAS capture
+  // abort). The old unconditional `return true` started doomed captures.
+  return !Q81ActivationsDisabled(policy) || !PackedActivationsDisabled(policy);
 }
 
 FusedQuantGemm::DownProjOperator SelectInferfluxCudaDownProjOperator(

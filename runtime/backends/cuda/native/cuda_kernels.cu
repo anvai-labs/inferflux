@@ -116,8 +116,8 @@ __global__ void RoPEKernel(T *__restrict__ q, T *__restrict__ k, int seq_len,
 
 template <typename T>
 cudaError_t RoPE(T *q, T *k, int seq_len, int num_heads, int num_kv_heads,
-                 int head_dim, int n_past, float freq_base,
-                 cudaStream_t stream, int rope_type) {
+                 int head_dim, int n_past, float freq_base, cudaStream_t stream,
+                 int rope_type) {
   int half_dim = head_dim / 2;
   int total_pairs =
       seq_len * num_heads * half_dim + seq_len * num_kv_heads * half_dim;
@@ -125,8 +125,8 @@ cudaError_t RoPE(T *q, T *k, int seq_len, int num_heads, int num_kv_heads,
   int blocks = (total_pairs + threads - 1) / threads;
 
   RoPEKernel<T><<<blocks, threads, 0, stream>>>(q, k, seq_len, num_heads,
-                                                 num_kv_heads, head_dim,
-                                                 n_past, freq_base, rope_type);
+                                                num_kv_heads, head_dim, n_past,
+                                                freq_base, rope_type);
   return cudaGetLastError();
 }
 
@@ -189,11 +189,10 @@ cudaError_t ResidualAdd(T *residual, const T *input, int count,
 // a single kernel, eliminating one kernel launch per fusion site.
 
 template <typename T>
-__global__ void ResidualAddRmsNormKernel(T *__restrict__ residual,
-                                         const T *__restrict__ input,
-                                         const T *__restrict__ weight,
-                                         T *__restrict__ output,
-                                         int hidden_size, float eps) {
+__global__ void
+ResidualAddRmsNormKernel(T *__restrict__ residual, const T *__restrict__ input,
+                         const T *__restrict__ weight, T *__restrict__ output,
+                         int hidden_size, float eps) {
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
   T *res_row = residual + row * hidden_size;
@@ -242,9 +241,8 @@ cudaError_t ResidualAddRmsNorm(T *residual, const T *input, const T *weight,
   threads = t;
   int smem = threads * sizeof(float);
 
-  ResidualAddRmsNormKernel<T>
-      <<<count, threads, smem, stream>>>(residual, input, weight, output,
-                                         hidden_size, eps);
+  ResidualAddRmsNormKernel<T><<<count, threads, smem, stream>>>(
+      residual, input, weight, output, hidden_size, eps);
   return cudaGetLastError();
 }
 
@@ -362,8 +360,8 @@ cudaError_t QuantizeRowsSymmetric(const T *input, int8_t *output,
   }
   threads = t;
   const int smem = threads * sizeof(float);
-  QuantizeRowsSymmetricKernel<T><<<rows, threads, smem, stream>>>(
-      input, output, row_scales, cols);
+  QuantizeRowsSymmetricKernel<T>
+      <<<rows, threads, smem, stream>>>(input, output, row_scales, cols);
   return cudaGetLastError();
 }
 
@@ -429,8 +427,8 @@ cudaError_t SiluMulQuantizeRowsSymmetric(const T *gate, const T *up,
   }
   threads = t;
   const int smem = threads * sizeof(float);
-  SiluMulQuantizeRowsSymmetricKernel<T><<<rows, threads, smem, stream>>>(
-      gate, up, output, row_scales, cols);
+  SiluMulQuantizeRowsSymmetricKernel<T>
+      <<<rows, threads, smem, stream>>>(gate, up, output, row_scales, cols);
   return cudaGetLastError();
 }
 
@@ -656,9 +654,10 @@ template cudaError_t ResidualAdd<__nv_bfloat16>(__nv_bfloat16 *,
 template cudaError_t ResidualAddRmsNorm<half>(half *, const half *,
                                               const half *, half *, int, int,
                                               float, cudaStream_t);
-template cudaError_t ResidualAddRmsNorm<__nv_bfloat16>(
-    __nv_bfloat16 *, const __nv_bfloat16 *, const __nv_bfloat16 *,
-    __nv_bfloat16 *, int, int, float, cudaStream_t);
+template cudaError_t
+ResidualAddRmsNorm<__nv_bfloat16>(__nv_bfloat16 *, const __nv_bfloat16 *,
+                                  const __nv_bfloat16 *, __nv_bfloat16 *, int,
+                                  int, float, cudaStream_t);
 
 template cudaError_t EmbeddingLookup<half>(const half *, const int *, half *,
                                            int, int, cudaStream_t);
@@ -671,15 +670,21 @@ template cudaError_t HalfToFloat<half>(const half *, float *, int,
                                        cudaStream_t);
 template cudaError_t HalfToFloat<__nv_bfloat16>(const __nv_bfloat16 *, float *,
                                                 int, cudaStream_t);
-template cudaError_t QuantizeRowsSymmetric<half>(const half *, int8_t *, float *,
-                                                 int, int, cudaStream_t);
-template cudaError_t QuantizeRowsSymmetric<__nv_bfloat16>(
-    const __nv_bfloat16 *, int8_t *, float *, int, int, cudaStream_t);
-template cudaError_t SiluMulQuantizeRowsSymmetric<half>(
-    const half *, const half *, int8_t *, float *, int, int, cudaStream_t);
-template cudaError_t SiluMulQuantizeRowsSymmetric<__nv_bfloat16>(
-    const __nv_bfloat16 *, const __nv_bfloat16 *, int8_t *, float *, int, int,
-    cudaStream_t);
+template cudaError_t QuantizeRowsSymmetric<half>(const half *, int8_t *,
+                                                 float *, int, int,
+                                                 cudaStream_t);
+template cudaError_t QuantizeRowsSymmetric<__nv_bfloat16>(const __nv_bfloat16 *,
+                                                          int8_t *, float *,
+                                                          int, int,
+                                                          cudaStream_t);
+template cudaError_t SiluMulQuantizeRowsSymmetric<half>(const half *,
+                                                        const half *, int8_t *,
+                                                        float *, int, int,
+                                                        cudaStream_t);
+template cudaError_t
+SiluMulQuantizeRowsSymmetric<__nv_bfloat16>(const __nv_bfloat16 *,
+                                            const __nv_bfloat16 *, int8_t *,
+                                            float *, int, int, cudaStream_t);
 
 template cudaError_t BiasAdd<half>(half *, const half *, int, int,
                                    cudaStream_t);
@@ -810,11 +815,12 @@ cudaError_t SiluMulQuantizeRowsSymmetric(const half *gate, const half *up,
 // ============================================================================
 
 template <typename T>
-__global__ void BatchedRoPEKernel(T *__restrict__ q, T *__restrict__ k,
-                                  int batch_size, int num_heads,
-                                  int num_kv_heads, int head_dim,
-                                  const int *__restrict__ d_n_past,
-                                  float freq_base, int rope_type) {
+__global__ void
+BatchedRoPEKernel(T *__restrict__ q, T *__restrict__ k, int batch_size,
+                  int num_heads, int num_kv_heads, int head_dim,
+                  const int *__restrict__ d_n_past, float freq_base,
+                  int rope_type, const T *__restrict__ q_bias,
+                  const T *__restrict__ k_bias) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int half_dim = head_dim / 2;
   const int q_pairs_per_seq = num_heads * half_dim;
@@ -857,8 +863,18 @@ __global__ void BatchedRoPEKernel(T *__restrict__ q, T *__restrict__ k,
     i1 = base_offset + 2 * pair_idx + 1;
   }
 
+  // Optional bias fold: adding Q/K bias at load reproduces the
+  // BiasAdd-then-RoPE sequence with one fewer half-rounding step.
+  const T *bias = is_q ? q_bias : k_bias;
   float v0 = DtypeTraits<T>::to_float(tensor[i0]);
   float v1 = DtypeTraits<T>::to_float(tensor[i1]);
+  if (bias != nullptr) {
+    const int bias_dim0 = i0 - base_offset;
+    const int bias_dim1 = i1 - base_offset;
+    const int bias_base = head_idx * head_dim;
+    v0 += DtypeTraits<T>::to_float(bias[bias_base + bias_dim0]);
+    v1 += DtypeTraits<T>::to_float(bias[bias_base + bias_dim1]);
+  }
 
   tensor[i0] = DtypeTraits<T>::from_float(v0 * cos_val - v1 * sin_val);
   tensor[i1] = DtypeTraits<T>::from_float(v0 * sin_val + v1 * cos_val);
@@ -867,7 +883,8 @@ __global__ void BatchedRoPEKernel(T *__restrict__ q, T *__restrict__ k,
 template <typename T>
 cudaError_t BatchedRoPE(T *q, T *k, int batch_size, int num_heads,
                         int num_kv_heads, int head_dim, const int *d_n_past,
-                        float freq_base, cudaStream_t stream, int rope_type) {
+                        float freq_base, cudaStream_t stream, int rope_type,
+                        const T *q_bias, const T *k_bias) {
   int half_dim = head_dim / 2;
   int pairs_per_seq = num_heads * half_dim + num_kv_heads * half_dim;
   int total_pairs = batch_size * pairs_per_seq;
@@ -876,15 +893,17 @@ cudaError_t BatchedRoPE(T *q, T *k, int batch_size, int num_heads,
 
   BatchedRoPEKernel<T><<<blocks, threads, 0, stream>>>(
       q, k, batch_size, num_heads, num_kv_heads, head_dim, d_n_past, freq_base,
-      rope_type);
+      rope_type, q_bias, k_bias);
   return cudaGetLastError();
 }
 
 template cudaError_t BatchedRoPE<half>(half *, half *, int, int, int, int,
-                                       const int *, float, cudaStream_t, int);
+                                       const int *, float, cudaStream_t, int,
+                                       const half *, const half *);
 template cudaError_t
-BatchedRoPE<__nv_bfloat16>(__nv_bfloat16 *, __nv_bfloat16 *, int, int, int,
-                            int, const int *, float, cudaStream_t, int);
+BatchedRoPE<__nv_bfloat16>(__nv_bfloat16 *, __nv_bfloat16 *, int, int, int, int,
+                           const int *, float, cudaStream_t, int,
+                           const __nv_bfloat16 *, const __nv_bfloat16 *);
 
 // ============================================================================
 // Batched KV Append: scatter-copy K/V for B sequences
@@ -918,25 +937,26 @@ cudaError_t BatchedKvAppend(const T *k_new, const T *v_new, T **d_k_dst,
   int threads = 256;
   int blocks = (total + threads - 1) / threads;
 
-  BatchedKvAppendKernel<T>
-      <<<blocks, threads, 0, stream>>>(k_new, v_new, d_k_dst, d_v_dst,
-                                       batch_size, kv_dim);
+  BatchedKvAppendKernel<T><<<blocks, threads, 0, stream>>>(
+      k_new, v_new, d_k_dst, d_v_dst, batch_size, kv_dim);
   return cudaGetLastError();
 }
 
 template cudaError_t BatchedKvAppend<half>(const half *, const half *, half **,
                                            half **, int, int, cudaStream_t);
-template cudaError_t
-BatchedKvAppend<__nv_bfloat16>(const __nv_bfloat16 *, const __nv_bfloat16 *,
-                                __nv_bfloat16 **, __nv_bfloat16 **, int, int,
-                                cudaStream_t);
+template cudaError_t BatchedKvAppend<__nv_bfloat16>(const __nv_bfloat16 *,
+                                                    const __nv_bfloat16 *,
+                                                    __nv_bfloat16 **,
+                                                    __nv_bfloat16 **, int, int,
+                                                    cudaStream_t);
 
 template <typename T>
 __global__ void BatchedKvAppendStridedKernel(
     const T *__restrict__ k_new, const T *__restrict__ v_new,
     T *__restrict__ kv_buffer, const int *__restrict__ d_seq_ids,
     const int *__restrict__ d_n_past, int layer, int batch_size, int kv_dim,
-    size_t slot_stride, size_t layer_stride, size_t kv_stride) {
+    size_t slot_stride, size_t layer_stride, size_t kv_stride,
+    const T *__restrict__ v_bias) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = batch_size * kv_dim;
   if (idx >= total) {
@@ -953,33 +973,42 @@ __global__ void BatchedKvAppendStridedKernel(
   const size_t v_offset = seq_offset + layer_offset + kv_stride + token_offset;
 
   kv_buffer[k_offset] = k_new[idx];
-  kv_buffer[v_offset] = v_new[idx];
+  // Optional V bias fold (V feeds only the cache, so adding at the store
+  // reproduces BiasAdd-then-append exactly).
+  if (v_bias != nullptr) {
+    kv_buffer[v_offset] =
+        DtypeTraits<T>::from_float(DtypeTraits<T>::to_float(v_new[idx]) +
+                                   DtypeTraits<T>::to_float(v_bias[d]));
+  } else {
+    kv_buffer[v_offset] = v_new[idx];
+  }
 }
 
 template <typename T>
-cudaError_t BatchedKvAppendStrided(const T *k_new, const T *v_new,
-                                   T *kv_buffer, const int *d_seq_ids,
-                                   const int *d_n_past, int layer,
-                                   int batch_size, int kv_dim,
+cudaError_t BatchedKvAppendStrided(const T *k_new, const T *v_new, T *kv_buffer,
+                                   const int *d_seq_ids, const int *d_n_past,
+                                   int layer, int batch_size, int kv_dim,
                                    size_t slot_stride, size_t layer_stride,
-                                   size_t kv_stride, cudaStream_t stream) {
+                                   size_t kv_stride, cudaStream_t stream,
+                                   const T *v_bias) {
   const int total = batch_size * kv_dim;
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
-  BatchedKvAppendStridedKernel<T>
-      <<<blocks, threads, 0, stream>>>(k_new, v_new, kv_buffer, d_seq_ids,
-                                       d_n_past, layer, batch_size, kv_dim,
-                                       slot_stride, layer_stride, kv_stride);
+  BatchedKvAppendStridedKernel<T><<<blocks, threads, 0, stream>>>(
+      k_new, v_new, kv_buffer, d_seq_ids, d_n_past, layer, batch_size, kv_dim,
+      slot_stride, layer_stride, kv_stride, v_bias);
   return cudaGetLastError();
 }
 
-template cudaError_t BatchedKvAppendStrided<half>(
-    const half *, const half *, half *, const int *, const int *, int, int,
-    int, size_t, size_t, size_t, cudaStream_t);
+template cudaError_t BatchedKvAppendStrided<half>(const half *, const half *,
+                                                  half *, const int *,
+                                                  const int *, int, int, int,
+                                                  size_t, size_t, size_t,
+                                                  cudaStream_t, const half *);
 template cudaError_t BatchedKvAppendStrided<__nv_bfloat16>(
-    const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *,
-    const int *, const int *, int, int, int, size_t, size_t, size_t,
-    cudaStream_t);
+    const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, const int *,
+    const int *, int, int, int, size_t, size_t, size_t, cudaStream_t,
+    const __nv_bfloat16 *);
 
 // ============================================================================
 // BatchedKvAppendIndirect: scatter-copy K/V using slot base pointer table
@@ -1054,9 +1083,10 @@ __global__ void MeanPoolKernel(const T *__restrict__ input,
 
 // BF16 specialization
 template <>
-__global__ void MeanPoolKernel<__nv_bfloat16>(
-    const __nv_bfloat16 *__restrict__ input, float *__restrict__ output,
-    int seq_len, int hidden_size) {
+__global__ void
+MeanPoolKernel<__nv_bfloat16>(const __nv_bfloat16 *__restrict__ input,
+                              float *__restrict__ output, int seq_len,
+                              int hidden_size) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= hidden_size)
     return;
@@ -1083,7 +1113,7 @@ cudaError_t MeanPool(const T *input, float *output, int seq_len,
 template cudaError_t MeanPool<half>(const half *, float *, int, int,
                                     cudaStream_t);
 template cudaError_t MeanPool<__nv_bfloat16>(const __nv_bfloat16 *, float *,
-                                              int, int, cudaStream_t);
+                                             int, int, cudaStream_t);
 
 // Mixed-precision instantiations
 template cudaError_t RmsNormMixed<half>(const float *, const half *, half *,

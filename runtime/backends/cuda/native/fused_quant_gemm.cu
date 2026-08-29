@@ -1017,41 +1017,6 @@ FusedQuantGemm::FfnProjOperator FusedQuantGemm::SelectFfnProjOperator(
   return selected;
 }
 
-const char *
-FusedQuantGemm::FfnProjOperatorName(FusedQuantGemm::FfnProjOperator op) {
-  switch (op) {
-  case FusedQuantGemm::FfnProjOperator::kQ81Group:
-    return "q8_1_group";
-  case FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K:
-    return "q8_1_group_hot_q4k";
-  case FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4:
-    return "q8_1_group_row_pair_w4";
-  case FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4:
-    return "q8_1_group_row_quad_m4";
-  case FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3:
-    return "q8_1_group_mmq3";
-  case FusedQuantGemm::FfnProjOperator::kPackedGroup:
-    return "packed_group";
-  case FusedQuantGemm::FfnProjOperator::kFallback:
-  default:
-    return "fallback";
-  }
-}
-
-const char *
-FusedQuantGemm::FfnProjOperatorMetricName(FusedQuantGemm::FfnProjOperator op,
-                                          int quant_type, int m, int k) {
-  (void)k;
-  const auto qtype = static_cast<GGUF::TensorType>(quant_type);
-  if (op == FusedQuantGemm::FfnProjOperator::kQ81Group &&
-      (qtype == GGUF::TensorType::Q4_K || qtype == GGUF::TensorType::Q6_K)) {
-    if (m <= 8)
-      return "q8_1_group_mmvq";
-    return "q8_1_group_mmq";
-  }
-  return FfnProjOperatorName(op);
-}
-
 FusedQuantGemm::DownProjOperator FusedQuantGemm::SelectDownProjOperator(
     int quant_type, const FusedDispatchGeometry &geometry, bool allow_q81,
     bool allow_packed, bool allow_mmq, const NativeExecutionPolicy *policy) {
@@ -1091,40 +1056,6 @@ FusedQuantGemm::DownProjOperator FusedQuantGemm::SelectDownProjOperator(
       DescribeInferfluxCudaDownProjDispatchDecision(
           profile, decision.reason ? decision.reason : "fallback"));
   return selected;
-}
-
-const char *
-FusedQuantGemm::DownProjOperatorName(FusedQuantGemm::DownProjOperator op) {
-  switch (op) {
-  case FusedQuantGemm::DownProjOperator::kQ81Gemv:
-    return "q8_1_gemv";
-  case FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed:
-    return "q8_1_gemv_hot_fixed";
-  case FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed:
-    return "q8_1_gemv_row_pair_hot_fixed";
-  case FusedQuantGemm::DownProjOperator::kQ81GemvRowPair:
-    return "q8_1_gemv_row_pair";
-  case FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad:
-    return "q8_1_gemv_row_quad";
-  case FusedQuantGemm::DownProjOperator::kPackedGemv:
-    return "packed_gemv";
-  case FusedQuantGemm::DownProjOperator::kMmq:
-    return "mmq";
-  case FusedQuantGemm::DownProjOperator::kFallback:
-  default:
-    return "fallback";
-  }
-}
-
-const char *
-FusedQuantGemm::DownProjOperatorMetricName(FusedQuantGemm::DownProjOperator op,
-                                           int quant_type, int m, int k) {
-  (void)quant_type;
-  (void)k;
-  if (op == FusedQuantGemm::DownProjOperator::kQ81Gemv) {
-    return (m <= 8) ? "q8_1_mmvq" : "q8_1_mmq";
-  }
-  return DownProjOperatorName(op);
 }
 
 bool FusedQuantGemm::GemvPacked(const QuantizedWeightInfo &weight,

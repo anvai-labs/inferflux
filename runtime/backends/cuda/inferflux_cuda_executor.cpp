@@ -1246,8 +1246,8 @@ void InferfluxCudaExecutor::DestroyLaneOverlapResourcesUnlocked() {
   }
   if (d_prefill_logits_) {
     if (cudaFree(d_prefill_logits_) != cudaSuccess) {
-      log::Error("inferflux_cuda_executor",
-                 "cudaFree(d_prefill_logits_) failed");
+      log::Warn("inferflux_cuda_executor",
+                "cudaFree(d_prefill_logits_) failed");
     }
     d_prefill_logits_ = nullptr;
   }
@@ -1709,9 +1709,9 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
     // Hybrid KV cache: dense base + per-slot overflow
     if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16) {
       auto cache = std::make_unique<HybridKvCacheGpuTyped<__nv_bfloat16>>();
-      if (!cache->Allocate(config.num_hidden_layers,
-                           config.num_key_value_heads, config.head_dim,
-                           max_seq, max_batch, kv_base_slots)) {
+      if (!cache->Allocate(config.num_hidden_layers, config.num_key_value_heads,
+                           config.head_dim, max_seq, max_batch,
+                           kv_base_slots)) {
         log::Error("inferflux_cuda_executor",
                    "Failed to allocate hybrid BF16 KV cache");
         return false;
@@ -1719,19 +1719,19 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
       kv_cache_ = std::move(cache);
     } else {
       auto cache = std::make_unique<HybridKvCacheGpuTyped<half>>();
-      if (!cache->Allocate(config.num_hidden_layers,
-                           config.num_key_value_heads, config.head_dim,
-                           max_seq, max_batch, kv_base_slots)) {
+      if (!cache->Allocate(config.num_hidden_layers, config.num_key_value_heads,
+                           config.head_dim, max_seq, max_batch,
+                           kv_base_slots)) {
         log::Error("inferflux_cuda_executor",
                    "Failed to allocate hybrid FP16 KV cache");
         return false;
       }
       kv_cache_ = std::move(cache);
     }
-    log::Info("inferflux_cuda_executor",
-              "Using hybrid KV cache: base_slots=" +
-                  std::to_string(kv_base_slots) +
-                  ", max_batch=" + std::to_string(max_batch));
+    log::Info(
+        "inferflux_cuda_executor",
+        "Using hybrid KV cache: base_slots=" + std::to_string(kv_base_slots) +
+            ", max_batch=" + std::to_string(max_batch));
   } else if (kv_precision_ == runtime::cuda::native::KvPrecision::kBf16) {
     auto cache = std::make_unique<KvCacheGpuTyped<__nv_bfloat16>>();
     if (!cache->Allocate(config.num_hidden_layers, config.num_key_value_heads,
@@ -1890,6 +1890,21 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
   // 3b. Pre-warm weight caches so CUDA graph capture doesn't encounter
   // illegal cudaStreamSynchronize from lazy F32→FP16 dequantization.
   model_forward_->WarmWeightCaches();
+
+  // Dispatch reachability probe: verifies every selectable operator can
+  // actually execute and down-ranks divergent ones for the process
+  // lifetime (see dispatch_catalog.h / dispatch_operator_health.h).
+  // Opt out with INFERFLUX_CUDA_DISPATCH_PROBE=0.
+  const char *probe_env = std::getenv("INFERFLUX_CUDA_DISPATCH_PROBE");
+  const bool probe_enabled = !probe_env || (std::string(probe_env) != "0" &&
+                                            std::string(probe_env) != "false");
+  if (probe_enabled) {
+    const std::string downgraded = model_forward_->ProbeDispatchPaths();
+    if (!downgraded.empty()) {
+      GlobalMetrics().RecordInferfluxCudaDispatchDivergence(
+          "probe", "probe", "probe", "down_ranked");
+    }
+  }
 
   // 4. Initialize GPU sampler
   sampler_ = std::make_unique<GpuSampler>();
@@ -2740,6 +2755,210 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
   return ExecuteUnifiedBatch(inputs, /*allow_overlap=*/true);
 }
 
+bool InferfluxCudaExecutor::NativeSupportsUnifiedBatchBurst() const {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!model_loaded_ || !model_forward_ || !sampler_ || !tokenizer_ ||
+      !kv_cache_) {
+    return false;
+  }
+  const auto &policy = execution_policy_;
+  // Debug traces walk the per-step path; keep them on it so trace tooling
+  // (decode_mapping, debug_logits) keeps working.
+  if (policy.debug_decode_mapping || policy.debug_logits) {
+    return false;
+  }
+  return policy.enable_decode_burst && policy.enable_batched_decode;
+#else
+  return false;
+#endif
+}
+
+UnifiedBurstResult InferfluxCudaExecutor::NativeExecuteUnifiedBatchBurst(
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &inputs,
+    const UnifiedBurstOptions &options, const BurstTokenSink &sink) {
+  UnifiedBurstResult result;
+  const std::size_t n = inputs.size();
+  result.last_tokens.assign(n, -1);
+  result.finished.assign(n, false);
+  result.ok = false;
+
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  if (!NativeSupportsUnifiedBatchBurst() || !sink || n == 0) {
+    return result;
+  }
+  for (const auto &in : inputs) {
+    if (in.tokens.size() != 1 || !in.request_logits ||
+        in.sampling.temperature > 0.0f) {
+      return result;
+    }
+  }
+  const int B = static_cast<int>(n);
+  const int decode_capacity = std::max(1, kv_cache_->MaxBatchSize());
+  const int max_seq_len = std::max(1, kv_cache_->MaxSeqLen());
+  if (B > decode_capacity ||
+      B > runtime::cuda::native::DecodeBurstController::kMaxBurstBatch) {
+    return result;
+  }
+
+  NVTX_SCOPE("DecodeBurst");
+  diagnostics::ScopedBreadcrumb breadcrumb("ExecuteUnifiedBatchBurst");
+
+  struct ScopedDequantCacheCleanup {
+    InferfluxCudaExecutor *executor{nullptr};
+    ~ScopedDequantCacheCleanup() {
+      if (executor) {
+        executor->ReleaseBatchScopedDequantizedCache();
+      }
+    }
+  } scoped_cleanup{this};
+
+  // Always serialize access to the shared GPU pipeline (matches the standard
+  // ExecuteUnifiedBatch path).
+  std::lock_guard<std::mutex> shared_pipeline_lock(shared_pipeline_mutex_);
+
+  if (!burst_controller_.EnsureResources(compute_stream_)) {
+    log::Warn("inferflux_cuda_executor",
+              "DecodeBurst: resource allocation failed");
+    return result;
+  }
+
+  // Step-0 metadata comes from the host (full BatchForward: upload + capture
+  // or replay); every later step is fed on device by the token-feed kernel.
+  std::vector<int> batch_tokens(B), batch_n_past(B), batch_seq_ids(B);
+  for (int b = 0; b < B; ++b) {
+    batch_tokens[b] = inputs[static_cast<std::size_t>(b)].tokens[0];
+    batch_n_past[b] = inputs[static_cast<std::size_t>(b)].n_past;
+    batch_seq_ids[b] = inputs[static_cast<std::size_t>(b)].sequence_id;
+  }
+
+  // Per-sequence step budget: policy chunk, caller cap, batch-wide token
+  // cap, and KV headroom (kv_lens reaches n_past + steps).
+  int k_chunk =
+      std::min(options.max_tokens_per_seq, burst_controller_.max_slots());
+  k_chunk =
+      std::min(k_chunk, std::max(1, execution_policy_.decode_burst_chunk));
+  k_chunk = std::min(k_chunk, std::max(1, options.max_batch_tokens / B));
+  std::vector<int> step_budget(B, 1);
+  for (int b = 0; b < B; ++b) {
+    const int headroom = std::max(1, max_seq_len - batch_n_past[b] - 1);
+    step_budget[b] = std::max(1, std::min(k_chunk, headroom));
+  }
+
+  const int eos_ids[1] = {tokenizer_->EosTokenId()};
+  if (!burst_controller_.BeginChunk(step_budget.data(), B, eos_ids, 1)) {
+    return result;
+  }
+
+  const bool record_timing =
+      ShouldRecordTimingSample(timing_sample_rate_, &timing_batch_counter_);
+  if (record_timing) {
+    cudaEventRecord(forward_start_, compute_stream_);
+  }
+
+  // Step 0: host-fed forward (uploads metadata; captures the decode graph on
+  // first use for this batch size).
+  if (!model_forward_->BatchForward(batch_tokens, batch_n_past, batch_seq_ids,
+                                    d_logits_, B)) {
+    log::Error("inferflux_cuda_executor", "DecodeBurst: step-0 forward failed");
+    return result;
+  }
+  if (!burst_controller_.EnqueueStepEpilogue(
+          /*slot_idx=*/0, model_forward_.get(), sampler_.get(), d_logits_, B)) {
+    log::Error("inferflux_cuda_executor",
+               "DecodeBurst: step-0 epilogue failed");
+    return result;
+  }
+
+  // Without a replayable decode graph every step would cost a full kernel
+  // launch storm from the host, defeating the point of the burst — degrade
+  // to a single step and let the caller drive the next one.
+  const int steps =
+      model_forward_->DecodeGraphReady(B)
+          ? *std::max_element(step_budget.begin(), step_budget.end())
+          : 1;
+  int enqueued = 1;
+  for (int i = 1; i < steps; ++i) {
+    if (!burst_controller_.EnqueueStep(i, model_forward_.get(), sampler_.get(),
+                                       d_logits_, B)) {
+      log::Error("inferflux_cuda_executor", "DecodeBurst: step enqueue failed");
+      // Consume whatever was enqueued so far; treat this as a short chunk.
+      break;
+    }
+    ++enqueued;
+  }
+
+  if (record_timing) {
+    cudaEventRecord(forward_stop_, compute_stream_);
+  }
+
+  // Consume slots in order while the GPU runs ahead. Sequences already
+  // stopped (EOS / sink stop) are skipped; their replayed steps are wasted
+  // compute only.
+  std::vector<bool> stopped(static_cast<std::size_t>(B), false);
+  for (int i = 0; i < enqueued; ++i) {
+    while (!burst_controller_.PollSlot(i)) {
+      std::this_thread::yield();
+    }
+    bool any_active = false;
+    for (int b = 0; b < B; ++b) {
+      if (stopped[static_cast<std::size_t>(b)]) {
+        continue;
+      }
+      const int token_id = burst_controller_.ReadSlot(i, b);
+      if (token_id < 0 || tokenizer_->IsTerminalGeneratedToken(token_id)) {
+        // Terminal token: matches the per-step path — emit nothing, finish
+        // the request, never forward the terminal token.
+        result.last_tokens[static_cast<std::size_t>(b)] = -1;
+        result.finished[static_cast<std::size_t>(b)] = true;
+        stopped[static_cast<std::size_t>(b)] = true;
+        burst_controller_.FreezeSequence(b);
+        continue;
+      }
+      const std::string piece = VisibleTokenPiece(tokenizer_.get(), token_id);
+      if (!piece.empty()) {
+        perf_accum_.generated_tokens.fetch_add(1, std::memory_order_relaxed);
+      }
+      result.last_tokens[static_cast<std::size_t>(b)] = token_id;
+      BurstTokenEvent ev;
+      ev.input_idx = static_cast<std::size_t>(b);
+      ev.token_id = token_id;
+      ev.piece = piece;
+      if (!sink(ev)) {
+        result.finished[static_cast<std::size_t>(b)] = true;
+        stopped[static_cast<std::size_t>(b)] = true;
+        burst_controller_.FreezeSequence(b);
+      }
+    }
+    for (int b = 0; b < B; ++b) {
+      if (!stopped[static_cast<std::size_t>(b)]) {
+        any_active = true;
+      }
+    }
+    if (!any_active) {
+      break;
+    }
+  }
+
+  burst_controller_.FinishChunk(enqueued - 1);
+
+  if (record_timing) {
+    float chunk_ms = 0.0f;
+    if (CheckCudaStatus(
+            cudaEventElapsedTime(&chunk_ms, forward_start_, forward_stop_),
+            "cudaEventElapsedTime(decode_burst_chunk)")) {
+      GlobalMetrics().RecordInferfluxCudaForwardLatency(chunk_ms);
+      perf_accum_.decode_ms.store(
+          perf_accum_.decode_ms.load(std::memory_order_relaxed) + chunk_ms,
+          std::memory_order_relaxed);
+    }
+  }
+  GlobalMetrics().RecordInferfluxCudaForwardShape(/*is_decode=*/true, B);
+  MaybeRefreshMemoryLedger();
+  result.ok = true;
+#endif // INFERFLUX_NATIVE_KERNELS_READY
+  return result;
+}
+
 std::vector<LlamaCppBackend::UnifiedBatchOutput>
 InferfluxCudaExecutor::ExecuteUnifiedBatch(
     const std::vector<LlamaCppBackend::UnifiedBatchInput> &inputs,
@@ -3332,6 +3551,16 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
 }
 
 bool InferfluxCudaExecutor::SupportsAsyncUnifiedBatch() const { return false; }
+
+bool InferfluxCudaExecutor::NativeSupportsUnifiedBatchBurst() const {
+  return false;
+}
+
+UnifiedBurstResult InferfluxCudaExecutor::NativeExecuteUnifiedBatchBurst(
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &,
+    const UnifiedBurstOptions &, const BurstTokenSink &) {
+  return UnifiedBurstResult{};
+}
 
 UnifiedBatchHandle InferfluxCudaExecutor::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &, UnifiedBatchLane) {

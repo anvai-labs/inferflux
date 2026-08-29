@@ -1031,6 +1031,142 @@ TEST_CASE("BatchedRoPE matches per-sequence decode RoPE for Qwen geometry",
   REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
 }
 
+TEST_CASE("Bias fold into RoPE and KV append matches BiasAdd-then-transform",
+          "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping bias-fold parity.");
+    return;
+  }
+
+  constexpr int batch_size = 2;
+  constexpr int num_heads = 16;
+  constexpr int num_kv_heads = 2;
+  constexpr int head_dim = 128;
+  constexpr int q_cols = num_heads * head_dim;
+  constexpr int kv_cols = num_kv_heads * head_dim;
+  const std::array<int, batch_size> n_past = {5, 11};
+  const std::array<int, batch_size> seq_ids = {0, 1};
+
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
+
+  const std::vector<half> h_q =
+      MakeWaveTensor(static_cast<size_t>(batch_size) * q_cols, 0.03f);
+  const std::vector<half> h_k =
+      MakeWaveTensor(static_cast<size_t>(batch_size) * kv_cols, 0.02f, 0.01f);
+  const std::vector<half> h_v =
+      MakeWaveTensor(static_cast<size_t>(batch_size) * kv_cols, 0.025f, -0.01f);
+  const std::vector<half> h_q_bias =
+      MakeWaveTensor(static_cast<size_t>(q_cols), 0.01f, 0.005f);
+  const std::vector<half> h_k_bias =
+      MakeWaveTensor(static_cast<size_t>(kv_cols), 0.008f, -0.004f);
+  const std::vector<half> h_v_bias =
+      MakeWaveTensor(static_cast<size_t>(kv_cols), 0.006f, 0.003f);
+
+  auto dev_copy = [&](const std::vector<half> &h) {
+    half *d = nullptr;
+    REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d),
+                       h.size() * sizeof(half)) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d, h.data(), h.size() * sizeof(half),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    return d;
+  };
+
+  half *d_q_a = dev_copy(h_q), *d_k_a = dev_copy(h_k), *d_v_a = dev_copy(h_v);
+  half *d_q_b = dev_copy(h_q), *d_k_b = dev_copy(h_k), *d_v_b = dev_copy(h_v);
+  half *d_q_bias = dev_copy(h_q_bias);
+  half *d_k_bias = dev_copy(h_k_bias);
+  half *d_v_bias = dev_copy(h_v_bias);
+  int *d_n_past = nullptr;
+  int *d_seq_ids = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_n_past),
+                     batch_size * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_seq_ids),
+                     batch_size * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_n_past, n_past.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_seq_ids, seq_ids.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  KvCacheGpuTyped<half> cache_a, cache_b;
+  constexpr int max_seq = 32;
+  constexpr int max_batch = 4;
+  REQUIRE(cache_a.Allocate(1, num_kv_heads, head_dim, max_seq, max_batch));
+  REQUIRE(cache_b.Allocate(1, num_kv_heads, head_dim, max_seq, max_batch));
+
+  // Unfused: BiasAdd each, then RoPE / KV append without bias params.
+  REQUIRE(cuda_kernel::BiasAdd<half>(d_q_a, d_q_bias, batch_size, q_cols,
+                                     stream) == cudaSuccess);
+  REQUIRE(cuda_kernel::BiasAdd<half>(d_k_a, d_k_bias, batch_size, kv_cols,
+                                     stream) == cudaSuccess);
+  REQUIRE(cuda_kernel::BiasAdd<half>(d_v_a, d_v_bias, batch_size, kv_cols,
+                                     stream) == cudaSuccess);
+  REQUIRE(cuda_kernel::BatchedRoPE<half>(d_q_a, d_k_a, batch_size, num_heads,
+                                         num_kv_heads, head_dim, d_n_past,
+                                         1000000.0f, stream,
+                                         /*rope_type=*/0) == cudaSuccess);
+  REQUIRE(cuda_kernel::BatchedKvAppendStrided<half>(
+              d_k_a, d_v_a, cache_a.Buffer(), d_seq_ids, d_n_past,
+              /*layer=*/0, batch_size, num_kv_heads * head_dim,
+              cache_a.SlotStride(), cache_a.LayerStride(), cache_a.KvStride(),
+              stream) == cudaSuccess);
+
+  // Fused: bias folded into the RoPE load and the append store.
+  REQUIRE(cuda_kernel::BatchedRoPE<half>(
+              d_q_b, d_k_b, batch_size, num_heads, num_kv_heads, head_dim,
+              d_n_past, 1000000.0f, stream,
+              /*rope_type=*/0, d_q_bias, d_k_bias) == cudaSuccess);
+  REQUIRE(cuda_kernel::BatchedKvAppendStrided<half>(
+              d_k_b, d_v_b, cache_b.Buffer(), d_seq_ids, d_n_past,
+              /*layer=*/0, batch_size, num_kv_heads * head_dim,
+              cache_b.SlotStride(), cache_b.LayerStride(), cache_b.KvStride(),
+              stream, d_v_bias) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  const std::vector<half> q_a = CopyDeviceHalfs(d_q_a, h_q.size());
+  const std::vector<half> k_a = CopyDeviceHalfs(d_k_a, h_k.size());
+  const std::vector<half> q_b = CopyDeviceHalfs(d_q_b, h_q.size());
+  const std::vector<half> k_b = CopyDeviceHalfs(d_k_b, h_k.size());
+  // Fused keeps the biased value in registers through rotation (one fewer
+  // half rounding), so allow the same tolerance as the other RoPE parities.
+  for (size_t i = 0; i < q_a.size(); ++i) {
+    REQUIRE(__half2float(q_b[i]) ==
+            Catch::Approx(__half2float(q_a[i])).margin(5e-3f));
+  }
+  for (size_t i = 0; i < k_a.size(); ++i) {
+    REQUIRE(__half2float(k_b[i]) ==
+            Catch::Approx(__half2float(k_a[i])).margin(5e-3f));
+  }
+
+  // V cache rows: both paths round the same float sum once, so compare the
+  // stored cache contents exactly.
+  const half *v_cache_a = cache_a.GetV(0, seq_ids[0]);
+  const half *v_cache_b = cache_b.GetV(0, seq_ids[0]);
+  std::vector<half> row_a(kv_cols), row_b(kv_cols);
+  REQUIRE(cudaMemcpy(row_a.data(), v_cache_a, kv_cols * sizeof(half),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  REQUIRE(cudaMemcpy(row_b.data(), v_cache_b, kv_cols * sizeof(half),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  for (int i = 0; i < kv_cols; ++i) {
+    REQUIRE(__half2float(row_b[i]) ==
+            Catch::Approx(__half2float(row_a[i])).margin(1e-6f));
+  }
+
+  REQUIRE(cudaFree(d_seq_ids) == cudaSuccess);
+  REQUIRE(cudaFree(d_n_past) == cudaSuccess);
+  REQUIRE(cudaFree(d_v_bias) == cudaSuccess);
+  REQUIRE(cudaFree(d_k_bias) == cudaSuccess);
+  REQUIRE(cudaFree(d_q_bias) == cudaSuccess);
+  REQUIRE(cudaFree(d_v_b) == cudaSuccess);
+  REQUIRE(cudaFree(d_k_b) == cudaSuccess);
+  REQUIRE(cudaFree(d_q_b) == cudaSuccess);
+  REQUIRE(cudaFree(d_v_a) == cudaSuccess);
+  REQUIRE(cudaFree(d_k_a) == cudaSuccess);
+  REQUIRE(cudaFree(d_q_a) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
 TEST_CASE(
     "FlashDecodeMultiSeq matches per-sequence FlashAttention decode for Qwen "
     "geometry",
@@ -1301,6 +1437,145 @@ TEST_CASE(
   REQUIRE(cudaFree(d_k0) == cudaSuccess);
   REQUIRE(cudaFree(d_o_batch) == cudaSuccess);
   REQUIRE(cudaFree(d_q_batch) == cudaSuccess);
+  REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+}
+
+TEST_CASE(
+    "FlashDecodeMultiSeqStridedSplit matches monolithic decode across splits",
+    "[native_forward][cuda_runtime_contract]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping split FlashDecode parity.");
+    return;
+  }
+
+  constexpr int batch_size = 2;
+  constexpr int num_heads = 16;
+  constexpr int num_kv_heads = 2;
+  constexpr int head_dim = 128;
+  constexpr int q_cols = num_heads * head_dim;
+  constexpr int kv_cols = num_kv_heads * head_dim;
+  constexpr int max_seq_len = 96;
+  constexpr int max_batch = 4;
+  constexpr int layer = 0;
+  // Non-multiple of every chunk size exercised below, plus a kv_len that
+  // spans multiple chunks when chunk is small.
+  const std::array<int, batch_size> seq_ids = {0, 2};
+  const std::array<int, batch_size> kv_lens = {37, 91};
+  const float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
+
+  cudaStream_t stream = nullptr;
+  REQUIRE(cudaStreamCreate(&stream) == cudaSuccess);
+
+  KvCacheGpuTyped<half> cache;
+  REQUIRE(cache.Allocate(/*num_layers=*/1, num_kv_heads, head_dim, max_seq_len,
+                         max_batch));
+
+  const std::vector<half> h_q =
+      MakeWaveTensor(static_cast<size_t>(batch_size) * q_cols, 0.03f);
+  const std::vector<half> h_k0 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[0]) * kv_cols, 0.02f, 0.01f);
+  const std::vector<half> h_v0 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[0]) * kv_cols, 0.02f, -0.01f);
+  const std::vector<half> h_k1 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[1]) * kv_cols, 0.025f, 0.02f);
+  const std::vector<half> h_v1 =
+      MakeWaveTensor(static_cast<size_t>(kv_lens[1]) * kv_cols, 0.015f, 0.03f);
+
+  half *d_q = nullptr;
+  half *d_o_mono = nullptr;
+  half *d_o_split = nullptr;
+  float *d_partials = nullptr;
+  int *d_seq_ids = nullptr;
+  int *d_kv_lens = nullptr;
+
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_q),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_o_mono),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_o_split),
+                     h_q.size() * sizeof(half)) == cudaSuccess);
+  const size_t partial_floats =
+      static_cast<size_t>(batch_size) * num_heads * 8 * (2 + head_dim);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_partials),
+                     partial_floats * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_seq_ids),
+                     batch_size * sizeof(int)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_kv_lens),
+                     batch_size * sizeof(int)) == cudaSuccess);
+
+  half *d_k0 = nullptr;
+  half *d_v0 = nullptr;
+  half *d_k1 = nullptr;
+  half *d_v1 = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k0),
+                     h_k0.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_v0),
+                     h_v0.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_k1),
+                     h_k1.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_v1),
+                     h_v1.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_k0, h_k0.data(), h_k0.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_v0, h_v0.data(), h_v0.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_k1, h_k1.data(), h_k1.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_v1, h_v1.data(), h_v1.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_q, h_q.data(), h_q.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cache.Append(layer, seq_ids[0], /*start_pos=*/0, kv_lens[0], d_k0,
+                       d_v0, stream) == cudaSuccess);
+  REQUIRE(cache.Append(layer, seq_ids[1], /*start_pos=*/0, kv_lens[1], d_k1,
+                       d_v1, stream) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_seq_ids, seq_ids.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_kv_lens, kv_lens.data(), batch_size * sizeof(int),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+
+  REQUIRE(cuda_kernel::FlashDecodeMultiSeqStrided<half>(
+              d_q, cache.Buffer(), d_o_mono, d_seq_ids, d_kv_lens, layer,
+              batch_size, num_heads, num_kv_heads, head_dim, cache.SlotStride(),
+              cache.LayerStride(), cache.KvStride(), scale,
+              stream) == cudaSuccess);
+  REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+  const std::vector<half> o_mono = CopyDeviceHalfs(d_o_mono, h_q.size());
+
+  // (qsplit, chunk, ksplits) configs: pure Q-split, pure KV-split with
+  // non-multiple chunk boundaries, both, and a non-divisor qsplit that the
+  // launcher must snap down to a ratio divisor (3 → 2 for GQA 8).
+  const std::vector<std::array<int, 3>> configs = {
+      {8, 96, 1}, {2, 96, 1}, {1, 16, 6}, {2, 24, 4}, {4, 32, 3}, {3, 96, 1}};
+  for (const auto &cfg : configs) {
+    REQUIRE(cudaMemset(d_o_split, 0xAB, h_q.size() * sizeof(half)) ==
+            cudaSuccess);
+    REQUIRE(cuda_kernel::FlashDecodeMultiSeqStridedSplit<half>(
+                d_q, cache.Buffer(), d_o_split, d_partials, d_seq_ids,
+                d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim,
+                cache.SlotStride(), cache.LayerStride(), cache.KvStride(),
+                scale, cfg[0], cfg[1], cfg[2], stream) == cudaSuccess);
+    REQUIRE(cudaStreamSynchronize(stream) == cudaSuccess);
+    const std::vector<half> o_split = CopyDeviceHalfs(d_o_split, h_q.size());
+    for (size_t i = 0; i < o_mono.size(); ++i) {
+      REQUIRE(__half2float(o_split[i]) ==
+              Catch::Approx(__half2float(o_mono[i])).margin(4e-3f));
+    }
+  }
+
+  REQUIRE(cudaFree(d_kv_lens) == cudaSuccess);
+  REQUIRE(cudaFree(d_seq_ids) == cudaSuccess);
+  REQUIRE(cudaFree(d_partials) == cudaSuccess);
+  REQUIRE(cudaFree(d_o_split) == cudaSuccess);
+  REQUIRE(cudaFree(d_o_mono) == cudaSuccess);
+  REQUIRE(cudaFree(d_v1) == cudaSuccess);
+  REQUIRE(cudaFree(d_k1) == cudaSuccess);
+  REQUIRE(cudaFree(d_v0) == cudaSuccess);
+  REQUIRE(cudaFree(d_k0) == cudaSuccess);
+  REQUIRE(cudaFree(d_q) == cudaSuccess);
   REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
 }
 
@@ -7147,6 +7422,154 @@ TEST_CASE(
   REQUIRE_FALSE(summary.used_q81);
   REQUIRE_FALSE(summary.used_packed);
   REQUIRE(summary.actual_op == FusedQuantGemm::DownProjOperator::kFallback);
+}
+
+// Regression shape of the kQ81GroupMmq3 allowlist bug: every selectable
+// operator must reach the lambda of its own tier when that tier is
+// available, and actual_op must equal the selection. Before the executor
+// allowlist learned kQ81GroupMmq3, that operator silently degraded to the
+// packed catch-all (metrics attributed packed_group, the tiled kernel never
+// launched, ~25% of c=16 throughput lost for months).
+TEST_CASE("InferfluxCudaLinearExecutor: every FFN operator reaches its tier "
+          "when available",
+          "[native_forward][dispatch_reachability]") {
+  using Op = FusedQuantGemm::FfnProjOperator;
+  const std::array<Op, 7> kAllFfnOps = {
+      Op::kFallback,          Op::kQ81Group,          Op::kQ81GroupHotQ4K,
+      Op::kQ81GroupRowPairW4, Op::kQ81GroupRowQuadM4, Op::kQ81GroupMmq3,
+      Op::kPackedGroup};
+
+  for (const Op op : kAllFfnOps) {
+    bool q81_called = false;
+    bool packed_called = false;
+    bool fallback_called = false;
+    NativeFfnExecutionSummary summary;
+
+    const bool ok = ExecuteInferfluxCudaFfnProjectionStage(
+        op, "decode", "q4_k",
+        static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 4,
+        11008, 2048,
+        [&]() {
+          q81_called = true;
+          return true;
+        },
+        [&]() {
+          packed_called = true;
+          return true;
+        },
+        [&]() {
+          fallback_called = true;
+          return true;
+        },
+        &summary);
+
+    CAPTURE(static_cast<int>(op));
+    REQUIRE(ok);
+
+    switch (op) {
+    case Op::kQ81Group:
+    case Op::kQ81GroupHotQ4K:
+    case Op::kQ81GroupRowPairW4:
+    case Op::kQ81GroupRowQuadM4:
+    case Op::kQ81GroupMmq3:
+      // The Q8_1 lambda must be the one invoked — this is the exact
+      // assertion that fails when an operator is missing from the
+      // executor's dispatch.
+      REQUIRE(q81_called);
+      REQUIRE_FALSE(packed_called);
+      REQUIRE(summary.used_q81);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kPackedGroup:
+      REQUIRE(packed_called);
+      REQUIRE_FALSE(q81_called);
+      REQUIRE(summary.used_packed);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kFallback:
+      // kFallback means the selector requested the dense fallback
+      // (force_cublas or no fused tier ready) — the fused catch-alls are
+      // skipped entirely.
+      REQUIRE(fallback_called);
+      REQUIRE_FALSE(packed_called);
+      REQUIRE(summary.actual_op == op);
+      break;
+    }
+  }
+}
+
+TEST_CASE("InferfluxCudaLinearExecutor: every down-proj operator reaches its "
+          "tier when available",
+          "[native_forward][dispatch_reachability]") {
+  using Op = FusedQuantGemm::DownProjOperator;
+  const std::array<Op, 8> kAllDownOps = {
+      Op::kFallback,        Op::kQ81Gemv,
+      Op::kQ81GemvHotFixed, Op::kQ81GemvRowPairHotFixed,
+      Op::kQ81GemvRowPair,  Op::kQ81GemvRowQuad,
+      Op::kPackedGemv,      Op::kMmq};
+
+  for (const Op op : kAllDownOps) {
+    bool mmq_called = false;
+    bool q81_called = false;
+    bool packed_called = false;
+    bool fallback_called = false;
+    NativeDownProjExecutionSummary summary;
+
+    const bool ok = ExecuteInferfluxCudaDownProjStage(
+        op, "decode", "q4_k",
+        static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 4,
+        2048, 11008,
+        [&]() {
+          mmq_called = true;
+          return true;
+        },
+        [&]() {
+          q81_called = true;
+          return true;
+        },
+        [&]() {
+          packed_called = true;
+          return true;
+        },
+        [&]() {
+          fallback_called = true;
+          return true;
+        },
+        [](FusedQuantGemm::DownProjOperator) {}, &summary);
+
+    CAPTURE(static_cast<int>(op));
+    REQUIRE(ok);
+
+    switch (op) {
+    case Op::kQ81Gemv:
+    case Op::kQ81GemvHotFixed:
+    case Op::kQ81GemvRowPairHotFixed:
+    case Op::kQ81GemvRowPair:
+    case Op::kQ81GemvRowQuad:
+      REQUIRE(q81_called);
+      REQUIRE_FALSE(mmq_called);
+      REQUIRE(summary.used_q81);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kMmq:
+      REQUIRE(mmq_called);
+      REQUIRE_FALSE(q81_called);
+      REQUIRE(summary.used_mmq);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kPackedGemv:
+      REQUIRE(packed_called);
+      REQUIRE(summary.used_packed);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kFallback:
+      // kFallback means the selector requested the dense fallback — the
+      // fused catch-alls are skipped entirely.
+      REQUIRE(fallback_called);
+      REQUIRE(summary.actual_op == op);
+      break;
+    }
+  }
 }
 
 TEST_CASE("FusedQuantGemm: metric names distinguish V2 hot-path variants",

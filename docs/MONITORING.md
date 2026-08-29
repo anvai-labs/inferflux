@@ -78,6 +78,10 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 | Overlap activity | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` | Non-zero deltas confirm mixed-workload lane activity. CUDA graphs are now enabled on the primary forward instance during lane overlap after the `lane_overlap_mutex_` fix in commit `0ccbad3` eliminated the heap corruption that previously required disabling them. |
 | Native KV sizing | `inferflux_cuda_kv_requested_max_seq`, `inferflux_cuda_kv_planned_max_seq`, `inferflux_cuda_kv_budget_bytes` | Planned values below requested show KV auto-tune is protecting VRAM |
 | Readiness on decode/disagg nodes | `/readyz` | Ready requires weights loaded, full decode-worker health, and timeout streak/debt below threshold |
+| Dispatch divergence | `inferflux_cuda_dispatch_divergence_total{layer,selected,actual,reason}` | Any increment means selection and execution disagreed, graph capture fell back, or the load probe down-ranked an operator; investigate before accepting performance results |
+| Dispatch trace | `INFERFLUX_CUDA_DISPATCH_TRACE=1` plus optional `_LIMIT` | Emits selected/actual operator and geometry; summarize with `python3 scripts/parse_dispatch_trace.py <log>` |
+| Dispatch self-heal | `/readyz` fields `dispatch_degraded`, `dispatch_divergences`, and `dispatch_downgraded_operators` | Shows operators down-ranked by the load-time probe; readiness remains available but explicitly degraded |
+| Operator down-rank drill | `INFERFLUX_CUDA_DISPATCH_PROBE_FORCE_UNHEALTHY=ffn:q8_1_group_mmq3,down:mmq` | Forces process-lifetime fallback to validate the next-best dispatch path |
 | Fail-closed admission | generation `503` with `error=distributed_kv_transport_degraded` | optional protection when degraded transport should stop new generation work immediately |
 
 Benchmark-only experiment:
@@ -109,6 +113,7 @@ Benchmark harness knobs:
 - `INFERFLUX_BENCH_DEBUG_UNIFIED_ASSEMBLY=1`
 - `INFERFLUX_BENCH_NATIVE_DEBUG_DECODE_MAPPING=1`
 - `INFERFLUX_BENCH_NATIVE_DEBUG_OPERATOR_SELECTION=1`
+- `INFERFLUX_BENCH_DISPATCH_TRACE=true`
   Passes the corresponding debug knobs through `scripts/run_gguf_comparison_benchmark.sh` so the artifact directory contains slot, decode-mapping, assembly, and operator-selection traces.
 
 Logging control:
@@ -185,6 +190,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 | InferFlux CUDA expected but missing | `/v1/models` exposure fields + native counters | inspect strict/fallback policy and model format path |
 | VRAM pressure | native KV planning metrics + dequant policy | tighten budget or keep memory-first dequant policy |
 | Cache not helping | prefix/kv reuse counters | validate warmup patterns and prefix-affinity policy |
+| Selected operator never executes | dispatch divergence metric plus `parse_dispatch_trace.py` | check `dispatch_catalog.h`, the executor allowlist, and `/readyz` down-rank fields |
 
 ## 9) Related Docs
 

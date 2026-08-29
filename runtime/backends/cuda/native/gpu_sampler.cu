@@ -1,6 +1,6 @@
-#include "runtime/backends/cuda/native/gpu_sampler.h"
 #include "runtime/backends/cuda/native/cuda_copy_trace.h"
 #include "runtime/backends/cuda/native/cuda_sync_trace.h"
+#include "runtime/backends/cuda/native/gpu_sampler.h"
 #include "runtime/backends/cuda/native/nvtx_scoped.h"
 
 #include "server/logging/logger.h"
@@ -459,8 +459,8 @@ bool GpuSampler::Initialize(int vocab_size, cudaStream_t stream) {
   err = cudaMalloc(&d_result_batch_, kMaxBatchSize * sizeof(int));
   if (err != cudaSuccess)
     return false;
-  err = cudaMallocHost(reinterpret_cast<void **>(&h_result_pinned_),
-                       sizeof(int));
+  err =
+      cudaMallocHost(reinterpret_cast<void **>(&h_result_pinned_), sizeof(int));
   if (err != cudaSuccess)
     return false;
   err = cudaMallocHost(reinterpret_cast<void **>(&h_result_batch_pinned_),
@@ -686,8 +686,8 @@ void GpuSampler::EnqueueSampleBatch(const float *d_logits, int batch_size,
     int threads = 256;
     int smem = threads * (sizeof(float) + sizeof(int));
 
-    BatchedArgmaxKernel<<<B, threads, smem, stream_>>>(d_logits, d_result_batch_,
-                                                       vocab_size_, B);
+    BatchedArgmaxKernel<<<B, threads, smem, stream_>>>(
+        d_logits, d_result_batch_, vocab_size_, B);
 
     runtime::cuda::native::TracedCudaMemcpyAsync(
         runtime::cuda::native::CopyTraceSite::kSamplerBatchResultD2H,
@@ -749,6 +749,17 @@ void GpuSampler::EnqueueSampleBatch(const float *d_logits, int batch_size,
     completion_pending_ = true;
     pending_batch_size_ = B;
   }
+}
+
+bool GpuSampler::EnqueueBatchedArgmax(const float *d_logits, int batch_size) {
+  if (batch_size <= 0 || batch_size > kMaxBatchSize) {
+    return false;
+  }
+  int threads = 256;
+  int smem = threads * (sizeof(float) + sizeof(int));
+  BatchedArgmaxKernel<<<batch_size, threads, smem, stream_>>>(
+      d_logits, d_result_batch_, vocab_size_, batch_size);
+  return cudaGetLastError() == cudaSuccess;
 }
 
 void GpuSampler::CollectSampleBatch(std::vector<int> *out_tokens) {

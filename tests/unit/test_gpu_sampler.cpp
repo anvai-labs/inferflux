@@ -1,6 +1,7 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
+#include "runtime/backends/cuda/native/decode_burst.h"
 #include "runtime/backends/cuda/native/gpu_sampler.h"
 #include <cuda_runtime.h>
 #include <vector>
@@ -250,6 +251,154 @@ TEST_CASE(
   }
 
   cudaFree(d_logits);
+  cudaStreamDestroy(stream);
+}
+
+namespace {
+// Device mirror helpers for the DecodeTokenFeed tests: upload state, run the
+// kernel, sync, download state.
+struct FeedState {
+  static constexpr int kB = 4;
+  int *sampled = nullptr;
+  int *token_ids = nullptr;
+  int *n_past = nullptr;
+  int *kv_lens = nullptr;
+  int *eos = nullptr;
+  int *done = nullptr;
+  int *steps_left = nullptr;
+
+  std::vector<int> h_sampled, h_token_ids, h_n_past, h_kv_lens, h_eos, h_done,
+      h_steps;
+
+  explicit FeedState(cudaStream_t stream) {
+    h_sampled = {5, 7, 99, 12};
+    h_token_ids = {0, 0, 0, 0};
+    h_n_past = {10, 20, 30, 40};
+    h_kv_lens = {11, 21, 31, 41};
+    h_eos = {99, 3};
+    h_done = {0, 0, 0, 0};
+    h_steps = {3, 3, 3, 0};
+    cudaMalloc(&sampled, sizeof(int) * kB);
+    cudaMalloc(&token_ids, sizeof(int) * kB);
+    cudaMalloc(&n_past, sizeof(int) * kB);
+    cudaMalloc(&kv_lens, sizeof(int) * kB);
+    cudaMalloc(&eos, sizeof(int) * 2);
+    cudaMalloc(&done, sizeof(int) * kB);
+    cudaMalloc(&steps_left, sizeof(int) * kB);
+    Upload(stream);
+  }
+  ~FeedState() {
+    cudaFree(sampled);
+    cudaFree(token_ids);
+    cudaFree(n_past);
+    cudaFree(kv_lens);
+    cudaFree(eos);
+    cudaFree(done);
+    cudaFree(steps_left);
+  }
+  void Upload(cudaStream_t stream) {
+    cudaMemcpyAsync(sampled, h_sampled.data(), sizeof(int) * kB,
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(token_ids, h_token_ids.data(), sizeof(int) * kB,
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(n_past, h_n_past.data(), sizeof(int) * kB,
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(kv_lens, h_kv_lens.data(), sizeof(int) * kB,
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(eos, h_eos.data(), sizeof(int) * 2, cudaMemcpyHostToDevice,
+                    stream);
+    cudaMemcpyAsync(done, h_done.data(), sizeof(int) * kB,
+                    cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(steps_left, h_steps.data(), sizeof(int) * kB,
+                    cudaMemcpyHostToDevice, stream);
+  }
+  void Download(cudaStream_t stream) {
+    cudaMemcpyAsync(h_token_ids.data(), token_ids, sizeof(int) * kB,
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_n_past.data(), n_past, sizeof(int) * kB,
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_kv_lens.data(), kv_lens, sizeof(int) * kB,
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_done.data(), done, sizeof(int) * kB,
+                    cudaMemcpyDeviceToHost, stream);
+    cudaMemcpyAsync(h_steps.data(), steps_left, sizeof(int) * kB,
+                    cudaMemcpyDeviceToHost, stream);
+    cudaStreamSynchronize(stream);
+  }
+};
+} // namespace
+
+TEST_CASE("DecodeTokenFeed: advances metadata, freezes on EOS and budget",
+          "[gpu_sampler][cuda]") {
+  int device_count = 0;
+  cudaGetDeviceCount(&device_count);
+  if (device_count == 0) {
+    SKIP("No CUDA device available");
+  }
+
+  cudaStream_t stream;
+  cudaStreamCreate(&stream);
+  {
+    FeedState st(stream);
+    // seq0/seq1: normal advance. seq2: sampled 99 == EOS -> freeze.
+    // seq3: steps_left 0 -> no-op (already exhausted).
+    REQUIRE(runtime::cuda::native::LaunchDecodeTokenFeed(
+        st.sampled, st.token_ids, st.n_past, st.kv_lens, st.eos, 2, st.done,
+        st.steps_left, FeedState::kB, stream));
+    st.Download(stream);
+
+    REQUIRE(st.h_token_ids[0] == 5);
+    REQUIRE(st.h_n_past[0] == 11);
+    REQUIRE(st.h_kv_lens[0] == 12);
+    REQUIRE(st.h_steps[0] == 2);
+    REQUIRE(st.h_done[0] == 0);
+
+    REQUIRE(st.h_token_ids[1] == 7);
+    REQUIRE(st.h_n_past[1] == 21);
+    REQUIRE(st.h_kv_lens[1] == 22);
+    REQUIRE(st.h_steps[1] == 2);
+
+    // EOS: frozen before any state update, flag set.
+    REQUIRE(st.h_done[2] == 1);
+    REQUIRE(st.h_token_ids[2] == 0);
+    REQUIRE(st.h_n_past[2] == 30);
+    REQUIRE(st.h_kv_lens[2] == 31);
+    REQUIRE(st.h_steps[2] == 3);
+
+    // Exhausted budget: no-op.
+    REQUIRE(st.h_token_ids[3] == 0);
+    REQUIRE(st.h_n_past[3] == 40);
+    REQUIRE(st.h_kv_lens[3] == 41);
+    REQUIRE(st.h_steps[3] == 0);
+
+    // Idempotence: replaying the same launch (as a graph replay past a
+    // freeze would) must not advance seq2 (done) or seq3 (budget), and must
+    // advance the live sequences exactly once more.
+    REQUIRE(runtime::cuda::native::LaunchDecodeTokenFeed(
+        st.sampled, st.token_ids, st.n_past, st.kv_lens, st.eos, 2, st.done,
+        st.steps_left, FeedState::kB, stream));
+    st.Download(stream);
+    REQUIRE(st.h_n_past[0] == 12);
+    REQUIRE(st.h_kv_lens[0] == 13);
+    REQUIRE(st.h_steps[0] == 1);
+    REQUIRE(st.h_done[2] == 1);
+    REQUIRE(st.h_n_past[2] == 30);
+    REQUIRE(st.h_n_past[3] == 40);
+
+    // Budget exhaustion mid-burst: seq0 hits steps_left 0 on this launch and
+    // must stop advancing afterwards.
+    REQUIRE(runtime::cuda::native::LaunchDecodeTokenFeed(
+        st.sampled, st.token_ids, st.n_past, st.kv_lens, st.eos, 2, st.done,
+        st.steps_left, FeedState::kB, stream));
+    st.Download(stream);
+    REQUIRE(st.h_steps[0] == 0);
+    REQUIRE(st.h_n_past[0] == 13);
+    REQUIRE(runtime::cuda::native::LaunchDecodeTokenFeed(
+        st.sampled, st.token_ids, st.n_past, st.kv_lens, st.eos, 2, st.done,
+        st.steps_left, FeedState::kB, stream));
+    st.Download(stream);
+    REQUIRE(st.h_n_past[0] == 13); // frozen at budget exhaustion
+  }
   cudaStreamDestroy(stream);
 }
 #endif

@@ -71,6 +71,21 @@ public:
   std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override;
 
+  // Burst-pipelined decode: backends that keep sampled tokens on device may
+  // run several decode steps per call and stream tokens through the sink
+  // while the GPU runs ahead. Default: not supported (callers fall back to
+  // per-token ExecuteUnifiedBatch).
+  virtual bool SupportsUnifiedBatchBurst() const { return false; }
+  virtual UnifiedBurstResult
+  ExecuteUnifiedBatchBurst(const std::vector<UnifiedBatchInput> &inputs,
+                           const UnifiedBurstOptions &options,
+                           const BurstTokenSink &sink) {
+    (void)inputs;
+    (void)options;
+    (void)sink;
+    return UnifiedBurstResult{};
+  }
+
   bool SupportsAsyncUnifiedBatch() const override;
   UnifiedBatchHandle SubmitUnifiedBatchAsync(
       const std::vector<UnifiedBatchInput> &inputs,

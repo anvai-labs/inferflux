@@ -1,7 +1,7 @@
 #pragma once
 
-#include "runtime/backends/cuda/native/model_forward.h"
 #include "runtime/backends/common/backend_interface.h"
+#include "runtime/backends/cuda/native/model_forward.h"
 #include <algorithm>
 #include <array>
 
@@ -108,7 +108,20 @@ public:
   int *GetBatchMetaDevice() override;
   int GetMaxBatchSize() const override;
 
+  BatchMetaDevice BatchMetaDevicePointers() const override {
+    return {d_batch_token_ids_, d_batch_n_past_, d_batch_seq_ids_,
+            d_batch_kv_lens_};
+  }
+
+  bool DecodeGraphReady(int batch_size) const override {
+    return decode_graph_exec_ != nullptr && graph_batch_size_ == batch_size &&
+           graph_enabled_;
+  }
+
+  bool BatchForwardDevice(int batch_size, float *d_logits) override;
+
   void WarmWeightCaches() override;
+  std::string ProbeDispatchPaths() override;
   void SetStream(cudaStream_t stream) override;
   void SetExecutionPolicy(const NativeExecutionPolicy &policy) override;
 
@@ -160,6 +173,9 @@ private:
   T *d_k_new_{nullptr};
   T *d_v_new_{nullptr};
   T *d_attn_out_{nullptr};
+  // Split-attention merge partials (see FlashDecodeMultiSeqStridedSplit).
+  static constexpr int kMaxAttnKSplits = 8;
+  float *d_attn_partials_{nullptr};
   T *d_ffn_gate_{nullptr};
   T *d_ffn_up_{nullptr};
   T *d_ffn_down_{nullptr};
@@ -214,7 +230,7 @@ private:
   struct DeviceTensorSnapshot {
     int layer_idx{-1};
     std::string operation;
-    float *d_data{nullptr};  // Device pointer (always float)
+    float *d_data{nullptr}; // Device pointer (always float)
     size_t num_elements{0};
     std::vector<int> shape;
   };
@@ -223,8 +239,8 @@ private:
   // Helper method to snapshot a tensor to device memory
   template <typename TensorT>
   void SnapshotTensorToDevice(const std::string &operation, int layer_idx,
-                               const TensorT *device_ptr,
-                               const std::vector<int> &shape);
+                              const TensorT *device_ptr,
+                              const std::vector<int> &shape);
 
   bool AllocateScratch();
 };

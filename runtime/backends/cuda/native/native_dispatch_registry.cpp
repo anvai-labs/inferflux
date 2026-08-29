@@ -1,4 +1,6 @@
 #include "runtime/backends/cuda/native/native_dispatch_registry.h"
+
+#include "runtime/backends/cuda/native/dispatch_operator_health.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
 
 #include <array>
@@ -285,6 +287,9 @@ InferfluxCudaFfnDispatchDecision SelectInferfluxCudaFfnDispatchDecision(
     const InferfluxCudaFfnDispatchProfile &profile,
     const NativeExecutionPolicy &policy) {
   for (const auto &rule : GetInferfluxCudaFfnDispatchRules()) {
+    if (InferfluxCudaOperatorHealth::Instance().IsUnhealthy(rule.op)) {
+      continue; // down-ranked by the probe / divergence telemetry
+    }
     if (rule.requires_q81 && !profile.q81_ready) {
       continue;
     }
@@ -341,6 +346,9 @@ SelectInferfluxCudaDownProjDispatchDecision(
     const InferfluxCudaDownProjDispatchProfile &profile,
     const NativeExecutionPolicy &policy) {
   for (const auto &rule : GetInferfluxCudaDownProjDispatchRules()) {
+    if (InferfluxCudaOperatorHealth::Instance().IsUnhealthy(rule.op)) {
+      continue; // down-ranked by the probe / divergence telemetry
+    }
     if (rule.requires_q81 && !profile.q81_ready) {
       continue;
     }

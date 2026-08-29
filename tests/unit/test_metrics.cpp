@@ -864,6 +864,27 @@ TEST_CASE(
           std::string::npos);
 }
 
+TEST_CASE("MetricsRegistry records native dispatch divergences", "[metrics]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordInferfluxCudaDispatchDivergence(
+      "ffn", "q8_1_group_mmq3", "packed_group", "tier_mismatch");
+  registry.RecordInferfluxCudaDispatchDivergence(
+      "ffn", "q8_1_group_mmq3", "packed_group", "tier_mismatch");
+  registry.RecordInferfluxCudaDispatchDivergence("down_proj", "mmq",
+                                                 "q8_1_gemv", "tier_mismatch");
+
+  auto output = registry.RenderPrometheus();
+  REQUIRE(output.find("inferflux_cuda_dispatch_divergence_total{"
+                      "layer=\"ffn\",selected=\"q8_1_group_mmq3\","
+                      "actual=\"packed_group\",reason=\"tier_mismatch\"} 2") !=
+          std::string::npos);
+  REQUIRE(output.find("inferflux_cuda_dispatch_divergence_total{"
+                      "layer=\"down_proj\",selected=\"mmq\","
+                      "actual=\"q8_1_gemv\",reason=\"tier_mismatch\"} 1") !=
+          std::string::npos);
+  REQUIRE(registry.GetInferfluxCudaDispatchDivergences() == 3);
+}
+
 TEST_CASE("MetricsRegistry exports native memory accounting snapshots",
           "[metrics]") {
   inferflux::MetricsRegistry registry;

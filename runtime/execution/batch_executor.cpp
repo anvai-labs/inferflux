@@ -164,6 +164,30 @@ MakeUnifiedBatchInput(const InferenceRequest &req, int n_past,
   return input;
 }
 
+// Burst decode is eligible for a step when every request is past prefill and
+// every input is a single-token greedy decode — the exact set the direct
+// step path already routes here (grammar/logprobs/response-format requests
+// are excluded upstream by the scheduler).
+bool BurstStepEligible(
+    const std::vector<InferenceRequest *> &active_reqs,
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &batch_inputs) {
+  if (batch_inputs.empty() || active_reqs.size() != batch_inputs.size()) {
+    return false;
+  }
+  for (auto *req : active_reqs) {
+    if (!req || req->execution.in_prefill) {
+      return false;
+    }
+  }
+  for (const auto &input : batch_inputs) {
+    if (input.tokens.size() != 1 || !input.request_logits ||
+        input.sampling.temperature > 0.0f) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // RAII guard that calls SetupSampler before execution and TeardownSampler on
 // scope exit.  Always sets up a sampler chain (grammar optional), so sampling
 // params (temperature, top_p, …) are always in effect.
@@ -1510,6 +1534,67 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     if (!step_ok) {
       step_outputs.clear();
     }
+  } else if (backend->SupportsUnifiedBatchBurst() &&
+             BurstStepEligible(active_reqs, batch_inputs)) {
+    // Burst-pipelined decode: the backend runs several tokens per call and
+    // streams them through the sink below (emission logic mirrors the
+    // per-step loop). On burst failure fall through to the normal path.
+    UnifiedBurstOptions burst_options;
+    const BurstTokenSink sink = [&](const BurstTokenEvent &ev) -> bool {
+      if (ev.input_idx >= active_reqs.size()) {
+        return false;
+      }
+      auto *req = active_reqs[ev.input_idx];
+      req->n_past += 1;
+      req->execution.current_token = ev.token_id;
+      const std::string piece(ev.piece);
+      bool stop_hit = false;
+      if (IsVisibleGeneratedPiece(piece)) {
+        req->execution.tokens_generated++;
+        stop_hit = AppendGeneratedPiece(
+            req, piece, &req->execution.result.completion, &metrics_);
+        if (req->cancellation_flag && req->cancellation_flag->load()) {
+          req->execution.active = false;
+          return false;
+        }
+      } else if (++req->execution.non_emitting_steps >=
+                 req->execution.max_non_emitting_steps) {
+        req->execution.active = false;
+        log::Warn("batch_executor",
+                  "unified batch burst stopped after too many non-emitting "
+                  "tokens");
+        return false;
+      }
+      if (stop_hit) {
+        req->execution.active = false;
+        return false;
+      }
+      if (req->execution.tokens_generated >= req->execution.decode_limit) {
+        req->execution.active = false;
+        return false;
+      }
+      LogUnifiedAssemblyState("burst_decode_emit", *req, piece,
+                              req->execution.result.completion, ev.token_id,
+                              req->execution.tokens_generated, req->n_past,
+                              stop_hit, req->execution.active);
+      return true;
+    };
+    const UnifiedBurstResult burst =
+        backend->ExecuteUnifiedBatchBurst(batch_inputs, burst_options, sink);
+    if (burst.ok) {
+      // Post-burst bookkeeping: sequences the executor marked finished
+      // (device EOS or sink stop) deactivate here; the sink already did
+      // per-token emission, n_past, and execution.current_token.
+      for (std::size_t j = 0; j < active_reqs.size(); ++j) {
+        if (j < burst.finished.size() && burst.finished[j]) {
+          active_reqs[j]->execution.active = false;
+        }
+      }
+      return;
+    }
+    log::Warn("batch_executor",
+              "Unified batch burst failed; falling back to per-step decode");
+    step_outputs = backend->ExecuteUnifiedBatch(batch_inputs);
   } else {
     step_outputs = backend->ExecuteUnifiedBatch(batch_inputs);
   }

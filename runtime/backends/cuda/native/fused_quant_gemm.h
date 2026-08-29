@@ -2,13 +2,25 @@
 
 #include <array>
 
+#include "runtime/backends/cuda/native/dispatch_catalog.h"
 #include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/weight_map.h"
 
 #ifdef INFERFLUX_HAS_CUDA
 #include <cstdint>
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
 #include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 #endif
 
 namespace inferflux {
@@ -48,26 +60,31 @@ class FusedQuantGemm {
 public:
   static constexpr int kDownProjMmqTileCols = 8;
 
-  enum class FfnProjOperator {
-    kFallback = 0,
-    kQ81Group,
-    kQ81GroupHotQ4K,
-    kQ81GroupRowPairW4,
-    kQ81GroupRowQuadM4,
-    kQ81GroupMmq3,
-    kPackedGroup,
-  };
+  // Operator enums live at namespace scope in dispatch_catalog.h (the
+  // single source of truth shared with the CPU-compiled decision layer);
+  // these aliases keep every historical FusedQuantGemm::-qualified use
+  // compiling unchanged.
+  using FfnProjOperator = ::inferflux::FfnProjOperator;
+  using DownProjOperator = ::inferflux::DownProjOperator;
 
-  enum class DownProjOperator {
-    kFallback = 0,
-    kQ81Gemv,
-    kQ81GemvHotFixed,
-    kQ81GemvRowPairHotFixed,
-    kQ81GemvRowPair,
-    kQ81GemvRowQuad,
-    kPackedGemv,
-    kMmq,
-  };
+  static const char *FfnProjOperatorName(FfnProjOperator op) {
+    return FfnSelectionLabel(op);
+  }
+  static const char *FfnProjOperatorMetricName(FfnProjOperator op,
+                                               int quant_type, int m,
+                                               int k = 0) {
+    (void)k;
+    return FfnMetricLabel(op, quant_type, m);
+  }
+  static const char *DownProjOperatorName(DownProjOperator op) {
+    return DownSelectionLabel(op);
+  }
+  static const char *DownProjOperatorMetricName(DownProjOperator op,
+                                                int quant_type, int m,
+                                                int k = 0) {
+    (void)k;
+    return DownMetricLabel(op, quant_type, m);
+  }
 
   /**
    * Attempt a fused dequant-GEMV using pre-quantized int8 activations packed
@@ -200,9 +217,9 @@ public:
    * Currently supports MMVQ path only (M<=8, covers all decode).
    */
   static bool GemvQ8_1AccumF32(const QuantizedWeightInfo &weight,
-                                const void *act_q8_1, float *output, int M,
-                                int N, int K, cudaStream_t stream,
-                                const NativeExecutionPolicy *policy = nullptr);
+                               const void *act_q8_1, float *output, int M,
+                               int N, int K, cudaStream_t stream,
+                               const NativeExecutionPolicy *policy = nullptr);
 
   /**
    * MMQ-style tiled down-projection path for transformed GGUF weights.
@@ -246,10 +263,6 @@ public:
                         bool allow_packed,
                         const NativeExecutionPolicy *policy = nullptr);
 
-  static const char *FfnProjOperatorName(FfnProjOperator op);
-  static const char *FfnProjOperatorMetricName(FfnProjOperator op,
-                                               int quant_type, int m, int k);
-
   /**
    * Hybrid down-proj operator selector.
    *
@@ -261,10 +274,6 @@ public:
   SelectDownProjOperator(int quant_type, const FusedDispatchGeometry &geometry,
                          bool allow_q81, bool allow_packed, bool allow_mmq,
                          const NativeExecutionPolicy *policy = nullptr);
-
-  static const char *DownProjOperatorName(DownProjOperator op);
-  static const char *DownProjOperatorMetricName(DownProjOperator op,
-                                                int quant_type, int m, int k);
 
   /**
    * Grouped Q8_1 GEMV for two sibling projections (single kernel launch).
@@ -295,7 +304,6 @@ public:
                                       const QuantizedWeightInfo &up_raw,
                                       const void *act_q8_1, half *output, int M,
                                       int N, int K, cudaStream_t stream);
-
   /**
    * Fused gate+up+SiLU MMVQ with Q8_1 quantization epilogue.
    * Produces both FP16 output and Q8_1 quantized output in a single kernel,
