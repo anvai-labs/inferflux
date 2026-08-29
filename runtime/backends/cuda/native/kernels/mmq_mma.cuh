@@ -60,24 +60,30 @@ constexpr int MmqSmemInts(int mmq_x) {
 }
 
 // ---------------------------------------------------------------------------
-// D4 quantizer: half[M, K] -> BlockQ8_1Mmq[M, K/128]. 128 threads per
-// block quantize one 128-value group; each thread handles 4 values, scale
-// reduced across the 8 threads of its 32-value sub-group.
+// D4 quantizer: half[M, K] -> BlockQ8_1Mmq[M, K/128]. 128-thread blocks
+// quantize four 128-value groups each (one warp per group); each thread
+// handles 4 values, scale reduced across the 8 lanes of its 32-value
+// sub-group.
 // ---------------------------------------------------------------------------
 __global__ void QuantizeRowQ8_1MmqKernel(const half *__restrict__ x,
                                           BlockQ8_1Mmq *__restrict__ y, int K,
                                           int total_rows) {
-  // One block (128 threads) quantizes one 128-value group = 4 sub-groups
-  // of 32; thread t covers values [4t, 4t+4); scale reduced across the
-  // 8 threads of each 32-value sub-group.
   const int row = blockIdx.y;
   if (row >= total_rows)
     return;
-  const int t = threadIdx.x;               // 0..127
+  const int t = threadIdx.x; // 0..127
   const int groups_per_row = K / 128;
-  BlockQ8_1Mmq &grp = y[row * groups_per_row + blockIdx.x];
+  const int group = blockIdx.x * 4 + t / 32;
+  if (group >= groups_per_row) {
+    return; // tail block when groups_per_row % 4 != 0
+  }
+  // Group-major layout [K/128][rows]: every 128-value group of all rows is
+  // contiguous, so the MMQ driver stages a whole activation tile as one
+  // contiguous chunk per K-group.
+  BlockQ8_1Mmq &grp = y[static_cast<size_t>(group) * total_rows + row];
+  const int lane = t % 32; // 4 values per lane: 32 lanes = 128 values
 
-  const int base = blockIdx.x * 128 + 4 * t;
+  const int base = row * K + group * 128 + 4 * lane;
   const half2 h01 = *reinterpret_cast<const half2 *>(&x[base + 0]);
   const half2 h23 = *reinterpret_cast<const half2 *>(&x[base + 2]);
   const float vals[4] = {__half2float(__low2half(h01)),
@@ -89,7 +95,7 @@ __global__ void QuantizeRowQ8_1MmqKernel(const half *__restrict__ x,
   amax = fmaxf(amax, fabsf(vals[1]));
   amax = fmaxf(amax, fabsf(vals[2]));
   amax = fmaxf(amax, fabsf(vals[3]));
-  // Sub-group = 32 values = 8 threads of 4.
+  // Sub-group = 32 values = 8 lanes of 4.
 #pragma unroll
   for (int off = 4; off > 0; off >>= 1) {
     amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, off));
@@ -101,10 +107,11 @@ __global__ void QuantizeRowQ8_1MmqKernel(const half *__restrict__ x,
   q.y = __float2int_rn(vals[1] * d_inv);
   q.z = __float2int_rn(vals[2] * d_inv);
   q.w = __float2int_rn(vals[3] * d_inv);
-  reinterpret_cast<char4 *>(grp.qs)[t] = q;
+  reinterpret_cast<char4 *>(grp.qs)[lane] = q;
 
-  if (t % 32 == 0) {
-    grp.d4[t / 32] = amax > 0.0f ? 1.0f / d_inv : 0.0f;
+  // Scale slots are group-relative: lanes 0/8/16/24 of the group's warp.
+  if (lane % 8 == 0) {
+    grp.d4[lane / 8] = amax > 0.0f ? 1.0f / d_inv : 0.0f;
   }
 }
 
@@ -140,13 +147,14 @@ LoadTilesQ6KMma(const char *__restrict__ x, int *__restrict__ x_tile,
     const block_q6_k *bxi =
         reinterpret_cast<const block_q6_k *>(x) + kbx0 + i * stride;
 
-    // get_int_b2(ql, txi): 4 bytes at 2*txi (2-byte aligned).
-    const int ql = LoadPackedInt32Unaligned(&bxi->ql[2 * txi]);
+    // get_int_b2 semantics: 4 bytes at offset 4*i (llama reads two
+    // uint16s at 2*i and 2*i+1) — NOT 2*i bytes.
+    const int ql = LoadPackedInt32Unaligned(&bxi->ql[4 * txi]);
     const int ql0 = (ql >> 0) & 0x0F0F0F0F;
     const int ql1 = (ql >> 4) & 0x0F0F0F0F;
 
     const int qh = LoadPackedInt32Unaligned(
-        &bxi->qh[(QI6 / 4) * (txi / (QI6 / 2)) + txi % (QI6 / 4)]);
+        &bxi->qh[4 * ((QI6 / 4) * (txi / (QI6 / 2)) + txi % (QI6 / 4))]);
     const int qh0 = ((qh >> ((txi & 0x08) >> 2)) << 4) & 0x30303030;
     const int qh1 = (qh >> ((txi & 0x08) >> 2)) & 0x30303030;
 
@@ -184,7 +192,7 @@ LoadTilesQ6KMma(const char *__restrict__ x, int *__restrict__ x_tile,
         reinterpret_cast<const block_q6_k *>(x) + kbx0 + i * stride +
         (threadIdx.x % (kMmqTileNeK / 8)) / 4;
     x_sc[i * kMmqMmaTileXKQ6K + threadIdx.x % 4] =
-        LoadPackedInt32Unaligned(&bxi->scales[2 * (threadIdx.x % 4)]);
+        LoadPackedInt32Unaligned(&bxi->scales[4 * (threadIdx.x % 4)]);
   }
 }
 
@@ -311,14 +319,30 @@ VecDotQ6KQ8_1Mma(const int *__restrict__ x, const int *__restrict__ y,
 // Driver: conventional tiling. Grid (ceil(N/mmq_y), ceil(M/mmq_x)).
 // __restrict__-clean; output half[M, N].
 // ---------------------------------------------------------------------------
+// Deterministic K-split reduce: partials[S][M][N] fp32 -> half[M][N],
+// summed in fixed z order (no atomics, bit-stable across runs).
+__global__ void ReduceMmqKSplit(const float *__restrict__ partials,
+                                half *__restrict__ out, int splits,
+                                size_t mn) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= mn) {
+    return;
+  }
+  float acc = 0.0f;
+  for (int s = 0; s < splits; ++s) {
+    acc += partials[static_cast<size_t>(s) * mn + idx];
+  }
+  out[idx] = __float2half(acc);
+}
+
 template <int mmq_x>
 __global__ void __launch_bounds__(kMmqWarps * 32, 1)
     InferfluxMmqQ6KMma(const char *__restrict__ w,
                        const BlockQ8_1Mmq *__restrict__ act, half *__restrict__ out,
-                       int N, int K, int M) {
+                       int N, int K, int M, float *__restrict__ partials,
+                       int ksplits) {
   constexpr int warp_size = 32;
   constexpr int QK = 256; // QK_K
-  constexpr int blocks_per_iter = kMmqIterK / QK;
 
   extern __shared__ int smem[];
   int *tile_y = smem;
@@ -339,28 +363,50 @@ __global__ void __launch_bounds__(kMmqWarps * 32, 1)
                           sizeof(block_q6_k);
   constexpr int sz = sizeof(BlockQ8_1Mmq) / sizeof(int);
   static_assert(sz == kMmqTileYK, "row stride must equal tile Y pitch");
-  // y layout: [M rows][K/128 groups][36 ints]. K-group kb0 across all M
-  // rows is contiguous; the tile stages rows [jt*mmq_x, +mmq_x) of it.
+  // y layout: group-major [K/128][M rows][36 ints]; the tile stages rows
+  // [jt*mmq_x, +mmq_x) of K-group kb0 as one contiguous chunk.
   const int *y_base = reinterpret_cast<const int *>(act);
 
-  for (int kb0 = 0; kb0 < blocks_per_row; kb0 += blocks_per_iter) {
+  // K-split: slice z covers super-blocks [kb_begin, kb_end). ksplits == 1
+  // (partials == nullptr) writes half outputs directly.
+  const int sb_per_split = (blocks_per_row + ksplits - 1) / ksplits;
+  const int kb_begin = blockIdx.z * sb_per_split;
+  const int kb_end = min(kb_begin + sb_per_split, blocks_per_row);
+
+  for (int kb0 = kb_begin; kb0 < kb_end; ++kb0) {
     LoadTilesQ6KMma<kMmqY>(x, tile_x, kb0, tile_x_max_i, blocks_per_row);
-    {
-      const int *src =
-          y_base +
-          (static_cast<size_t>(kb0 * QK / 128) * M + jt * mmq_x) * sz;
+    // Two 128-value chunks per 256-value super-block: vec_dot consumes
+    // kMmqTileNeK=32 int-cols (128 int8) per call, x_qs holds 64 — llama
+    // stages and consumes the second chunk in the same kb0 iteration.
 #pragma unroll
-      for (int l0 = 0; l0 < mmq_x * kMmqTileYK; l0 += kMmqWarps * warp_size) {
-        const int l = l0 + threadIdx.y * warp_size + threadIdx.x;
-        if (l < mmq_x * kMmqTileYK) {
-          tile_y[l] = src[l];
+    for (int chunk = 0; chunk < 2; ++chunk) {
+      {
+        const int *src =
+            y_base +
+            (static_cast<size_t>(kb0 * QK / 128 + chunk) * M + jt * mmq_x) *
+                sz;
+#pragma unroll
+        for (int l0 = 0; l0 < mmq_x * kMmqTileYK;
+             l0 += kMmqWarps * warp_size) {
+          const int l = l0 + threadIdx.y * warp_size + threadIdx.x;
+          if (l < mmq_x * kMmqTileYK) {
+            tile_y[l] = src[l];
+          }
         }
       }
+      __syncthreads();
+      VecDotQ6KQ8_1Mma<mmq_x>(tile_x, tile_y, sum, chunk * kMmqTileNeK);
+      __syncthreads();
     }
-    __syncthreads();
-    VecDotQ6KQ8_1Mma<mmq_x>(tile_x, tile_y, sum, 0);
-    __syncthreads();
   }
+
+#ifdef INFERFLUX_MMA_DEBUG_SUM
+  if (blockIdx.x == 0 && blockIdx.y == 0) {
+    float *dbg = reinterpret_cast<float *>(out) + M * N;
+    const int slot = (threadIdx.y * 32 + threadIdx.x) * 8;
+    for (int s = 0; s < 8; ++s) dbg[slot + s] = sum[s];
+  }
+#endif
 
   // Write back: warp w owns rows [w*32/ntx ... ] — mirror llama's
   // mmq_write_back_mma mapping for tile_C<16,16>, rows_per_warp=32.
@@ -380,8 +426,14 @@ __global__ void __launch_bounds__(kMmqWarps * 32, 1)
         if (i > tile_x_max_i || j > tile_y_max_j) {
           continue;
         }
-        out[static_cast<size_t>(j) * N + it * kMmqY + i] =
-            __float2half(sum[(j0 / TileC::J + n) * TileC::ne + l]);
+        if (ksplits == 1) {
+          out[static_cast<size_t>(j) * N + it * kMmqY + i] =
+              __float2half(sum[(j0 / TileC::J + n) * TileC::ne + l]);
+        } else {
+          partials[(static_cast<size_t>(blockIdx.z) * M + j) * N +
+                   it * kMmqY + i] =
+              sum[(j0 / TileC::J + n) * TileC::ne + l];
+        }
       }
     }
   }
