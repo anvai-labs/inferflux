@@ -222,9 +222,10 @@ public:
                                  int M, int K, cudaStream_t stream);
 
   /** Fused SwiGLU + D4 quantization for down-projection input. */
-  static void SiluMulQuantizeQ8_1Mmq(const half *gate, const half *up,
-                                     runtime::cuda::native::BlockQ8_1Mmq *output,
-                                     int M, int K, cudaStream_t stream);
+  static void
+  SiluMulQuantizeQ8_1Mmq(const half *gate, const half *up,
+                         runtime::cuda::native::BlockQ8_1Mmq *output, int M,
+                         int K, cudaStream_t stream);
 
   /**
    * MMA down-projection: out[M, N] = act[M, K] x W[N, K]^T for Q6_K W in
@@ -237,8 +238,8 @@ public:
    */
   static bool DownProjMmqMma(const QuantizedWeightInfo &weight,
                              const runtime::cuda::native::BlockQ8_1Mmq *act_mmq,
-                             half *output, int M, int N, int K,
-                             float *partials, cudaStream_t stream,
+                             half *output, int M, int N, int K, float *partials,
+                             cudaStream_t stream,
                              const NativeExecutionPolicy *policy = nullptr);
 
   /**
