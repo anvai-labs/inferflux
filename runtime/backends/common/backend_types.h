@@ -1,7 +1,10 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "scheduler/request_batch.h" // For SamplingParams
@@ -33,6 +36,55 @@ struct UnifiedBatchOutput {
   std::string piece; // Text of token; empty when token == -1
   bool ok{false};    // true if token was successfully sampled
 };
+
+// ============================================================================
+// Decode Burst Types
+// ============================================================================
+
+/// Tuning knobs for a burst-pipelined decode call. The executor enqueues up to
+/// max_tokens_per_seq decode steps per sequence back-to-back on the device
+/// (forward + sample + on-device token feed) and streams tokens to the sink
+/// from a pinned ring while the GPU runs ahead. Stop decisions made by the
+/// sink take effect at chunk boundaries; at most max_tokens_per_seq extra
+/// tokens are computed past a stop.
+struct UnifiedBurstOptions {
+  int max_tokens_per_seq{8}; ///< Steps enqueued per sequence per chunk
+  int max_batch_tokens{256}; ///< Cap on chunk_tokens * batch_size
+  // Reserved for the graph-replayed burst path. Support stays disabled until
+  // device-side sampling parity and bounded polling are implemented.
+  std::chrono::milliseconds max_wall_ms{40};
+};
+
+/// One sampled token surfaced by a burst. input_idx maps back to the position
+/// in the ExecuteUnifiedBatchBurst() input vector. token_id is the sampled
+/// token; piece is its detokenized text (may be empty for non-emitting
+/// tokens). The sink returns false to stop that sequence (stop string, decode
+/// limit, cancellation); emission-side stops freeze the sequence at the next
+/// chunk boundary.
+struct BurstTokenEvent {
+  std::size_t input_idx{0};
+  int token_id{-1};
+  std::string_view piece;
+};
+
+using BurstTokenSink = std::function<bool(const BurstTokenEvent &)>;
+
+/// Result of a burst call. last_tokens[b] is the most recent token sampled for
+/// input b (the token that feeds the next decode step); finished[b] is true
+/// when the sequence ended inside the burst (device EOS or sink stop). ok is
+/// false only on hard execution errors, in which case no tokens were emitted.
+struct UnifiedBurstResult {
+  bool ok{false};
+  std::vector<int> last_tokens;
+  std::vector<bool> finished;
+};
+
+/// Whether a sampled ring slot belongs to a sequence's per-chunk budget.
+/// Burst execution may enqueue to the largest budget in a heterogeneous
+/// batch, so consumers must ignore later frozen slots for shorter sequences.
+inline bool BurstSlotWithinBudget(int slot_idx, int step_budget) {
+  return slot_idx >= 0 && slot_idx < step_budget;
+}
 
 /// Execution lane hint for async unified-batch submission.
 /// kDecode should be favored for lower token latency.

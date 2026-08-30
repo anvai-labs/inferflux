@@ -74,5 +74,20 @@ cudaError_t FlashDecodeMultiSeqIndirect(
     float scale, cudaStream_t stream, void *ptr_workspace,
     size_t ptr_workspace_bytes);
 
+/**
+ * FlashDecodeMultiSeqStridedSplit: split-parallel decode attention.
+ *
+ * Parallelizes over the Q-heads sharing each KV head and fixed KV chunks.
+ * With multiple KV splits, CTAs write online-softmax partials to d_partials
+ * for a combine pass; otherwise they write output directly.
+ */
+template <typename T>
+cudaError_t FlashDecodeMultiSeqStridedSplit(
+    const T *Q, const T *kv_buffer, T *O, float *d_partials,
+    const int *d_seq_ids, const int *d_kv_lens, int layer, int batch_size,
+    int num_heads, int num_kv_heads, int head_dim, size_t slot_stride,
+    size_t layer_stride, size_t kv_stride, float scale, int qsplit, int chunk,
+    int ksplits, cudaStream_t stream = 0);
+
 } // namespace cuda_kernel
 } // namespace inferflux

@@ -3,6 +3,8 @@ import csv
 import sys
 from collections import defaultdict
 
+USAGE = "usage: analyze_ncu.py <ncu_details.csv>"
+
 def main():
     metrics_of_interest = {
         "Memory Throughput": "mem_throughput_pct",
@@ -16,12 +18,21 @@ def main():
         "Achieved Active Warps Per SM": "active_warps",
     }
 
-    csv_path = r"C:\Users\vjsin\code\inferflux\ncu_details.csv"
+    csv_path = sys.argv[1] if len(sys.argv) > 1 else "ncu_details.csv"
+    if len(sys.argv) > 2:
+        print(USAGE, file=sys.stderr)
+        sys.exit(2)
 
     # Collect per-kernel-instance metrics
     kernels = defaultdict(lambda: {"block": "", "grid": ""})
 
-    with open(csv_path, 'r', encoding='utf-8-sig') as f:
+    try:
+        f = open(csv_path, 'r', encoding='utf-8-sig')
+    except FileNotFoundError:
+        print(f"error: {csv_path} not found\n{USAGE}", file=sys.stderr)
+        sys.exit(1)
+
+    with f:
         reader = csv.DictReader(f)
         for row in reader:
             kid = row["ID"]

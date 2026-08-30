@@ -17,8 +17,10 @@
 #include "runtime/backends/cuda/native/quantization_handler.h"
 #include "support/model_loader_test_access.h"
 
-#include <cstring>
+#ifdef INFERFLUX_HAS_CUDA
 #include <cuda_runtime_api.h>
+#endif
+#include <cstring>
 #include <fstream>
 #include <numeric>
 #include <vector>

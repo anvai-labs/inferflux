@@ -18,8 +18,8 @@ cudaError_t RmsNorm(const T *input, const T *weight, T *output, int count,
 // rope_type: 0 = kNorm (consecutive pairs), 2 = kNeox (split-half pairs)
 template <typename T>
 cudaError_t RoPE(T *q, T *k, int seq_len, int num_heads, int num_kv_heads,
-                 int head_dim, int n_past, float freq_base,
-                 cudaStream_t stream, int rope_type = 0);
+                 int head_dim, int n_past, float freq_base, cudaStream_t stream,
+                 int rope_type = 0);
 
 template <typename T>
 cudaError_t SiluMul(const T *gate, const T *up, T *output, int count,
@@ -95,8 +95,7 @@ cudaError_t ResidualAdd(half *residual, const half *input, int count,
 
 cudaError_t ResidualAddRmsNorm(half *residual, const half *input,
                                const half *weight, half *output, int count,
-                               int hidden_size, float eps,
-                               cudaStream_t stream);
+                               int hidden_size, float eps, cudaStream_t stream);
 
 cudaError_t EmbeddingLookup(const half *table, const int *token_ids,
                             half *output, int seq_len, int hidden_size,
@@ -164,12 +163,14 @@ cudaError_t EmbeddingLookupF32(const T *table, const int *token_ids,
  * BatchedRoPE: Apply RoPE to B sequences with different n_past values.
  * q layout: [B, num_heads * head_dim], k layout: [B, num_kv_heads * head_dim]
  * d_n_past: [B] per-sequence positions on device.
+ * Optional q_bias/k_bias ([heads * head_dim]) are added to the loaded
+ * values before rotation — the fused equivalent of BiasAdd-then-RoPE.
  */
 template <typename T>
 cudaError_t BatchedRoPE(T *q, T *k, int batch_size, int num_heads,
                         int num_kv_heads, int head_dim, const int *d_n_past,
-                        float freq_base, cudaStream_t stream,
-                        int rope_type = 0);
+                        float freq_base, cudaStream_t stream, int rope_type = 0,
+                        const T *q_bias = nullptr, const T *k_bias = nullptr);
 
 /**
  * BatchedKvAppend: Scatter-copy K/V for B sequences into KV cache.
@@ -189,12 +190,12 @@ cudaError_t BatchedKvAppend(const T *k_new, const T *v_new, T **d_k_dst,
  * d_seq_ids/d_n_past: [B] sequence IDs and append positions on device.
  */
 template <typename T>
-cudaError_t BatchedKvAppendStrided(const T *k_new, const T *v_new,
-                                   T *kv_buffer, const int *d_seq_ids,
-                                   const int *d_n_past, int layer,
-                                   int batch_size, int kv_dim,
+cudaError_t BatchedKvAppendStrided(const T *k_new, const T *v_new, T *kv_buffer,
+                                   const int *d_seq_ids, const int *d_n_past,
+                                   int layer, int batch_size, int kv_dim,
                                    size_t slot_stride, size_t layer_stride,
-                                   size_t kv_stride, cudaStream_t stream);
+                                   size_t kv_stride, cudaStream_t stream,
+                                   const T *v_bias = nullptr);
 
 /**
  * BatchedKvAppendIndirect: Same as Strided but uses slot base pointer table.

@@ -188,6 +188,15 @@ public:
   void RecordCudaAttentionKernelFallback(const std::string &requested_kernel,
                                          const std::string &selected_kernel,
                                          const std::string &reason);
+
+  // Dispatch divergence: the executor ran a different tier than the
+  // selector chose (layer=ffn|down_proj|graph|probe). The canonical signal
+  // for routing regressions like the kQ81GroupMmq3 allowlist bug.
+  void RecordInferfluxCudaDispatchDivergence(std::string_view layer,
+                                             std::string_view selected,
+                                             std::string_view actual,
+                                             std::string_view reason);
+  uint64_t GetInferfluxCudaDispatchDivergences() const;
   void RecordCudaAttentionKernelSwitch(const std::string &from_kernel,
                                        const std::string &to_kernel);
   void RecordDecodeWorkerBatchSize(std::size_t batch_size);
@@ -450,6 +459,9 @@ private:
   std::chrono::steady_clock::time_point cuda_overlap_started_at_{};
   mutable std::mutex cuda_attention_fallback_mutex_;
   std::unordered_map<std::string, uint64_t> cuda_attention_fallback_counts_;
+  mutable std::mutex cuda_dispatch_divergence_mutex_;
+  std::unordered_map<std::string, uint64_t> cuda_dispatch_divergence_counts_;
+  uint64_t cuda_dispatch_divergence_total_{0};
   mutable std::mutex cuda_attention_switch_mutex_;
   std::unordered_map<std::string, uint64_t> cuda_attention_switch_counts_;
 

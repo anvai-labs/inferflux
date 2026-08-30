@@ -1,4 +1,12 @@
 #include "runtime/backends/cuda/native/quantization_handler.h"
+
+// sizeof_half on CPU builds: the guarded header typedef makes __half
+// opaque, so use the standard IEEE binary16 size directly.
+#ifndef INFERFLUX_HAS_CUDA
+#define sizeof_half 2
+#else
+#define sizeof_half sizeof(half)
+#endif
 #include "runtime/backends/cuda/native/safetensors_adapter.h"
 #include "server/logging/logger.h"
 #include <algorithm>
@@ -62,7 +70,7 @@ public:
       return 0;
     }
     const size_t blocks = quantized_size / block_bytes_;
-    return blocks * block_size_ * sizeof(half);
+    return blocks * block_size_ * sizeof_half;
   }
 
   double GetBitsPerValue() const override { return bits_per_value_; }
@@ -220,21 +228,21 @@ size_t BaseQuantizationHandler::GetQuantizedSize(size_t num_elements,
 
   // Block sizes in bytes (from ggml-common.h)
   static const std::unordered_map<std::string, size_t> block_bytes = {
-      {"q4_0", 18}, // sizeof(half) + 32/2 = 2 + 16 = 18
-      {"q4_1", 20}, // 2*sizeof(half) + 32/2 = 4 + 16 = 20
-      {"q5_0", 22}, // sizeof(half) + 4 + 32/2 = 2 + 4 + 16 = 22
-      {"q5_1", 24}, // 2*sizeof(half) + 4 + 32/2 = 4 + 4 + 16 = 24
-      {"q8_0", 34}, // sizeof(half) + 32 = 2 + 32 = 34
-      {"q8_1", 36}, // 2*sizeof(half) + 32 = 4 + 32 = 36
-      {"q2_k", 96}, // 2*sizeof(half) + 256/16 + 256/4 = 4 + 16 + 64 = 84
+      {"q4_0", 18}, // sizeof_half + 32/2 = 2 + 16 = 18
+      {"q4_1", 20}, // 2*sizeof_half + 32/2 = 4 + 16 = 20
+      {"q5_0", 22}, // sizeof_half + 4 + 32/2 = 2 + 4 + 16 = 22
+      {"q5_1", 24}, // 2*sizeof_half + 4 + 32/2 = 4 + 4 + 16 = 24
+      {"q8_0", 34}, // sizeof_half + 32 = 2 + 32 = 34
+      {"q8_1", 36}, // 2*sizeof_half + 32 = 4 + 32 = 36
+      {"q2_k", 96}, // 2*sizeof_half + 256/16 + 256/4 = 4 + 16 + 64 = 84
       {"q3_k",
-       100}, // sizeof(half) + 256/4 + 256/8 + 12 = 2 + 64 + 32 + 12 = 110
-      {"q4_k", 144}, // 2*sizeof(half) + 12 + 256/2 = 4 + 12 + 128 = 144
+       100}, // sizeof_half + 256/4 + 256/8 + 12 = 2 + 64 + 32 + 12 = 110
+      {"q4_k", 144}, // 2*sizeof_half + 12 + 256/2 = 4 + 12 + 128 = 144
       {"q4_k_m", 144},
       {"q5_k",
-       176}, // 2*sizeof(half) + 12 + 256/2 + 256/8 = 4 + 12 + 128 + 32 = 176
+       176}, // 2*sizeof_half + 12 + 256/2 + 256/8 = 4 + 12 + 128 + 32 = 176
       {"q5_k_m", 176},
-      {"q6_k", 210}, // sizeof(half) + 256/16 + 3*256/4 = 2 + 16 + 192 = 210
+      {"q6_k", 210}, // sizeof_half + 256/16 + 3*256/4 = 2 + 16 + 192 = 210
       {"q6_k_m", 210},
       {"q8_k", 292},   // sizeof(float) + 256 + 256/16*sizeof(int16_t)
       {"q8_k_m", 292}, // alias
@@ -243,7 +251,7 @@ size_t BaseQuantizationHandler::GetQuantizedSize(size_t num_elements,
   auto it = block_bytes.find(type);
   if (it == block_bytes.end()) {
     log::Warn("quantization_handler", "Unknown quantization type: " + type);
-    return num_elements * sizeof(half); // Assume FP16
+    return num_elements * sizeof_half; // Assume FP16
   }
 
   return num_blocks * it->second;

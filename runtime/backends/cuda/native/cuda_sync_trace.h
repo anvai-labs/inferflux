@@ -8,8 +8,20 @@
 #include <mutex>
 #include <string>
 
-#include <cuda_runtime.h>
 #include <thread>
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
+#include <cuda_fp16.h>
+#include <cuda_runtime_api.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 
 namespace inferflux::runtime::cuda::native {
 
@@ -21,6 +33,7 @@ enum class SyncTraceSite : size_t {
   kPrefillForwardDrain,
   kTimingForwardReady,
   kTimingSamplingReady,
+  kBurstChunkReady,
   kCount,
 };
 
@@ -39,6 +52,7 @@ inline std::array<SyncTraceEntry, static_cast<size_t>(SyncTraceSite::kCount)>
         {"executor.prefill_forward_drain"},
         {"executor.timing_forward_ready"},
         {"executor.timing_sampling_ready"},
+        {"burst.chunk_ready"},
     }};
 
 inline bool SyncTraceEnabled() {

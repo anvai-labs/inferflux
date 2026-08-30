@@ -1,8 +1,12 @@
 #pragma once
 
-#include "runtime/backends/cuda/native/fused_quant_gemm.h"
+#include "runtime/backends/cuda/native/dispatch_catalog.h"
+#include "runtime/backends/cuda/native/native_execution_policy.h"
+
+#include "server/logging/logger.h"
 
 #include "server/metrics/metrics.h"
+#include <cstdio>
 
 #include <string>
 #include <string_view>
@@ -10,9 +14,29 @@
 
 namespace inferflux {
 
+// Budgeted dispatch-trace emission (thread_local budget resets when the
+// limit changes, mirroring ConsumeOperatorSelectionBudget).
+inline bool ConsumeDispatchTraceBudget(const NativeExecutionPolicy *policy) {
+  if (!policy || !policy->dispatch_trace) {
+    return false;
+  }
+  struct Budget {
+    int limit;
+    int used;
+  };
+  thread_local Budget budget{0, 0};
+  if (budget.limit != policy->dispatch_trace_limit) {
+    budget = Budget{policy->dispatch_trace_limit, 0};
+  }
+  if (budget.used >= budget.limit) {
+    return false;
+  }
+  ++budget.used;
+  return true;
+}
+
 struct NativeFfnExecutionSummary {
-  FusedQuantGemm::FfnProjOperator actual_op{
-      FusedQuantGemm::FfnProjOperator::kFallback};
+  FfnProjOperator actual_op{FfnProjOperator::kFallback};
   bool used_q81{false};
   bool used_packed{false};
 };
@@ -61,39 +85,70 @@ bool ExecuteNativeGroupedProjectionStage(
 
 template <typename TryQ81Fn, typename TryPackedFn, typename FallbackFn>
 bool ExecuteInferfluxCudaFfnProjectionStage(
-    FusedQuantGemm::FfnProjOperator selected_op, const char *phase,
+    FfnProjOperator selected_op, const char *phase,
     const std::string &quant_label, int quant_type, int batch_rows,
     int intermediate_size, int hidden_size, TryQ81Fn &&try_q81_group,
     TryPackedFn &&try_packed_group, FallbackFn &&run_fallback,
-    NativeFfnExecutionSummary *summary = nullptr) {
+    NativeFfnExecutionSummary *summary = nullptr,
+    const NativeExecutionPolicy *policy = nullptr) {
   NativeFfnExecutionSummary local_summary;
 
-  if (selected_op == FusedQuantGemm::FfnProjOperator::kQ81Group ||
-      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupHotQ4K ||
-      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowPairW4 ||
-      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupRowQuadM4 ||
-      selected_op == FusedQuantGemm::FfnProjOperator::kQ81GroupMmq3) {
+  switch (selected_op) {
+  case FfnProjOperator::kQ81Group:
+  case FfnProjOperator::kQ81GroupHotQ4K:
+  case FfnProjOperator::kQ81GroupRowPairW4:
+  case FfnProjOperator::kQ81GroupRowQuadM4:
+  case FfnProjOperator::kQ81GroupMmq3:
     local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81_group)();
     if (local_summary.used_q81) {
       local_summary.actual_op = selected_op;
     }
-  } else if (selected_op == FusedQuantGemm::FfnProjOperator::kPackedGroup) {
+    break;
+  case FfnProjOperator::kPackedGroup:
     local_summary.used_packed = std::forward<TryPackedFn>(try_packed_group)();
     if (local_summary.used_packed) {
       local_summary.actual_op = selected_op;
     }
+    break;
+  case FfnProjOperator::kFallback:
+    // Selector requested the dense fallback (force_cublas or no fused tier
+    // ready) — skip the fused catch-alls entirely.
+    break;
   }
 
   if (!local_summary.used_q81 && !local_summary.used_packed &&
-      selected_op != FusedQuantGemm::FfnProjOperator::kPackedGroup) {
+      selected_op != FfnProjOperator::kPackedGroup &&
+      selected_op != FfnProjOperator::kFallback) {
     local_summary.used_packed = std::forward<TryPackedFn>(try_packed_group)();
     if (local_summary.used_packed) {
-      local_summary.actual_op = FusedQuantGemm::FfnProjOperator::kPackedGroup;
+      local_summary.actual_op = FfnProjOperator::kPackedGroup;
     }
   }
 
-  const char *metric_op = FusedQuantGemm::FfnProjOperatorMetricName(
-      local_summary.actual_op, quant_type, batch_rows, hidden_size);
+  const bool ffn_divergent =
+      TierOf(selected_op) != TierOf(local_summary.actual_op) ||
+      (local_summary.actual_op == FfnProjOperator::kFallback &&
+       selected_op != FfnProjOperator::kFallback);
+  if (ffn_divergent) {
+    ReportDispatchDivergence("ffn", FfnSelectionLabel(selected_op),
+                             FfnSelectionLabel(local_summary.actual_op),
+                             "tier_mismatch");
+  }
+  if (ConsumeDispatchTraceBudget(policy)) {
+    // Direct stderr like [phase_timing]: a diagnostic trace that must
+    // survive warning-level logging in benchmark harnesses.
+    std::fprintf(stderr,
+                 "[dispatch_trace] [ffn]: phase=%s M=%d N=%d K=%d "
+                 "selected=%s actual=%s tier=%s%s\n",
+                 phase, batch_rows, intermediate_size, hidden_size,
+                 FfnSelectionLabel(selected_op),
+                 FfnSelectionLabel(local_summary.actual_op),
+                 DispatchTierLabel(TierOf(local_summary.actual_op)),
+                 ffn_divergent ? " reason=tier_mismatch" : "");
+  }
+
+  const char *metric_op =
+      FfnMetricLabel(local_summary.actual_op, quant_type, batch_rows);
   GlobalMetrics().RecordInferfluxCudaFfnProjOperator(phase, metric_op);
   GlobalMetrics().RecordInferfluxCudaFfnProjGeometry(
       phase, metric_op, quant_label, batch_rows, intermediate_size, hidden_size,
@@ -115,8 +170,7 @@ bool ExecuteInferfluxCudaFfnProjectionStage(
 }
 
 struct NativeDownProjExecutionSummary {
-  FusedQuantGemm::DownProjOperator actual_op{
-      FusedQuantGemm::DownProjOperator::kFallback};
+  DownProjOperator actual_op{DownProjOperator::kFallback};
   bool used_mmq{false};
   bool used_q81{false};
   bool used_packed{false};
@@ -125,31 +179,42 @@ struct NativeDownProjExecutionSummary {
 template <typename TryMmqFn, typename TryQ81Fn, typename TryPackedFn,
           typename FallbackFn, typename LogFn>
 bool ExecuteInferfluxCudaDownProjStage(
-    FusedQuantGemm::DownProjOperator selected_op, const char *phase,
+    DownProjOperator selected_op, const char *phase,
     const std::string &quant_label, int quant_type, int batch_rows,
     int hidden_size, int intermediate_size, TryMmqFn &&try_mmq,
     TryQ81Fn &&try_q81, TryPackedFn &&try_packed, FallbackFn &&run_fallback,
     LogFn &&log_selected_operator,
-    NativeDownProjExecutionSummary *summary = nullptr) {
+    NativeDownProjExecutionSummary *summary = nullptr,
+    const NativeExecutionPolicy *policy = nullptr) {
   NativeDownProjExecutionSummary local_summary;
 
-  if (selected_op == FusedQuantGemm::DownProjOperator::kMmq) {
+  switch (selected_op) {
+  case DownProjOperator::kMmq:
     local_summary.used_mmq = std::forward<TryMmqFn>(try_mmq)();
     if (local_summary.used_mmq) {
-      local_summary.actual_op = FusedQuantGemm::DownProjOperator::kMmq;
+      local_summary.actual_op = DownProjOperator::kMmq;
     }
     if (!local_summary.used_mmq) {
       local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81)();
       if (local_summary.used_q81) {
-        local_summary.actual_op = selected_op;
+        // Report what actually ran, not what was selected — the old code
+        // set actual_op = selected_op (kMmq) while the Q8_1 GEMV executed,
+        // mislabeling the operator counters.
+        local_summary.actual_op = DownProjOperator::kQ81Gemv;
       }
     }
-  } else if (selected_op == FusedQuantGemm::DownProjOperator::kPackedGemv) {
+    break;
+  case DownProjOperator::kPackedGemv:
     local_summary.used_packed = std::forward<TryPackedFn>(try_packed)();
     if (local_summary.used_packed) {
       local_summary.actual_op = selected_op;
     }
-  } else {
+    break;
+  case DownProjOperator::kQ81Gemv:
+  case DownProjOperator::kQ81GemvHotFixed:
+  case DownProjOperator::kQ81GemvRowPairHotFixed:
+  case DownProjOperator::kQ81GemvRowPair:
+  case DownProjOperator::kQ81GemvRowQuad:
     local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81)();
     if (local_summary.used_q81) {
       local_summary.actual_op = selected_op;
@@ -157,34 +222,58 @@ bool ExecuteInferfluxCudaDownProjStage(
     if (!local_summary.used_q81) {
       local_summary.used_mmq = std::forward<TryMmqFn>(try_mmq)();
       if (local_summary.used_mmq) {
-        local_summary.actual_op = FusedQuantGemm::DownProjOperator::kMmq;
+        local_summary.actual_op = DownProjOperator::kMmq;
       }
     }
+    break;
+  case DownProjOperator::kFallback:
+    // Selector requested the dense fallback — skip the fused catch-alls.
+    break;
   }
 
   if (!local_summary.used_mmq && !local_summary.used_q81 &&
-      !local_summary.used_packed) {
+      !local_summary.used_packed &&
+      selected_op != DownProjOperator::kPackedGemv &&
+      selected_op != DownProjOperator::kFallback) {
     local_summary.used_packed = std::forward<TryPackedFn>(try_packed)();
     if (local_summary.used_packed) {
-      local_summary.actual_op = FusedQuantGemm::DownProjOperator::kPackedGemv;
+      local_summary.actual_op = DownProjOperator::kPackedGemv;
     }
   }
 
-  const char *metric_op = FusedQuantGemm::DownProjOperatorMetricName(
-      local_summary.actual_op, quant_type, batch_rows, intermediate_size);
+  const bool down_divergent =
+      TierOf(selected_op) != TierOf(local_summary.actual_op) ||
+      (local_summary.actual_op == DownProjOperator::kFallback &&
+       selected_op != DownProjOperator::kFallback);
+  if (down_divergent) {
+    ReportDispatchDivergence("down_proj", DownSelectionLabel(selected_op),
+                             DownSelectionLabel(local_summary.actual_op),
+                             "tier_mismatch");
+  }
+  if (ConsumeDispatchTraceBudget(policy)) {
+    std::fprintf(stderr,
+                 "[dispatch_trace] [down_proj]: phase=%s M=%d N=%d K=%d "
+                 "selected=%s actual=%s tier=%s%s\n",
+                 phase, batch_rows, hidden_size, intermediate_size,
+                 DownSelectionLabel(selected_op),
+                 DownSelectionLabel(local_summary.actual_op),
+                 DispatchTierLabel(TierOf(local_summary.actual_op)),
+                 down_divergent ? " reason=tier_mismatch" : "");
+  }
+
+  const char *metric_op =
+      DownMetricLabel(local_summary.actual_op, quant_type, batch_rows);
   GlobalMetrics().RecordInferfluxCudaDownProjOperator(phase, metric_op);
   GlobalMetrics().RecordInferfluxCudaDownProjGeometry(
       phase, metric_op, quant_label, batch_rows, hidden_size,
       intermediate_size);
-  if (local_summary.actual_op ==
-          FusedQuantGemm::DownProjOperator::kQ81GemvRowPair ||
-      local_summary.actual_op ==
-          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed) {
+  if (local_summary.actual_op == DownProjOperator::kQ81GemvRowPair ||
+      local_summary.actual_op == DownProjOperator::kQ81GemvRowPairHotFixed) {
     GlobalMetrics().RecordInferfluxCudaRowPairSelection(phase, metric_op,
                                                         batch_rows);
   }
 
-  if (local_summary.actual_op != FusedQuantGemm::DownProjOperator::kFallback) {
+  if (local_summary.actual_op != DownProjOperator::kFallback) {
     std::forward<LogFn>(log_selected_operator)(local_summary.actual_op);
   }
 

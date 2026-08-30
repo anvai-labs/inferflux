@@ -1,14 +1,25 @@
 #pragma once
 
+#include "runtime/backends/common/backend_interface.h"
 #include "runtime/backends/cuda/inferflux_cuda_executor.h"
 #include "runtime/backends/cuda/native/cublas_gemm.h"
 #include "runtime/backends/cuda/native/kv_cache_gpu.h"
 #include "runtime/backends/cuda/native/native_execution_policy.h"
 #include "runtime/backends/cuda/native/weight_map.h"
-#include "runtime/backends/common/backend_interface.h"
 
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
 #include <cuda_fp16.h>
-#include <cuda_runtime.h>
+#include <cuda_runtime_api.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 #include <memory>
 #include <string>
 #include <vector>
@@ -98,6 +109,32 @@ public:
     return true;
   }
 
+  /// Device-resident batch decode metadata used by the burst token feed.
+  struct BatchMetaDevice {
+    int *token_ids{nullptr};
+    int *n_past{nullptr};
+    int *seq_ids{nullptr};
+    int *kv_lens{nullptr};
+  };
+
+  /// Access the device batch metadata buffers (fixed addresses). Only
+  /// meaningful for forwarders that support device-fed decode.
+  virtual BatchMetaDevice BatchMetaDevicePointers() const { return {}; }
+
+  /// True when a replayable decode graph exists for this batch size — i.e.
+  /// subsequent steps can be enqueued as a single graph launch.
+  virtual bool DecodeGraphReady(int /*batch_size*/) const { return false; }
+
+  /**
+   * Batched forward pass WITHOUT the host metadata upload: the device-side
+   * token/n_past/kv_len buffers are assumed current (advanced on device by
+   * the burst token-feed kernel). Used for burst-pipelined decode steps
+   * after the first. Default: unsupported.
+   */
+  virtual bool BatchForwardDevice(int /*batch_size*/, float * /*d_logits*/) {
+    return false;
+  }
+
   /**
    * Pre-warm lazily-initialized weight caches (F32→FP16 norm weights,
    * attention biases, embeddings).  Must be called once after Initialize()
@@ -105,6 +142,15 @@ public:
    * cudaStreamSynchronize calls inside the capture region.
    */
   virtual void WarmWeightCaches() {}
+
+  /**
+   * Load-time dispatch reachability probe. Runs selectable FFN and down-proj
+   * operators on layer-0 weights through the production executor stages and
+   * marks divergent operators unhealthy (self-heal: the dispatch rules
+   * then skip them). Returns "" when not implemented. Must be called only
+   * at load time, after WarmWeightCaches().
+   */
+  virtual std::string ProbeDispatchPaths() { return ""; }
 
   /**
    * Set the CUDA stream for forward passes.

@@ -63,6 +63,13 @@ public:
     uint64_t disagg_timeout_streak_threshold{0};
     std::string role{"unified"};
     std::string reason;
+    // Native dispatch self-heal state: down-ranked operators keep serving
+    // at best-available speed, visibly. Deliberately does NOT flip
+    // `ready` (unlike disagg degradation) — throughput is reduced, not
+    // broken.
+    bool dispatch_degraded{false};
+    uint64_t dispatch_divergences{0};
+    std::string dispatch_downgraded_operators;
   };
 
   struct AdminPoolsStatus {

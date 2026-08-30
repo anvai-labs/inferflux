@@ -12,7 +12,8 @@ flowchart LR
   B --> Q[ADR-0005 Trusted GPU release evidence]
   B --> O[TD-006 Dependency/runtime currency]
   O --> P[TD-007 Context and sequence capacity]
-  P --> C[ADR-0001 Runtime proof-or-pivot]
+  P --> R[TD-008 Unified burst sampling parity]
+  R --> C[ADR-0001 Runtime proof-or-pivot]
   C --> D[TD-003 Reproducible runtime evidence]
   D --> E[FTR-002 Agent contract]
   E --> M[ADR-0003 Tenant boundary]
@@ -44,12 +45,13 @@ flowchart LR
 | 2 | [TD-002](technical-debt/TD-002-required-evidence-gates.md) | Prevents correctness and performance regressions from becoming release claims | CPU contracts required; one stable CUDA behavioral lane defined |
 | 3 | [TD-006](technical-debt/TD-006-dependency-runtime-currency.md) | Runtime evidence is invalid when accelerator support silently compiles out or uses obsolete interfaces | Versioned CPU/CUDA/ROCm matrix passes on supported pins |
 | 4 | [TD-007](technical-debt/TD-007-context-sequence-capacity.md) | Load evidence is invalid until context capacity, errors, and request completion are deterministic | Mixed-prompt lifecycle and capacity matrix passes on CPU/CUDA/ROCm |
-| 5 | [ADR-0001](adr/ADR-0001-evidence-gated-runtime-portfolio.md) + [TD-003](technical-debt/TD-003-runtime-evidence-drift.md) | Decides whether native CUDA deserves continued proprietary-kernel investment | Representative correctness, throughput, memory, and reliability matrix |
-| 6 | [FTR-001](features/FTR-001-managed-local-and-endpoint-cli.md) | Removes the largest adoption failure without duplicating the runtime | `inferctl run` and explicit endpoint/context flows pass end-to-end tests |
-| 7 | [FTR-002](features/FTR-002-agent-api-contract.md) | Agent workloads require stronger contracts than basic chat | Native structured output plus Responses/tool compatibility gates |
-| 8 | [FTR-003](features/FTR-003-tenant-safe-adapters-and-cache.md) | Efficiency is unsafe unless tenant identity scopes reusable state | Per-request adapters and tenant-salted cache isolation are measured |
-| 9 | [FTR-004](features/FTR-004-slo-aware-serving.md) | Operators buy predictable service, not peak-token anecdotes | SLO admission, routing, and capacity signals validated under load |
-| 10 | [FTR-005](features/FTR-005-distributed-lifecycle.md) | Distribution magnifies lifecycle errors and follows single-node rigor | Worker-loss and ownership matrix passes in multi-process CI |
+| 5 | [TD-008](technical-debt/TD-008-unified-burst-sampling-parity.md) | Graph replay cannot be a supported optimization while it changes greedy sampling semantics | Stepwise parity, deadline, and heterogeneous lifecycle matrix passes |
+| 6 | [ADR-0001](adr/ADR-0001-evidence-gated-runtime-portfolio.md) + [TD-003](technical-debt/TD-003-runtime-evidence-drift.md) | Decides whether native CUDA deserves continued proprietary-kernel investment | Representative correctness, throughput, memory, and reliability matrix |
+| 7 | [FTR-001](features/FTR-001-managed-local-and-endpoint-cli.md) | Removes the largest adoption failure without duplicating the runtime | `inferctl run` and explicit endpoint/context flows pass end-to-end tests |
+| 8 | [FTR-002](features/FTR-002-agent-api-contract.md) | Agent workloads require stronger contracts than basic chat | Native structured output plus Responses/tool compatibility gates |
+| 9 | [FTR-003](features/FTR-003-tenant-safe-adapters-and-cache.md) | Efficiency is unsafe unless tenant identity scopes reusable state | Per-request adapters and tenant-salted cache isolation are measured |
+| 10 | [FTR-004](features/FTR-004-slo-aware-serving.md) | Operators buy predictable service, not peak-token anecdotes | SLO admission, routing, and capacity signals validated under load |
+| 11 | [FTR-005](features/FTR-005-distributed-lifecycle.md) | Distribution magnifies lifecycle errors and follows single-node rigor | Worker-loss and ownership matrix passes in multi-process CI |
 
 ## Critical-Path Gantt
 
@@ -63,7 +65,8 @@ gantt
   Required evidence gates (TD-002)       :crit, t2, after t1, 10d
   Dependency/runtime currency (TD-006)   :crit, t6, after t2, 10d
   Context and sequence capacity (TD-007) :crit, t7, after t6, 10d
-  Runtime proof and decision (ADR-0001/TD-003) :crit, t3, after t7, 10d
+  Unified burst sampling parity (TD-008) :crit, t8, after t7, 10d
+  Runtime proof and decision (ADR-0001/TD-003) :crit, t3, after t8, 10d
   section Product adoption
   Local transport and CLI (ADR-0002/FTR-001)   :p1, after t1, 20d
   Agent API contract (FTR-002)                 :crit, p2, after t3, 25d

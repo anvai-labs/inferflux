@@ -1,7 +1,19 @@
 #pragma once
 
 #include <cstdint>
-#include <cuda_runtime.h>
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
+#include <cuda_fp16.h>
+#include <cuda_runtime_api.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 #include <curand.h>
 #include <vector>
 
@@ -89,6 +101,18 @@ public:
                           const std::vector<float> &top_ps,
                           const std::vector<uint32_t> &seeds);
   void CollectSampleBatch(std::vector<int> *out_tokens);
+
+  /**
+   * Graph-safe batched greedy argmax: launches ONLY the BatchedArgmaxKernel
+   * writing the device result buffer. No memcpy, no event, no host state
+   * changes — used by the decode-burst pipeline, which copies results into
+   * its own ring slots. Returns false on launch failure.
+   */
+  bool EnqueueBatchedArgmax(const float *d_logits, int batch_size);
+
+  /// Device pointer to the batched argmax results ([kMaxBatchSize] ints).
+  /// Valid after Initialize(); written by EnqueueBatchedArgmax.
+  const int *batch_result_device() const { return d_result_batch_; }
 
   std::size_t DeviceWorkspaceBytes() const;
   std::size_t HostWorkspaceBytes() const;

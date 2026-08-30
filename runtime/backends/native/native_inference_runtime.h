@@ -35,6 +35,17 @@ public:
                          const LlamaBackendConfig &config) = 0;
   virtual std::vector<UnifiedBatchOutput>
   ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) = 0;
+  // Burst-pipelined decode (optional). Default: unsupported.
+  virtual bool NativeSupportsUnifiedBatchBurst() const { return false; }
+  virtual UnifiedBurstResult
+  NativeExecuteUnifiedBatchBurst(const std::vector<UnifiedBatchInput> &inputs,
+                                 const UnifiedBurstOptions &options,
+                                 const BurstTokenSink &sink) {
+    (void)inputs;
+    (void)options;
+    (void)sink;
+    return UnifiedBurstResult{};
+  }
   virtual bool SupportsAsyncUnifiedBatch() const = 0;
   virtual UnifiedBatchHandle
   SubmitUnifiedBatchAsync(const std::vector<UnifiedBatchInput> &inputs,

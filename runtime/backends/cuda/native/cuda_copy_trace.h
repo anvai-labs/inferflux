@@ -8,7 +8,19 @@
 #include <mutex>
 #include <string>
 
-#include <cuda_runtime.h>
+// CUDA headers when available; opaque typedefs otherwise (mirrors
+// model_loader.h) so CPU-only CI builds compile this header.
+#if defined(INFERFLUX_HAS_CUDA) ||                                             \
+    (defined(__has_include) && __has_include(<cuda_runtime_api.h>) && \
+     __has_include(<cuda_fp16.h>))
+#include <cuda_fp16.h>
+#include <cuda_runtime_api.h>
+#else
+struct cudaStream_t__;
+typedef cudaStream_t__ *cudaStream_t;
+struct __half;
+typedef __half half;
+#endif
 
 namespace inferflux::runtime::cuda::native {
 
@@ -22,6 +34,7 @@ enum class CopyTraceSite : size_t {
   kSamplerLogitsToProbsD2D,
   kSamplerTempToProbsD2D,
   kSamplerCopyLogitsD2H,
+  kBurstSlotD2H,
   kCount,
 };
 
@@ -43,6 +56,7 @@ inline std::array<CopyTraceEntry, static_cast<size_t>(CopyTraceSite::kCount)>
         {"sampler.logits_to_probs_d2d"},
         {"sampler.temp_to_probs_d2d"},
         {"sampler.copy_logits_d2h"},
+        {"burst.slot_d2h"},
     }};
 
 inline bool CopyTraceEnabled() {

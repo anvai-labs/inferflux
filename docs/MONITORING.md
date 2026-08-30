@@ -57,6 +57,24 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 
 ## 4) CUDA and Native Quick Reference
 
+### MMA tensor-core down-proj (S7, experimental)
+
+`INFERFLUX_CUDA_MMQ_MMA=1` routes Q6_K down-projection through the
+`mma.sync` int8 kernel with deterministic K-split. Confirm engagement through:
+
+- The one-time `fused_quant_gemm: Using MMA tensor-core Q6_K down-proj`
+  INFO log (set `INFERFLUX_BENCH_LOG_LEVEL=info` in the comparison harness).
+- The per-forward `llama_forward: down_proj: using MMA tensor-core Q6_K
+  down-proj` INFO log.
+- Dispatch traces with CUDA graphs disabled:
+  `INFERFLUX_DISABLE_CUDA_GRAPH=1 INFERFLUX_BENCH_DISPATCH_TRACE=1`.
+
+CUDA graph replay bypasses host-side operator counters, so use the log signals
+above during graph-enabled runs. Cap eligible batches with
+`INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` (default `16`); the partials buffer is sized
+only when the feature is enabled, capped at that eligible row count. The path
+requires an NVIDIA Turing GPU (compute capability 7.5) or newer.
+
 | Signal | What to check | How to read it |
 |---|---|---|
 | Selected provider | `/v1/models` or `inferctl models --json` | `provider=llama_cpp` with `fallback=true` means native is not serving the request path |
@@ -78,6 +96,10 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 | Overlap activity | `inferflux_cuda_lane_submissions_total`, `inferflux_cuda_lane_overlap_events_total` | Non-zero deltas confirm mixed-workload lane activity. CUDA graphs are now enabled on the primary forward instance during lane overlap after the `lane_overlap_mutex_` fix in commit `0ccbad3` eliminated the heap corruption that previously required disabling them. |
 | Native KV sizing | `inferflux_cuda_kv_requested_max_seq`, `inferflux_cuda_kv_planned_max_seq`, `inferflux_cuda_kv_budget_bytes` | Planned values below requested show KV auto-tune is protecting VRAM |
 | Readiness on decode/disagg nodes | `/readyz` | Ready requires weights loaded, full decode-worker health, and timeout streak/debt below threshold |
+| Dispatch divergence | `inferflux_cuda_dispatch_divergence_total{layer,selected,actual,reason}` | Any increment means selection and execution disagreed, graph capture fell back, or the load probe down-ranked an operator; investigate before accepting performance results |
+| Dispatch trace | `INFERFLUX_CUDA_DISPATCH_TRACE=1` plus optional `_LIMIT` | Emits selected/actual operator and geometry; summarize with `python3 scripts/parse_dispatch_trace.py <log>` |
+| Dispatch self-heal | `/readyz` fields `dispatch_degraded`, `dispatch_divergences`, and `dispatch_downgraded_operators` | Shows operators down-ranked by the load-time probe; readiness remains available but explicitly degraded |
+| Operator down-rank drill | `INFERFLUX_CUDA_DISPATCH_PROBE_FORCE_UNHEALTHY=ffn:q8_1_group_mmq3,down:mmq` | Forces process-lifetime fallback to validate the next-best dispatch path |
 | Fail-closed admission | generation `503` with `error=distributed_kv_transport_degraded` | optional protection when degraded transport should stop new generation work immediately |
 
 Benchmark-only experiment:
@@ -109,6 +131,7 @@ Benchmark harness knobs:
 - `INFERFLUX_BENCH_DEBUG_UNIFIED_ASSEMBLY=1`
 - `INFERFLUX_BENCH_NATIVE_DEBUG_DECODE_MAPPING=1`
 - `INFERFLUX_BENCH_NATIVE_DEBUG_OPERATOR_SELECTION=1`
+- `INFERFLUX_BENCH_DISPATCH_TRACE=true`
   Passes the corresponding debug knobs through `scripts/run_gguf_comparison_benchmark.sh` so the artifact directory contains slot, decode-mapping, assembly, and operator-selection traces.
 
 Logging control:
@@ -185,6 +208,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 | InferFlux CUDA expected but missing | `/v1/models` exposure fields + native counters | inspect strict/fallback policy and model format path |
 | VRAM pressure | native KV planning metrics + dequant policy | tighten budget or keep memory-first dequant policy |
 | Cache not helping | prefix/kv reuse counters | validate warmup patterns and prefix-affinity policy |
+| Selected operator never executes | dispatch divergence metric plus `parse_dispatch_trace.py` | check `dispatch_catalog.h`, the executor allowlist, and `/readyz` down-rank fields |
 
 ## 9) Related Docs
 

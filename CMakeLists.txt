@@ -52,6 +52,8 @@ add_library(inferflux_core STATIC
   runtime/backends/llama/llama_cpp_backend.cpp
   runtime/backends/llama/llama_cpp_backend.h
   runtime/backends/native/native_inference_runtime.h
+  runtime/backends/cuda/native/dispatch_operator_health.cpp
+  runtime/backends/cuda/native/dispatch_operator_health.h
   model/tokenizer_factory.cpp
   model/tokenizer_factory.h
   runtime/backends/backend_capabilities.cpp
@@ -303,12 +305,13 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/inferflux_cuda_executor.cpp
     runtime/backends/cuda/inferflux_cuda_executor.h
     runtime/backends/cuda/native/native_bootstrap_config.cpp
+    runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/cublas_gemm.cpp
     runtime/backends/cuda/native/native_dispatch_registry.cpp
     runtime/backends/cuda/native/native_dispatch_policy.cpp
-    runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/model_forward_factory.cpp
     runtime/backends/cuda/native/transformer_forward.cu
+    runtime/backends/cuda/native/decode_burst.cu
     runtime/backends/cuda/native/fused_quant_gemm.cu
     # GGUF quantization support (Phase 1-5: Foundation, GGUF Parsing, Handlers, CUDA Kernels, Forward Pass)
     runtime/backends/cuda/native/safetensors_adapter.cpp
@@ -345,6 +348,14 @@ else()
   # GGUF tests require CUDA for now.
   message(STATUS "CUDA disabled - GGUF native loader unavailable (GGUF tests require CUDA)")
   set(LLAMA_CUDA OFF CACHE BOOL "" FORCE)
+endif()
+
+
+# Dispatch exhaustiveness gate (applies to all configurations): switches
+# over dispatch_catalog.h enums carry no default clause, so an operator
+# added without wiring its label switch or executor stage fails the build.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  target_compile_options(inferflux_core PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Werror=switch>)
 endif()
 
 if(ENABLE_MPS AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
@@ -389,9 +400,17 @@ endif()
 # ggml-cuda and ggml-hip as independent backends; InferFlux native kernels use
 # CUDA only.  Use --all-backends in scripts/build.sh or set both options here.
 if(ENABLE_ROCM)
-  find_package(hip QUIET CONFIG PATHS /opt/rocm)
-  find_package(rocblas QUIET CONFIG PATHS /opt/rocm)
-  find_package(hipblas QUIET CONFIG PATHS /opt/rocm)
+  set(_inferflux_rocm_paths /opt/rocm)
+  if(DEFINED ENV{ROCM_PATH} AND NOT "$ENV{ROCM_PATH}" STREQUAL "")
+    list(PREPEND _inferflux_rocm_paths "$ENV{ROCM_PATH}")
+  endif()
+  find_package(hip QUIET CONFIG PATHS ${_inferflux_rocm_paths})
+  find_package(rocblas QUIET CONFIG PATHS ${_inferflux_rocm_paths})
+  # ROCm 7 hipBLAS declares this as a transitive package. Resolve it from
+  # the same ROCm prefix before loading hipblas so CMake does not silently
+  # disable an otherwise complete ROCm installation.
+  find_package(hipblas-common QUIET CONFIG PATHS ${_inferflux_rocm_paths})
+  find_package(hipblas QUIET CONFIG PATHS ${_inferflux_rocm_paths})
   if(hip_FOUND AND rocblas_FOUND AND hipblas_FOUND)
     message(STATUS "ROCm/HIP found: enabling ROCm build path")
     set(GGML_HIP ON CACHE BOOL "" FORCE)
@@ -561,9 +580,14 @@ if(MSVC)
   target_link_libraries(inferfluxd PRIVATE inferflux_core)
   target_link_options(inferfluxd PRIVATE /WHOLEARCHIVE:inferflux_core)
 elseif(APPLE)
+  # ld64 has no --whole-archive; -force_load achieves the same
+  # self-registration guarantee. Link the target by name so its usage
+  # requirements (PUBLIC include dirs) still propagate — embedding it in
+  # a quoted flag string makes CMake treat it as an opaque flag and drops
+  # the include paths (broke the macOS CI build at model/model_format.h).
   target_link_libraries(inferfluxd PRIVATE inferflux_core)
   target_link_options(inferfluxd PRIVATE
-    "LINKER:-force_load,$<TARGET_FILE:inferflux_core>")
+      "LINKER:-force_load,$<TARGET_FILE:inferflux_core>")
 else()
   target_link_libraries(inferfluxd PRIVATE
     -Wl,--whole-archive inferflux_core -Wl,--no-whole-archive)
@@ -574,9 +598,13 @@ target_link_libraries(inferctl PRIVATE inferflux_core)
 
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   add_executable(benchmark_downproj_q81 tests/unit/benchmark_downproj_q81.cu)
+  add_executable(benchmark_q6k_kernels tests/unit/benchmark_q6k_kernels.cu)
+  target_include_directories(benchmark_q6k_kernels PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_include_directories(benchmark_downproj_q81 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_downproj_q81 PRIVATE inferflux_core)
+  target_link_libraries(benchmark_q6k_kernels PRIVATE inferflux_core inferflux_cuda_kernels)
   add_executable(benchmark_fused_gate_up_q81
                  tests/unit/benchmark_fused_gate_up_q81.cu)
   target_include_directories(benchmark_fused_gate_up_q81 PRIVATE
@@ -587,7 +615,6 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_include_directories(benchmark_grouped_q81_pair PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_grouped_q81_pair PRIVATE inferflux_core)
-
   # Fused kernel parity tests: .cpp (Catch2, MSVC) + .cu (test-only kernels, nvcc)
   # Split avoids nvcc/Catch2 operator== conflict with cuda_bf16.hpp on CUDA 13.2.
   add_executable(inferflux_fused_kernel_tests
@@ -604,6 +631,12 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     CUDA_STANDARD 17
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   )
+  add_executable(test_mma_q6k tests/unit/test_mma_q6k.cu)
+  target_include_directories(test_mma_q6k PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(test_mma_q6k PRIVATE CUDA::cudart)
+  add_test(NAME MmaQ6KTests COMMAND test_mma_q6k)
+  set_tests_properties(MmaQ6KTests PROPERTIES LABELS "mma_q6k")
 endif()
 
 install(TARGETS inferfluxd inferctl
@@ -672,7 +705,6 @@ add_executable(inferflux_tests
   tests/integration/test_http_generation_admission.cpp
   external/catch2/catch_amalgamated.cpp
 )
-
 # CUDA-specific tests (require CUDA headers and native kernel support)
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_sources(inferflux_tests PRIVATE
@@ -699,6 +731,10 @@ target_include_directories(inferflux_tests PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/external
   ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 target_compile_definitions(inferflux_tests PRIVATE INFERFLUX_TESTING)
+# Dispatch exhaustiveness gate for tests: mirrors the core gate.
+if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+  target_compile_options(inferflux_tests PRIVATE $<$<COMPILE_LANGUAGE:CXX>:-Werror=switch>)
+endif()
 target_link_libraries(inferflux_tests PRIVATE inferflux_core)
 if(ENABLE_CUDA)
   add_executable(inferflux_first_token_probe

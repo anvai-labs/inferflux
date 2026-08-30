@@ -11,6 +11,39 @@ namespace inferflux {
 struct NativeExecutionPolicy {
   bool enable_batched_decode{true};
   bool disable_cuda_graph{false};
+  // Burst-pipelined decode: enqueue K decode steps (forward + sample +
+  // on-device token feed) per ExecuteUnifiedBatchBurst() call and consume
+  // tokens from a pinned ring while the GPU runs ahead. Default off until
+  // device-side sampling-history parity + benchmark gates pass (S1 rollout).
+  // The executor currently reports this path unsupported even when requested.
+  bool enable_decode_burst{false};
+  int decode_burst_chunk{8};
+  int decode_burst_max_ms{40};
+  // Split-parallel decode attention (S3): parallelize FlashDecode over
+  // Q-heads (short context) and KV chunks (long context). Default off.
+  bool enable_attn_split_kv{false};
+  int attn_split_chunk{512};
+  int attn_split_qsplit_override{-1};
+  // Prefer the packed dp4a tier over Q8_1 activations for tiny decode
+  // batches (measured faster at M=1-2 on Ada; MMQ keeps winning at larger
+  // M). Applied by switching the WHOLE compute-section policy to
+  // disable_q81_activations for the step — gating individual dispatch
+  // sites desyncs operator selection onto cuBLAS fallbacks. -1 = off.
+  int packed_tier_max_batch{-1};
+  // Use the fused gate+up+SiLU MMVQ kernel only for batches up to this
+  // size. The fused kernel is memory-bandwidth-inefficient as M grows
+  // (32% of peak at M=16 vs 63% at M=1); the unfused grouped path wins
+  // by ~13% end to end at c=16. -1 = always (historic default).
+  int fused_gate_up_silu_max_batch{-1};
+  // Fold Q/K bias into BatchedRoPE's register load and V bias into the KV
+  // append store, deleting the three per-layer BiasAdd launches. Off by
+  // default; null-bias models take the identical old path either way.
+  bool enable_bias_rope_fusion{false};
+  // Unified dispatch trace: one machine-parseable line per projection
+  // dispatch (phase, geometry, selected, actual, tier). Budgeted like the
+  // other debug traces; parsed by scripts/parse_dispatch_trace.py.
+  bool dispatch_trace{false};
+  int dispatch_trace_limit{256};
   bool phase_timing_enabled{false};
   bool force_cublas{false};
   bool disable_prepacked_activations{false};
@@ -35,6 +68,15 @@ struct NativeExecutionPolicy {
   bool enable_experimental_q81_grouped_mmq3{true};
   bool enable_downproj_mmq{false};
   int downproj_mmq_min_batch_override{-1};
+  // mma.sync Q6_K down-projection (S7): int8 tensor-core MMQ with
+  // deterministic K-split. Default off; A/B gate pending. When on, the
+  // down-proj MMQ tier prefers the MMA kernel for Q6_K weights.
+  bool enable_mmq_mma{false};
+  // MMA only wins where the dp4a MMVQ tier stops being at the bandwidth
+  // floor: measured -13% at c4 (M=4) vs the incumbent MMVQ, so the floor
+  // M is 9 (the same batch range the dp4a MMQ threshold targets).
+  int mmq_mma_min_batch{9};
+  int mmq_mma_max_batch{16};
   bool use_vectorized_loads{false};
   bool enable_fused_gate_up_silu{true};
   bool enable_adaptive_mmvq_threads{true};
@@ -62,6 +104,29 @@ struct NativeExecutionPolicy {
     NativeExecutionPolicy policy;
     policy.enable_batched_decode =
         ParseBoolEnv("INFERFLUX_ENABLE_BATCHED_DECODE", true);
+    policy.enable_decode_burst =
+        ParseBoolEnv("INFERFLUX_CUDA_DECODE_BURST", false);
+    policy.decode_burst_chunk =
+        ParseIntEnv("INFERFLUX_CUDA_DECODE_BURST_CHUNK", 8, 1, 32);
+    policy.decode_burst_max_ms =
+        ParseIntEnv("INFERFLUX_CUDA_DECODE_BURST_MAX_MS", 40, 1, 1000);
+    policy.enable_attn_split_kv =
+        ParseBoolEnv("INFERFLUX_CUDA_ATTN_SPLIT_KV", false);
+    policy.attn_split_chunk =
+        ParseIntEnv("INFERFLUX_CUDA_ATTN_SPLIT_CHUNK", 512, 64, 8192);
+    policy.attn_split_qsplit_override =
+        ParseIntEnv("INFERFLUX_CUDA_ATTN_QSPLIT", -1, 1, 8);
+    policy.packed_tier_max_batch =
+        ParseIntEnv("INFERFLUX_CUDA_PACKED_TIER_MAX_BATCH", -1, -1, 8);
+    policy.fused_gate_up_silu_max_batch =
+        ParseIntEnv("INFERFLUX_CUDA_FUSED_GATE_UP_SILU_MAX_BATCH", -1, -1, 64);
+    policy.enable_bias_rope_fusion =
+        ParseBoolEnv("INFERFLUX_CUDA_FUSE_BIAS_ROPE", false);
+    policy.dispatch_trace =
+        ParseBoolEnv("INFERFLUX_CUDA_DISPATCH_TRACE", false);
+    policy.dispatch_trace_limit =
+        ParseIntEnv("INFERFLUX_CUDA_DISPATCH_TRACE_LIMIT", 256, 1,
+                    std::numeric_limits<int>::max());
     // CUDA graph capture: cudaDeviceSynchronize drains async work before
     // capture to prevent heap corruption. Disable with
     // INFERFLUX_DISABLE_CUDA_GRAPH=1 if issues arise.
@@ -119,6 +184,11 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", false);
     policy.downproj_mmq_min_batch_override =
         ParseIntEnv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", -1, 1, 64);
+    policy.enable_mmq_mma = ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", false);
+    policy.mmq_mma_min_batch =
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 9, 1, 64);
+    policy.mmq_mma_max_batch =
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH", 16, 1, 64);
     policy.use_vectorized_loads =
         ParseBoolEnv("INFERFLUX_USE_VECTORIZED_LOADS", false);
     policy.enable_fused_gate_up_silu =

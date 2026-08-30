@@ -1,9 +1,13 @@
 #include "server/metrics/metrics.h"
+
+#include "runtime/backends/cuda/native/dispatch_catalog.h"
 #include "server/diagnostics/crash_handler.h"
 
 #include <algorithm>
 #include <cmath>
 #include <iomanip>
+#include <map>
+#include <set>
 #include <sstream>
 #include <vector>
 
@@ -890,7 +894,6 @@ void MetricsRegistry::RecordInferfluxCudaBurstDecodeIneligible(
       inferflux_cuda_burst_decode_ineligible_mutex_);
   inferflux_cuda_burst_decode_ineligible_counts_[key] += 1;
 }
-
 void MetricsRegistry::RecordInferfluxCudaForwardBatchSize(
     std::string_view phase, int batch_size) {
   const std::string key = NormalizeNativePhase(phase) + "|" +
@@ -902,19 +905,13 @@ void MetricsRegistry::RecordInferfluxCudaForwardBatchSize(
 void MetricsRegistry::RecordInferfluxCudaFfnProjOperator(std::string_view phase,
                                                          std::string_view op) {
   const std::string phase_label = NormalizeNativePhase(phase);
+  // Labels come from dispatch_catalog.h (FfnMetricLabel) — recorded
+  // verbatim. The old hand-written allowlist mapped q8_1_group_mmq3 and
+  // the M>8 remap to "unknown", which the fixed-grid render below never
+  // exported: the exact invisibility that hid the kQ81GroupMmq3 executor
+  // bug for months.
   const std::string op_label =
-      op == "q8_1_group_hot_q4k"       ? "q8_1_group_hot_q4k"
-      : op == "q8_1_group_row_pair_w4" ? "q8_1_group_row_pair_w4"
-      : op == "q8_1_group_row_quad_m4" ? "q8_1_group_row_quad_m4"
-      : op == "q8_1_group_mmq3"        ? "q8_1_group_mmq3"
-      : op == "q8_1_group_v2"          ? "q8_1_group_v2"
-      : op == "q8_1_group_generic"     ? "q8_1_group_generic"
-      : op == "q8_1_group_row_pair"    ? "q8_1_group_row_pair"
-      : op == "q8_1_group_row_quad"    ? "q8_1_group_row_quad"
-      : op == "q8_1_group"             ? "q8_1_group_generic"
-      : op == "packed_group"           ? "packed_group"
-      : op == "fallback"               ? "fallback"
-                                       : "unknown";
+      (op == "q8_1_group") ? "q8_1_group_generic" : std::string(op);
   const std::string key = phase_label + "|" + op_label;
   std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
   inferflux_cuda_ffn_proj_operator_counts_[key] += 1;
@@ -1048,6 +1045,22 @@ void MetricsRegistry::RecordCudaAttentionKernelSwitch(
   const std::string key = from + "|" + to;
   std::lock_guard<std::mutex> lock(cuda_attention_switch_mutex_);
   cuda_attention_switch_counts_[key] += 1;
+}
+
+void MetricsRegistry::RecordInferfluxCudaDispatchDivergence(
+    std::string_view layer, std::string_view selected, std::string_view actual,
+    std::string_view reason) {
+  const std::string key = std::string(layer) + "|" + std::string(selected) +
+                          "|" + std::string(actual) + "|" +
+                          std::string(reason.empty() ? "unspecified" : reason);
+  std::lock_guard<std::mutex> lock(cuda_dispatch_divergence_mutex_);
+  cuda_dispatch_divergence_counts_[key] += 1;
+  cuda_dispatch_divergence_total_ += 1;
+}
+
+uint64_t MetricsRegistry::GetInferfluxCudaDispatchDivergences() const {
+  std::lock_guard<std::mutex> lock(cuda_dispatch_divergence_mutex_);
+  return cuda_dispatch_divergence_total_;
 }
 
 MetricsRegistry::CacheMetrics MetricsRegistry::GetCacheMetrics() const {
@@ -2177,15 +2190,25 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_cuda_ffn_proj_operator_total counter\n";
   {
     static constexpr const char *kPhases[] = {"prefill", "decode"};
-    static constexpr const char *kOps[] = {
-        "q8_1_group_hot_q4k",     "q8_1_group_row_pair_w4",
-        "q8_1_group_row_quad_m4", "q8_1_group_mmq3",
-        "q8_1_group_v2",          "q8_1_group_generic",
-        "q8_1_group_row_pair",    "q8_1_group_row_quad",
-        "packed_group",           "fallback"};
+    // Operator universe derived from dispatch_catalog.h — plus any key
+    // observed at runtime, so a new label can never be silently dropped
+    // from exposition again.
+    std::set<std::string> ops;
+    for (const char *label : kFfnMetricLabels) {
+      ops.insert(label);
+    }
+    {
+      std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
+      for (const auto &kv : inferflux_cuda_ffn_proj_operator_counts_) {
+        const std::string::size_type bar = kv.first.find('|');
+        if (bar != std::string::npos) {
+          ops.insert(kv.first.substr(bar + 1));
+        }
+      }
+    }
     std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
     for (const char *phase : kPhases) {
-      for (const char *op : kOps) {
+      for (const auto &op : ops) {
         const std::string key = std::string(phase) + "|" + op;
         const auto it = inferflux_cuda_ffn_proj_operator_counts_.find(key);
         const uint64_t count =
@@ -2203,19 +2226,24 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_cuda_down_proj_operator_total counter\n";
   {
     static constexpr const char *kPhases[] = {"prefill", "decode"};
-    static constexpr const char *kOps[] = {"q8_1_gemv_v2",
-                                           "q8_1_gemv",
-                                           "q8_1_gemv_hot_fixed",
-                                           "q8_1_gemv_row_pair_hot_fixed",
-                                           "q8_1_gemv_row_pair_v2",
-                                           "q8_1_gemv_row_pair",
-                                           "q8_1_gemv_row_quad",
-                                           "packed_gemv",
-                                           "mmq",
-                                           "fallback"};
+    // Operator universe derived from dispatch_catalog.h plus any runtime
+    // observed key — a new label can never be silently unexported.
+    std::set<std::string> ops;
+    for (const char *label : kDownMetricLabels) {
+      ops.insert(label);
+    }
+    {
+      std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
+      for (const auto &kv : inferflux_cuda_down_proj_operator_counts_) {
+        const std::string::size_type bar = kv.first.find('|');
+        if (bar != std::string::npos) {
+          ops.insert(kv.first.substr(bar + 1));
+        }
+      }
+    }
     std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
     for (const char *phase : kPhases) {
-      for (const char *op : kOps) {
+      for (const auto &op : ops) {
         const std::string key = std::string(phase) + "|" + op;
         const auto it = inferflux_cuda_down_proj_operator_counts_.find(key);
         const uint64_t count =
@@ -2639,6 +2667,31 @@ std::string MetricsRegistry::RenderPrometheus() const {
       out << "inferflux_cuda_attention_kernel_fallbacks_total{requested=\""
           << requested << "\",selected=\"" << selected << "\",reason=\""
           << reason << "\"} " << count << "\n";
+    }
+  }
+
+  out << "# HELP inferflux_cuda_dispatch_divergence_total Selected vs "
+         "executed native dispatch operator divergences (layer|selected|"
+         "actual|reason)\n";
+  out << "# TYPE inferflux_cuda_dispatch_divergence_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(cuda_dispatch_divergence_mutex_);
+    std::map<std::string, uint64_t> sorted(
+        cuda_dispatch_divergence_counts_.begin(),
+        cuda_dispatch_divergence_counts_.end());
+    for (const auto &kv : sorted) {
+      const std::string::size_type b1 = kv.first.find('|');
+      const std::string::size_type b2 = kv.first.find('|', b1 + 1);
+      const std::string::size_type b3 = kv.first.find('|', b2 + 1);
+      if (b1 == std::string::npos || b2 == std::string::npos ||
+          b3 == std::string::npos) {
+        continue;
+      }
+      out << "inferflux_cuda_dispatch_divergence_total{layer=\""
+          << kv.first.substr(0, b1) << "\",selected=\""
+          << kv.first.substr(b1 + 1, b2 - b1 - 1) << "\",actual=\""
+          << kv.first.substr(b2 + 1, b3 - b2 - 1) << "\",reason=\""
+          << kv.first.substr(b3 + 1) << "\"} " << kv.second << "\n";
     }
   }
 

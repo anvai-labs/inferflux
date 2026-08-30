@@ -6,6 +6,7 @@
 #include "model/model_format.h"
 #include "runtime/backends/backend_capabilities.h"
 #include "runtime/backends/backend_factory.h"
+#include "runtime/backends/cuda/native/dispatch_operator_health.h"
 #include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/string_utils.h"
@@ -772,6 +773,111 @@ std::vector<std::string> SplitForStreaming(const std::string &text) {
   return chunks;
 }
 
+// JSON string escaping for the fast streaming frame builder. Only the two
+// characters JSON mandates plus control chars need escaping; UTF-8 payload
+// passes through untouched.
+void AppendJsonEscaped(std::string &out, std::string_view text) {
+  for (unsigned char c : text) {
+    switch (c) {
+    case '"':
+      out += "\\\"";
+      break;
+    case '\\':
+      out += "\\\\";
+      break;
+    case '\b':
+      out += "\\b";
+      break;
+    case '\f':
+      out += "\\f";
+      break;
+    case '\n':
+      out += "\\n";
+      break;
+    case '\r':
+      out += "\\r";
+      break;
+    case '\t':
+      out += "\\t";
+      break;
+    default:
+      if (c < 0x20) {
+        char buf[7];
+        std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+        out += buf;
+      } else {
+        out += static_cast<char>(c);
+      }
+    }
+  }
+}
+
+// Fixed-schema chat.completion.chunk delta frame without nlohmann — the
+// per-token json build/dump showed up as measurable server overhead at
+// decode rates. Produces byte-identical framing to BuildStreamChunk for
+// plain content deltas (no logprobs).
+std::string BuildStreamChunkFast(const std::string &id, std::string_view model,
+                                 std::time_t ts, std::string_view content) {
+  std::string out;
+  out.reserve(content.size() + model.size() + id.size() + 128);
+  out += "{\"id\":\"";
+  AppendJsonEscaped(out, id);
+  out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
+  out += std::to_string(ts);
+  out += ",\"model\":\"";
+  AppendJsonEscaped(out, model);
+  out += "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"";
+  AppendJsonEscaped(out, content);
+  out += "\"},\"finish_reason\":null}]}";
+  return "data: " + out + "\n\n";
+}
+
+// Batches several generated pieces into one SSE frame. Stop-string trimming
+// happens upstream (ApplyStop in the executor) so pieces arriving here are
+// already safe to emit; batching only changes frame granularity, not bytes.
+// Defaults preserve today's one-frame-per-piece behavior; raise
+// INFERFLUX_SERVER_SSE_FLUSH_TOKENS / _BYTES to amortize socket writes and
+// JSON framing.
+struct SseStreamChunker {
+  int flush_tokens{1};
+  std::size_t flush_bytes{4096};
+
+  std::string buf;
+  int pieces_in_buf{0};
+
+  static SseStreamChunker FromEnv() {
+    SseStreamChunker c;
+    if (const char *t = std::getenv("INFERFLUX_SERVER_SSE_FLUSH_TOKENS")) {
+      c.flush_tokens = std::max(1, std::atoi(t));
+    }
+    if (const char *b = std::getenv("INFERFLUX_SERVER_SSE_FLUSH_BYTES")) {
+      c.flush_bytes = std::max<size_t>(1, static_cast<size_t>(std::atoll(b)));
+    }
+    return c;
+  }
+
+  void Append(std::string_view piece) {
+    buf += piece;
+    ++pieces_in_buf;
+  }
+
+  bool ShouldFlush() const {
+    return pieces_in_buf >= flush_tokens || buf.size() >= flush_bytes;
+  }
+
+  bool Empty() const { return buf.empty(); }
+
+  std::string TakeFrame(const std::string &id, std::string_view model,
+                        std::time_t ts) {
+    std::string frame = BuildStreamChunkFast(
+        id, model, ts,
+        buf.empty() ? std::string_view() : std::string_view(buf));
+    buf.clear();
+    pieces_in_buf = 0;
+    return frame;
+  }
+};
+
 // `logprob` is non-null when the caller collected per-token logprobs (i.e.
 // the request had logprobs=true with streaming).  Ignored on finish chunks.
 std::string BuildStreamChunk(const std::string &id, std::string_view model,
@@ -969,6 +1075,15 @@ HttpServer::ReadyStatus HttpServer::EvaluateReadyStatus() const {
   ReadyStatus status;
   const PoolRole role = role_.load(std::memory_order_relaxed);
   status.role = PoolRoleToString(role);
+  // Dispatch self-heal visibility (does not flip `ready`): divergences and
+  // down-ranked operators from the load-time probe / runtime telemetry.
+  status.dispatch_divergences =
+      GlobalMetrics().GetInferfluxCudaDispatchDivergences();
+  status.dispatch_degraded =
+      status.dispatch_divergences > 0 ||
+      InferfluxCudaOperatorHealth::Instance().AnyUnhealthy();
+  status.dispatch_downgraded_operators =
+      InferfluxCudaOperatorHealth::Instance().Describe();
   status.disagg_timeout_debt_threshold =
       static_cast<uint64_t>(readyz_disagg_timeout_debt_threshold_);
   status.disagg_timeout_streak_threshold =
@@ -1496,6 +1611,12 @@ void HttpServer::HandleClient(ClientSession &session) {
           ready_status.disagg_timeout_streak_threshold;
       body["disagg_transport_degraded"] =
           ready_status.disagg_transport_degraded;
+    }
+    if (ready_status.dispatch_degraded) {
+      body["dispatch_degraded"] = ready_status.dispatch_degraded;
+      body["dispatch_divergences"] = ready_status.dispatch_divergences;
+      body["dispatch_downgraded_operators"] =
+          ready_status.dispatch_downgraded_operators;
     }
     if (!ready_status.ready)
       body["reason"] = ready_status.reason;
@@ -2931,6 +3052,8 @@ void HttpServer::HandleClient(ClientSession &session) {
     // Declared here (outer scope) so they're visible in both the streaming
     // setup block and the post-Generate streaming completion block.
     auto token_buffer = std::make_shared<std::vector<std::string>>();
+    auto sse_chunker =
+        std::make_shared<SseStreamChunker>(SseStreamChunker::FromEnv());
     bool buffer_tokens = use_tools;
     if (parsed.stream) {
       stream_ts = std::chrono::duration_cast<std::chrono::seconds>(
@@ -2964,8 +3087,8 @@ void HttpServer::HandleClient(ClientSession &session) {
       req.on_token = [this, stream_session, stream_mutex, stream_active,
                       stream_had_chunk, stream_cancel_flag, stream_id,
                       stream_model, stream_ts, token_buffer, buffer_tokens,
-                      stream_collect_logprobs](const std::string &chunk,
-                                               const TokenLogprob *lp) {
+                      sse_chunker, stream_collect_logprobs](
+                         const std::string &chunk, const TokenLogprob *lp) {
         if (chunk.empty() || !stream_active->load()) {
           return;
         }
@@ -2992,21 +3115,22 @@ void HttpServer::HandleClient(ClientSession &session) {
           stream_had_chunk->store(true);
           return;
         }
-        auto pieces = SplitForStreaming(chunk);
-        for (const auto &piece : pieces) {
-          std::string payload = BuildStreamChunk(stream_id, stream_model,
-                                                 stream_ts, piece, false);
-          std::lock_guard<std::mutex> lock(*stream_mutex);
-          if (!stream_active->load()) {
-            return;
-          }
-          if (!SendAll(*stream_session, payload)) {
-            stream_active->store(false);
-            stream_cancel_flag->store(true);
-            return;
-          }
-          stream_had_chunk->store(true);
+        sse_chunker->Append(chunk);
+        if (!sse_chunker->ShouldFlush()) {
+          return;
         }
+        std::lock_guard<std::mutex> lock(*stream_mutex);
+        if (!stream_active->load()) {
+          return;
+        }
+        if (!SendAll(
+                *stream_session,
+                sse_chunker->TakeFrame(stream_id, stream_model, stream_ts))) {
+          stream_active->store(false);
+          stream_cancel_flag->store(true);
+          return;
+        }
+        stream_had_chunk->store(true);
       };
     }
 
@@ -3120,6 +3244,12 @@ void HttpServer::HandleClient(ClientSession &session) {
           if (stream_active->load()) {
             const std::string stream_finish_reason =
                 result.finish_reason_length ? "length" : "stop";
+            if (!buffer_tokens && !sse_chunker->Empty()) {
+              // Flush any buffered content deltas before the finish frame.
+              SendAll(session, sse_chunker->TakeFrame(stream_id, parsed.model,
+                                                      stream_ts));
+              stream_had_chunk->store(true);
+            }
             if (tool_call.detected) {
               // §2.3: emit structured tool_calls delta sequence (role → name →
               // args → finish).
