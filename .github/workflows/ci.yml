@@ -24,31 +24,68 @@ jobs:
   # Non-PR events (push, schedule) always run the full matrix.
   # ---------------------------------------------------------------------------
   changes:
-    name: Detect docs-only change set
+    name: Detect change areas
     runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
+      shared: ${{ steps.detect.outputs.shared }}
+      cuda: ${{ steps.detect.outputs.cuda }}
+      rocm: ${{ steps.detect.outputs.rocm }}
+      apple: ${{ steps.detect.outputs.apple }}
+      vulkan: ${{ steps.detect.outputs.vulkan }}
     steps:
-      - name: Detect docs-only diff via PR file list
+      - name: Classify PR file list into areas
         id: detect
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -eu
           if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            # push / schedule: full matrix, all areas.
+            for f in docs_only shared cuda rocm apple vulkan; do
+              [ "$f" = docs_only ] && v=false || v=true
+              echo "$f=$v" >> "$GITHUB_OUTPUT"
+            done
             exit 0
           fi
-          FILES=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files"             --paginate --jq '.[].filename')
+          FILES=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" --paginate --jq '.[].filename')
           echo "Changed files:"
           echo "$FILES"
-          # Conservative: any non-markdown path keeps the full matrix. A
-          # stale file list fails toward docs_only=false (heavy CI runs).
-          if echo "$FILES" | grep -vE '\.md$' | grep -q .; then
-            echo "docs_only=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+
+          # Classification. Every classification failure fails toward MORE
+          # jobs, never fewer: an unmatched path sets shared=true.
+          docs_only=true; shared=false; cuda=false; rocm=false; apple=false; vulkan=false
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *.md) ;;  # markdown alone never gates an area
+              # Backend-specific trees.
+              runtime/backends/cuda/*) cuda=true ;;
+              runtime/backends/rocm/*) rocm=true ;;
+              runtime/backends/mps/*|runtime/backends/mlx/*|tests/unit/test_mlx*) apple=true ;;
+              runtime/backends/vulkan/*|runtime/backends/opencl/*) vulkan=true ;;
+              # Shared surface: compiled into or included by every backend
+              # (dispatch_catalog.h includes server/metrics; the llama.cpp
+              # submodule feeds cuda + rocm + cpu alike).
+              runtime/*|server/*|scheduler/*|model/*|cli/*|net/*|io/*|policy/*|tests/*|scripts/*|cmake/*|CMakeLists.txt|external/*|.github/workflows/ci.yml)
+                shared=true ;;
+              *) shared=true ;;  # unmatched path: conservative
+            esac
+            case "$f" in *.md) ;; *) docs_only=false ;; esac
+          done <<< "$FILES"
+
+          # Runtime backends shared by several targets: native/ and gpu/
+          # feed both CUDA and ROCm native runtimes.
+          if echo "$FILES" | grep -qE '^runtime/backends/(native|gpu)/'; then
+            cuda=true; rocm=true
           fi
+
+          echo "docs_only=$docs_only"  >> "$GITHUB_OUTPUT"
+          echo "shared=$shared"        >> "$GITHUB_OUTPUT"
+          echo "cuda=$cuda"            >> "$GITHUB_OUTPUT"
+          echo "rocm=$rocm"            >> "$GITHUB_OUTPUT"
+          echo "apple=$apple"          >> "$GITHUB_OUTPUT"
+          echo "vulkan=$vulkan"        >> "$GITHUB_OUTPUT"
 
   docs-gate:
     name: Docs contract gate
@@ -247,7 +284,7 @@ jobs:
     name: Build & Test (macos-latest, MPS)
     runs-on: macos-latest
     needs: [changes]
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.apple == 'true' || needs.changes.outputs.shared == 'true')
 
     steps:
       - name: Checkout (with submodules)
@@ -282,7 +319,7 @@ jobs:
     name: Build (macos-latest, MLX flag)
     runs-on: macos-latest
     needs: [changes]
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.apple == 'true' || needs.changes.outputs.shared == 'true')
 
     steps:
       - name: Checkout (with submodules)
@@ -324,7 +361,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true   # advisory only; no GPU available for execution
     needs: [changes]
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.cuda == 'true' || needs.changes.outputs.shared == 'true')
 
     steps:
       - name: Checkout (with submodules)
@@ -377,7 +414,7 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true   # Advisory — no Vulkan GPU in CI
     needs: [changes]
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.vulkan == 'true' || needs.changes.outputs.shared == 'true')
 
     steps:
       - name: Checkout (with submodules)
