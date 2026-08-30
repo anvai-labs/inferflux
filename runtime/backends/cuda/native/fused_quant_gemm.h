@@ -31,6 +31,7 @@ namespace runtime {
 namespace cuda {
 namespace native {
 struct BlockQ8_1Mmq;
+struct BlockQ8_1MmqDs;
 } // namespace native
 } // namespace cuda
 } // namespace runtime
@@ -284,6 +285,19 @@ public:
    * @return true if the kernel launched, false when unsupported (caller
    * falls back to the dp4a MMQ / Q8_1 tiers).
    */
+  /**
+   * Generic Q4_K single-projection MMA (S8): out[M, N] = act[M, K] x
+   * W[N, K]^T via the int8 tensor-core kernel with DS activations.
+   * Gated on NativeExecutionPolicy::enable_mmq_mma for Q4_K, M in
+   * [mmq_mma_min_batch_exclusive..max]; M=1 and non-Q4_K fall through.
+   */
+  static bool GemvMmqMma(const QuantizedWeightInfo &weight, const half *input,
+                         half *output,
+                         runtime::cuda::native::BlockQ8_1MmqDs *ds_act,
+                         float *partials, int M, int N, int K,
+                         cudaStream_t stream,
+                         const NativeExecutionPolicy *policy = nullptr);
+
   static bool DownProjMmqMma(const QuantizedWeightInfo &weight,
                              const runtime::cuda::native::BlockQ8_1Mmq *act_mmq,
                              half *output, int M, int N, int K, float *partials,

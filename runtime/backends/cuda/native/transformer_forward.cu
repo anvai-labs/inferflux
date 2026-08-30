@@ -733,6 +733,36 @@ bool TryMmqMmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
   return ok;
 }
 
+// Generic Q4_K MMA projection (S8): tensor-core path for gate/up/o and
+// other single Q4_K projections at M >= 2. Falls through (unchanged
+// dispatch) unless INFERFLUX_CUDA_MMQ_MMA=1.
+template <typename T>
+bool TryQ8_1MmaGemv(const QuantizedWeightInfo &, const T *, T *, void *,
+                    float *, int, int, int, cudaStream_t, const char * = nullptr,
+                    const NativeExecutionPolicy * = nullptr) {
+  return false;
+}
+
+template <>
+bool TryQ8_1MmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
+                          half *output, void *ds_act, float *partials, int M,
+                          int N, int K, cudaStream_t stream,
+                          const char *proj_name,
+                          const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+  if (!policy_ref.enable_mmq_mma || M < 2) {
+    return false;
+  }
+  const bool ok = FusedQuantGemm::GemvMmqMma(
+      weight, input, output,
+      static_cast<runtime::cuda::native::BlockQ8_1MmqDs *>(ds_act), partials,
+      M, N, K, stream, policy);
+  if (ok && proj_name) {
+    LogPackedGemmPath(proj_name, "using Q4_K MMA projection");
+  }
+  return ok;
+}
+
 template <typename T>
 bool TryQ8_1Gemv(const QuantizedWeightInfo &, const T *, T *, void *, int, int,
                  int, cudaStream_t, const char * = nullptr,
@@ -1634,10 +1664,17 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1Gemv<T>(
-                              k_raw, d_norm_out_, d_k_new_, d_act_q8_1_,
-                              seq_len, num_kv_heads_ * head_dim_, hidden_size_,
-                              stream_, "k_proj", &execution_policy_);
+                          return TryQ8_1MmaGemv<T>(
+                                     k_raw, d_norm_out_, d_k_new_,
+                                     d_act_q8_1_mmq_, d_mma_partials_,
+                                     seq_len, num_kv_heads_ * head_dim_,
+                                     hidden_size_, stream_, "k_proj",
+                                     &execution_policy_) ||
+                                 TryQ8_1Gemv<T>(
+                                     k_raw, d_norm_out_, d_k_new_,
+                                     d_act_q8_1_, seq_len,
+                                     num_kv_heads_ * head_dim_, hidden_size_,
+                                     stream_, "k_proj", &execution_policy_);
                         },
                         [&]() {
                           const T *k_proj = reinterpret_cast<const T *>(
@@ -1669,10 +1706,17 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1Gemv<T>(
-                              v_raw, d_norm_out_, d_v_new_, d_act_q8_1_,
-                              seq_len, num_kv_heads_ * head_dim_, hidden_size_,
-                              stream_, "v_proj", &execution_policy_);
+                          return TryQ8_1MmaGemv<T>(
+                                     v_raw, d_norm_out_, d_v_new_,
+                                     d_act_q8_1_mmq_, d_mma_partials_,
+                                     seq_len, num_kv_heads_ * head_dim_,
+                                     hidden_size_, stream_, "v_proj",
+                                     &execution_policy_) ||
+                                 TryQ8_1Gemv<T>(
+                                     v_raw, d_norm_out_, d_v_new_,
+                                     d_act_q8_1_, seq_len,
+                                     num_kv_heads_ * head_dim_, hidden_size_,
+                                     stream_, "v_proj", &execution_policy_);
                         },
                         [&]() {
                           const T *v_proj = reinterpret_cast<const T *>(
@@ -2002,10 +2046,17 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1Gemv<T>(
-                              gate_raw, d_norm_out_, d_ffn_gate_, d_act_q8_1_,
-                              seq_len, intermediate_size_, hidden_size_,
-                              stream_, "gate_proj", &execution_policy_);
+                          return TryQ8_1MmaGemv<T>(
+                                     gate_raw, d_norm_out_, d_ffn_gate_,
+                                     d_act_q8_1_mmq_, d_mma_partials_,
+                                     seq_len, intermediate_size_, hidden_size_,
+                                     stream_, "gate_proj",
+                                     &execution_policy_) ||
+                                 TryQ8_1Gemv<T>(
+                                     gate_raw, d_norm_out_, d_ffn_gate_,
+                                     d_act_q8_1_, seq_len, intermediate_size_,
+                                     hidden_size_, stream_, "gate_proj",
+                                     &execution_policy_);
                         },
                         [&]() {
                           const T *gate_proj = reinterpret_cast<const T *>(
@@ -2036,10 +2087,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1Gemv<T>(
-                              up_raw, d_norm_out_, d_ffn_up_, d_act_q8_1_,
-                              seq_len, intermediate_size_, hidden_size_,
-                              stream_, "up_proj", &execution_policy_);
+                          return TryQ8_1MmaGemv<T>(
+                                     up_raw, d_norm_out_, d_ffn_up_,
+                                     d_act_q8_1_mmq_, d_mma_partials_,
+                                     seq_len, intermediate_size_, hidden_size_,
+                                     stream_, "up_proj", &execution_policy_) ||
+                                 TryQ8_1Gemv<T>(
+                                     up_raw, d_norm_out_, d_ffn_up_,
+                                     d_act_q8_1_, seq_len, intermediate_size_,
+                                     hidden_size_, stream_, "up_proj",
+                                     &execution_policy_);
                         },
                         [&]() {
                           const T *up_proj = reinterpret_cast<const T *>(
@@ -2809,10 +2866,15 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             return true;
                           },
                           [&]() {
-                            return TryQ8_1Gemv<T>(
-                                q_raw, d_norm_out_, d_q_, d_act_q8_1_, B,
-                                num_heads_ * head_dim_, hidden_size_, stream_,
-                                "q_proj", active_policy);
+                            return TryQ8_1MmaGemv<T>(
+                                       q_raw, d_norm_out_, d_q_,
+                                       d_act_q8_1_mmq_, d_mma_partials_, B,
+                                       num_heads_ * head_dim_, hidden_size_,
+                                       stream_, "q_proj", active_policy) ||
+                                   TryQ8_1Gemv<T>(
+                                       q_raw, d_norm_out_, d_q_, d_act_q8_1_,
+                                       B, num_heads_ * head_dim_, hidden_size_,
+                                       stream_, "q_proj", active_policy);
                           },
                           [&]() {
                             if (capturing) {
@@ -2838,10 +2900,16 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             return true;
                           },
                           [&]() {
-                            return TryQ8_1Gemv<T>(
-                                k_raw, d_norm_out_, d_k_new_, d_act_q8_1_, B,
-                                num_kv_heads_ * head_dim_, hidden_size_,
-                                stream_, "k_proj", active_policy);
+                            return TryQ8_1MmaGemv<T>(
+                                       k_raw, d_norm_out_, d_k_new_,
+                                       d_act_q8_1_mmq_, d_mma_partials_, B,
+                                       num_kv_heads_ * head_dim_, hidden_size_,
+                                       stream_, "k_proj", active_policy) ||
+                                   TryQ8_1Gemv<T>(
+                                       k_raw, d_norm_out_, d_k_new_,
+                                       d_act_q8_1_, B,
+                                       num_kv_heads_ * head_dim_, hidden_size_,
+                                       stream_, "k_proj", active_policy);
                           },
                           [&]() {
                             if (capturing) {
@@ -2867,10 +2935,16 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             return true;
                           },
                           [&]() {
-                            return TryQ8_1Gemv<T>(
-                                v_raw, d_norm_out_, d_v_new_, d_act_q8_1_, B,
-                                num_kv_heads_ * head_dim_, hidden_size_,
-                                stream_, "v_proj", active_policy);
+                            return TryQ8_1MmaGemv<T>(
+                                       v_raw, d_norm_out_, d_v_new_,
+                                       d_act_q8_1_mmq_, d_mma_partials_, B,
+                                       num_kv_heads_ * head_dim_, hidden_size_,
+                                       stream_, "v_proj", active_policy) ||
+                                   TryQ8_1Gemv<T>(
+                                       v_raw, d_norm_out_, d_v_new_,
+                                       d_act_q8_1_, B,
+                                       num_kv_heads_ * head_dim_, hidden_size_,
+                                       stream_, "v_proj", active_policy);
                           },
                           [&]() {
                             if (capturing) {
@@ -3253,6 +3327,31 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                   ffn_selected_op, "decode", ffn_quant, gate_raw.quant_type, B,
                   intermediate_size_, hidden_size_,
                   [&]() {
+                    // S8: Q4_K MMA gate+up pair at M >= 2 (12x over the
+                    // grouped families at M=16 in the isolated rig).
+                    // Produces raw gate/up into d_ffn_gate_/d_ffn_up_ — the
+                    // down-proj stage's SiluMul consumers take exactly that.
+                    if constexpr (std::is_same_v<T, half>) {
+                      if (B >= 2) {
+                        if (!ffn_norm_precomputed) {
+                          cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm,
+                                                  d_norm_out_, B, hidden_size_,
+                                                  rms_norm_eps_, stream_);
+                        }
+                        if (TryQ8_1MmaGemv<T>(
+                                gate_raw, d_norm_out_, d_ffn_gate_,
+                                d_act_q8_1_mmq_, d_mma_partials_, B,
+                                intermediate_size_, hidden_size_, stream_,
+                                "gate_proj", active_policy) &&
+                            TryQ8_1MmaGemv<T>(
+                                up_raw, d_norm_out_, d_ffn_up_,
+                                d_act_q8_1_mmq_, d_mma_partials_, B,
+                                intermediate_size_, hidden_size_, stream_,
+                                "up_proj", active_policy)) {
+                          return true;
+                        }
+                      }
+                    }
                     return TryQ8_1ProjectionGroup(
                         ffn_plans, ffn_input, ffn_norm_weight, d_act_q8_1_, B,
                         hidden_size_, rms_norm_eps_, stream_, active_policy,
@@ -3276,7 +3375,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                               return true;
                             },
                             [&]() {
-                              return TryQ8_1Gemv<T>(gate_raw, d_norm_out_,
+                              return TryQ8_1MmaGemv<T>(
+                                         gate_raw, d_norm_out_, d_ffn_gate_,
+                                         d_act_q8_1_mmq_, d_mma_partials_, B,
+                                         intermediate_size_, hidden_size_,
+                                         stream_, "gate_proj",
+                                         active_policy) ||
+                                     TryQ8_1Gemv<T>(gate_raw, d_norm_out_,
                                                     d_ffn_gate_, d_act_q8_1_, B,
                                                     intermediate_size_,
                                                     hidden_size_, stream_,
@@ -3306,10 +3411,16 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                               return true;
                             },
                             [&]() {
-                              return TryQ8_1Gemv<T>(
-                                  up_raw, d_norm_out_, d_ffn_up_, d_act_q8_1_,
-                                  B, intermediate_size_, hidden_size_, stream_,
-                                  "up_proj", active_policy);
+                              return TryQ8_1MmaGemv<T>(
+                                         up_raw, d_norm_out_, d_ffn_up_,
+                                         d_act_q8_1_mmq_, d_mma_partials_, B,
+                                         intermediate_size_, hidden_size_,
+                                         stream_, "up_proj", active_policy) ||
+                                     TryQ8_1Gemv<T>(
+                                         up_raw, d_norm_out_, d_ffn_up_,
+                                         d_act_q8_1_, B, intermediate_size_,
+                                         hidden_size_, stream_, "up_proj",
+                                         active_policy);
                             },
                             [&]() {
                               if (capturing) {
