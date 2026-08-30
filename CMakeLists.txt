@@ -598,6 +598,7 @@ target_link_libraries(inferctl PRIVATE inferflux_core)
 
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   add_executable(benchmark_downproj_q81 tests/unit/benchmark_downproj_q81.cu)
+  add_executable(benchmark_gate_up_kernels tests/unit/benchmark_gate_up_kernels.cu)
   add_executable(benchmark_q6k_kernels tests/unit/benchmark_q6k_kernels.cu)
   target_include_directories(benchmark_q6k_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -605,6 +606,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_downproj_q81 PRIVATE inferflux_core)
   target_link_libraries(benchmark_q6k_kernels PRIVATE inferflux_core inferflux_cuda_kernels)
+  target_link_libraries(benchmark_gate_up_kernels PRIVATE inferflux_core inferflux_cuda_kernels)
   add_executable(benchmark_fused_gate_up_q81
                  tests/unit/benchmark_fused_gate_up_q81.cu)
   target_include_directories(benchmark_fused_gate_up_q81 PRIVATE
@@ -631,6 +633,12 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     CUDA_STANDARD 17
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   )
+  add_executable(test_mma_q4k tests/unit/test_mma_q4k.cu)
+  target_include_directories(test_mma_q4k PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(test_mma_q4k PRIVATE CUDA::cudart)
+  add_test(NAME MmaQ4KTests COMMAND test_mma_q4k)
+  set_tests_properties(MmaQ4KTests PROPERTIES LABELS "mma_q4k")
   add_executable(test_mma_q6k tests/unit/test_mma_q6k.cu)
   target_include_directories(test_mma_q6k PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)

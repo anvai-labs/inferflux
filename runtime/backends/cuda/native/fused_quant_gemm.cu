@@ -2003,6 +2003,87 @@ bool FusedQuantGemm::DownProjMmq(const MmqWeightInfo &weight,
                   stream);
 }
 
+bool FusedQuantGemm::GemvMmqMma(
+    const QuantizedWeightInfo &weight, const half *input, half *output,
+    runtime::cuda::native::BlockQ8_1MmqDs *ds_act, float *partials, int M,
+    int N, int K, cudaStream_t stream, const NativeExecutionPolicy *policy) {
+  using namespace runtime::cuda::native;
+  const auto &p = ResolveExecutionPolicy(policy);
+  if (!p.enable_mmq_mma || !weight.data || !input || !output || !ds_act ||
+      !partials || M <= 1 || M > p.mmq_mma_max_batch || N <= 0 || K <= 0 ||
+      static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
+      static_cast<GGUF::TensorType>(weight.quant_type) !=
+          GGUF::TensorType::Q4_K ||
+      K % QK_K != 0) {
+    return false;
+  }
+
+  static bool smem_configured = false;
+  static size_t configured_smem = 0;
+  const size_t smem = MmqSmemInts(16) * sizeof(int);
+  if (!smem_configured || configured_smem != smem) {
+    if (cudaFuncSetAttribute(InferfluxMmqQ4KMma<16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(smem)) != cudaSuccess) {
+      return false;
+    }
+    smem_configured = true;
+    configured_smem = smem;
+  }
+
+  // CUDA-graph safety: no per-call device queries (cudaGetDeviceProperties
+  // during stream capture aborts the capture, silently dropping decode into
+  // eager mode — measured -22% e2e despite the kernels being 40% faster).
+  // SM count is process-static.
+  static int sm_count = [] {
+    cudaDeviceProp prop{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+      return 0;
+    }
+    return prop.multiProcessorCount;
+  }();
+  if (sm_count <= 0) {
+    return false;
+  }
+  const int n_tiles = (N + kMmqY - 1) / kMmqY;
+  int splits = std::min((sm_count + n_tiles - 1) / n_tiles,
+                        static_cast<int>(kMmqMmaMaxSplits));
+  if (M > 8) {
+    splits = std::max(splits, 2); // M=16 tail-wave balance (measured 2.5x)
+  }
+
+  dim3 qgrid((K / 128 + 3) / 4, M);
+  QuantizeRowQ8_1MmqDsKernel<<<qgrid, 128, 0, stream>>>(input, ds_act, K, M);
+
+  dim3 grid(n_tiles, (M + 15) / 16, splits);
+  InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
+      static_cast<const char *>(weight.data), ds_act, output, N, K, M,
+      splits > 1 ? partials : nullptr, splits);
+  if (splits > 1) {
+    const size_t mn = static_cast<size_t>(M) * N;
+    const int rthreads = 256;
+    const size_t rblocks = (mn + rthreads - 1) / rthreads;
+    ReduceMmqKSplit<<<rblocks, rthreads, 0, stream>>>(partials, output, splits,
+                                                      mn);
+  }
+  if (cudaPeekAtLastError() != cudaSuccess) {
+    return false;
+  }
+
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    log::Info("fused_quant_gemm",
+              std::string("Using Q4_K MMA projection (M=") +
+                  std::to_string(M) + ", N=" + std::to_string(N) + ", K=" +
+                  std::to_string(K) + ", ksplit=" + std::to_string(splits) +
+                  ")");
+  }
+  return true;
+}
+
 void FusedQuantGemm::QuantizeRowQ8_1Mmq(
     const half *input, runtime::cuda::native::BlockQ8_1Mmq *output, int M,
     int K, cudaStream_t stream) {
@@ -2054,16 +2135,23 @@ bool FusedQuantGemm::DownProjMmqMma(
 
   // K-split only when the N-tile grid alone under-occupies the device:
   // one block per super-block slice keeps the deterministic reduce cheap.
-  cudaDeviceProp prop{};
-  int device = 0;
-  if (cudaGetDevice(&device) != cudaSuccess ||
-      cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+  // CUDA-graph safety: process-static SM count (see GemvMmqMma).
+  static int sm_count = [] {
+    cudaDeviceProp prop{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+      return 0;
+    }
+    return prop.multiProcessorCount;
+  }();
+  if (sm_count <= 0) {
     return false;
   }
   const int n_tiles = (N + kMmqY - 1) / kMmqY;
   int splits = 1;
-  if (n_tiles < prop.multiProcessorCount) {
-    splits = std::min((prop.multiProcessorCount + n_tiles - 1) / n_tiles,
+  if (n_tiles < sm_count) {
+    splits = std::min((sm_count + n_tiles - 1) / n_tiles,
                       static_cast<int>(kMmqMmaMaxSplits));
   }
 
