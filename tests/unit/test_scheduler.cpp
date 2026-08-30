@@ -1941,6 +1941,11 @@ TEST_CASE("Scheduler fairness preemption keeps decode requests on decode queue",
   high_pending->inference.phase = RequestPhase::kPending;
 
   SchedulerTestAccess acc(scheduler);
+  // The Scheduler constructor starts WorkerLoop, which drains these queues
+  // under queue_mutex_. Drive ApplyFairness and assert under the same lock
+  // — otherwise the worker races the assertions (deterministically lost on
+  // the macOS CI runners; won on Linux by scheduling luck).
+  std::lock_guard<std::mutex> queue_lock(acc.queue_mutex());
   acc.pending_prefill().push_back(high_pending);
 
   Scheduler::BatchSelection selection;
