@@ -405,6 +405,8 @@ The multi-backend harness runs each backend in an isolated child process on purp
 
 ## Commits & PRs
 
+**Branch flow:** feature/fix branches PR into `develop`; `develop` promotes to `main` via a promotion PR (CI runs on both targets — `pull_request: [main, develop]`). Never PR a feature branch straight to `main`, and never let the two lines diverge — after any direct-to-main hotfix, fast-forward `develop` to `main` immediately. This convention exists because mixed targeting (PRs #27–#29 to main while #30+ targeted develop) produced an 80-commit divergence that required a dedicated reconciliation PR (#35).
+
 Short imperative subjects under ~72 chars mentioning scope (e.g., `Wire speculative validation and async NVMe writes`). **No AI attribution, co-author trailers, or agent names — the `commit-msg` hook rejects them.** PR bodies should link the tracking issue, enumerate config/env changes, and paste ctest output. Update README.md, docs/, and Helm/Docker assets alongside code changes; re-run `python3 scripts/check_docs_contract.py` when doc or surface changes are involved.
 
 <!-- imported-from: codex:project:instructions -->
