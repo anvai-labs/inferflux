@@ -1942,6 +1942,16 @@ void FusedQuantGemm::DestroyDownProjMmqLayout(const MmqWeightInfo &layout) {
   }
 }
 
+bool FusedQuantGemm::SupportsMmqMmaArchitecture(int sm_major, int sm_minor) {
+  return sm_major > 7 || (sm_major == 7 && sm_minor >= 5);
+}
+
+bool FusedQuantGemm::CurrentDeviceSupportsMmqMma() {
+  const auto &gpu = GetGpuProfile();
+  return gpu.initialized &&
+         SupportsMmqMmaArchitecture(gpu.sm_major, gpu.sm_minor);
+}
+
 bool FusedQuantGemm::DownProjMmq(const MmqWeightInfo &weight,
                                  const void *act_q8_1, half *output, int M,
                                  int N, int K, cudaStream_t stream,
@@ -2019,7 +2029,7 @@ bool FusedQuantGemm::DownProjMmqMma(
   using namespace runtime::cuda::native;
   const auto &p = ResolveExecutionPolicy(policy);
   if (!p.enable_mmq_mma || !weight.data || !act_mmq || !output || !partials ||
-      M <= 0 || N <= 0 || K <= 0 ||
+      !CurrentDeviceSupportsMmqMma() || M <= 0 || N <= 0 || K <= 0 ||
       static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements)) {
     return false;
   }

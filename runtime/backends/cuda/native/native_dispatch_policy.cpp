@@ -98,6 +98,7 @@ FusedQuantGemm::DownProjOperator SelectInferfluxCudaDownProjOperator(
   // try_mmq callback runs the MMA kernel first (transformer_forward.cu).
   const bool mma_ready =
       policy.enable_mmq_mma && raw.data != nullptr &&
+      FusedQuantGemm::CurrentDeviceSupportsMmqMma() &&
       raw.quant_type ==
           static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K) &&
       geometry.M >= policy.mmq_mma_min_batch &&

@@ -14,7 +14,8 @@ struct NativeExecutionPolicy {
   // Burst-pipelined decode: enqueue K decode steps (forward + sample +
   // on-device token feed) per ExecuteUnifiedBatchBurst() call and consume
   // tokens from a pinned ring while the GPU runs ahead. Default off until
-  // parity + benchmark gates pass (S1 rollout).
+  // device-side sampling-history parity + benchmark gates pass (S1 rollout).
+  // The executor currently reports this path unsupported even when requested.
   bool enable_decode_burst{false};
   int decode_burst_chunk{8};
   int decode_burst_max_ms{40};

@@ -669,8 +669,11 @@ bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
                             const NativeExecutionPolicy *policy) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_mmq_mma || !weight.data || !gate || !up || !output ||
-      !act_mmq || !partials || M <= 0 || N <= 0 || K <= 0 ||
-      M < policy_ref.mmq_mma_min_batch ||
+      !act_mmq || !partials || !FusedQuantGemm::CurrentDeviceSupportsMmqMma() ||
+      InferfluxCudaOperatorHealth::Instance().IsUnhealthy(
+          FusedQuantGemm::DownProjOperator::kMmq) ||
+      M <= 0 || N <= 0 || K <= 0 || M < policy_ref.mmq_mma_min_batch ||
+      M > policy_ref.mmq_mma_max_batch ||
       static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
       weight.quant_type !=
           static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
@@ -707,8 +710,11 @@ bool TryMmqMmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
                          const NativeExecutionPolicy *policy) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_mmq_mma || !weight.data || !input || !output ||
-      !act_mmq || !partials || M <= 0 || N <= 0 || K <= 0 ||
-      M < policy_ref.mmq_mma_min_batch || M > policy_ref.mmq_mma_max_batch ||
+      !act_mmq || !partials || !FusedQuantGemm::CurrentDeviceSupportsMmqMma() ||
+      InferfluxCudaOperatorHealth::Instance().IsUnhealthy(
+          FusedQuantGemm::DownProjOperator::kMmq) ||
+      M <= 0 || N <= 0 || K <= 0 || M < policy_ref.mmq_mma_min_batch ||
+      M > policy_ref.mmq_mma_max_batch ||
       static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
       weight.quant_type !=
           static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
@@ -1190,25 +1196,28 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
       return false;
     device_workspace_bytes_ += rows * blocks_per_row * q8_1_block_size;
   }
-  // MMA down-proj (S7) buffers: group-major D4 activations sized for the
-  // larger projection K, and fp32 partials for the deterministic K-split
-  // reduce (kMmqMmaMaxSplits x rows x hidden floats). Only touched when
-  // INFERFLUX_CUDA_MMQ_MMA=1.
-  {
+  // MMA down-proj (S7) buffers. This tier is opt-in and rejects rows above
+  // mmq_mma_max_batch, so do not charge every model for max-sequence-sized
+  // scratch while the feature is disabled (or for rows it cannot consume).
+  if (execution_policy_.enable_mmq_mma &&
+      FusedQuantGemm::CurrentDeviceSupportsMmqMma()) {
     using namespace runtime::cuda::native;
-    const int max_dim = std::max(hidden_size_, intermediate_size_);
-    err = cudaMalloc(&d_act_q8_1_mmq_, static_cast<size_t>(max_dim / 128) *
-                                           rows * sizeof(BlockQ8_1Mmq));
+    const size_t mma_rows = std::min(
+        rows, static_cast<size_t>(execution_policy_.mmq_mma_max_batch));
+    const size_t blocks_per_row =
+        (static_cast<size_t>(intermediate_size_) + 127) / 128;
+    err = cudaMalloc(&d_act_q8_1_mmq_,
+                     blocks_per_row * mma_rows * sizeof(BlockQ8_1Mmq));
     if (err != cudaSuccess)
       return false;
-    device_workspace_bytes_ +=
-        static_cast<size_t>(max_dim / 128) * rows * sizeof(BlockQ8_1Mmq);
+    device_workspace_bytes_ += blocks_per_row * mma_rows * sizeof(BlockQ8_1Mmq);
     err = cudaMalloc(&d_mma_partials_, static_cast<size_t>(kMmqMmaMaxSplits) *
-                                           rows * hidden_size_ * sizeof(float));
+                                           mma_rows * hidden_size_ *
+                                           sizeof(float));
     if (err != cudaSuccess)
       return false;
-    device_workspace_bytes_ += static_cast<size_t>(kMmqMmaMaxSplits) * rows *
-                               hidden_size_ * sizeof(float);
+    device_workspace_bytes_ += static_cast<size_t>(kMmqMmaMaxSplits) *
+                               mma_rows * hidden_size_ * sizeof(float);
   }
   // Logits buffer sized for batched decode: [max_batch_size, vocab_size]
   if (!alloc(&d_logits_typed_,
@@ -2064,7 +2073,20 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
               down_selected_op, ffn_phase, ProjectionQuantLabel(down_raw),
               down_raw.quant_type, seq_len, hidden_size_, intermediate_size_,
               [&]() {
-                // Try accumulate SiLU+GEMV: writes directly to residual
+                return TryMmqMmaSiluMul<T>(
+                           down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                           d_act_q8_1_mmq_, d_mma_partials_, seq_len,
+                           hidden_size_, intermediate_size_, stream_,
+                           "down_proj", &execution_policy_) ||
+                       TryMmqSiluMulGemv<T>(down_mmq, d_ffn_gate_, d_ffn_up_,
+                                            d_ffn_down_, d_act_q8_1_, seq_len,
+                                            hidden_size_, intermediate_size_,
+                                            stream_, "down_proj",
+                                            &execution_policy_);
+              },
+              [&]() {
+                // Q8_1 can fuse the residual accumulation; keep it in the
+                // Q8_1 tier so selected-vs-actual telemetry remains truthful.
                 if constexpr (std::is_same_v<T, half>) {
                   if (fp32_residual_active_ &&
                       TryQ8_1SiluMulGemvAccumF32(
@@ -2084,18 +2106,6 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                   down_accumulated = true;
                   return true;
                 }
-                return TryMmqMmaSiluMul<T>(
-                           down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-                           d_act_q8_1_mmq_, d_mma_partials_, seq_len,
-                           hidden_size_, intermediate_size_, stream_,
-                           "down_proj", &execution_policy_) ||
-                       TryMmqSiluMulGemv<T>(down_mmq, d_ffn_gate_, d_ffn_up_,
-                                            d_ffn_down_, d_act_q8_1_, seq_len,
-                                            hidden_size_, intermediate_size_,
-                                            stream_, "down_proj",
-                                            &execution_policy_);
-              },
-              [&]() {
                 return TryQ8_1SiluMulGemv<T>(
                     down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
                     seq_len, hidden_size_, intermediate_size_, stream_,
@@ -2403,6 +2413,7 @@ template <typename T> std::string LlamaForwardTyped<T>::ProbeDispatchPaths() {
   const auto gate_raw = weights_->LayerGateProjRaw(layer);
   const auto up_raw = weights_->LayerUpProjRaw(layer);
   const auto down_raw = weights_->LayerDownProjRaw(layer);
+  const auto down_mmq = weights_->LayerDownProjMmq(layer);
   int divergences = 0;
 
   const int m_values[] = {1, 2, 4, 8, 16};
@@ -2442,6 +2453,64 @@ template <typename T> std::string LlamaForwardTyped<T>::ProbeDispatchPaths() {
          selected != FfnProjOperator::kFallback)) {
       ++divergences;
       health.MarkUnhealthy(selected, "probe_divergence");
+    }
+
+    const auto selected_down = SelectInferfluxCudaDownProjOperator(
+        down_raw, down_mmq, InferfluxCudaDispatchPhase::kDecode,
+        FusedDispatchGeometry{M, hidden_size_, intermediate_size_, 1, true,
+                              false},
+        true, execution_policy_);
+    NativeDownProjExecutionSummary down_summary;
+    ExecuteInferfluxCudaDownProjStage(
+        selected_down, "probe", ProjectionQuantLabel(down_raw),
+        down_raw.quant_type, M, hidden_size_, intermediate_size_,
+        [&]() {
+          return TryMmqMmaSiluMul<T>(down_raw, d_ffn_gate_, d_ffn_up_,
+                                     d_ffn_down_, d_act_q8_1_mmq_,
+                                     d_mma_partials_, M, hidden_size_,
+                                     intermediate_size_, stream_,
+                                     "down_proj_probe", &execution_policy_) ||
+                 TryMmqSiluMulGemv<T>(down_mmq, d_ffn_gate_, d_ffn_up_,
+                                      d_ffn_down_, d_act_q8_1_, M, hidden_size_,
+                                      intermediate_size_, stream_,
+                                      "down_proj_probe", &execution_policy_);
+        },
+        [&]() {
+          if constexpr (std::is_same_v<T, half>) {
+            if (fp32_residual_active_ &&
+                TryQ8_1SiluMulGemvAccumF32(
+                    down_raw, d_ffn_gate_, d_ffn_up_, d_residual_f32_,
+                    d_act_q8_1_, M, hidden_size_, intermediate_size_, stream_,
+                    "down_proj_probe", &execution_policy_)) {
+              return true;
+            }
+          }
+          if (!fp32_residual_active_ &&
+              TryQ8_1SiluMulGemvAccum<T>(
+                  down_raw, d_ffn_gate_, d_ffn_up_, d_residual_, d_act_q8_1_, M,
+                  hidden_size_, intermediate_size_, stream_, "down_proj_probe",
+                  &execution_policy_)) {
+            return true;
+          }
+          return TryQ8_1SiluMulGemv<T>(
+              down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_, M,
+              hidden_size_, intermediate_size_, stream_, "down_proj_probe",
+              &execution_policy_);
+        },
+        [&]() {
+          return TryPackedSiluMulGemv<T>(
+              down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+              d_packed_activation_, d_packed_activation_scales_, M,
+              hidden_size_, intermediate_size_, stream_, "down_proj_probe",
+              &execution_policy_);
+        },
+        []() { return false; }, [](DownProjOperator) {}, &down_summary,
+        &execution_policy_);
+    if (TierOf(selected_down) != TierOf(down_summary.actual_op) ||
+        (down_summary.actual_op == DownProjOperator::kFallback &&
+         selected_down != DownProjOperator::kFallback)) {
+      ++divergences;
+      health.MarkUnhealthy(selected_down, "probe_divergence");
     }
   }
 
@@ -3272,9 +3341,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
           // post-activation FP16 result.  When P5 is active, consume the
           // epilogue's pre-quantized Q8_1 buffer directly before falling back
           // to the legacy re-quantization path.
-          bool down_ok = false;
+          const bool mma_down_ok = TryMmqMmaGemv<T>(
+              down_raw, d_ffn_gate_, d_ffn_down_, d_act_q8_1_mmq_,
+              d_mma_partials_, B, hidden_size_, intermediate_size_, stream_,
+              "down_proj", active_policy);
+          bool down_ok = mma_down_ok;
           if constexpr (std::is_same_v<T, half>) {
-            if (fp32_residual_active_) {
+            if (!down_ok && fp32_residual_active_) {
               if (gate_up_q81_epilogue) {
                 down_ok = TryQ8_1GemvPrequantizedAccumF32(
                     down_raw, d_ffn_act_q8_1_, d_residual_f32_, B, hidden_size_,
@@ -3301,14 +3374,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                             "down_proj", active_policy);
             }
           }
-          if (down_ok) {
+          if (down_ok && !mma_down_ok) {
             down_accumulated = true;
-          }
-          if (!down_ok) {
-            down_ok = TryMmqMmaGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
-                                       d_act_q8_1_mmq_, d_mma_partials_, B,
-                                       hidden_size_, intermediate_size_,
-                                       stream_, "down_proj", active_policy);
           }
           if (!down_ok) {
             if (gate_up_q81_epilogue) {
@@ -3364,8 +3431,17 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                   down_selected_op, "decode", ProjectionQuantLabel(down_raw),
                   down_raw.quant_type, B, hidden_size_, intermediate_size_,
                   [&]() {
-                    // Preserve the validated residual-accumulation paths
-                    // before falling back to an output-producing MMA/MMQ path.
+                    return TryMmqMmaSiluMul<T>(down_raw, d_ffn_gate_, d_ffn_up_,
+                                               d_ffn_down_, d_act_q8_1_mmq_,
+                                               d_mma_partials_, B, hidden_size_,
+                                               intermediate_size_, stream_,
+                                               "down_proj", active_policy) ||
+                           TryMmqSiluMulGemv<T>(
+                               down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                               d_act_q8_1_, B, hidden_size_, intermediate_size_,
+                               stream_, "down_proj", active_policy);
+                  },
+                  [&]() {
                     if constexpr (std::is_same_v<T, half>) {
                       if (fp32_residual_active_ &&
                           TryQ8_1SiluMulGemvAccumF32(
@@ -3384,17 +3460,6 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                       down_accumulated = true;
                       return true;
                     }
-                    return TryMmqMmaSiluMul<T>(down_raw, d_ffn_gate_, d_ffn_up_,
-                                               d_ffn_down_, d_act_q8_1_mmq_,
-                                               d_mma_partials_, B, hidden_size_,
-                                               intermediate_size_, stream_,
-                                               "down_proj", active_policy) ||
-                           TryMmqSiluMulGemv<T>(
-                               down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-                               d_act_q8_1_, B, hidden_size_, intermediate_size_,
-                               stream_, "down_proj", active_policy);
-                  },
-                  [&]() {
                     return TryQ8_1SiluMulGemv<T>(
                         down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
                         d_act_q8_1_, B, hidden_size_, intermediate_size_,

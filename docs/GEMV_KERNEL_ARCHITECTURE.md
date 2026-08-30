@@ -342,8 +342,9 @@ Everything else is derived and enforced:
   can never be silently unexported.
 - The reachability tests enumerate every table row against the executor
   stages; the load-time probe (`INFERFLUX_CUDA_DISPATCH_PROBE`, default on)
-  verifies real execution on real weights and down-ranks divergent
-  operators (self-heal) with `/readyz` visibility.
+  verifies FFN and down-projection execution on real weights at representative
+  decode rows and down-ranks divergent operators (self-heal) with `/readyz`
+  visibility.
 - Runtime divergence is counted at
   `inferflux_cuda_dispatch_divergence_total{layer,selected,actual,reason}`
   and the per-dispatch trace (`INFERFLUX_CUDA_DISPATCH_TRACE=1`, parsed by

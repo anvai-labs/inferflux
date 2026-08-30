@@ -103,10 +103,9 @@ private:
   cudaStream_t stream_{nullptr};
 
   // Pinned ring: slot i holds the sampled token ids for the i-th step of the
-  // current chunk. 64 ids + a done mask per slot.
+  // current chunk.
   struct RingSlot {
     int token_ids[kMaxBurstBatch];
-    unsigned int done_mask;
   };
   RingSlot *ring_{nullptr};
   cudaEvent_t slot_events_[kMaxRingSlots]{};

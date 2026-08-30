@@ -245,6 +245,13 @@ public:
   static bool
   IsDownProjMmqEnabled(const NativeExecutionPolicy *policy = nullptr);
 
+  /// True when the CUDA architecture provides the signed-int8 mma.sync
+  /// primitive used by the Q6_K MMA path (Turing / SM 7.5 or newer).
+  static bool SupportsMmqMmaArchitecture(int sm_major, int sm_minor);
+
+  /// Runtime form of SupportsMmqMmaArchitecture for the active CUDA device.
+  static bool CurrentDeviceSupportsMmqMma();
+
   // -----------------------------------------------------------------------
   // MMA tensor-core path (S7): Q6_K down-projection via mma.sync int8
   // tensor cores with deterministic K-split. Consumes the RAW row-major

@@ -10,6 +10,15 @@
 
 using namespace inferflux;
 
+TEST_CASE("Burst ring consumption respects heterogeneous sequence budgets",
+          "[unified_batching]") {
+  REQUIRE(BurstSlotWithinBudget(0, 1));
+  REQUIRE_FALSE(BurstSlotWithinBudget(1, 1));
+  REQUIRE(BurstSlotWithinBudget(2, 3));
+  REQUIRE_FALSE(BurstSlotWithinBudget(3, 3));
+  REQUIRE_FALSE(BurstSlotWithinBudget(-1, 3));
+}
+
 // Mock backend to intercept ExecuteUnifiedBatch calls.
 class MockUnifiedBackend : public LlamaCppBackend {
 public:

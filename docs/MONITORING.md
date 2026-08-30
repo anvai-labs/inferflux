@@ -72,7 +72,8 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 CUDA graph replay bypasses host-side operator counters, so use the log signals
 above during graph-enabled runs. Cap eligible batches with
 `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` (default `16`); the partials buffer is sized
-for `max_batch` rows.
+only when the feature is enabled, capped at that eligible row count. The path
+requires an NVIDIA Turing GPU (compute capability 7.5) or newer.
 
 | Signal | What to check | How to read it |
 |---|---|---|

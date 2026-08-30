@@ -1359,6 +1359,14 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
     return false;
   }
 
+  // Allocate policy-dependent scratch from the same policy used at runtime.
+  // Lane forwards additionally keep graphs disabled because their workers
+  // execute concurrently with varying batch sizes.
+  NativeExecutionPolicy lane_policy = execution_policy_;
+  lane_policy.disable_cuda_graph = true;
+  decode_lane_forward_->SetExecutionPolicy(lane_policy);
+  prefill_lane_forward_->SetExecutionPolicy(lane_policy);
+
   if (is_gguf_path) {
     decode_lane_quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
     prefill_lane_quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
@@ -1404,8 +1412,6 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
       DestroyLaneOverlapResources();
       return false;
     }
-    decode_lane_forward_->SetExecutionPolicy(execution_policy_);
-    prefill_lane_forward_->SetExecutionPolicy(execution_policy_);
   } else {
     if (!decode_lane_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
                                           decode_lane_gemm_.get(),
@@ -1418,8 +1424,6 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
       DestroyLaneOverlapResources();
       return false;
     }
-    decode_lane_forward_->SetExecutionPolicy(execution_policy_);
-    prefill_lane_forward_->SetExecutionPolicy(execution_policy_);
   }
 
   // CUDA graphs are unsafe with lane overlap workers: decode and prefill
@@ -1430,15 +1434,9 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
   // The lane_overlap_mutex_ in ExecuteLaneBatchForAsync and
   // ReleaseBatchScopedDequantizedCache prevents concurrent access to shared
   // resources during lane execution.
-  {
-    NativeExecutionPolicy lane_policy = execution_policy_;
-    lane_policy.disable_cuda_graph = true;
-    decode_lane_forward_->SetExecutionPolicy(lane_policy);
-    prefill_lane_forward_->SetExecutionPolicy(lane_policy);
-    log::Info("inferflux_cuda_executor",
-              "CUDA graphs disabled on lane forwards (overlap active); "
-              "primary forward retains graph support");
-  }
+  log::Info("inferflux_cuda_executor",
+            "CUDA graphs disabled on lane forwards (overlap active); "
+            "primary forward retains graph support");
 
   decode_lane_sampler_ = std::make_unique<GpuSampler>();
   prefill_lane_sampler_ = std::make_unique<GpuSampler>();
@@ -1852,6 +1850,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
                      config.model_type);
       return false;
     }
+    model_forward_->SetExecutionPolicy(execution_policy_);
     auto gguf_config = ConvertModelInfo(model_info_);
     if (!model_forward_->Initialize(gguf_config, *quantized_weight_adapter_,
                                     kv_cache_.get(), gemm_.get(),
@@ -1860,7 +1859,6 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
                  "Failed to initialize forward pass for GGUF model");
       return false;
     }
-    model_forward_->SetExecutionPolicy(execution_policy_);
   } else {
     weight_map_ = std::make_unique<WeightMap>();
     if (!weight_map_->Build(*loader_, config)) {
@@ -1878,13 +1876,13 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
                  "Unsupported model_type: " + config.model_type);
       return false;
     }
+    model_forward_->SetExecutionPolicy(execution_policy_);
     if (!model_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
                                     gemm_.get(), compute_stream_)) {
       log::Error("inferflux_cuda_executor",
                  "Failed to initialize forward pass");
       return false;
     }
-    model_forward_->SetExecutionPolicy(execution_policy_);
   }
 
   // 3b. Pre-warm weight caches so CUDA graph capture doesn't encounter
@@ -2767,7 +2765,16 @@ bool InferfluxCudaExecutor::NativeSupportsUnifiedBatchBurst() const {
   if (policy.debug_decode_mapping || policy.debug_logits) {
     return false;
   }
-  return policy.enable_decode_burst && policy.enable_batched_decode;
+  if (!policy.enable_decode_burst || !policy.enable_batched_decode) {
+    return false;
+  }
+  // The regular native greedy path applies per-sequence penalties (including
+  // its implicit 1.15 repetition penalty) and updates token history after
+  // every sample. The graph-replayed burst sampler currently does neither,
+  // so advertising support would silently change tokens. Keep the unsafe
+  // experimental path unreachable until those state transitions live on the
+  // device between replays and pass stepwise parity tests.
+  return false;
 #else
   return false;
 #endif
@@ -2901,7 +2908,8 @@ UnifiedBurstResult InferfluxCudaExecutor::NativeExecuteUnifiedBatchBurst(
     }
     bool any_active = false;
     for (int b = 0; b < B; ++b) {
-      if (stopped[static_cast<std::size_t>(b)]) {
+      if (stopped[static_cast<std::size_t>(b)] ||
+          !BurstSlotWithinBudget(i, step_budget[b])) {
         continue;
       }
       const int token_id = burst_controller_.ReadSlot(i, b);

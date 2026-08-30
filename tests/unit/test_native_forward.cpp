@@ -8448,6 +8448,14 @@ TEST_CASE("GEMV v2: Q6_K dispatch succeeds for representative dimensions",
   REQUIRE(FusedQuantGemm::ShouldUseFusedPath(quant_type, 4));
 }
 
+TEST_CASE("Q6_K MMA architecture gate requires SM 7.5", "[native_forward]") {
+  REQUIRE_FALSE(FusedQuantGemm::SupportsMmqMmaArchitecture(7, 0));
+  REQUIRE_FALSE(FusedQuantGemm::SupportsMmqMmaArchitecture(7, 4));
+  REQUIRE(FusedQuantGemm::SupportsMmqMmaArchitecture(7, 5));
+  REQUIRE(FusedQuantGemm::SupportsMmqMmaArchitecture(8, 0));
+  REQUIRE(FusedQuantGemm::SupportsMmqMmaArchitecture(12, 0));
+}
+
 #endif // INFERFLUX_NATIVE_KERNELS_READY
 
 } // namespace inferflux

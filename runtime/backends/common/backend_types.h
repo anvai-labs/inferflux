@@ -50,7 +50,9 @@ struct UnifiedBatchOutput {
 struct UnifiedBurstOptions {
   int max_tokens_per_seq{8}; ///< Steps enqueued per sequence per chunk
   int max_batch_tokens{256}; ///< Cap on chunk_tokens * batch_size
-  std::chrono::milliseconds max_wall_ms{40}; ///< Wall-clock cap per burst call
+  // Reserved for the graph-replayed burst path. Support stays disabled until
+  // device-side sampling parity and bounded polling are implemented.
+  std::chrono::milliseconds max_wall_ms{40};
 };
 
 /// One sampled token surfaced by a burst. input_idx maps back to the position
@@ -76,6 +78,13 @@ struct UnifiedBurstResult {
   std::vector<int> last_tokens;
   std::vector<bool> finished;
 };
+
+/// Whether a sampled ring slot belongs to a sequence's per-chunk budget.
+/// Burst execution may enqueue to the largest budget in a heterogeneous
+/// batch, so consumers must ignore later frozen slots for shorter sequences.
+inline bool BurstSlotWithinBudget(int slot_idx, int step_budget) {
+  return slot_idx >= 0 && slot_idx < step_budget;
+}
 
 /// Execution lane hint for async unified-batch submission.
 /// kDecode should be favored for lower token latency.

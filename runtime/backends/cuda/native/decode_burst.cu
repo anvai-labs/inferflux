@@ -168,7 +168,6 @@ bool DecodeBurstController::EnqueueStepEpilogue(int slot_idx,
     return false;
   }
   RingSlot &slot = ring_[slot_idx];
-  slot.done_mask = 0;
   if (TracedCudaMemcpyAsync(CopyTraceSite::kBurstSlotD2H, slot.token_ids,
                             sampler->batch_result_device(),
                             sizeof(int) * batch_size, cudaMemcpyDeviceToHost,
