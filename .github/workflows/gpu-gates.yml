@@ -61,9 +61,13 @@ jobs:
             -DENABLE_SBOM=OFF
 
       - name: Build CUDA contracts
+        # DRIFT TRAP: ctest below runs every registered test. Any new
+        # add_executable test target in CMakeLists.txt must be added here
+        # or the gate fails with "(Not Run)" — this bit MmaQ6KTests (PR #34).
         run: >-
           cmake --build build-ci-cuda -j$(nproc) --target
           inferfluxd inferctl inferflux_tests inferflux_fused_kernel_tests
+          test_mma_q6k
 
       - name: Run CUDA unit and behavioral contracts
         run: ctest --test-dir build-ci-cuda --output-on-failure --timeout 180
@@ -137,6 +141,8 @@ jobs:
             -DENABLE_SBOM=OFF
 
       - name: Build ROCm contracts
+        # DRIFT TRAP: same as the CUDA job — keep in sync with every
+        # add_executable test target registered under ENABLE_ROCM.
         run: cmake --build build-ci-rocm -j$(nproc) --target inferfluxd inferctl inferflux_tests
 
       - name: Run ROCm unit and behavioral contracts
