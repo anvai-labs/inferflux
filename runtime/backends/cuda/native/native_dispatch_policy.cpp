@@ -92,12 +92,23 @@ FusedQuantGemm::DownProjOperator SelectInferfluxCudaDownProjOperator(
       !PackedActivationsDisabled(policy) &&
       FusedQuantGemm::SupportsPackedActivations(raw.quant_type) &&
       FusedQuantGemm::ShouldUseFusedPath(raw.quant_type, single_geometry);
+  // MMA tensor-core path (S7): ready on its own policy for Q6_K — it reads
+  // the raw row-major layout, so it needs neither the transformed MMQ
+  // layout nor the dp4a MMQ threshold. When it wins, the executor's
+  // try_mmq callback runs the MMA kernel first (transformer_forward.cu).
+  const bool mma_ready =
+      policy.enable_mmq_mma && raw.data != nullptr &&
+      raw.quant_type ==
+          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K) &&
+      geometry.M >= policy.mmq_mma_min_batch &&
+      geometry.M <= policy.mmq_mma_max_batch && geometry.K % 256 == 0;
   const bool mmq_ready =
-      mmq_weight.data != nullptr &&
-      FusedQuantGemm::IsDownProjMmqEnabled(&policy) &&
-      FusedQuantGemm::SupportsDownProjMmq(raw.quant_type) &&
-      geometry.M >= FusedQuantGemm::GetDownProjMmqThreshold(
-                        raw.quant_type, geometry.M, geometry.N, geometry.K);
+      mma_ready ||
+      (mmq_weight.data != nullptr &&
+       FusedQuantGemm::IsDownProjMmqEnabled(&policy) &&
+       FusedQuantGemm::SupportsDownProjMmq(raw.quant_type) &&
+       geometry.M >= FusedQuantGemm::GetDownProjMmqThreshold(
+                         raw.quant_type, geometry.M, geometry.N, geometry.K));
   const auto profile = BuildInferfluxCudaDownProjDispatchProfile(
       phase, raw.quant_type, geometry, q81_ready, packed_ready, mmq_ready);
   return SelectInferfluxCudaDownProjDispatchDecision(profile, policy).op;

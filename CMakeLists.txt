@@ -598,9 +598,13 @@ target_link_libraries(inferctl PRIVATE inferflux_core)
 
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   add_executable(benchmark_downproj_q81 tests/unit/benchmark_downproj_q81.cu)
+  add_executable(benchmark_q6k_kernels tests/unit/benchmark_q6k_kernels.cu)
+  target_include_directories(benchmark_q6k_kernels PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_include_directories(benchmark_downproj_q81 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_downproj_q81 PRIVATE inferflux_core)
+  target_link_libraries(benchmark_q6k_kernels PRIVATE inferflux_core inferflux_cuda_kernels)
   add_executable(benchmark_fused_gate_up_q81
                  tests/unit/benchmark_fused_gate_up_q81.cu)
   target_include_directories(benchmark_fused_gate_up_q81 PRIVATE
@@ -611,7 +615,6 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_include_directories(benchmark_grouped_q81_pair PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_grouped_q81_pair PRIVATE inferflux_core)
-
   # Fused kernel parity tests: .cpp (Catch2, MSVC) + .cu (test-only kernels, nvcc)
   # Split avoids nvcc/Catch2 operator== conflict with cuda_bf16.hpp on CUDA 13.2.
   add_executable(inferflux_fused_kernel_tests
@@ -628,6 +631,12 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     CUDA_STANDARD 17
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   )
+  add_executable(test_mma_q6k tests/unit/test_mma_q6k.cu)
+  target_include_directories(test_mma_q6k PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(test_mma_q6k PRIVATE CUDA::cudart)
+  add_test(NAME MmaQ6KTests COMMAND test_mma_q6k)
+  set_tests_properties(MmaQ6KTests PROPERTIES LABELS "mma_q6k")
 endif()
 
 install(TARGETS inferfluxd inferctl

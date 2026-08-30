@@ -192,6 +192,11 @@ private:
   void *d_ffn_act_q8_1_{nullptr}; // FFN epilogue Q8_1 buffer (post-SiLU)
   void *d_attn_split_workspace_{nullptr}; // FlashDecode KV-split partials
   size_t attn_split_workspace_bytes_{0};
+  // Group-major D4 activations + fp32 K-split partials for the MMA
+  // down-proj path (S7); allocated unconditionally, used only when
+  // INFERFLUX_CUDA_MMQ_MMA=1.
+  void *d_act_q8_1_mmq_{nullptr}; // BlockQ8_1Mmq (D4) activations
+  float *d_mma_partials_{nullptr};
   int *d_token_ids_{nullptr};
   T *d_logits_typed_{nullptr};
 

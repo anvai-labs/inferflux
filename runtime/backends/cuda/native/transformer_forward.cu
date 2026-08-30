@@ -4,9 +4,10 @@
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
 #include "runtime/backends/cuda/native/dispatch_operator_health.h"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
+#include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/kernels/fused_gemv_accum_norm_quant.cuh"
 #include "runtime/backends/cuda/native/kernels/fused_rope_kv_append.cuh"
-#include "runtime/backends/cuda/native/gguf_util.h"
+#include "runtime/backends/cuda/native/kernels/mmq_mma.cuh"
 #include "runtime/backends/cuda/native/llama_forward.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/native_dispatch_policy.h"
@@ -136,9 +137,9 @@ void DebugDumpLogits(const float *d_logits, int vocab_size,
     return;
   constexpr int TOP_N = 10;
   std::vector<float> h_logits(vocab_size);
-  cudaError_t err = cudaMemcpyAsync(h_logits.data(), d_logits,
-                                    vocab_size * sizeof(float),
-                                    cudaMemcpyDeviceToHost, stream);
+  cudaError_t err =
+      cudaMemcpyAsync(h_logits.data(), d_logits, vocab_size * sizeof(float),
+                      cudaMemcpyDeviceToHost, stream);
   if (err != cudaSuccess) {
     fprintf(stderr, "[DEBUG_LOGITS] cudaMemcpyAsync failed: %s\n",
             cudaGetErrorString(err));
@@ -187,8 +188,7 @@ void DebugDumpHidden(const char *label, const void *d_data, int count,
     return;
   // Read as half, convert to float
   std::vector<half> h_data(count);
-  cudaError_t err = cudaMemcpyAsync(h_data.data(), d_data,
-                                    count * sizeof(half),
+  cudaError_t err = cudaMemcpyAsync(h_data.data(), d_data, count * sizeof(half),
                                     cudaMemcpyDeviceToHost, stream);
   if (err != cudaSuccess) {
     fprintf(stderr, "[DEBUG_HIDDEN] %s: cudaMemcpyAsync failed: %s\n", label,
@@ -369,8 +369,7 @@ bool TryPackedProjectionGroup(
     output_cols[i] = plan.output_cols;
     if (!FusedQuantGemm::ShouldUseFusedPath(
             plan.raw.quant_type,
-            FusedDispatchGeometry{M, plan.output_cols, K, 1, true,
-                                  has_norm})) {
+            FusedDispatchGeometry{M, plan.output_cols, K, 1, true, has_norm})) {
       return false;
     }
     pair_ready[i] = FusedQuantGemm::ShouldUseFusedPath(
@@ -473,118 +472,126 @@ bool TryPackedProjectionGroup(
 // MMVQ kernels; other types return false.
 template <size_t GroupSize, typename T>
 bool TryQ8_1ProjectionGroup(
-    const std::array<PackedProjectionPlan<T>, GroupSize> &plans,
-    const T *input, const T *norm_weight, void *act_q8_1, int M, int K,
-    float eps, cudaStream_t stream, const NativeExecutionPolicy *policy = nullptr,
+    const std::array<PackedProjectionPlan<T>, GroupSize> &plans, const T *input,
+    const T *norm_weight, void *act_q8_1, int M, int K, float eps,
+    cudaStream_t stream, const NativeExecutionPolicy *policy = nullptr,
     FusedQuantGemm::FfnProjOperator selected_op =
         FusedQuantGemm::FfnProjOperator::kFallback) {
   if constexpr (!std::is_same_v<T, half>) {
-    (void)input; (void)norm_weight; (void)act_q8_1; (void)M; (void)K;
-    (void)eps; (void)stream; (void)policy; (void)selected_op;
+    (void)input;
+    (void)norm_weight;
+    (void)act_q8_1;
+    (void)M;
+    (void)K;
+    (void)eps;
+    (void)stream;
+    (void)policy;
+    (void)selected_op;
     return false;
   } else {
-  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
-  if (Q81ActivationsDisabled(policy_ref) || !input || !act_q8_1 || M <= 0 ||
-      K <= 0) {
-    return false;
-  }
-
-  std::array<int, GroupSize> quant_types{};
-  std::array<int, GroupSize> output_cols{};
-  std::array<bool, GroupSize> pair_ready{};
-  std::array<bool, GroupSize> triple_ready{};
-  for (size_t i = 0; i < GroupSize; ++i) {
-    const auto &plan = plans[i];
-    if (!plan.raw.data || plan.output == nullptr || plan.output_cols <= 0 ||
-        !FusedQuantGemm::SupportsQ8_1Activations(plan.raw.quant_type)) {
+    const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+    if (Q81ActivationsDisabled(policy_ref) || !input || !act_q8_1 || M <= 0 ||
+        K <= 0) {
       return false;
     }
-    quant_types[i] = plan.raw.quant_type;
-    output_cols[i] = plan.output_cols;
-    if (!FusedQuantGemm::ShouldUseFusedPath(
-            plan.raw.quant_type,
-            FusedDispatchGeometry{M, plan.output_cols, K, 1, true,
-                                  norm_weight != nullptr})) {
-      return false;
-    }
-    pair_ready[i] = FusedQuantGemm::ShouldUseFusedPath(
-        plan.raw.quant_type,
-        FusedDispatchGeometry{M, plan.output_cols, K, 2, true,
-                              norm_weight != nullptr});
-    if constexpr (GroupSize == 3) {
-      triple_ready[i] = FusedQuantGemm::ShouldUseFusedPath(
-          plan.raw.quant_type,
-          FusedDispatchGeometry{M, plan.output_cols, K, 3, true,
-                                norm_weight != nullptr});
-    }
-  }
 
-  // Quantize activations: fused RmsNorm+Quantize or standalone quantize
-  if (norm_weight) {
-    FusedQuantGemm::FusedRmsNormQuantizeQ8_1(input, norm_weight, act_q8_1, M, K,
-                                             eps, stream);
-  } else {
-    FusedQuantGemm::QuantizeRowQ8_1(input, act_q8_1, M, K, stream);
-  }
-
-  const auto grouping = SelectSharedActivationGrouping(
-      quant_types, output_cols, pair_ready, triple_ready);
-  std::array<bool, GroupSize> completed{};
-  bool used_grouped = false;
-
-  if constexpr (GroupSize == 3) {
-    if (grouping.grouped_count == 3) {
-      const std::array<PackedProjectionSpec, 3> grouped = {{
-          {plans[0].raw, plans[0].output, plans[0].output_cols},
-          {plans[1].raw, plans[1].output, plans[1].output_cols},
-          {plans[2].raw, plans[2].output, plans[2].output_cols},
-      }};
-      if (FusedQuantGemm::GemvQ8_1Triple(grouped, act_q8_1, M, K, stream,
-                                         policy)) {
-        LogPackedGemmPath("q8_1_triple", "using Q8_1 grouped triple GEMV");
-        return true;
+    std::array<int, GroupSize> quant_types{};
+    std::array<int, GroupSize> output_cols{};
+    std::array<bool, GroupSize> pair_ready{};
+    std::array<bool, GroupSize> triple_ready{};
+    for (size_t i = 0; i < GroupSize; ++i) {
+      const auto &plan = plans[i];
+      if (!plan.raw.data || plan.output == nullptr || plan.output_cols <= 0 ||
+          !FusedQuantGemm::SupportsQ8_1Activations(plan.raw.quant_type)) {
+        return false;
       }
-      // Q8_1 triple requires all same quant type. For Q4_K_M models
-      // where V uses Q6_K, this falls through to pair (Q+K) + individual (V).
+      quant_types[i] = plan.raw.quant_type;
+      output_cols[i] = plan.output_cols;
+      if (!FusedQuantGemm::ShouldUseFusedPath(
+              plan.raw.quant_type,
+              FusedDispatchGeometry{M, plan.output_cols, K, 1, true,
+                                    norm_weight != nullptr})) {
+        return false;
+      }
+      pair_ready[i] = FusedQuantGemm::ShouldUseFusedPath(
+          plan.raw.quant_type,
+          FusedDispatchGeometry{M, plan.output_cols, K, 2, true,
+                                norm_weight != nullptr});
+      if constexpr (GroupSize == 3) {
+        triple_ready[i] = FusedQuantGemm::ShouldUseFusedPath(
+            plan.raw.quant_type,
+            FusedDispatchGeometry{M, plan.output_cols, K, 3, true,
+                                  norm_weight != nullptr});
+      }
     }
-  }
 
-  if (grouping.grouped_count == 2) {
-    const int i = grouping.indices[0];
-    const int j = grouping.indices[1];
-    const std::array<PackedProjectionSpec, 2> grouped = {{
-        {plans[i].raw, plans[i].output, plans[i].output_cols},
-        {plans[j].raw, plans[j].output, plans[j].output_cols},
-    }};
-    if (FusedQuantGemm::GemvQ8_1Pair(grouped, act_q8_1, M, K, stream, policy,
-                                     selected_op)) {
-      completed[i] = true;
-      completed[j] = true;
-      used_grouped = true;
-    }
-  }
-
-  for (size_t i = 0; i < GroupSize; ++i) {
-    if (completed[i]) {
-      continue;
-    }
-    const auto &plan = plans[i];
-    if (!FusedQuantGemm::GemvQ8_1(plan.raw, act_q8_1, plan.output, M,
-                                  plan.output_cols, K, stream, policy)) {
-      return false;
-    }
-  }
-  if constexpr (GroupSize > 1) {
-    if (used_grouped && grouping.grouped_count < static_cast<int>(GroupSize)) {
-      LogPackedGemmPath("q8_1_mixed", "using Q8_1 grouped+individual GEMV");
-    } else if (used_grouped) {
-      LogPackedGemmPath("q8_1_pair", "using Q8_1 grouped pair GEMV");
+    // Quantize activations: fused RmsNorm+Quantize or standalone quantize
+    if (norm_weight) {
+      FusedQuantGemm::FusedRmsNormQuantizeQ8_1(input, norm_weight, act_q8_1, M,
+                                               K, eps, stream);
     } else {
-      LogPackedGemmPath("q8_1_individual",
-                        "using Q8_1 individual GEMV (shared quantization)");
+      FusedQuantGemm::QuantizeRowQ8_1(input, act_q8_1, M, K, stream);
     }
-  }
-  return true;
+
+    const auto grouping = SelectSharedActivationGrouping(
+        quant_types, output_cols, pair_ready, triple_ready);
+    std::array<bool, GroupSize> completed{};
+    bool used_grouped = false;
+
+    if constexpr (GroupSize == 3) {
+      if (grouping.grouped_count == 3) {
+        const std::array<PackedProjectionSpec, 3> grouped = {{
+            {plans[0].raw, plans[0].output, plans[0].output_cols},
+            {plans[1].raw, plans[1].output, plans[1].output_cols},
+            {plans[2].raw, plans[2].output, plans[2].output_cols},
+        }};
+        if (FusedQuantGemm::GemvQ8_1Triple(grouped, act_q8_1, M, K, stream,
+                                           policy)) {
+          LogPackedGemmPath("q8_1_triple", "using Q8_1 grouped triple GEMV");
+          return true;
+        }
+        // Q8_1 triple requires all same quant type. For Q4_K_M models
+        // where V uses Q6_K, this falls through to pair (Q+K) + individual (V).
+      }
+    }
+
+    if (grouping.grouped_count == 2) {
+      const int i = grouping.indices[0];
+      const int j = grouping.indices[1];
+      const std::array<PackedProjectionSpec, 2> grouped = {{
+          {plans[i].raw, plans[i].output, plans[i].output_cols},
+          {plans[j].raw, plans[j].output, plans[j].output_cols},
+      }};
+      if (FusedQuantGemm::GemvQ8_1Pair(grouped, act_q8_1, M, K, stream, policy,
+                                       selected_op)) {
+        completed[i] = true;
+        completed[j] = true;
+        used_grouped = true;
+      }
+    }
+
+    for (size_t i = 0; i < GroupSize; ++i) {
+      if (completed[i]) {
+        continue;
+      }
+      const auto &plan = plans[i];
+      if (!FusedQuantGemm::GemvQ8_1(plan.raw, act_q8_1, plan.output, M,
+                                    plan.output_cols, K, stream, policy)) {
+        return false;
+      }
+    }
+    if constexpr (GroupSize > 1) {
+      if (used_grouped &&
+          grouping.grouped_count < static_cast<int>(GroupSize)) {
+        LogPackedGemmPath("q8_1_mixed", "using Q8_1 grouped+individual GEMV");
+      } else if (used_grouped) {
+        LogPackedGemmPath("q8_1_pair", "using Q8_1 grouped pair GEMV");
+      } else {
+        LogPackedGemmPath("q8_1_individual",
+                          "using Q8_1 individual GEMV (shared quantization)");
+      }
+    }
+    return true;
   } // if constexpr (std::is_same_v<T, half>)
 }
 
@@ -639,6 +646,83 @@ bool TryMmqSiluMulGemv<half>(const MmqWeightInfo &weight, const half *gate,
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name,
                       "using MMQ-style tiled fused SwiGLU down-proj");
+  }
+  return ok;
+}
+
+// MMA tensor-core down-proj (S7): Q6_K only, raw row-major weights, D4
+// activations. Returns false (unchanged dispatch) unless
+// INFERFLUX_CUDA_MMQ_MMA=1 — callers fall through to the dp4a MMQ tier.
+template <typename T>
+bool TryMmqMmaSiluMul(const QuantizedWeightInfo &, const T *, const T *, T *,
+                      void *, float *, int, int, int, cudaStream_t,
+                      const char * = nullptr,
+                      const NativeExecutionPolicy * = nullptr) {
+  return false;
+}
+
+template <>
+bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
+                            const half *up, half *output, void *act_mmq,
+                            float *partials, int M, int N, int K,
+                            cudaStream_t stream, const char *proj_name,
+                            const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+  if (!policy_ref.enable_mmq_mma || !weight.data || !gate || !up || !output ||
+      !act_mmq || !partials || M <= 0 || N <= 0 || K <= 0 ||
+      M < policy_ref.mmq_mma_min_batch ||
+      static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
+      weight.quant_type !=
+          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
+    return false;
+  }
+
+  FusedQuantGemm::SiluMulQuantizeQ8_1Mmq(
+      gate, up, static_cast<runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq), M,
+      K, stream);
+  const bool ok = FusedQuantGemm::DownProjMmqMma(
+      weight, static_cast<const runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq),
+      output, M, N, K, partials, stream, policy);
+  if (ok && proj_name) {
+    LogPackedGemmPath(proj_name, "using MMA tensor-core Q6_K down-proj");
+  }
+  return ok;
+}
+
+// MMA down-proj for already-activated input (the fused gate+up+SiLU
+// kernel produced d_ffn_gate_): quantize to D4 then MMA. Q6_K only,
+// INFERFLUX_CUDA_MMQ_MMA=1, M <= mmq_mma_max_batch.
+template <typename T>
+bool TryMmqMmaGemv(const QuantizedWeightInfo &, const T *, T *, void *, float *,
+                   int, int, int, cudaStream_t, const char * = nullptr,
+                   const NativeExecutionPolicy * = nullptr) {
+  return false;
+}
+
+template <>
+bool TryMmqMmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
+                         half *output, void *act_mmq, float *partials, int M,
+                         int N, int K, cudaStream_t stream,
+                         const char *proj_name,
+                         const NativeExecutionPolicy *policy) {
+  const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+  if (!policy_ref.enable_mmq_mma || !weight.data || !input || !output ||
+      !act_mmq || !partials || M <= 0 || N <= 0 || K <= 0 ||
+      M < policy_ref.mmq_mma_min_batch || M > policy_ref.mmq_mma_max_batch ||
+      static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
+      weight.quant_type !=
+          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
+    return false;
+  }
+
+  FusedQuantGemm::QuantizeRowQ8_1Mmq(
+      input, static_cast<runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq), M, K,
+      stream);
+  const bool ok = FusedQuantGemm::DownProjMmqMma(
+      weight, static_cast<const runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq),
+      output, M, N, K, partials, stream, policy);
+  if (ok && proj_name) {
+    LogPackedGemmPath(proj_name, "using MMA tensor-core Q6_K down-proj");
   }
   return ok;
 }
@@ -699,7 +783,7 @@ bool TryQ8_1GemvAccum<half>(const QuantizedWeightInfo &raw, const half *input,
 
   FusedQuantGemm::QuantizeRowQ8_1(input, act_q8_1, M, K, stream);
   bool ok = FusedQuantGemm::GemvQ8_1Accum(raw, act_q8_1, output, M, N, K,
-                                           stream, policy);
+                                          stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using Q8_1 accumulate GEMV");
   }
@@ -709,9 +793,9 @@ bool TryQ8_1GemvAccum<half>(const QuantizedWeightInfo &raw, const half *input,
 // FP32 accumulate: quantize half input, GEMV-accum into float* output.
 // Used for O-proj and down-proj when FP32 residual stream is active.
 bool TryQ8_1GemvAccumF32(const QuantizedWeightInfo &raw, const half *input,
-                          float *output, void *act_q8_1, int M, int N, int K,
-                          cudaStream_t stream, const char *proj_name = nullptr,
-                          const NativeExecutionPolicy *policy = nullptr) {
+                         float *output, void *act_q8_1, int M, int N, int K,
+                         cudaStream_t stream, const char *proj_name = nullptr,
+                         const NativeExecutionPolicy *policy = nullptr) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_gemv_accumulate ||
       Q81ActivationsDisabled(policy_ref) || !raw.data || !input || !output ||
@@ -724,7 +808,7 @@ bool TryQ8_1GemvAccumF32(const QuantizedWeightInfo &raw, const half *input,
 
   FusedQuantGemm::QuantizeRowQ8_1(input, act_q8_1, M, K, stream);
   bool ok = FusedQuantGemm::GemvQ8_1AccumF32(raw, act_q8_1, output, M, N, K,
-                                               stream, policy);
+                                             stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using Q8_1 FP32 accumulate GEMV");
   }
@@ -732,8 +816,8 @@ bool TryQ8_1GemvAccumF32(const QuantizedWeightInfo &raw, const half *input,
 }
 
 template <typename T>
-bool TryQ8_1GemvPrequantized(const QuantizedWeightInfo &, const void *, T *, int,
-                             int, int, cudaStream_t,
+bool TryQ8_1GemvPrequantized(const QuantizedWeightInfo &, const void *, T *,
+                             int, int, int, cudaStream_t,
                              const char * = nullptr,
                              const NativeExecutionPolicy * = nullptr) {
   return false;
@@ -757,15 +841,14 @@ bool TryQ8_1GemvPrequantized<half>(const QuantizedWeightInfo &raw,
   const bool ok =
       FusedQuantGemm::GemvQ8_1(raw, act_q8_1, output, M, N, K, stream, policy);
   if (ok && proj_name) {
-    LogPackedGemmPath(proj_name,
-                      "using pre-quantized Q8_1 GEMV from epilogue");
+    LogPackedGemmPath(proj_name, "using pre-quantized Q8_1 GEMV from epilogue");
   }
   return ok;
 }
 
 template <typename T>
-bool TryQ8_1GemvPrequantizedAccum(const QuantizedWeightInfo &, const void *, T *,
-                                  int, int, int, cudaStream_t,
+bool TryQ8_1GemvPrequantizedAccum(const QuantizedWeightInfo &, const void *,
+                                  T *, int, int, int, cudaStream_t,
                                   const char * = nullptr,
                                   const NativeExecutionPolicy * = nullptr) {
   return false;
@@ -798,12 +881,10 @@ bool TryQ8_1GemvPrequantizedAccum<half>(const QuantizedWeightInfo &raw,
 }
 
 // FP32 variant of pre-quantized accumulate
-bool TryQ8_1GemvPrequantizedAccumF32(const QuantizedWeightInfo &raw,
-                                      const void *act_q8_1, float *output,
-                                      int M, int N, int K,
-                                      cudaStream_t stream,
-                                      const char *proj_name = nullptr,
-                                      const NativeExecutionPolicy *policy = nullptr) {
+bool TryQ8_1GemvPrequantizedAccumF32(
+    const QuantizedWeightInfo &raw, const void *act_q8_1, float *output, int M,
+    int N, int K, cudaStream_t stream, const char *proj_name = nullptr,
+    const NativeExecutionPolicy *policy = nullptr) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_gemv_accumulate ||
       Q81ActivationsDisabled(policy_ref) || !raw.data || !act_q8_1 || !output ||
@@ -815,7 +896,7 @@ bool TryQ8_1GemvPrequantizedAccumF32(const QuantizedWeightInfo &raw,
   }
 
   const bool ok = FusedQuantGemm::GemvQ8_1AccumF32(raw, act_q8_1, output, M, N,
-                                                     K, stream, policy);
+                                                   K, stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name,
                       "using pre-quantized Q8_1 FP32 accumulate GEMV");
@@ -823,22 +904,23 @@ bool TryQ8_1GemvPrequantizedAccumF32(const QuantizedWeightInfo &raw,
   return ok;
 }
 
-// Accumulate-mode Q8_1 SiLU+Mul+GEMV for down-proj: residual += down(silu(gate)*up)
+// Accumulate-mode Q8_1 SiLU+Mul+GEMV for down-proj: residual +=
+// down(silu(gate)*up)
 template <typename T>
-bool TryQ8_1SiluMulGemvAccum(const QuantizedWeightInfo &, const T *,
-                              const T *, T *, void *, int, int, int,
-                              cudaStream_t, const char * = nullptr,
-                              const NativeExecutionPolicy * = nullptr) {
+bool TryQ8_1SiluMulGemvAccum(const QuantizedWeightInfo &, const T *, const T *,
+                             T *, void *, int, int, int, cudaStream_t,
+                             const char * = nullptr,
+                             const NativeExecutionPolicy * = nullptr) {
   return false;
 }
 
 template <>
 bool TryQ8_1SiluMulGemvAccum<half>(const QuantizedWeightInfo &raw,
-                                    const half *gate, const half *up,
-                                    half *output, void *act_q8_1, int M, int N,
-                                    int K, cudaStream_t stream,
-                                    const char *proj_name,
-                                    const NativeExecutionPolicy *policy) {
+                                   const half *gate, const half *up,
+                                   half *output, void *act_q8_1, int M, int N,
+                                   int K, cudaStream_t stream,
+                                   const char *proj_name,
+                                   const NativeExecutionPolicy *policy) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_gemv_accumulate ||
       Q81ActivationsDisabled(policy_ref) || !raw.data || !gate || !up ||
@@ -851,7 +933,7 @@ bool TryQ8_1SiluMulGemvAccum<half>(const QuantizedWeightInfo &raw,
 
   FusedQuantGemm::SiluMulQuantizeQ8_1(gate, up, act_q8_1, M, K, stream);
   bool ok = FusedQuantGemm::GemvQ8_1Accum(raw, act_q8_1, output, M, N, K,
-                                           stream, policy);
+                                          stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using Q8_1 accumulate SiLU+Mul+GEMV");
   }
@@ -860,11 +942,11 @@ bool TryQ8_1SiluMulGemvAccum<half>(const QuantizedWeightInfo &raw,
 
 // FP32 accumulate SiLU+Mul+GEMV: silu(gate)*up → Q8_1 → GEMV-accum into float*
 bool TryQ8_1SiluMulGemvAccumF32(const QuantizedWeightInfo &raw,
-                                 const half *gate, const half *up,
-                                 float *output, void *act_q8_1, int M, int N,
-                                 int K, cudaStream_t stream,
-                                 const char *proj_name = nullptr,
-                                 const NativeExecutionPolicy *policy = nullptr) {
+                                const half *gate, const half *up, float *output,
+                                void *act_q8_1, int M, int N, int K,
+                                cudaStream_t stream,
+                                const char *proj_name = nullptr,
+                                const NativeExecutionPolicy *policy = nullptr) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_gemv_accumulate ||
       Q81ActivationsDisabled(policy_ref) || !raw.data || !gate || !up ||
@@ -877,7 +959,7 @@ bool TryQ8_1SiluMulGemvAccumF32(const QuantizedWeightInfo &raw,
 
   FusedQuantGemm::SiluMulQuantizeQ8_1(gate, up, act_q8_1, M, K, stream);
   bool ok = FusedQuantGemm::GemvQ8_1AccumF32(raw, act_q8_1, output, M, N, K,
-                                               stream, policy);
+                                             stream, policy);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using Q8_1 FP32 accumulate SiLU+Mul+GEMV");
   }
@@ -905,8 +987,8 @@ bool TryMmqGemvPrequantized<half>(const MmqWeightInfo &weight,
   const bool ok = FusedQuantGemm::DownProjMmq(weight, act_q8_1, output, M, N, K,
                                               stream, policy);
   if (ok && proj_name) {
-    LogPackedGemmPath(
-        proj_name, "using MMQ-style tiled Q8_1 down-proj from epilogue");
+    LogPackedGemmPath(proj_name,
+                      "using MMQ-style tiled Q8_1 down-proj from epilogue");
   }
   return ok;
 }
@@ -1034,8 +1116,7 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   const size_t up_elems = gate_elems;
 
   // Verify aliasing fits: attention buffers must fit inside FFN buffers.
-  if (q_elems + k_elems + v_elems > gate_elems ||
-      attn_out_elems > up_elems) {
+  if (q_elems + k_elems + v_elems > gate_elems || attn_out_elems > up_elems) {
     // Fallback: allocate separately (no aliasing possible for this model).
     if (!alloc(&d_q_, q_elems))
       return false;
@@ -1104,11 +1185,30 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
     const size_t blocks_per_row =
         (static_cast<size_t>(intermediate_size_) + 31) / 32;
     const size_t q8_1_block_size = 36;
-    err =
-        cudaMalloc(&d_ffn_act_q8_1_, rows * blocks_per_row * q8_1_block_size);
+    err = cudaMalloc(&d_ffn_act_q8_1_, rows * blocks_per_row * q8_1_block_size);
     if (err != cudaSuccess)
       return false;
     device_workspace_bytes_ += rows * blocks_per_row * q8_1_block_size;
+  }
+  // MMA down-proj (S7) buffers: group-major D4 activations sized for the
+  // larger projection K, and fp32 partials for the deterministic K-split
+  // reduce (kMmqMmaMaxSplits x rows x hidden floats). Only touched when
+  // INFERFLUX_CUDA_MMQ_MMA=1.
+  {
+    using namespace runtime::cuda::native;
+    const int max_dim = std::max(hidden_size_, intermediate_size_);
+    err = cudaMalloc(&d_act_q8_1_mmq_, static_cast<size_t>(max_dim / 128) *
+                                           rows * sizeof(BlockQ8_1Mmq));
+    if (err != cudaSuccess)
+      return false;
+    device_workspace_bytes_ +=
+        static_cast<size_t>(max_dim / 128) * rows * sizeof(BlockQ8_1Mmq);
+    err = cudaMalloc(&d_mma_partials_, static_cast<size_t>(kMmqMmaMaxSplits) *
+                                           rows * hidden_size_ * sizeof(float));
+    if (err != cudaSuccess)
+      return false;
+    device_workspace_bytes_ += static_cast<size_t>(kMmqMmaMaxSplits) * rows *
+                               hidden_size_ * sizeof(float);
   }
   // Logits buffer sized for batched decode: [max_batch_size, vocab_size]
   if (!alloc(&d_logits_typed_,
@@ -1142,7 +1242,8 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   //       + partial_max [B * num_kv_heads * splits * gqa_ratio] float
   //       + partial_sum [B * num_kv_heads * splits * gqa_ratio] float
   {
-    constexpr int kSplits = 8; // must match kFlashDecodeSplits in flash_attention.cu
+    constexpr int kSplits =
+        8; // must match kFlashDecodeSplits in flash_attention.cu
     const int gqa_ratio = (num_kv_heads_ > 0 && num_heads_ > num_kv_heads_)
                               ? (num_heads_ / num_kv_heads_)
                               : 1;
@@ -1168,9 +1269,9 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
     const size_t f32_bytes = rows * hidden_size_ * sizeof(float);
     err = cudaMalloc(&d_residual_f32_, f32_bytes);
     if (err != cudaSuccess) {
-      log::Warn("llama_forward",
-                "FP32 residual alloc failed (" + std::to_string(f32_bytes) +
-                    " bytes), falling back to FP16 residual");
+      log::Warn("llama_forward", "FP32 residual alloc failed (" +
+                                     std::to_string(f32_bytes) +
+                                     " bytes), falling back to FP16 residual");
       d_residual_f32_ = nullptr;
       fp32_residual_active_ = false;
     } else {
@@ -1186,9 +1287,9 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
       } else {
         fp32_residual_active_ = true;
         device_workspace_bytes_ += f32_bytes;
-        log::Info("llama_forward",
-                  "FP32 residual enabled (" + std::to_string(f32_bytes / 1024) +
-                      " KB)");
+        log::Info("llama_forward", "FP32 residual enabled (" +
+                                       std::to_string(f32_bytes / 1024) +
+                                       " KB)");
       }
     }
   }
@@ -1258,6 +1359,14 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
     d_residual_f32_ = nullptr;
     fp32_residual_active_ = false;
   }
+  if (d_act_q8_1_mmq_) {
+    cudaFree(d_act_q8_1_mmq_);
+    d_act_q8_1_mmq_ = nullptr;
+  }
+  if (d_mma_partials_) {
+    cudaFree(d_mma_partials_);
+    d_mma_partials_ = nullptr;
+  }
 
   if (d_token_ids_) {
     cudaFree(d_token_ids_);
@@ -1322,7 +1431,8 @@ bool LlamaForwardTyped<T>::Initialize(
   const char *capture_env = std::getenv("INFERFLUX_DEBUG_ATTENTION_TENSORS");
   if (capture_env && std::string(capture_env) == "1") {
     capture_attention_tensors_ = true;
-    log::Info("llama_forward", "Attention tensor capture enabled - performance will be severely degraded");
+    log::Info("llama_forward", "Attention tensor capture enabled - performance "
+                               "will be severely degraded");
   }
 
   // Match scratch buffer sizing to KV cache limits (not model max)
@@ -1393,9 +1503,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   {
     NVTX_SCOPE("Embedding");
     if (fp32_residual_active_) {
-      err = cuda_kernel::EmbeddingLookupF32<T>(embed, d_token_ids_,
-                                                d_residual_f32_, seq_len,
-                                                hidden_size_, stream_);
+      err = cuda_kernel::EmbeddingLookupF32<T>(
+          embed, d_token_ids_, d_residual_f32_, seq_len, hidden_size_, stream_);
     } else {
       err = cuda_kernel::EmbeddingLookup<T>(embed, d_token_ids_, d_residual_,
                                             seq_len, hidden_size_, stream_);
@@ -1427,8 +1536,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     // downstream projection paths see pre-computed half input.
     if (fp32_residual_active_ && !input_norm_precomputed) {
       err = cuda_kernel::RmsNormMixed<T>(d_residual_f32_, input_norm,
-                                          d_norm_out_, seq_len, hidden_size_,
-                                          rms_norm_eps_, stream_);
+                                         d_norm_out_, seq_len, hidden_size_,
+                                         rms_norm_eps_, stream_);
       if (err != cudaSuccess) {
         log::Error("llama_forward",
                    "FP32 RmsNormMixed (pre-attn) failed at layer " +
@@ -1438,8 +1547,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       input_norm_precomputed = true;
     }
     const T *qkv_input = input_norm_precomputed
-                              ? static_cast<const T *>(d_norm_out_)
-                              : static_cast<const T *>(d_residual_);
+                             ? static_cast<const T *>(d_norm_out_)
+                             : static_cast<const T *>(d_residual_);
     const T *qkv_norm = input_norm_precomputed ? nullptr : input_norm;
     input_norm_precomputed = false;
     {
@@ -1582,7 +1691,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
           reinterpret_cast<const T *>(weights_->LayerKProjBias(layer));
       const T *v_bias =
           reinterpret_cast<const T *>(weights_->LayerVProjBias(layer));
-      if (q_bias && k_bias && v_bias && execution_policy_.enable_fused_bias_add) {
+      if (q_bias && k_bias && v_bias &&
+          execution_policy_.enable_fused_bias_add) {
         // Fused triple bias add: 1 kernel instead of 3
         err = cuda_kernel::BiasAddTriple<T>(
             d_q_, d_k_new_, d_v_new_, q_bias, k_bias, v_bias, seq_len,
@@ -1633,9 +1743,12 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
     // Capture QKV tensors for debugging
     if (capture_attention_tensors_) {
-      SnapshotTensorToDevice("qkv_q", layer, d_q_, {seq_len, num_heads_, head_dim_});
-      SnapshotTensorToDevice("qkv_k", layer, d_k_new_, {seq_len, num_kv_heads_, head_dim_});
-      SnapshotTensorToDevice("qkv_v", layer, d_v_new_, {seq_len, num_kv_heads_, head_dim_});
+      SnapshotTensorToDevice("qkv_q", layer, d_q_,
+                             {seq_len, num_heads_, head_dim_});
+      SnapshotTensorToDevice("qkv_k", layer, d_k_new_,
+                             {seq_len, num_kv_heads_, head_dim_});
+      SnapshotTensorToDevice("qkv_v", layer, d_v_new_,
+                             {seq_len, num_kv_heads_, head_dim_});
     }
 
     // 4e: RoPE in-place
@@ -1654,15 +1767,17 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
     // Capture Q,K after RoPE for debugging
     if (capture_attention_tensors_) {
-      SnapshotTensorToDevice("rope_q", layer, d_q_, {seq_len, num_heads_, head_dim_});
-      SnapshotTensorToDevice("rope_k", layer, d_k_new_, {seq_len, num_kv_heads_, head_dim_});
+      SnapshotTensorToDevice("rope_q", layer, d_q_,
+                             {seq_len, num_heads_, head_dim_});
+      SnapshotTensorToDevice("rope_k", layer, d_k_new_,
+                             {seq_len, num_kv_heads_, head_dim_});
     }
 
     // 4f: KV cache append (works for both dense and hybrid KV cache)
     {
       NVTX_SCOPE("KV_Append");
-      err = kv_cache_->AppendVoid(layer, sequence_id, n_past, seq_len,
-                                  d_k_new_, d_v_new_, stream_);
+      err = kv_cache_->AppendVoid(layer, sequence_id, n_past, seq_len, d_k_new_,
+                                  d_v_new_, stream_);
       if (err != cudaSuccess) {
         log::Error("llama_forward", "KV cache append failed");
         return false;
@@ -1693,7 +1808,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
     // Capture attention output for debugging
     if (capture_attention_tensors_) {
-      SnapshotTensorToDevice("attn_out", layer, d_attn_out_, {seq_len, hidden_size_});
+      SnapshotTensorToDevice("attn_out", layer, d_attn_out_,
+                             {seq_len, hidden_size_});
     }
 
     // 4h: O projection + residual accumulation
@@ -1706,35 +1822,34 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       if constexpr (std::is_same_v<T, half>) {
         if (fp32_residual_active_ &&
             TryQ8_1GemvAccumF32(o_raw, d_attn_out_, d_residual_f32_,
-                                 d_act_q8_1_, seq_len, hidden_size_,
-                                 num_heads_ * head_dim_, stream_, "o_proj",
-                                 &execution_policy_)) {
+                                d_act_q8_1_, seq_len, hidden_size_,
+                                num_heads_ * head_dim_, stream_, "o_proj",
+                                &execution_policy_)) {
           o_accumulated = true;
         }
       }
       if (!o_accumulated && !fp32_residual_active_ &&
           TryQ8_1GemvAccum<T>(o_raw, d_attn_out_, d_residual_, d_act_q8_1_,
-                               seq_len, hidden_size_, num_heads_ * head_dim_,
-                               stream_, "o_proj", &execution_policy_)) {
+                              seq_len, hidden_size_, num_heads_ * head_dim_,
+                              stream_, "o_proj", &execution_policy_)) {
         o_accumulated = true;
       }
       if (!o_accumulated &&
-          !TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_, d_act_q8_1_,
-                                  seq_len, hidden_size_, num_heads_ * head_dim_,
-                                  stream_, "o_proj", &execution_policy_) &&
-                 !TryPackedGemv<T>(
-                     o_raw, d_attn_out_, d_norm_out_, d_packed_activation_,
-                     d_packed_activation_scales_, seq_len, hidden_size_,
-                     num_heads_ * head_dim_, stream_, "o_proj",
-                     &execution_policy_)) {
+          !TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_, d_act_q8_1_, seq_len,
+                          hidden_size_, num_heads_ * head_dim_, stream_,
+                          "o_proj", &execution_policy_) &&
+          !TryPackedGemv<T>(o_raw, d_attn_out_, d_norm_out_,
+                            d_packed_activation_, d_packed_activation_scales_,
+                            seq_len, hidden_size_, num_heads_ * head_dim_,
+                            stream_, "o_proj", &execution_policy_)) {
         // cuBLAS fallback
         const T *o_proj =
             reinterpret_cast<const T *>(weights_->LayerOProj(layer));
         if (fp32_residual_active_) {
           // Write to d_norm_out_ (half), then ResidualAddMixed into FP32
           if (!gemm_->GemmTyped<T>(seq_len, hidden_size_,
-                                    num_heads_ * head_dim_, d_attn_out_, o_proj,
-                                    d_norm_out_)) {
+                                   num_heads_ * head_dim_, d_attn_out_, o_proj,
+                                   d_norm_out_)) {
             log::Error("llama_forward", "O projection failed");
             return false;
           }
@@ -1768,7 +1883,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
             err = cuda_kernel::ResidualAddMixed<T>(
                 d_residual_f32_, d_norm_out_, seq_len * hidden_size_, stream_);
             if (err != cudaSuccess) {
-              log::Error("llama_forward", "FP32 ResidualAddMixed (attn) failed");
+              log::Error("llama_forward",
+                         "FP32 ResidualAddMixed (attn) failed");
               return false;
             }
           }
@@ -1813,8 +1929,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     // FP32 residual: pre-normalize if needed
     if (fp32_residual_active_ && !ffn_norm_precomputed) {
       err = cuda_kernel::RmsNormMixed<T>(d_residual_f32_, post_attn_norm,
-                                          d_norm_out_, seq_len, hidden_size_,
-                                          rms_norm_eps_, stream_);
+                                         d_norm_out_, seq_len, hidden_size_,
+                                         rms_norm_eps_, stream_);
       if (err != cudaSuccess) {
         log::Error("llama_forward",
                    "FP32 RmsNormMixed (post-attn) failed at layer " +
@@ -1850,9 +1966,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
               seq_len, intermediate_size_, hidden_size_,
               [&]() {
                 return TryQ8_1ProjectionGroup(
-                    ffn_plans, ffn_input, ffn_norm_weight, d_act_q8_1_,
-                    seq_len, hidden_size_, rms_norm_eps_, stream_,
-                    &execution_policy_, ffn_selected_op);
+                    ffn_plans, ffn_input, ffn_norm_weight, d_act_q8_1_, seq_len,
+                    hidden_size_, rms_norm_eps_, stream_, &execution_policy_,
+                    ffn_selected_op);
               },
               [&]() {
                 return TryPackedProjectionGroup(
@@ -1968,10 +2084,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                   down_accumulated = true;
                   return true;
                 }
-                return TryMmqSiluMulGemv<T>(
-                    down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_, d_act_q8_1_,
-                    seq_len, hidden_size_, intermediate_size_, stream_,
-                    "down_proj", &execution_policy_);
+                return TryMmqMmaSiluMul<T>(
+                           down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                           d_act_q8_1_mmq_, d_mma_partials_, seq_len,
+                           hidden_size_, intermediate_size_, stream_,
+                           "down_proj", &execution_policy_) ||
+                       TryMmqSiluMulGemv<T>(down_mmq, d_ffn_gate_, d_ffn_up_,
+                                            d_ffn_down_, d_act_q8_1_, seq_len,
+                                            hidden_size_, intermediate_size_,
+                                            stream_, "down_proj",
+                                            &execution_policy_);
               },
               [&]() {
                 return TryQ8_1SiluMulGemv<T>(
@@ -2032,8 +2154,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                   if (fp32_residual_active_) {
                     // Write to d_ffn_down_ (half), residual add handled below
                     if (!gemm_->GemmTyped<T>(seq_len, hidden_size_,
-                                              intermediate_size_, d_ffn_gate_,
-                                              down_proj, d_ffn_down_)) {
+                                             intermediate_size_, d_ffn_gate_,
+                                             down_proj, d_ffn_down_)) {
                       log::Error("llama_forward", "Down projection failed");
                       return false;
                     }
@@ -2065,8 +2187,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       if (fp32_residual_active_) {
         if (execution_policy_.enable_fused_residual_norm &&
             layer < num_layers_ - 1) {
-          const T *next_input_norm = reinterpret_cast<const T *>(
-              weights_->LayerInputNorm(layer + 1));
+          const T *next_input_norm =
+              reinterpret_cast<const T *>(weights_->LayerInputNorm(layer + 1));
           err = cuda_kernel::ResidualAddRmsNormMixed<T>(
               d_residual_f32_, d_ffn_down_, next_input_norm, d_norm_out_,
               seq_len, hidden_size_, rms_norm_eps_, stream_);
@@ -2088,8 +2210,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       } else {
         if (execution_policy_.enable_fused_residual_norm &&
             layer < num_layers_ - 1) {
-          const T *next_input_norm = reinterpret_cast<const T *>(
-              weights_->LayerInputNorm(layer + 1));
+          const T *next_input_norm =
+              reinterpret_cast<const T *>(weights_->LayerInputNorm(layer + 1));
           err = cuda_kernel::ResidualAddRmsNorm<T>(
               d_residual_, d_ffn_down_, next_input_norm, d_norm_out_, seq_len,
               hidden_size_, rms_norm_eps_, stream_);
@@ -2117,9 +2239,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     NVTX_SCOPE("LM_Head");
     T *last_hidden = d_residual_ + (seq_len - 1) * hidden_size_;
     float *last_hidden_f32 =
-        fp32_residual_active_
-            ? d_residual_f32_ + (seq_len - 1) * hidden_size_
-            : nullptr;
+        fp32_residual_active_ ? d_residual_f32_ + (seq_len - 1) * hidden_size_
+                              : nullptr;
     const T *final_norm = reinterpret_cast<const T *>(weights_->FinalNorm());
 
     // Try Q8_1 fused RmsNorm+Quantize+GEMV for LM head first
@@ -2157,8 +2278,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       // For FP32 residual, pre-normalize to half d_norm_out_ for downstream
       if (fp32_residual_active_) {
         err = cuda_kernel::RmsNormMixed<T>(last_hidden_f32, final_norm,
-                                            d_norm_out_, 1, hidden_size_,
-                                            rms_norm_eps_, stream_);
+                                           d_norm_out_, 1, hidden_size_,
+                                           rms_norm_eps_, stream_);
         if (err != cudaSuccess) {
           log::Error("llama_forward", "FP32 final RmsNormMixed failed");
           return false;
@@ -2168,10 +2289,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     if (!lm_q8_1_ok &&
         (fp32_residual_active_ ||
          !TryPackedRmsNormGemv<T>(lm_raw, last_hidden, final_norm, d_norm_out_,
-                                   d_packed_activation_,
-                                   d_packed_activation_scales_, d_logits_typed_,
-                                   1, vocab_size_, hidden_size_, rms_norm_eps_,
-                                   stream_, "lm_head", &execution_policy_))) {
+                                  d_packed_activation_,
+                                  d_packed_activation_scales_, d_logits_typed_,
+                                  1, vocab_size_, hidden_size_, rms_norm_eps_,
+                                  stream_, "lm_head", &execution_policy_))) {
       // Fallback: standalone RmsNorm + GEMV/cuBLAS
       if (!fp32_residual_active_) {
         err = cuda_kernel::RmsNorm<T>(last_hidden, final_norm, d_norm_out_, 1,
@@ -2182,8 +2303,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
         }
       }
       // d_norm_out_ now has the normalized half output (both paths)
-      if (!TryQ8_1Gemv<T>(lm_raw, d_norm_out_, d_logits_typed_, d_act_q8_1_,
-                          1, vocab_size_, hidden_size_, stream_, "lm_head",
+      if (!TryQ8_1Gemv<T>(lm_raw, d_norm_out_, d_logits_typed_, d_act_q8_1_, 1,
+                          vocab_size_, hidden_size_, stream_, "lm_head",
                           &execution_policy_)) {
         const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
         if (!gemm_->GemmTyped<T>(1, vocab_size_, hidden_size_, d_norm_out_,
@@ -2242,9 +2363,9 @@ template <typename T> void LlamaForwardTyped<T>::WarmWeightCaches() {
   // Clear any CUDA errors from pre-warm (e.g., missing bias tensors return
   // nullptr without error, but some edge-case allocations may fail).
   cudaGetLastError();
-  log::Info("llama_forward",
-            "Weight caches pre-warmed (" + std::to_string(num_layers_) +
-                " layers, including LM head)");
+  log::Info("llama_forward", "Weight caches pre-warmed (" +
+                                 std::to_string(num_layers_) +
+                                 " layers, including LM head)");
 }
 
 template <typename T>
@@ -2258,13 +2379,11 @@ bool LlamaForwardTyped<T>::BatchForwardReplay(float *d_logits, int batch_size) {
   return err == cudaSuccess;
 }
 
-template <typename T>
-int *LlamaForwardTyped<T>::GetBatchMetaDevice() {
+template <typename T> int *LlamaForwardTyped<T>::GetBatchMetaDevice() {
   return d_batch_meta_;
 }
 
-template <typename T>
-int LlamaForwardTyped<T>::GetMaxBatchSize() const {
+template <typename T> int LlamaForwardTyped<T>::GetMaxBatchSize() const {
   return max_batch_size_;
 }
 
@@ -2550,9 +2669,9 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       NVTX_SCOPE("Embedding");
       const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
       if (fp32_residual_active_) {
-        err = cuda_kernel::EmbeddingLookupF32<T>(
-            embed, d_batch_token_ids_, d_residual_f32_, B, hidden_size_,
-            stream_);
+        err = cuda_kernel::EmbeddingLookupF32<T>(embed, d_batch_token_ids_,
+                                                 d_residual_f32_, B,
+                                                 hidden_size_, stream_);
       } else {
         err = cuda_kernel::EmbeddingLookup<T>(
             embed, d_batch_token_ids_, d_residual_, B, hidden_size_, stream_);
@@ -2580,12 +2699,12 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       // FP32 residual: pre-normalize from FP32 → half d_norm_out_
       if (fp32_residual_active_ && !input_norm_precomputed) {
         cuda_kernel::RmsNormMixed<T>(d_residual_f32_, input_norm, d_norm_out_,
-                                      B, hidden_size_, rms_norm_eps_, stream_);
+                                     B, hidden_size_, rms_norm_eps_, stream_);
         input_norm_precomputed = true;
       }
       const T *qkv_input = input_norm_precomputed
-                                ? static_cast<const T *>(d_norm_out_)
-                                : static_cast<const T *>(d_residual_);
+                               ? static_cast<const T *>(d_norm_out_)
+                               : static_cast<const T *>(d_residual_);
       const T *qkv_norm = input_norm_precomputed ? nullptr : input_norm;
       input_norm_precomputed = false;
       {
@@ -2758,9 +2877,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
               kv_cache_->KvStride(), rope_freq_base_, stream_, rope_type_);
         }
         if (err != cudaSuccess) {
-          log::Error("llama_forward",
-                     "FusedRoPEKvAppend launch failed: " +
-                         std::string(cudaGetErrorString(err)));
+          log::Error("llama_forward", "FusedRoPEKvAppend launch failed: " +
+                                          std::string(cudaGetErrorString(err)));
           return false;
         }
         pt.rope_ms += pt.Mark();
@@ -2810,8 +2928,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       {
         NVTX_SCOPE("FlashAttention2");
         float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
-        if (kv_contiguous && policy.enable_attn_split_kv &&
-            d_attn_partials_) {
+        if (kv_contiguous && policy.enable_attn_split_kv && d_attn_partials_) {
           // Split geometry is fixed at capture time from the configured
           // context length so graph replays stay shape-static; per-sequence
           // kv_lens early-exit empty chunks on device.
@@ -2843,15 +2960,15 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
           const int ksplits = std::min(
               kMaxAttnKSplits, std::max(1, (max_seq_len_ + chunk - 1) / chunk));
           err = cuda_kernel::FlashDecodeMultiSeqStridedSplit<T>(
-              d_q_, kv_buffer, d_attn_out_, d_attn_partials_,
-              d_batch_seq_ids_, d_batch_kv_lens_, layer, B, num_heads_,
-              num_kv_heads_, head_dim_, kv_cache_->SlotStride(),
-              kv_cache_->LayerStride(), kv_cache_->KvStride(), attn_scale,
-              qsplit, chunk, ksplits, stream_);
+              d_q_, kv_buffer, d_attn_out_, d_attn_partials_, d_batch_seq_ids_,
+              d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_, head_dim_,
+              kv_cache_->SlotStride(), kv_cache_->LayerStride(),
+              kv_cache_->KvStride(), attn_scale, qsplit, chunk, ksplits,
+              stream_);
         } else if (kv_contiguous) {
           err = cuda_kernel::FlashDecodeMultiSeqStrided<T>(
-              d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_,
-              d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_, head_dim_,
+              d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_, d_batch_kv_lens_,
+              layer, B, num_heads_, num_kv_heads_, head_dim_,
               kv_cache_->SlotStride(), kv_cache_->LayerStride(),
               kv_cache_->KvStride(), attn_scale, stream_,
               d_attn_split_workspace_, attn_split_workspace_bytes_);
@@ -2860,13 +2977,11 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
               d_q_, d_slot_base_ptrs, d_attn_out_, d_batch_seq_ids_,
               d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_, head_dim_,
               kv_cache_->LayerStride(), kv_cache_->KvStride(), attn_scale,
-              stream_, d_attn_split_workspace_,
-              attn_split_workspace_bytes_);
+              stream_, d_attn_split_workspace_, attn_split_workspace_bytes_);
         }
         if (err != cudaSuccess) {
-          log::Error("llama_forward",
-                     "FlashDecode launch failed: " +
-                         std::string(cudaGetErrorString(err)));
+          log::Error("llama_forward", "FlashDecode launch failed: " +
+                                          std::string(cudaGetErrorString(err)));
           return false;
         }
       }
@@ -2883,28 +2998,26 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         if constexpr (std::is_same_v<T, half>) {
           if (fp32_residual_active_ &&
               TryQ8_1GemvAccumF32(o_raw, d_attn_out_, d_residual_f32_,
-                                   d_act_q8_1_, B, hidden_size_,
-                                   num_heads_ * head_dim_, stream_, "o_proj",
-                                   active_policy)) {
+                                  d_act_q8_1_, B, hidden_size_,
+                                  num_heads_ * head_dim_, stream_, "o_proj",
+                                  active_policy)) {
             o_accumulated = true;
           }
         }
         if (!o_accumulated && !fp32_residual_active_ &&
-            TryQ8_1GemvAccum<T>(o_raw, d_attn_out_, d_residual_, d_act_q8_1_,
-                                 B, hidden_size_, num_heads_ * head_dim_,
-                                 stream_, "o_proj", active_policy)) {
+            TryQ8_1GemvAccum<T>(o_raw, d_attn_out_, d_residual_, d_act_q8_1_, B,
+                                hidden_size_, num_heads_ * head_dim_, stream_,
+                                "o_proj", active_policy)) {
           o_accumulated = true;
         }
         if (!o_accumulated &&
-            !TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_,
-                                    d_act_q8_1_, B, hidden_size_,
-                                    num_heads_ * head_dim_, stream_, "o_proj",
-                                    active_policy) &&
-                   !TryPackedGemv<T>(
-                       o_raw, d_attn_out_, d_norm_out_, d_packed_activation_,
-                       d_packed_activation_scales_, B, hidden_size_,
-                       num_heads_ * head_dim_, stream_, "o_proj",
-                       active_policy)) {
+            !TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_, d_act_q8_1_, B,
+                            hidden_size_, num_heads_ * head_dim_, stream_,
+                            "o_proj", active_policy) &&
+            !TryPackedGemv<T>(o_raw, d_attn_out_, d_norm_out_,
+                              d_packed_activation_, d_packed_activation_scales_,
+                              B, hidden_size_, num_heads_ * head_dim_, stream_,
+                              "o_proj", active_policy)) {
           if (capturing) {
             capture_abort = true;
             return false;
@@ -2913,7 +3026,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
               reinterpret_cast<const T *>(weights_->LayerOProj(layer));
           if (fp32_residual_active_) {
             gemm_->GemmTyped<T>(B, hidden_size_, num_heads_ * head_dim_,
-                                 d_attn_out_, o_proj, d_norm_out_);
+                                d_attn_out_, o_proj, d_norm_out_);
           } else {
             gemm_->GemmTypedAccum<T>(B, hidden_size_, num_heads_ * head_dim_,
                                      d_attn_out_, o_proj, d_residual_);
@@ -2935,10 +3048,9 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             }
           } else {
             if (active_policy->enable_fused_residual_norm) {
-              cuda_kernel::ResidualAddRmsNorm<T>(d_residual_, d_norm_out_,
-                                                  post_attn_norm, d_norm_out_,
-                                                  B, hidden_size_,
-                                                  rms_norm_eps_, stream_);
+              cuda_kernel::ResidualAddRmsNorm<T>(
+                  d_residual_, d_norm_out_, post_attn_norm, d_norm_out_, B,
+                  hidden_size_, rms_norm_eps_, stream_);
               ffn_norm_precomputed = true;
             } else {
               cuda_kernel::ResidualAdd<T>(d_residual_, d_norm_out_,
@@ -2956,10 +3068,10 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             // pre-normalize from FP32 instead and set flags.
             if (fp32_residual_active_) {
               cuda_kernel::RmsNormMixed<T>(d_residual_f32_, post_attn_norm,
-                                            d_norm_out_, B, hidden_size_,
-                                            rms_norm_eps_, stream_);
+                                           d_norm_out_, B, hidden_size_,
+                                           rms_norm_eps_, stream_);
               FusedQuantGemm::QuantizeRowQ8_1(d_norm_out_, d_act_q8_1_, B,
-                                               hidden_size_, stream_);
+                                              hidden_size_, stream_);
             } else {
               cuda_kernel::FinishNormQuantQ8_1(
                   d_residual_, post_attn_norm, d_norm_out_, d_act_q8_1_, B,
@@ -2976,14 +3088,15 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       // FP32 residual: pre-normalize if needed
       if (fp32_residual_active_ && !ffn_norm_precomputed) {
         cuda_kernel::RmsNormMixed<T>(d_residual_f32_, post_attn_norm,
-                                      d_norm_out_, B, hidden_size_,
-                                      rms_norm_eps_, stream_);
+                                     d_norm_out_, B, hidden_size_,
+                                     rms_norm_eps_, stream_);
         ffn_norm_precomputed = true;
       }
       const T *ffn_input = ffn_norm_precomputed
                                ? static_cast<const T *>(d_norm_out_)
                                : static_cast<const T *>(d_residual_);
-      const T *ffn_norm_weight = ffn_norm_precomputed ? nullptr : post_attn_norm;
+      const T *ffn_norm_weight =
+          ffn_norm_precomputed ? nullptr : post_attn_norm;
       bool down_accumulated = false;
       bool fused_gate_up_silu = false;
       bool gate_up_q81_epilogue = false;
@@ -3165,8 +3278,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
               if (gate_up_q81_epilogue) {
                 down_ok = TryQ8_1GemvPrequantizedAccumF32(
                     down_raw, d_ffn_act_q8_1_, d_residual_f32_, B, hidden_size_,
-                    intermediate_size_, stream_, "down_proj",
-                    active_policy);
+                    intermediate_size_, stream_, "down_proj", active_policy);
               }
               if (!down_ok) {
                 down_ok = TryQ8_1GemvAccumF32(
@@ -3183,14 +3295,20 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                   intermediate_size_, stream_, "down_proj", active_policy);
             }
             if (!down_ok) {
-              down_ok = TryQ8_1GemvAccum<T>(
-                  down_raw, d_ffn_gate_, d_residual_, d_act_q8_1_, B,
-                  hidden_size_, intermediate_size_, stream_, "down_proj",
-                  active_policy);
+              down_ok = TryQ8_1GemvAccum<T>(down_raw, d_ffn_gate_, d_residual_,
+                                            d_act_q8_1_, B, hidden_size_,
+                                            intermediate_size_, stream_,
+                                            "down_proj", active_policy);
             }
           }
           if (down_ok) {
             down_accumulated = true;
+          }
+          if (!down_ok) {
+            down_ok = TryMmqMmaGemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
+                                       d_act_q8_1_mmq_, d_mma_partials_, B,
+                                       hidden_size_, intermediate_size_,
+                                       stream_, "down_proj", active_policy);
           }
           if (!down_ok) {
             if (gate_up_q81_epilogue) {
@@ -3199,10 +3317,10 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                   intermediate_size_, stream_, "down_proj", active_policy);
             }
             if (!down_ok) {
-              down_ok = TryQ8_1Gemv<T>(
-                  down_raw, d_ffn_gate_, d_ffn_down_, d_act_q8_1_, B,
-                  hidden_size_, intermediate_size_, stream_, "down_proj",
-                  active_policy);
+              down_ok = TryQ8_1Gemv<T>(down_raw, d_ffn_gate_, d_ffn_down_,
+                                       d_act_q8_1_, B, hidden_size_,
+                                       intermediate_size_, stream_, "down_proj",
+                                       active_policy);
             }
           }
           if (!down_ok) {
@@ -3212,10 +3330,10 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                   intermediate_size_, stream_, "down_proj", active_policy);
             }
             if (!down_ok) {
-              down_ok = TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
-                                      d_act_q8_1_, B, hidden_size_,
-                                      intermediate_size_, stream_, "down_proj",
-                                      active_policy);
+              down_ok =
+                  TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_, d_act_q8_1_,
+                                B, hidden_size_, intermediate_size_, stream_,
+                                "down_proj", active_policy);
             }
           }
           if (!down_ok) {
@@ -3227,7 +3345,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                 reinterpret_cast<const T *>(weights_->LayerDownProj(layer));
             if (fp32_residual_active_) {
               gemm_->GemmTyped<T>(B, hidden_size_, intermediate_size_,
-                                   d_ffn_gate_, down_proj, d_ffn_down_);
+                                  d_ffn_gate_, down_proj, d_ffn_down_);
               // Non-accumulated — residual add handled below
             } else {
               gemm_->GemmTypedAccum<T>(B, hidden_size_, intermediate_size_,
@@ -3236,57 +3354,63 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             }
           }
         } else {
-        const auto down_selected_op = SelectInferfluxCudaDownProjOperator(
-            down_raw, down_mmq, InferfluxCudaDispatchPhase::kDecode,
-            FusedDispatchGeometry{B, hidden_size_, intermediate_size_, 1, true,
-                                  false},
-            g_allow_fused_quantized_matmul, *active_policy);
-        NativeDownProjExecutionSummary down_summary;
-        if (!ExecuteInferfluxCudaDownProjStage(
-                down_selected_op, "decode", ProjectionQuantLabel(down_raw),
-                down_raw.quant_type, B, hidden_size_, intermediate_size_,
-                [&]() {
-                  // Try accumulate SiLU+GEMV: writes directly to residual
-                  if constexpr (std::is_same_v<T, half>) {
-                    if (fp32_residual_active_ &&
-                        TryQ8_1SiluMulGemvAccumF32(
-                            down_raw, d_ffn_gate_, d_ffn_up_, d_residual_f32_,
+          const auto down_selected_op = SelectInferfluxCudaDownProjOperator(
+              down_raw, down_mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{B, hidden_size_, intermediate_size_, 1,
+                                    true, false},
+              g_allow_fused_quantized_matmul, *active_policy);
+          NativeDownProjExecutionSummary down_summary;
+          if (!ExecuteInferfluxCudaDownProjStage(
+                  down_selected_op, "decode", ProjectionQuantLabel(down_raw),
+                  down_raw.quant_type, B, hidden_size_, intermediate_size_,
+                  [&]() {
+                    // Preserve the validated residual-accumulation paths
+                    // before falling back to an output-producing MMA/MMQ path.
+                    if constexpr (std::is_same_v<T, half>) {
+                      if (fp32_residual_active_ &&
+                          TryQ8_1SiluMulGemvAccumF32(
+                              down_raw, d_ffn_gate_, d_ffn_up_, d_residual_f32_,
+                              d_act_q8_1_, B, hidden_size_, intermediate_size_,
+                              stream_, "down_proj", active_policy)) {
+                        down_accumulated = true;
+                        return true;
+                      }
+                    }
+                    if (!fp32_residual_active_ &&
+                        TryQ8_1SiluMulGemvAccum<T>(
+                            down_raw, d_ffn_gate_, d_ffn_up_, d_residual_,
                             d_act_q8_1_, B, hidden_size_, intermediate_size_,
                             stream_, "down_proj", active_policy)) {
                       down_accumulated = true;
                       return true;
                     }
-                  }
-                  if (!fp32_residual_active_ &&
-                      TryQ8_1SiluMulGemvAccum<T>(
-                          down_raw, d_ffn_gate_, d_ffn_up_, d_residual_,
-                          d_act_q8_1_, B, hidden_size_, intermediate_size_,
-                          stream_, "down_proj", active_policy)) {
-                    down_accumulated = true;
-                    return true;
-                  }
-                  return TryMmqSiluMulGemv<T>(
-                      down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-                      d_act_q8_1_, B, hidden_size_, intermediate_size_, stream_,
-                      "down_proj", active_policy);
-                },
-                [&]() {
-                  return TryQ8_1SiluMulGemv<T>(
-                      down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-                      d_act_q8_1_, B, hidden_size_, intermediate_size_, stream_,
-                      "down_proj", active_policy);
-                },
-                [&]() {
-                  return TryPackedSiluMulGemv<T>(
-                      down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-                      d_packed_activation_, d_packed_activation_scales_, B,
-                      hidden_size_, intermediate_size_, stream_, "down_proj",
-                      active_policy);
-                },
-                [&]() {
-                  cuda_kernel::SiluMul<T>(d_ffn_gate_, d_ffn_up_, d_ffn_gate_,
-                                          B * intermediate_size_, stream_);
-                  pt.ffn_silu_ms += pt.Mark();
+                    return TryMmqMmaSiluMul<T>(down_raw, d_ffn_gate_, d_ffn_up_,
+                                               d_ffn_down_, d_act_q8_1_mmq_,
+                                               d_mma_partials_, B, hidden_size_,
+                                               intermediate_size_, stream_,
+                                               "down_proj", active_policy) ||
+                           TryMmqSiluMulGemv<T>(
+                               down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                               d_act_q8_1_, B, hidden_size_, intermediate_size_,
+                               stream_, "down_proj", active_policy);
+                  },
+                  [&]() {
+                    return TryQ8_1SiluMulGemv<T>(
+                        down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                        d_act_q8_1_, B, hidden_size_, intermediate_size_,
+                        stream_, "down_proj", active_policy);
+                  },
+                  [&]() {
+                    return TryPackedSiluMulGemv<T>(
+                        down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                        d_packed_activation_, d_packed_activation_scales_, B,
+                        hidden_size_, intermediate_size_, stream_, "down_proj",
+                        active_policy);
+                  },
+                  [&]() {
+                    cuda_kernel::SiluMul<T>(d_ffn_gate_, d_ffn_up_, d_ffn_gate_,
+                                            B * intermediate_size_, stream_);
+                    pt.ffn_silu_ms += pt.Mark();
 
                     bool down_ok = false;
                     if (down_selected_op ==
@@ -3361,17 +3485,16 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             input_norm_precomputed = true;
           } else {
             cuda_kernel::ResidualAddMixed<T>(d_residual_f32_, d_ffn_down_,
-                                              B * hidden_size_, stream_);
+                                             B * hidden_size_, stream_);
           }
         } else {
           if (active_policy->enable_fused_residual_norm &&
               layer < num_layers_ - 1) {
             const T *next_input_norm = reinterpret_cast<const T *>(
                 weights_->LayerInputNorm(layer + 1));
-            cuda_kernel::ResidualAddRmsNorm<T>(d_residual_, d_ffn_down_,
-                                                next_input_norm, d_norm_out_, B,
-                                                hidden_size_, rms_norm_eps_,
-                                                stream_);
+            cuda_kernel::ResidualAddRmsNorm<T>(
+                d_residual_, d_ffn_down_, next_input_norm, d_norm_out_, B,
+                hidden_size_, rms_norm_eps_, stream_);
             input_norm_precomputed = true;
           } else {
             cuda_kernel::ResidualAdd<T>(d_residual_, d_ffn_down_,
@@ -3385,14 +3508,14 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         if (down_accumulated && !input_norm_precomputed &&
             active_policy->enable_fused_gemv_norm_quant_epilogue &&
             d_act_q8_1_ && layer < num_layers_ - 1) {
-          const T *next_input_norm = reinterpret_cast<const T *>(
-              weights_->LayerInputNorm(layer + 1));
+          const T *next_input_norm =
+              reinterpret_cast<const T *>(weights_->LayerInputNorm(layer + 1));
           if (fp32_residual_active_) {
             cuda_kernel::RmsNormMixed<T>(d_residual_f32_, next_input_norm,
-                                          d_norm_out_, B, hidden_size_,
-                                          rms_norm_eps_, stream_);
+                                         d_norm_out_, B, hidden_size_,
+                                         rms_norm_eps_, stream_);
             FusedQuantGemm::QuantizeRowQ8_1(d_norm_out_, d_act_q8_1_, B,
-                                             hidden_size_, stream_);
+                                            hidden_size_, stream_);
           } else {
             cuda_kernel::FinishNormQuantQ8_1(
                 d_residual_, next_input_norm, d_norm_out_, d_act_q8_1_, B,
@@ -3437,8 +3560,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         // Pre-normalize from FP32 for fallback paths
         if (fp32_residual_active_) {
           cuda_kernel::RmsNormMixed<T>(d_residual_f32_, final_norm, d_norm_out_,
-                                        B, hidden_size_, rms_norm_eps_,
-                                        stream_);
+                                       B, hidden_size_, rms_norm_eps_, stream_);
         }
       }
       if (!lm_q8_1_ok &&
@@ -3501,10 +3623,9 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         graph_enabled_ = false;
       } else {
         graph_warmup_remaining_ = 2;
-        log::Info("llama_forward",
-                  "CUDA graph capture aborted, will retry (" +
-                      std::to_string(graph_retry_remaining_) +
-                      " attempts remaining)");
+        log::Info("llama_forward", "CUDA graph capture aborted, will retry (" +
+                                       std::to_string(graph_retry_remaining_) +
+                                       " attempts remaining)");
       }
       return RunCompute();
     }
@@ -3535,10 +3656,9 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       graph_enabled_ = false;
     } else {
       graph_warmup_remaining_ = 2;
-      log::Warn("llama_forward",
-                "CUDA graph capture failed, will retry (" +
-                    std::to_string(graph_retry_remaining_) +
-                    " attempts remaining)");
+      log::Warn("llama_forward", "CUDA graph capture failed, will retry (" +
+                                     std::to_string(graph_retry_remaining_) +
+                                     " attempts remaining)");
     }
     return RunCompute();
   }
@@ -3586,12 +3706,12 @@ bool LlamaForwardTyped<T>::EmbedForward(const std::vector<int> &token_ids,
     cudaError_t err;
     if (fp32_residual_active_) {
       err = cuda_kernel::RmsNormMixed<T>(d_residual_f32_, final_norm_w,
-                                          d_norm_out_, seq_len, hidden_size_,
-                                          rms_norm_eps_, stream_);
+                                         d_norm_out_, seq_len, hidden_size_,
+                                         rms_norm_eps_, stream_);
     } else {
       err = cuda_kernel::RmsNorm<T>(d_residual_, final_norm_w, d_norm_out_,
-                                     seq_len, hidden_size_, rms_norm_eps_,
-                                     stream_);
+                                    seq_len, hidden_size_, rms_norm_eps_,
+                                    stream_);
     }
     if (err != cudaSuccess) {
       log::Error("llama_forward", "EmbedForward: final norm failed");
@@ -3640,18 +3760,20 @@ void LlamaForwardTyped<T>::SnapshotTensorToDevice(
   float *d_snapshot = nullptr;
   cudaError_t err = cudaMalloc(&d_snapshot, num_elements * sizeof(float));
   if (err != cudaSuccess) {
-    log::Error("llama_forward", "Failed to allocate device memory for tensor snapshot");
+    log::Error("llama_forward",
+               "Failed to allocate device memory for tensor snapshot");
     return;
   }
 
   // Convert and copy tensor data
-  if constexpr (std::is_same_v<TensorT, half> || std::is_same_v<TensorT, __nv_bfloat16>) {
+  if constexpr (std::is_same_v<TensorT, half> ||
+                std::is_same_v<TensorT, __nv_bfloat16>) {
     // Convert half/bfloat16 to float
     const int block_size = 256;
     const int num_blocks = (num_elements + block_size - 1) / block_size;
 
     cuda_kernel::ConvertHalfToFloat(device_ptr, d_snapshot, num_elements,
-                                     stream_);
+                                    stream_);
   } else if constexpr (std::is_same_v<TensorT, float>) {
     // Already float, just copy
     cudaMemcpy(d_snapshot, device_ptr, num_elements * sizeof(float),
@@ -3681,7 +3803,8 @@ AttentionTensorData LlamaForwardTyped<T>::CaptureAttentionTensors() {
   // Check if attention tensor capture is enabled
   const char *env_var = std::getenv("INFERFLUX_DEBUG_ATTENTION_TENSORS");
   if (!env_var || std::string(env_var) != "1") {
-    result.error = "Attention tensor capture not enabled. Set INFERFLUX_DEBUG_ATTENTION_TENSORS=1";
+    result.error = "Attention tensor capture not enabled. Set "
+                   "INFERFLUX_DEBUG_ATTENTION_TENSORS=1";
     return result;
   }
 

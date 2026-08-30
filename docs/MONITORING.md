@@ -57,6 +57,23 @@ Reference knobs: [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 
 ## 4) CUDA and Native Quick Reference
 
+### MMA tensor-core down-proj (S7, experimental)
+
+`INFERFLUX_CUDA_MMQ_MMA=1` routes Q6_K down-projection through the
+`mma.sync` int8 kernel with deterministic K-split. Confirm engagement through:
+
+- The one-time `fused_quant_gemm: Using MMA tensor-core Q6_K down-proj`
+  INFO log (set `INFERFLUX_BENCH_LOG_LEVEL=info` in the comparison harness).
+- The per-forward `llama_forward: down_proj: using MMA tensor-core Q6_K
+  down-proj` INFO log.
+- Dispatch traces with CUDA graphs disabled:
+  `INFERFLUX_DISABLE_CUDA_GRAPH=1 INFERFLUX_BENCH_DISPATCH_TRACE=1`.
+
+CUDA graph replay bypasses host-side operator counters, so use the log signals
+above during graph-enabled runs. Cap eligible batches with
+`INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` (default `16`); the partials buffer is sized
+for `max_batch` rows.
+
 | Signal | What to check | How to read it |
 |---|---|---|
 | Selected provider | `/v1/models` or `inferctl models --json` | `provider=llama_cpp` with `fallback=true` means native is not serving the request path |

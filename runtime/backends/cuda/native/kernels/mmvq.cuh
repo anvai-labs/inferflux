@@ -2,6 +2,8 @@
 
 #include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 
+#include <array>
+
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <type_traits>
@@ -48,9 +50,9 @@ constexpr int calc_mmvq_threads(int ncols) {
 
 template <int ncols>
 __global__ void inferflux_mmvq_q4k(const block_q4_k *__restrict__ weight,
-                   const block_q8_1 *__restrict__ act_q8_1,
-                   half *__restrict__ output, int N, int K,
-                   int M) {
+                                   const block_q8_1 *__restrict__ act_q8_1,
+                                   half *__restrict__ output, int N, int K,
+                                   int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -74,7 +76,8 @@ __global__ void inferflux_mmvq_q4k(const block_q4_k *__restrict__ weight,
     // Load weight data ONCE from global memory (use __ldg for read-only cache)
     const block_q4_k &b = wrow[blk];
     const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
-    const float dmin = __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
+    const float dmin =
+        __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
 
     unsigned char sc_lo, m_lo, sc_hi, m_hi;
     if ((lane & 7) == 0) {
@@ -161,10 +164,11 @@ __global__ void inferflux_mmvq_q4k(const block_q4_k *__restrict__ weight,
 // Identical to inferflux_mmvq_q4k but adds bias in writeback, eliminating
 // a separate BiasAdd kernel launch. Bias may be nullptr (no-op).
 template <int ncols>
-__global__ void inferflux_mmvq_q4k_bias(
-    const block_q4_k *__restrict__ weight,
-    const block_q8_1 *__restrict__ act_q8_1, half *__restrict__ output,
-    const half *__restrict__ bias, int N, int K, int M) {
+__global__ void inferflux_mmvq_q4k_bias(const block_q4_k *__restrict__ weight,
+                                        const block_q8_1 *__restrict__ act_q8_1,
+                                        half *__restrict__ output,
+                                        const half *__restrict__ bias, int N,
+                                        int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -185,8 +189,7 @@ __global__ void inferflux_mmvq_q4k_bias(
 
   for (int blk = warp_id; blk < num_super_blocks; blk += kMmvqWarps) {
     const block_q4_k &b = wrow[blk];
-    const float d =
-        __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+    const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
     const float dmin =
         __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
 
@@ -205,8 +208,7 @@ __global__ void inferflux_mmvq_q4k_bias(
     const float d_sc_hi = d * static_cast<float>(sc_hi);
     const float dm_m_hi = dmin * static_cast<float>(m_hi);
 
-    int qs4 =
-        __ldg(reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
+    int qs4 = __ldg(reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
     int q_lo4 = qs4 & 0x0F0F0F0F;
     int q_hi4 = (qs4 >> 4) & 0x0F0F0F0F;
 
@@ -275,13 +277,14 @@ __global__ void inferflux_mmvq_q4k_bias(
 // Q4_K × Q8_1 MMVQ accumulate variant (adds to existing output)
 // OutputT = half (default): read-modify-write via __half2float/__float2half
 // OutputT = float: pure FP32 accumulation for FP32 residual stream
-// UseAtomic = true (default): use atomicAdd for FP32 output (safe for residual accumulation)
-// UseAtomic = false: direct write (faster, only safe when no race conditions)
+// UseAtomic = true (default): use atomicAdd for FP32 output (safe for residual
+// accumulation) UseAtomic = false: direct write (faster, only safe when no race
+// conditions)
 template <int ncols, typename OutputT = half, bool UseAtomic = true>
-__global__ void inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
+__global__ void
+inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
                          const block_q8_1 *__restrict__ act_q8_1,
-                         OutputT *__restrict__ output, int N, int K,
-                         int M) {
+                         OutputT *__restrict__ output, int N, int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -305,7 +308,8 @@ __global__ void inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
     // Load weight data ONCE from global memory (use __ldg for read-only cache)
     const block_q4_k &b = wrow[blk];
     const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
-    const float dmin = __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
+    const float dmin =
+        __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
 
     unsigned char sc_lo, m_lo, sc_hi, m_hi;
     if ((lane & 7) == 0) {
@@ -394,7 +398,8 @@ __global__ void inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
           output[row * N + out_idx] = sum;
         }
       } else {
-        output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+        output[row * N + out_idx] =
+            __float2half(sum + __half2float(output[row * N + out_idx]));
       }
     }
   }
@@ -406,9 +411,9 @@ __global__ void inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
 
 template <int ncols>
 __global__ void inferflux_mmvq_q6k(const block_q6_k *__restrict__ weight,
-                   const block_q8_1 *__restrict__ act_q8_1,
-                   half *__restrict__ output, int N, int K,
-                   int M) {
+                                   const block_q8_1 *__restrict__ act_q8_1,
+                                   half *__restrict__ output, int N, int K,
+                                   int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -468,9 +473,9 @@ __global__ void inferflux_mmvq_q6k(const block_q6_k *__restrict__ weight,
       int dot_hi = Dp4aS8(vi_hi, x_hi, 0);
 
       acc[c] += d * (static_cast<float>(b.scales[sc_lo]) * d8_lo *
-                          static_cast<float>(dot_lo) +
-                      static_cast<float>(b.scales[sc_hi]) * d8_hi *
-                          static_cast<float>(dot_hi));
+                         static_cast<float>(dot_lo) +
+                     static_cast<float>(b.scales[sc_hi]) * d8_hi *
+                         static_cast<float>(dot_hi));
     }
   }
 
@@ -510,9 +515,9 @@ __global__ void inferflux_mmvq_q6k(const block_q6_k *__restrict__ weight,
 // instruction count and leveraging the read-only data cache more effectively.
 template <int ncols>
 __global__ void inferflux_mmvq_q6k_vec(const block_q6_k *__restrict__ weight,
-                                        const block_q8_1 *__restrict__ act_q8_1,
-                                        half *__restrict__ output, int N, int K,
-                                        int M) {
+                                       const block_q8_1 *__restrict__ act_q8_1,
+                                       half *__restrict__ output, int N, int K,
+                                       int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -539,8 +544,7 @@ __global__ void inferflux_mmvq_q6k_vec(const block_q6_k *__restrict__ weight,
   for (int blk = warp_id; blk < num_super_blocks; blk += kMmvqWarps) {
     const block_q6_k &b = wrow[blk];
     // Use __ldg for read-only texture cache path on all weight loads
-    const float d =
-        __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+    const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
 
     // Use LoadPackedInt32Unaligned for ql/qh (not 4-byte aligned within
     // the Q6_K struct). __ldg with int* requires alignment and causes
@@ -618,10 +622,10 @@ __global__ void inferflux_mmvq_q6k_vec(const block_q6_k *__restrict__ weight,
 
 // Q6_K × Q8_1 MMVQ accumulate variant (adds to existing output)
 template <int ncols, typename OutputT = half, bool UseAtomic = true>
-__global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
-                          const block_q8_1 *__restrict__ act_q8_1,
-                          OutputT *__restrict__ output, int N, int K,
-                          int M) {
+__global__ void
+inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
+                         const block_q8_1 *__restrict__ act_q8_1,
+                         OutputT *__restrict__ output, int N, int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -681,9 +685,9 @@ __global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
       int dot_hi = Dp4aS8(vi_hi, x_hi, 0);
 
       acc[c] += d * (static_cast<float>(b.scales[sc_lo]) * d8_lo *
-                          static_cast<float>(dot_lo) +
-                      static_cast<float>(b.scales[sc_hi]) * d8_hi *
-                          static_cast<float>(dot_hi));
+                         static_cast<float>(dot_lo) +
+                     static_cast<float>(b.scales[sc_hi]) * d8_hi *
+                         static_cast<float>(dot_hi));
     }
   }
 
@@ -722,7 +726,8 @@ __global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
           output[row * N + out_idx] = sum;
         }
       } else {
-        output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+        output[row * N + out_idx] =
+            __float2half(sum + __half2float(output[row * N + out_idx]));
       }
     }
   }
@@ -730,10 +735,11 @@ __global__ void inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
 
 // Q6_K x Q8_1 MMVQ accumulate variant with vectorized weight loads.
 template <int ncols, typename OutputT = half, bool UseAtomic = true>
-__global__ void inferflux_mmvq_q6k_accum_vec(
-    const block_q6_k *__restrict__ weight,
-    const block_q8_1 *__restrict__ act_q8_1, OutputT *__restrict__ output, int N,
-    int K, int M) {
+__global__ void
+inferflux_mmvq_q6k_accum_vec(const block_q6_k *__restrict__ weight,
+                             const block_q8_1 *__restrict__ act_q8_1,
+                             OutputT *__restrict__ output, int N, int K,
+                             int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -759,8 +765,7 @@ __global__ void inferflux_mmvq_q6k_accum_vec(
 
   for (int blk = warp_id; blk < num_super_blocks; blk += kMmvqWarps) {
     const block_q6_k &b = wrow[blk];
-    const float d =
-        __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+    const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
 
     const int ql4 =
         LoadPackedInt32Unaligned(&b.ql[g * 64 + sub_base * 32 + e_base]);
@@ -923,10 +928,10 @@ __global__ void inferflux_mmvq_q8_0(const block_q8_0 *__restrict__ weight,
 
 // Q8_0 × Q8_1 MMVQ accumulate variant (adds to existing output)
 template <int ncols, typename OutputT = half, bool UseAtomic = true>
-__global__ void inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
-                                           const block_q8_1 *__restrict__ act_q8_1,
-                                           OutputT *__restrict__ output, int N, int K,
-                                           int M) {
+__global__ void
+inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
+                          const block_q8_1 *__restrict__ act_q8_1,
+                          OutputT *__restrict__ output, int N, int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -1007,7 +1012,8 @@ __global__ void inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
           output[row * N + out_idx] = sum;
         }
       } else {
-        output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+        output[row * N + out_idx] =
+            __float2half(sum + __half2float(output[row * N + out_idx]));
       }
     }
   }
@@ -1098,10 +1104,10 @@ __global__ void inferflux_mmvq_q8k(const block_q8_k *__restrict__ weight,
 
 // Q8_K × Q8_1 MMVQ accumulate variant (adds to existing output)
 template <int ncols, typename OutputT = half, bool UseAtomic = true>
-__global__ void inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
-                                          const block_q8_1 *__restrict__ act_q8_1,
-                                          OutputT *__restrict__ output, int N, int K,
-                                          int M) {
+__global__ void
+inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
+                         const block_q8_1 *__restrict__ act_q8_1,
+                         OutputT *__restrict__ output, int N, int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -1180,7 +1186,8 @@ __global__ void inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
           output[row * N + out_idx] = sum;
         }
       } else {
-        output[row * N + out_idx] = __float2half(sum + __half2float(output[row * N + out_idx]));
+        output[row * N + out_idx] =
+            __float2half(sum + __half2float(output[row * N + out_idx]));
       }
     }
   }
@@ -1195,9 +1202,10 @@ __global__ void inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
 // ============================================================================
 
 template <int ncols, int nprojs>
-__global__ void inferflux_mmvq_q4k_group(
-    PackedProjectionGroupParams<block_q4_k, nprojs> params,
-    const block_q8_1 *__restrict__ act_q8_1, int K, int M) {
+__global__ void
+inferflux_mmvq_q4k_group(PackedProjectionGroupParams<block_q4_k, nprojs> params,
+                         const block_q8_1 *__restrict__ act_q8_1, int K,
+                         int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -1245,10 +1253,10 @@ __global__ void inferflux_mmvq_q4k_group(
         if (out_idx >= params.output_cols[p])
           continue;
 
-        const block_q4_k *wrow =
-            params.weights[p] + out_idx * num_super_blocks;
+        const block_q4_k *wrow = params.weights[p] + out_idx * num_super_blocks;
         const block_q4_k &b = wrow[blk];
-        const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+        const float d =
+            __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
         const float dmin =
             __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
 
@@ -1270,10 +1278,8 @@ __global__ void inferflux_mmvq_q4k_group(
         int dot_hi = Dp4aS8(q_hi4, x_hi4, 0);
 
         acc[p][c] +=
-            d * static_cast<float>(sc_lo) * d8_lo *
-                static_cast<float>(dot_lo) +
-            d * static_cast<float>(sc_hi) * d8_hi *
-                static_cast<float>(dot_hi);
+            d * static_cast<float>(sc_lo) * d8_lo * static_cast<float>(dot_lo) +
+            d * static_cast<float>(sc_hi) * d8_hi * static_cast<float>(dot_hi);
         if ((lane & 7) == 0) {
           acc[p][c] -= dmin * static_cast<float>(m_lo) * s_lo +
                        dmin * static_cast<float>(m_hi) * s_hi;
@@ -1326,9 +1332,10 @@ __global__ void inferflux_mmvq_q4k_group(
 }
 
 template <int ncols, int nprojs>
-__global__ void inferflux_mmvq_q6k_group(
-    PackedProjectionGroupParams<block_q6_k, nprojs> params,
-    const block_q8_1 *__restrict__ act_q8_1, int K, int M) {
+__global__ void
+inferflux_mmvq_q6k_group(PackedProjectionGroupParams<block_q6_k, nprojs> params,
+                         const block_q8_1 *__restrict__ act_q8_1, int K,
+                         int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -1377,10 +1384,10 @@ __global__ void inferflux_mmvq_q6k_group(
         if (out_idx >= params.output_cols[p])
           continue;
 
-        const block_q6_k *wrow =
-            params.weights[p] + out_idx * num_super_blocks;
+        const block_q6_k *wrow = params.weights[p] + out_idx * num_super_blocks;
         const block_q6_k &b = wrow[blk];
-        const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+        const float d =
+            __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
 
         const int ql4 =
             LoadPackedInt32Unaligned(&b.ql[g * 64 + sub_base * 32 + e_base]);
@@ -1453,15 +1460,12 @@ __global__ void inferflux_mmvq_q6k_group(
 // Select ncols template at runtime based on batch size M.
 // ============================================================================
 
-template <typename BlockT,
-          void (*Kernel1)(const BlockT *, const block_q8_1 *, half *, int, int,
-                          int),
-          void (*Kernel2)(const BlockT *, const block_q8_1 *, half *, int, int,
-                          int),
-          void (*Kernel4)(const BlockT *, const block_q8_1 *, half *, int, int,
-                          int),
-          void (*Kernel8)(const BlockT *, const block_q8_1 *, half *, int, int,
-                          int)>
+template <
+    typename BlockT,
+    void (*Kernel1)(const BlockT *, const block_q8_1 *, half *, int, int, int),
+    void (*Kernel2)(const BlockT *, const block_q8_1 *, half *, int, int, int),
+    void (*Kernel4)(const BlockT *, const block_q8_1 *, half *, int, int, int),
+    void (*Kernel8)(const BlockT *, const block_q8_1 *, half *, int, int, int)>
 bool DispatchMmvq(const void *data, const void *act_q8_1, half *output, int M,
                   int N, int K, cudaStream_t stream) {
   auto *w = static_cast<const BlockT *>(data);
@@ -1521,15 +1525,12 @@ bool DispatchMmvqBias(const void *data, const void *act_q8_1, half *output,
   return false;
 }
 
-template <typename BlockT,
-          void (*Kernel1)(const BlockT *, const block_q8_1 *, half *, int, int,
-                          int),
-          void (*Kernel2)(const BlockT *, const block_q8_1 *, half *, int, int,
-                          int),
-          void (*Kernel4)(const BlockT *, const block_q8_1 *, half *, int, int,
-                          int),
-          void (*Kernel8)(const BlockT *, const block_q8_1 *, half *, int, int,
-                          int)>
+template <
+    typename BlockT,
+    void (*Kernel1)(const BlockT *, const block_q8_1 *, half *, int, int, int),
+    void (*Kernel2)(const BlockT *, const block_q8_1 *, half *, int, int, int),
+    void (*Kernel4)(const BlockT *, const block_q8_1 *, half *, int, int, int),
+    void (*Kernel8)(const BlockT *, const block_q8_1 *, half *, int, int, int)>
 bool DispatchMmvqAccum(const void *data, const void *act_q8_1, half *output,
                        int M, int N, int K, cudaStream_t stream) {
   auto *w = static_cast<const BlockT *>(data);
@@ -1556,18 +1557,14 @@ bool DispatchMmvqAccum(const void *data, const void *act_q8_1, half *output,
 
 // FP32 output variant of DispatchMmvqAccum for FP32 residual stream.
 // Kernel function pointers take float* output instead of half*.
-template <typename BlockT,
-          void (*Kernel1)(const BlockT *, const block_q8_1 *, float *, int, int,
-                          int),
-          void (*Kernel2)(const BlockT *, const block_q8_1 *, float *, int, int,
-                          int),
-          void (*Kernel4)(const BlockT *, const block_q8_1 *, float *, int, int,
-                          int),
-          void (*Kernel8)(const BlockT *, const block_q8_1 *, float *, int, int,
-                          int)>
-bool DispatchMmvqAccumF32(const void *data, const void *act_q8_1,
-                           float *output, int M, int N, int K,
-                           cudaStream_t stream) {
+template <
+    typename BlockT,
+    void (*Kernel1)(const BlockT *, const block_q8_1 *, float *, int, int, int),
+    void (*Kernel2)(const BlockT *, const block_q8_1 *, float *, int, int, int),
+    void (*Kernel4)(const BlockT *, const block_q8_1 *, float *, int, int, int),
+    void (*Kernel8)(const BlockT *, const block_q8_1 *, float *, int, int, int)>
+bool DispatchMmvqAccumF32(const void *data, const void *act_q8_1, float *output,
+                          int M, int N, int K, cudaStream_t stream) {
   auto *w = static_cast<const BlockT *>(data);
   auto *a = static_cast<const block_q8_1 *>(act_q8_1);
 
@@ -1599,11 +1596,11 @@ template <typename BlockT, int nprojs,
                           const block_q8_1 *, int, int),
           void (*Kernel8)(PackedProjectionGroupParams<BlockT, nprojs>,
                           const block_q8_1 *, int, int)>
-bool DispatchMmvqGroup(
-    const std::array<const void *, nprojs> &weights, const void *act_q8_1,
-    const std::array<half *, nprojs> &outputs,
-    const std::array<int, nprojs> &output_cols, int M, int K,
-    cudaStream_t stream) {
+bool DispatchMmvqGroup(const std::array<const void *, nprojs> &weights,
+                       const void *act_q8_1,
+                       const std::array<half *, nprojs> &outputs,
+                       const std::array<int, nprojs> &output_cols, int M, int K,
+                       cudaStream_t stream) {
   auto *a = static_cast<const block_q8_1 *>(act_q8_1);
   PackedProjectionGroupParams<BlockT, nprojs> params{};
   int max_output_cols = 0;
@@ -1661,11 +1658,10 @@ template <typename BlockT,
                           const block_q8_1 *, int, int),
           void (*Kernel8)(PackedProjectionGroupParams<BlockT, 3>,
                           const block_q8_1 *, int, int)>
-bool DispatchMmvqTriple(const void *data0, const void *data1,
-                        const void *data2, const void *act_q8_1,
-                        half *output0, int N0, half *output1, int N1,
-                        half *output2, int N2, int M, int K,
-                        cudaStream_t stream) {
+bool DispatchMmvqTriple(const void *data0, const void *data1, const void *data2,
+                        const void *act_q8_1, half *output0, int N0,
+                        half *output1, int N1, half *output2, int N2, int M,
+                        int K, cudaStream_t stream) {
   return DispatchMmvqGroup<BlockT, 3, Kernel1, Kernel2, Kernel4, Kernel8>(
       {data0, data1, data2}, act_q8_1, {output0, output1, output2},
       {N0, N1, N2}, M, K, stream);
@@ -1728,7 +1724,8 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu(
       // Gate projection
       {
         const block_q4_k &b = grow[blk];
-        const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+        const float d =
+            __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
         const float dmin =
             __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
 
@@ -1748,10 +1745,8 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu(
         const int dot_hi = Dp4aS8((qs4 >> 4) & 0x0F0F0F0F, x_hi4, 0);
 
         gate_acc[c] +=
-            d * static_cast<float>(sc_lo) * d8_lo *
-                static_cast<float>(dot_lo) +
-            d * static_cast<float>(sc_hi) * d8_hi *
-                static_cast<float>(dot_hi);
+            d * static_cast<float>(sc_lo) * d8_lo * static_cast<float>(dot_lo) +
+            d * static_cast<float>(sc_hi) * d8_hi * static_cast<float>(dot_hi);
         if ((lane & 7) == 0) {
           const float s_lo = __half2float(__high2half(a_lo.ds));
           const float s_hi = __half2float(__high2half(a_hi.ds));
@@ -1763,7 +1758,8 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu(
       // Up projection (reuses activation data, loads different weights)
       {
         const block_q4_k &b = urow[blk];
-        const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+        const float d =
+            __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
         const float dmin =
             __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
 
@@ -1783,10 +1779,8 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu(
         const int dot_hi = Dp4aS8((qs4 >> 4) & 0x0F0F0F0F, x_hi4, 0);
 
         up_acc[c] +=
-            d * static_cast<float>(sc_lo) * d8_lo *
-                static_cast<float>(dot_lo) +
-            d * static_cast<float>(sc_hi) * d8_hi *
-                static_cast<float>(dot_hi);
+            d * static_cast<float>(sc_lo) * d8_lo * static_cast<float>(dot_lo) +
+            d * static_cast<float>(sc_hi) * d8_hi * static_cast<float>(dot_hi);
         if ((lane & 7) == 0) {
           const float s_lo = __half2float(__high2half(a_lo.ds));
           const float s_hi = __half2float(__high2half(a_hi.ds));
@@ -1901,14 +1895,13 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu_q81(
         m_lo = __shfl_sync(0xFFFFFFFF, m_lo, group_leader);
         sc_hi = __shfl_sync(0xFFFFFFFF, sc_hi, group_leader);
         m_hi = __shfl_sync(0xFFFFFFFF, m_hi, group_leader);
-        const int qs4 = __ldg(
-            reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
+        const int qs4 =
+            __ldg(reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
         gate_acc[c] +=
             d * static_cast<float>(sc_lo) * d8_lo *
                 static_cast<float>(Dp4aS8(qs4 & 0x0F0F0F0F, x_lo4, 0)) +
             d * static_cast<float>(sc_hi) * d8_hi *
-                static_cast<float>(
-                    Dp4aS8((qs4 >> 4) & 0x0F0F0F0F, x_hi4, 0));
+                static_cast<float>(Dp4aS8((qs4 >> 4) & 0x0F0F0F0F, x_hi4, 0));
         if ((lane & 7) == 0) {
           gate_acc[c] -= dmin * static_cast<float>(m_lo) *
                              __half2float(__high2half(a_lo.ds)) +
@@ -1933,14 +1926,13 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu_q81(
         m_lo = __shfl_sync(0xFFFFFFFF, m_lo, group_leader);
         sc_hi = __shfl_sync(0xFFFFFFFF, sc_hi, group_leader);
         m_hi = __shfl_sync(0xFFFFFFFF, m_hi, group_leader);
-        const int qs4 = __ldg(
-            reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
+        const int qs4 =
+            __ldg(reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
         up_acc[c] +=
             d * static_cast<float>(sc_lo) * d8_lo *
                 static_cast<float>(Dp4aS8(qs4 & 0x0F0F0F0F, x_lo4, 0)) +
             d * static_cast<float>(sc_hi) * d8_hi *
-                static_cast<float>(
-                    Dp4aS8((qs4 >> 4) & 0x0F0F0F0F, x_hi4, 0));
+                static_cast<float>(Dp4aS8((qs4 >> 4) & 0x0F0F0F0F, x_hi4, 0));
         if ((lane & 7) == 0) {
           up_acc[c] -= dmin * static_cast<float>(m_lo) *
                            __half2float(__high2half(a_lo.ds)) +

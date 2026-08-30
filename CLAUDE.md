@@ -336,6 +336,16 @@ stale object files (WSL2 filesystem timestamp issue):
 - `INFERFLUX_CUDA_KV_BASE_SLOTS=N` — hybrid KV cache: N dense base slots + per-slot overflow (0=all dense, default 0)
 - `INFERFLUX_CUDA_DISPATCH_TRACE` (+ `_LIMIT`) — emit selected/actual operator traces, summarized by `scripts/parse_dispatch_trace.py`
 - `INFERFLUX_CUDA_DISPATCH_PROBE` / `INFERFLUX_CUDA_DISPATCH_PROBE_FORCE_UNHEALTHY` — load-time reachability and controlled operator down-ranking; degraded state is visible in `/readyz`
+- `INFERFLUX_DISABLE_FUSED_GEMV=1`, `INFERFLUX_FORCE_CUBLAS=1`, `INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL=1` — dispatch overrides
+- `INFERFLUX_ENABLE_DOWNPROJ_MMQ` / `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH` — down-projection MMQ threshold
+- `INFERFLUX_CUDA_MMQ_MMA=1` / `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` — mma.sync int8 tensor-core Q6_K down-proj with deterministic K-split (default off; needs no MMQ layout transform)
+- `INFERFLUX_MMVQ_MIN_WARPS` / `INFERFLUX_MMVQ_MAX_WARPS` / `INFERFLUX_ENABLE_ADAPTIVE_MMVQ_THREADS` — MMVQ occupancy tuning
+- `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_*` — experimental grouped/rowpair/rowquad kernel variants (default off)
+- `INFERFLUX_CUDA_DEQUANT_CACHE_POLICY` — dequantized-weight cache policy (memory contract; see `GGUFMemoryContractTests`)
+- `INFERFLUX_CUDA_TIMING_SAMPLE_RATE=N` / `INFERFLUX_CUDA_PHASE_TIMING=1` — CUDA event timing (0=off)
+- `INFERFLUX_CUDA_DEBUG_OPERATOR_SELECTION` / `INFERFLUX_CUDA_DEBUG_DECODE_MAPPING` (+ `_LIMIT` variants), `INFERFLUX_DEBUG_LOGITS` — dispatch/numeric debug traces
+- Set outside the policy struct (parsed in `server/main.cpp` / bootstrap): `INFERFLUX_CUDA_PHASE_OVERLAP` (prefill/decode lane overlap), `INFERFLUX_CUDA_ATTENTION_KERNEL` (`auto`|`fa2`|`standard`), `INFERFLUX_CUDA_KV_MAX_BATCH` / `INFERFLUX_CUDA_KV_MAX_SEQ` (KV sizing, `native_bootstrap_config.cpp`)
+- Dispatch observability/self-heal: `INFERFLUX_CUDA_DISPATCH_TRACE` (+`_LIMIT`) — per-dispatch stderr trace parsed by `scripts/parse_dispatch_trace.py`; `INFERFLUX_CUDA_DISPATCH_PROBE` (default on) — load-time reachability probe that down-ranks unreachable operators (self-heal; visible in `/readyz` `dispatch_degraded`); `INFERFLUX_CUDA_DISPATCH_PROBE_FORCE_UNHEALTHY` — CSV (e.g. `ffn:q8_1_group_mmq3`) to force operators unhealthy for A/B
 
 **InferFlux CUDA kernel files:**
 - `runtime/backends/cuda/native/kernels/fused_dequant_gemv.cuh` — V1 GEMV kernels (column-major, 8 warps/block, used for pair/triple M>8 fallback)
