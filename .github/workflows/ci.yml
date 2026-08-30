@@ -18,6 +18,49 @@ concurrency:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Path-aware gating: a change set that touches ONLY markdown skips the
+  # heavy build matrix below. The docs contract gate stays unconditional
+  # so documentation edits keep their link/canonical-doc/surface checks.
+  # Non-PR events (push, schedule) always run the full matrix.
+  # ---------------------------------------------------------------------------
+  changes:
+    name: Detect docs-only change set
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.detect.outputs.docs_only }}
+    steps:
+      - name: Detect docs-only diff via PR file list
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          FILES=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files"             --paginate --jq '.[].filename')
+          echo "Changed files:"
+          echo "$FILES"
+          # Conservative: any non-markdown path keeps the full matrix. A
+          # stale file list fails toward docs_only=false (heavy CI runs).
+          if echo "$FILES" | grep -vE '\.md$' | grep -q .; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  docs-gate:
+    name: Docs contract gate
+    needs: changes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Assert docs contract gate
+        run: python3 scripts/check_docs_contract.py
+
+  # ---------------------------------------------------------------------------
   # Primary build + test job
   # Builds a CPU-only release binary, runs the full unit + stub-integration
   # suite, generates SBOM, and uploads it as a workflow artifact.
@@ -25,6 +68,8 @@ jobs:
   build-and-test:
     name: Build & Test (ubuntu-latest)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
 
     steps:
       - name: Checkout (with submodules)
@@ -85,14 +130,6 @@ jobs:
       # ------------------------------------------------------------------
       - name: Build
         run: cmake --build build -j$(nproc)
-
-      # ------------------------------------------------------------------
-      # Focused assertion: canonical OSS docs contract
-      # Fails fast on missing canonical docs, broken local links, API/CLI
-      # surface drift, or infographic-first contract violations.
-      # ------------------------------------------------------------------
-      - name: Assert docs contract gate
-        run: python3 scripts/check_docs_contract.py
 
       - name: Assert planning artifact graph
         run: python3 scripts/check_planning_artifacts.py
@@ -209,6 +246,8 @@ jobs:
   build-check-mps:
     name: Build & Test (macos-latest, MPS)
     runs-on: macos-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
 
     steps:
       - name: Checkout (with submodules)
@@ -242,6 +281,8 @@ jobs:
   build-check-mlx:
     name: Build (macos-latest, MLX flag)
     runs-on: macos-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
 
     steps:
       - name: Checkout (with submodules)
@@ -282,6 +323,8 @@ jobs:
     name: CUDA compile check (ubuntu-latest)
     runs-on: ubuntu-latest
     continue-on-error: true   # advisory only; no GPU available for execution
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
 
     steps:
       - name: Checkout (with submodules)
@@ -333,6 +376,8 @@ jobs:
     name: Build check (Vulkan)
     runs-on: ubuntu-latest
     continue-on-error: true   # Advisory — no Vulkan GPU in CI
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
 
     steps:
       - name: Checkout (with submodules)
@@ -391,7 +436,8 @@ jobs:
   cuda-throughput-gate:
     name: CUDA throughput gate (self-hosted)
     # Defense in depth: persistent runners must never execute public PR code.
-    if: ${{ github.event_name != 'pull_request' && vars.INFERFLUX_ENABLE_CUDA_THROUGHPUT_GATE == 'true' }}
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' && vars.INFERFLUX_ENABLE_CUDA_THROUGHPUT_GATE == 'true' && needs.changes.outputs.docs_only != 'true' }}
     runs-on: [self-hosted, linux, x64, cuda]
     timeout-minutes: 45
     env:
@@ -500,6 +546,8 @@ jobs:
   coverage:
     name: Coverage (ubuntu-latest)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
 
     steps:
       - name: Checkout (with submodules)
@@ -545,14 +593,6 @@ jobs:
       # doesn't use.
       - name: Export coverage-tree binary paths
         run: echo "INFERCTL_BIN=$PWD/build-cov/inferctl" >> "$GITHUB_ENV"
-
-      # ------------------------------------------------------------------
-      # Focused assertion: canonical OSS docs contract
-      # Fails fast on missing canonical docs, broken local links, API/CLI
-      # surface drift, or infographic-first contract violations.
-      # ------------------------------------------------------------------
-      - name: Assert docs contract gate
-        run: python3 scripts/check_docs_contract.py
 
       # ------------------------------------------------------------------
       # Focused assertion: inferctl model-list output modes
@@ -655,6 +695,8 @@ jobs:
   gguf-quantization-tests:
     name: GGUF & Quantization Tests (ubuntu-latest)
     runs-on: ubuntu-latest
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
 
     steps:
       - name: Checkout (with submodules)
@@ -726,7 +768,8 @@ jobs:
   gguf-quantization-tests-cuda:
     name: GGUF & Quantization Tests (self-hosted CUDA)
     # Defense in depth: persistent runners must never execute public PR code.
-    if: ${{ github.event_name != 'pull_request' && vars.INFERFLUX_ENABLE_CUDA_GGUF_TESTS == 'true' }}
+    needs: changes
+    if: ${{ github.event_name != 'pull_request' && vars.INFERFLUX_ENABLE_CUDA_GGUF_TESTS == 'true' && needs.changes.outputs.docs_only != 'true' }}
     runs-on: [self-hosted, linux, x64, cuda]
     timeout-minutes: 30
 
@@ -809,6 +852,8 @@ jobs:
     name: clang-format check
     runs-on: ubuntu-latest
     continue-on-error: true
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true'
 
     steps:
       - name: Checkout
