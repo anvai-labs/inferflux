@@ -2844,6 +2844,36 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
              {v_raw, d_v_new_, num_kv_heads_ * head_dim_}}};
         if (!ExecuteNativeGroupedProjectionStage(
                 [&]() {
+                  // S8: Q4_K MMA QKV triple at M >= 2 — replaces the
+                  // grouped dp4a family (1.14s of c16 kernel time).
+                  if constexpr (std::is_same_v<T, half>) {
+                    if (B >= 2) {
+                      if (qkv_norm != nullptr) {
+                        cuda_kernel::RmsNorm<T>(d_residual_, qkv_norm,
+                                                d_norm_out_, B, hidden_size_,
+                                                rms_norm_eps_, stream_);
+                      }
+                      const half *mma_input = static_cast<const half *>(
+                          qkv_norm != nullptr ? d_norm_out_ : qkv_input);
+                      if (TryQ8_1MmaGemv<T>(
+                              q_raw, mma_input, d_q_, d_act_q8_1_mmq_,
+                              d_mma_partials_, B, num_heads_ * head_dim_,
+                              hidden_size_, stream_, "q_proj",
+                              active_policy) &&
+                          TryQ8_1MmaGemv<T>(
+                              k_raw, mma_input, d_k_new_, d_act_q8_1_mmq_,
+                              d_mma_partials_, B, num_kv_heads_ * head_dim_,
+                              hidden_size_, stream_, "k_proj",
+                              active_policy) &&
+                          TryQ8_1MmaGemv<T>(
+                              v_raw, mma_input, d_v_new_, d_act_q8_1_mmq_,
+                              d_mma_partials_, B, num_kv_heads_ * head_dim_,
+                              hidden_size_, stream_, "v_proj",
+                              active_policy)) {
+                        return true;
+                      }
+                    }
+                  }
                   return TryQ8_1ProjectionGroup(
                       qkv_plans, qkv_input, qkv_norm, d_act_q8_1_, B,
                       hidden_size_, rms_norm_eps_, stream_, active_policy);
@@ -3137,9 +3167,23 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         NVTX_SCOPE("O_Projection");
         auto o_raw = weights_->LayerOProjRaw(layer);
         bool o_accumulated = false;
+        // S8: Q4_K MMA o_proj at M >= 2 — writes d_norm_out_ (the
+        // ResidualAdd path below consumes it); dp4a MMQ measured ~106us
+        // vs ~20us for MMA at this geometry.
+        const bool o_mma_done = [&, this]() {
+          if constexpr (std::is_same_v<T, half>) {
+            return B >= 2 &&
+                   TryQ8_1MmaGemv<T>(o_raw, d_attn_out_, d_norm_out_,
+                                     d_act_q8_1_mmq_, d_mma_partials_, B,
+                                     hidden_size_, num_heads_ * head_dim_,
+                                     stream_, "o_proj", active_policy);
+          } else {
+            return false;
+          }
+        }();
         // Try accumulate mode: write directly to residual, skip ResidualAdd
         if constexpr (std::is_same_v<T, half>) {
-          if (fp32_residual_active_ &&
+          if (!o_mma_done && fp32_residual_active_ &&
               TryQ8_1GemvAccumF32(o_raw, d_attn_out_, d_residual_f32_,
                                   d_act_q8_1_, B, hidden_size_,
                                   num_heads_ * head_dim_, stream_, "o_proj",
@@ -3147,13 +3191,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             o_accumulated = true;
           }
         }
-        if (!o_accumulated && !fp32_residual_active_ &&
+        if (!o_mma_done && !o_accumulated && !fp32_residual_active_ &&
             TryQ8_1GemvAccum<T>(o_raw, d_attn_out_, d_residual_, d_act_q8_1_, B,
                                 hidden_size_, num_heads_ * head_dim_, stream_,
                                 "o_proj", active_policy)) {
           o_accumulated = true;
         }
-        if (!o_accumulated &&
+        if (!o_mma_done && !o_accumulated &&
             !TryQ8_1Gemv<T>(o_raw, d_attn_out_, d_norm_out_, d_act_q8_1_, B,
                             hidden_size_, num_heads_ * head_dim_, stream_,
                             "o_proj", active_policy) &&
