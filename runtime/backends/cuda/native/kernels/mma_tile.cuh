@@ -114,6 +114,25 @@ LoadLdmatrix(Tile<16, 4, T> &t, const T *__restrict__ xs, int stride) {
 #endif
 }
 
+// ldmatrix x4 load for the k32 A operand fragment (tile<16,8>). Column
+// term: lanes 16-31 start half a row-width in (llama's t.J/2 term).
+template <typename T, DataLayout DL>
+__device__ __forceinline__ void LoadLdmatrix(Tile<16, 8, T, DL> &t,
+                                             const T *__restrict__ xs,
+                                             int stride) {
+#ifdef INFERFLUX_TURING_MMA
+  int *xi = reinterpret_cast<int *>(t.x);
+  const int *xs32 =
+      reinterpret_cast<const int *>(xs) + (threadIdx.x % t.I) * stride +
+      (threadIdx.x / t.I) * (t.J / 2);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
+               : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
+               : "l"(xs32));
+#else
+  LoadGeneric(t, xs, stride);
+#endif
+}
+
 // D(16x8) = A(16x4) x B(8x4) on int8 fragments, accumulate int32 —
 // mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32. Register counts:
 // a.ne=2, b.ne=1, c.ne=4 (the PTX fragment layout for m16n8k16).
@@ -142,6 +161,49 @@ __device__ __forceinline__ void MmaS8(Tile<16, 8, int> &c,
   (void)c;
   (void)a;
   (void)b;
+#endif
+}
+
+// D(16x8) = A(16x8) x B(8x8) on int8 fragments — the k32 form used by the
+// Q8_1-family MMA path (Q4_K/Q5_K/Q8_0/Q8_1 weights):
+// mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32. a.ne=4, b.ne=2, c.ne=4.
+__device__ __forceinline__ void MmaS8K32(Tile<16, 8, int> &c,
+                                         const Tile<16, 8, int> &a,
+                                         const Tile<8, 8, int> &b) {
+  static_assert(a.ne == 4 && b.ne == 2 && c.ne == 4, "fragment sizes");
+#ifdef INFERFLUX_TURING_MMA
+#if __CUDA_ARCH__ >= 800
+  asm volatile(
+      "mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+      : "+r"(c.x[0]), "+r"(c.x[1]), "+r"(c.x[2]), "+r"(c.x[3])
+      : "r"(a.x[0]), "r"(a.x[1]), "r"(a.x[2]), "r"(a.x[3]), "r"(b.x[0]),
+        "r"(b.x[1]));
+#else
+  // sm_75: four m8n8k16 instructions (llama's exact pairing).
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0, %1}, {%2}, {%3}, {%0, %1};"
+      : "+r"(c.x[0]), "+r"(c.x[1])
+      : "r"(a.x[0]), "r"(b.x[0]));
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0, %1}, {%2}, {%3}, {%0, %1};"
+      : "+r"(c.x[2]), "+r"(c.x[3])
+      : "r"(a.x[1]), "r"(b.x[0]));
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0, %1}, {%2}, {%3}, {%0, %1};"
+      : "+r"(c.x[0]), "+r"(c.x[1])
+      : "r"(a.x[2]), "r"(b.x[1]));
+  asm volatile(
+      "mma.sync.aligned.m8n8k16.row.col.s32.s8.s8.s32 "
+      "{%0, %1}, {%2}, {%3}, {%0, %1};"
+      : "+r"(c.x[2]), "+r"(c.x[3])
+      : "r"(a.x[3]), "r"(b.x[1]));
+#endif
+#else
+  (void)c; (void)a; (void)b;
 #endif
 }
 
