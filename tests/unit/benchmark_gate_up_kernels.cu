@@ -12,6 +12,7 @@
 
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/kernels/dequantization.cuh"
+#include "runtime/backends/cuda/native/kernels/mmvq.cuh"
 #include "runtime/backends/cuda/native/kernels/mmq_mma.cuh"
 #include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 
@@ -43,14 +44,24 @@ double BenchMs(cudaEvent_t start, cudaEvent_t stop) {
   return ms / kIters;
 }
 
-// Host Q4_K dequant reference for one weight element (row-major blocks).
+// Host Q4_K dequant reference — 6-bit k4 scales across 12 bytes
+// (get_scale_min_k4 scheme; see K_SCALE_SIZE=12).
+void ScaleMinK4(const unsigned char *q, int j, int *sc, int *m) {
+  if (j < 4) {
+    *sc = q[j] & 63;
+    *m = q[j + 4] & 63;
+  } else {
+    *sc = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+    *m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+  }
+}
+
 float Q4KValue(const block_q4_k &b, int e) {
   const float d = __half2float(*reinterpret_cast<const half *>(&b.d));
   const float dmin = __half2float(*reinterpret_cast<const half *>(&b.dmin));
   const int sb = e / 32;
-  const unsigned char qs = b.scales[sb / 2];
-  const int sc = (sb & 1) ? (qs >> 4) : (qs & 0xF);
-  const int m = (sb & 1) ? (qs >> 12) & 0xF : (qs >> 8) & 0xF;
+  int sc = 0, m = 0;
+  ScaleMinK4(b.scales, sb, &sc, &m);
   const unsigned char qbyte = b.qs[(sb / 2) * 32 + (e % 32)];
   const int q = (sb & 1) ? (qbyte >> 4) : (qbyte & 0xF);
   return d * sc * q - dmin * m;
@@ -64,6 +75,8 @@ int main() {
   using inferflux::runtime::cuda::native::BlockQ8_1MmqDs;
   using inferflux::runtime::cuda::native::InferfluxMmqQ4KMma;
   using inferflux::runtime::cuda::native::QuantizeRowQ8_1MmqDsKernel;
+  using inferflux::runtime::cuda::native::block_q8_1;
+  constexpr int kWideWarps = 4; // incumbent launch: (128,1,1) blocks
   cudaFree(0);
 
   cudaDeviceProp prop{};
@@ -80,11 +93,16 @@ int main() {
   for (auto &b : host_w) {
     for (int i = 0; i < QK_K / 2; ++i)
       b.qs[i] = Lcg(seed) & 0xFF;
+    // Valid 6-bit k4 scale encoding across 12 bytes: bytes 0-3 = sc0-3
+    // (6-bit), bytes 4-7 = m0-3 (6-bit), bytes 8-11 = sc4-7 low nibbles
+    // (high 2 bits of sc4-7 live in bytes 0-3 bit 6-7, kept 0 here).
     for (int i = 0; i < K_SCALE_SIZE; ++i)
-      b.scales[i] = Lcg(seed) & 0xFF;
-    // Keep scales/mins in their 6-bit lanes: mask to valid k4 encoding.
-    for (int i = 0; i < K_SCALE_SIZE; ++i)
-      b.scales[i] &= 0x55; // scales in low nibbles, mins in high nibbles
+      b.scales[i] = 0;
+    for (int j = 0; j < 4; ++j) {
+      b.scales[j] = 1 + (Lcg(seed) % 60);      // sc0-3, top 2 bits 0
+      b.scales[j + 4] = Lcg(seed) % 60;        // m0-3
+      b.scales[j + 8] = 1 + (Lcg(seed) % 15);  // sc4-7 low nibbles
+    }
     const half d = __float2half(0.002f);
     const half dmin = __float2half(0.001f);
     std::memcpy(&b.d, &d, 2);
@@ -145,6 +163,64 @@ int main() {
     }
     cudaEventRecord(stop, s);
     const double fused_ms = BenchMs(start, stop);
+
+    // Wide-load variant (uint4 weight loads).
+    {
+      using namespace inferflux::runtime::cuda::native;
+      const dim3 grid(kN, M);
+      const dim3 block(kWideWarps * 32);
+      auto run_wide = [&] {
+        if (M == 1) {
+          inferflux_mmvq_q4k_fused_gate_up_silu_wide<1>
+              <<<grid, block, 0, s>>>(
+                  static_cast<const block_q4_k *>(gate_info.data),
+                  static_cast<const block_q4_k *>(up_info.data),
+                  static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
+        } else if (M <= 2) {
+          inferflux_mmvq_q4k_fused_gate_up_silu_wide<2>
+              <<<grid, block, 0, s>>>(
+                  static_cast<const block_q4_k *>(gate_info.data),
+                  static_cast<const block_q4_k *>(up_info.data),
+                  static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
+        }
+      };
+      if (M <= 2) {
+        // Reference: incumbent output.
+        std::vector<half> ref(static_cast<size_t>(M) * kN);
+        FusedQuantGemm::FusedGateUpSiluGemvQ8_1(gate_info, up_info, d_act_q8,
+                                                d_out, M, kN, kK, s);
+        cudaDeviceSynchronize();
+        cudaMemcpy(ref.data(), d_out, ref.size() * sizeof(half),
+                   cudaMemcpyDeviceToHost);
+        for (int i = 0; i < kWarmup; ++i) run_wide();
+        cudaEventRecord(start, s);
+        for (int i = 0; i < kIters; ++i) run_wide();
+        cudaEventRecord(stop, s);
+        cudaDeviceSynchronize();
+        const double wide_ms = BenchMs(start, stop);
+        printf("M=%-2d  fused wide (hot)  : %7.1f us   (%.2fx floor)\n", M,
+               wide_ms * 1000, wide_ms * 1000 / floor_us);
+        std::vector<half> got(ref.size());
+        cudaMemcpy(got.data(), d_out, got.size() * sizeof(half),
+                   cudaMemcpyDeviceToHost);
+        int bad = 0, shown = 0;
+        double max_rel2 = 0;
+        for (size_t i2 = 0; i2 < ref.size(); ++i2) {
+          const double r = __half2float(ref[i2]);
+          const double g = __half2float(got[i2]);
+          const double rel = std::fabs(g - r) / (std::fabs(r) > 1.0 ? r : 1.0);
+          max_rel2 = std::max(max_rel2, rel);
+          if (rel > 1e-2) {
+            ++bad;
+            if (shown++ < 6)
+              printf("  wide mismatch out[%zu]: ref=%.3f wide=%.3f\n", i2,
+                     r, g);
+          }
+        }
+        printf("  wide vs incumbent: %d/%zu bad, max_rel=%.3e\n", bad,
+               ref.size(), max_rel2);
+      }
+    }
 
     // FPU spot-check at M=1: silu(gate dot) * up dot for sampled columns.
     double max_rel = 0;

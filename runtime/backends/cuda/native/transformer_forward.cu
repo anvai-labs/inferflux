@@ -750,6 +750,12 @@ bool TryQ8_1MmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
                           const char *proj_name,
                           const NativeExecutionPolicy *policy) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+  // M >= 2 for every projection family — measured three ways at c1:
+  // QKV+o (-12%), gate/up+o (-4%). The M=1 incumbents' floor gaps
+  // (fused gate/up 1.5x DRAM cold, o accum 3.5x) are real but smaller
+  // than the masked-tile + per-projection quantize/reduce launch
+  // overhead at M=1. Improving M=1 requires kernel work on the
+  // incumbents, not dispatch changes.
   if (!policy_ref.enable_mmq_mma || M < 2) {
     return false;
   }
@@ -3139,12 +3145,33 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
               kv_cache_->KvStride(), attn_scale, qsplit, chunk, ksplits,
               stream_);
         } else if (kv_contiguous) {
-          err = cuda_kernel::FlashDecodeMultiSeqStrided<T>(
-              d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_, d_batch_kv_lens_,
-              layer, B, num_heads_, num_kv_heads_, head_dim_,
-              kv_cache_->SlotStride(), kv_cache_->LayerStride(),
-              kv_cache_->KvStride(), attn_scale, stream_,
-              d_attn_split_workspace_, attn_split_workspace_bytes_);
+          // Warp-per-head decode: no block barriers, no split workspace,
+          // no combine launch — the block-cooperative split path pays
+          // ~232 synchronized reductions per CTA at decode sizes. Use it
+          // while the full-KV scan by num_heads warps keeps CTAs and KV
+          // re-reads bounded (num_heads warps >= 2x SMs at B>=6 for 16
+          // heads; at small B the single scan still beats split+reduce).
+          // Opt-in (INFERFLUX_CUDA_ATTN_WPH=1): measured -16% at c1 —
+          // each warp's serial online-softmax chain has no latency hiding
+          // with only num_heads/4 blocks resident. Kept for tile-ILP rework.
+          static const bool wph_enabled = [] {
+            const char *raw = std::getenv("INFERFLUX_CUDA_ATTN_WPH");
+            return raw && (std::string(raw) == "1" || std::string(raw) == "true");
+          }();
+          if (wph_enabled) {
+            err = cuda_kernel::FlashDecodeWarpPerHead<T>(
+                d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_,
+                d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_,
+                head_dim_, kv_cache_->SlotStride(), kv_cache_->LayerStride(),
+                kv_cache_->KvStride(), attn_scale, stream_);
+          } else {
+            err = cuda_kernel::FlashDecodeMultiSeqStrided<T>(
+                d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_,
+                d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_,
+                head_dim_, kv_cache_->SlotStride(), kv_cache_->LayerStride(),
+                kv_cache_->KvStride(), attn_scale, stream_,
+                d_attn_split_workspace_, attn_split_workspace_bytes_);
+          }
         } else {
           err = cuda_kernel::FlashDecodeMultiSeqIndirect<T>(
               d_q_, d_slot_base_ptrs, d_attn_out_, d_batch_seq_ids_,
