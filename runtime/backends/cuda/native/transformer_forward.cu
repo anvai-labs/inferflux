@@ -745,7 +745,8 @@ bool TryMmqMmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
 template <typename T>
 bool TryQ8_1MmaGemv(const QuantizedWeightInfo &, const T *, T *, void *,
                     float *, int, int, int, cudaStream_t, const char * = nullptr,
-                    const NativeExecutionPolicy * = nullptr) {
+                    const NativeExecutionPolicy * = nullptr,
+                    int = -1) {
   return false;
 }
 
@@ -754,7 +755,8 @@ bool TryQ8_1MmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
                           half *output, void *ds_act, float *partials, int M,
                           int N, int K, cudaStream_t stream,
                           const char *proj_name,
-                          const NativeExecutionPolicy *policy) {
+                          const NativeExecutionPolicy *policy,
+                          int m_cap_override) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   // M >= 2 for every projection family — measured three ways at c1:
   // QKV+o (-12%), gate/up+o (-4%). The M=1 incumbents' floor gaps
@@ -768,7 +770,7 @@ bool TryQ8_1MmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
   const bool ok = FusedQuantGemm::GemvMmqMma(
       weight, input, output,
       static_cast<runtime::cuda::native::BlockQ8_1MmqDs *>(ds_act), partials,
-      M, N, K, stream, policy);
+      M, N, K, stream, policy, m_cap_override);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using Q4_K MMA projection");
   }
@@ -1246,13 +1248,20 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
     using namespace runtime::cuda::native;
     const size_t mma_rows = std::min(
         rows, static_cast<size_t>(execution_policy_.mmq_mma_max_batch));
+    // S12 prefill: the activation buffer also covers prefill-chunk M
+    // (Q4_K family at Forward()-path sites). Partials stay decode-sized:
+    // the y-tile-aware split heuristic yields splits=1 for M >= 48.
+    const size_t mma_prefill_rows = std::min(
+        static_cast<size_t>(512),
+        static_cast<size_t>(execution_policy_.mmq_mma_max_prefill_batch));
+    const size_t act_rows = std::max(mma_rows, mma_prefill_rows);
     const size_t blocks_per_row =
         (static_cast<size_t>(intermediate_size_) + 127) / 128;
     err = cudaMalloc(&d_act_q8_1_mmq_,
-                     blocks_per_row * mma_rows * sizeof(BlockQ8_1Mmq));
+                     blocks_per_row * act_rows * sizeof(BlockQ8_1Mmq));
     if (err != cudaSuccess)
       return false;
-    device_workspace_bytes_ += blocks_per_row * mma_rows * sizeof(BlockQ8_1Mmq);
+    device_workspace_bytes_ += blocks_per_row * act_rows * sizeof(BlockQ8_1Mmq);
     err = cudaMalloc(&d_mma_partials_, static_cast<size_t>(kMmqMmaMaxSplits) *
                                            mma_rows * hidden_size_ *
                                            sizeof(float));
@@ -1614,6 +1623,45 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
       // Priority: Q8_1 > packed per-row > fused RmsNorm+GEMV > cuBLAS
       if (!ExecuteNativeGroupedProjectionStage(
               [&]() {
+                // S12: prefill MMA triple — the grouped dp4a incumbent
+                // ran 415us/call at chunk M (1.23s of the c16 profile).
+                if constexpr (std::is_same_v<T, half>) {
+                  if (seq_len >= 2) {
+                    // d_norm_out_ is only valid when a producer normed it
+                    // (fp32 pre-normalize); half-residual configs must
+                    // norm here or the MMA reads stale values.
+                    if (qkv_norm != nullptr) {
+                      err = cuda_kernel::RmsNorm<T>(
+                          d_residual_, input_norm, d_norm_out_, seq_len,
+                          hidden_size_, rms_norm_eps_, stream_);
+                      if (err != cudaSuccess) {
+                        return false;
+                      }
+                    }
+                    const half *mma_in = static_cast<const half *>(
+                        d_norm_out_);
+                    if (TryQ8_1MmaGemv<T>(
+                            q_raw, mma_in, d_q_, d_act_q8_1_mmq_,
+                            d_mma_partials_, seq_len, num_heads_ * head_dim_,
+                            hidden_size_, stream_, "q_proj",
+                            &execution_policy_,
+                            execution_policy_.mmq_mma_max_prefill_batch) &&
+                        TryQ8_1MmaGemv<T>(
+                            k_raw, mma_in, d_k_new_, d_act_q8_1_mmq_,
+                            d_mma_partials_, seq_len,
+                            num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                            "k_proj", &execution_policy_,
+                            execution_policy_.mmq_mma_max_prefill_batch) &&
+                        TryQ8_1MmaGemv<T>(
+                            v_raw, mma_in, d_v_new_, d_act_q8_1_mmq_,
+                            d_mma_partials_, seq_len,
+                            num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                            "v_proj", &execution_policy_,
+                            execution_policy_.mmq_mma_max_prefill_batch)) {
+                      return true;
+                    }
+                  }
+                }
                 return TryQ8_1ProjectionGroup(
                     qkv_plans, qkv_input, qkv_norm, d_act_q8_1_, seq_len,
                     hidden_size_, rms_norm_eps_, stream_, &execution_policy_);
@@ -1642,10 +1690,19 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1Gemv<T>(
-                              q_raw, d_norm_out_, d_q_, d_act_q8_1_, seq_len,
-                              num_heads_ * head_dim_, hidden_size_, stream_,
-                              "q_proj", &execution_policy_);
+                          return TryQ8_1MmaGemv<T>(
+                                     q_raw, d_norm_out_, d_q_,
+                                     d_act_q8_1_mmq_, d_mma_partials_,
+                                     seq_len, num_heads_ * head_dim_,
+                                     hidden_size_, stream_, "q_proj",
+                                     &execution_policy_,
+                                     execution_policy_
+                                         .mmq_mma_max_prefill_batch) ||
+                                 TryQ8_1Gemv<T>(
+                                     q_raw, d_norm_out_, d_q_, d_act_q8_1_,
+                                     seq_len, num_heads_ * head_dim_,
+                                     hidden_size_, stream_, "q_proj",
+                                     &execution_policy_);
                         },
                         [&]() {
                           const T *q_proj = reinterpret_cast<const T *>(
@@ -1681,7 +1738,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                      d_act_q8_1_mmq_, d_mma_partials_,
                                      seq_len, num_kv_heads_ * head_dim_,
                                      hidden_size_, stream_, "k_proj",
-                                     &execution_policy_) ||
+                                     &execution_policy_,
+                                     execution_policy_.mmq_mma_max_prefill_batch) ||
                                  TryQ8_1Gemv<T>(
                                      k_raw, d_norm_out_, d_k_new_,
                                      d_act_q8_1_, seq_len,
@@ -1723,7 +1781,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                      d_act_q8_1_mmq_, d_mma_partials_,
                                      seq_len, num_kv_heads_ * head_dim_,
                                      hidden_size_, stream_, "v_proj",
-                                     &execution_policy_) ||
+                                     &execution_policy_,
+                                     execution_policy_
+                                         .mmq_mma_max_prefill_batch) ||
                                  TryQ8_1Gemv<T>(
                                      v_raw, d_norm_out_, d_v_new_,
                                      d_act_q8_1_, seq_len,
@@ -2030,6 +2090,33 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
               ffn_selected_op, ffn_phase, ffn_quant, gate_raw.quant_type,
               seq_len, intermediate_size_, hidden_size_,
               [&]() {
+                if constexpr (std::is_same_v<T, half>) {
+                  if (seq_len >= 2) {
+                    // Ensure the FFN norm is in d_norm_out_ before MMA.
+                    err = cuda_kernel::RmsNorm<T>(
+                        d_residual_, post_attn_norm, d_norm_out_, seq_len,
+                        hidden_size_, rms_norm_eps_, stream_);
+                    if (err != cudaSuccess) {
+                      return false;
+                    }
+                    const half *mma_in =
+                        static_cast<const half *>(d_norm_out_);
+                    if (TryQ8_1MmaGemv<T>(
+                            gate_raw, mma_in, d_ffn_gate_, d_act_q8_1_mmq_,
+                            d_mma_partials_, seq_len, intermediate_size_,
+                            hidden_size_, stream_, "gate_proj",
+                            &execution_policy_,
+                            execution_policy_.mmq_mma_max_prefill_batch) &&
+                        TryQ8_1MmaGemv<T>(
+                            up_raw, mma_in, d_ffn_up_, d_act_q8_1_mmq_,
+                            d_mma_partials_, seq_len, intermediate_size_,
+                            hidden_size_, stream_, "up_proj",
+                            &execution_policy_,
+                            execution_policy_.mmq_mma_max_prefill_batch)) {
+                      return true;
+                    }
+                  }
+                }
                 return TryQ8_1ProjectionGroup(
                     ffn_plans, ffn_input, ffn_norm_weight, d_act_q8_1_, seq_len,
                     hidden_size_, rms_norm_eps_, stream_, &execution_policy_,
@@ -2062,8 +2149,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                      gate_raw, d_norm_out_, d_ffn_gate_,
                                      d_act_q8_1_mmq_, d_mma_partials_,
                                      seq_len, intermediate_size_, hidden_size_,
-                                     stream_, "gate_proj",
-                                     &execution_policy_) ||
+                                     stream_, "gate_proj", &execution_policy_,
+                                     execution_policy_
+                                         .mmq_mma_max_prefill_batch) ||
                                  TryQ8_1Gemv<T>(
                                      gate_raw, d_norm_out_, d_ffn_gate_,
                                      d_act_q8_1_, seq_len, intermediate_size_,
@@ -2103,7 +2191,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                      up_raw, d_norm_out_, d_ffn_up_,
                                      d_act_q8_1_mmq_, d_mma_partials_,
                                      seq_len, intermediate_size_, hidden_size_,
-                                     stream_, "up_proj", &execution_policy_) ||
+                                     stream_, "up_proj", &execution_policy_,
+                                     execution_policy_
+                                         .mmq_mma_max_prefill_batch) ||
                                  TryQ8_1Gemv<T>(
                                      up_raw, d_norm_out_, d_ffn_up_,
                                      d_act_q8_1_, seq_len, intermediate_size_,

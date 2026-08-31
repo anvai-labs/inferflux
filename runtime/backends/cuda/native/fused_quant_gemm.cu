@@ -2053,11 +2053,14 @@ bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
                                 runtime::cuda::native::BlockQ8_1MmqDs *ds_act,
                                 float *partials, int M, int N, int K,
                                 cudaStream_t stream,
-                                const NativeExecutionPolicy *policy) {
+                                const NativeExecutionPolicy *policy,
+                                int max_m_override) {
   using namespace runtime::cuda::native;
   const auto &p = ResolveExecutionPolicy(policy);
+  const int m_cap =
+      max_m_override > 0 ? max_m_override : p.mmq_mma_max_batch;
   if (!p.enable_mmq_mma || !weight.data || !input || !output || !ds_act ||
-      !partials || M < 2 || M > p.mmq_mma_max_batch || N <= 0 || K <= 0 ||
+      !partials || M < 2 || M > m_cap || N <= 0 || K <= 0 ||
       static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
       static_cast<GGUF::TensorType>(weight.quant_type) !=
           GGUF::TensorType::Q4_K ||
@@ -2094,11 +2097,15 @@ bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
   if (sm_count <= 0) {
     return false;
   }
+  // Splits only when the TOTAL grid (x-tiles x y-tiles) under-occupies:
+  // counting x-tiles alone oversplits at prefill M (y-tiles already fill
+  // the SM array) and would demand partials sized for prefill M.
   const int n_tiles = (N + kMmqY - 1) / kMmqY;
-  int splits = std::min((sm_count + n_tiles - 1) / n_tiles,
+  const int total_ctas = n_tiles * ((M + 15) / 16);
+  int splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                         static_cast<int>(kMmqMmaMaxSplits));
-  if (M > 8) {
-    splits = std::max(splits, 2); // M=16 tail-wave balance (measured 2.5x)
+  if (M > 8 && M <= p.mmq_mma_max_batch) {
+    splits = std::max(splits, 2); // decode M=16 tail-wave balance (2.5x)
   }
 
   dim3 qgrid((K / 128 + 3) / 4, M);
