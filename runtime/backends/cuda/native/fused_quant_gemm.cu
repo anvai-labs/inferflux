@@ -1356,7 +1356,14 @@ bool DispatchQ8_1MmvqAccumF32Q4K(const void *data, const void *act_q8_1,
                     static_cast<unsigned>((M + ncols - 1) / ncols));
     const auto *w = static_cast<const block_q4_k *>(data);
     const auto *ax = static_cast<const block_q8_1 *>(act_q8_1);
-    const dim3 block(kMmvqWarps * 32);
+    // Size warps to the actual work: each warp's quartet covers 4
+    // super-blocks, so small K leaves the tail warps idle (K=2048 -> 8
+    // blocks -> 2 of 4 warps idle). Rig: 10.7us -> 6.6us at K=2048.
+    // Never below 2 warps: 1 warp cannot cover 8 blocks (the 32-thread
+    // rig "win" was computing half the sum).
+    const int warps =
+        std::max(2, std::min(kMmvqWarps, (K / QK_K + 3) / 4));
+    const dim3 block(warps * 32);
     switch (ncols) {
     case 1:
       inferflux_mmvq_q4k_accum_wide<1, float, true>
