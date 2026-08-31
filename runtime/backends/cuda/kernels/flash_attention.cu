@@ -1076,6 +1076,123 @@ __global__ void FlashDecodeMultiSeqStridedKernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// Warp-per-head FlashDecode: each warp owns one Q head and serially scans
+// the full KV range with 32-lane dot reductions (5 shuffle rounds) — no
+// shared memory, no block-wide barriers, no split workspace, no combine
+// kernel. The block-cooperative split kernel pays ~232 synchronized
+// block reductions per CTA at decode sizes; this layout pays none, which
+// is why llama.cpp's decode attention is 4x faster at short contexts.
+// One launch, shape-static (kv_len read on device): CUDA-graph safe.
+// Grid: (ceil(num_heads / kWarpsPerBlock), batch).
+// ---------------------------------------------------------------------------
+constexpr int kFlashDecodeWarpsPerBlock = 4;
+
+template <typename T, int GQARatio>
+__global__ void FlashDecodeGQAWarpPerHeadKernel(
+    const T *__restrict__ Q, const T *__restrict__ kv_buffer, T *__restrict__ O,
+    const int *__restrict__ seq_ids, const int *__restrict__ kv_lens, int layer,
+    int num_heads, int num_kv_heads, int head_dim, size_t slot_stride,
+    size_t layer_stride, size_t kv_stride, float scale) {
+  const int warp = (blockIdx.x * kFlashDecodeWarpsPerBlock) +
+                   (threadIdx.x / 32);
+  const int lane = threadIdx.x & 31;
+  const int b = blockIdx.y;
+  if (warp >= num_heads) {
+    return;
+  }
+  const int head_idx = warp;
+  const int kv_head_idx = head_idx / GQARatio;
+  // Lanes stride head_dim: 4 consecutive elements per lane (head_dim 128).
+  const int elems_per_lane = head_dim / 32;
+
+  const int kv_len = kv_lens[b];
+  if (kv_len <= 0) {
+    for (int e = 0; e < elems_per_lane; ++e) {
+      const int dim = lane * elems_per_lane + e;
+      O[(static_cast<size_t>(b) * num_heads + head_idx) * head_dim + dim] =
+          static_cast<T>(0.0f);
+    }
+    return;
+  }
+
+  const size_t seq_offset = static_cast<size_t>(seq_ids[b]) * slot_stride;
+  const size_t layer_offset = static_cast<size_t>(layer) * layer_stride;
+  const T *K = kv_buffer + seq_offset + layer_offset;
+  const T *V = K + kv_stride;
+  const int kv_row_elems = num_kv_heads * head_dim;
+  const size_t kv_head_off = static_cast<size_t>(kv_head_idx) * head_dim +
+                             lane * elems_per_lane;
+
+  // Q fragment.
+  float q[8];
+  const T *q_row = Q + static_cast<size_t>(b) * num_heads * head_dim +
+                   static_cast<size_t>(head_idx) * head_dim +
+                   lane * elems_per_lane;
+#pragma unroll
+  for (int e = 0; e < elems_per_lane; ++e) {
+    q[e] = static_cast<float>(q_row[e]);
+  }
+
+  float m = -INFINITY;
+  float l = 0.0f;
+  float acc[8] = {0.0f};
+
+  for (int t = 0; t < kv_len; ++t) {
+    const size_t base = static_cast<size_t>(t) * kv_row_elems + kv_head_off;
+    // Q dot K (per-lane partial, then 5-round warp reduce).
+    float dot = 0.0f;
+#pragma unroll
+    for (int e = 0; e < elems_per_lane; ++e) {
+      dot += q[e] * static_cast<float>(K[base + e]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      dot += __shfl_xor_sync(0xFFFFFFFFu, dot, off);
+    }
+    const float score = dot * scale;
+
+    // Online softmax update (m/l identical across lanes after reduce).
+    const float m_new = fmaxf(m, score);
+    const float alpha = __expf(m - m_new);
+    const float p = __expf(score - m_new);
+    l = l * alpha + p;
+    const float inv_alpha_scale = alpha;
+#pragma unroll
+    for (int e = 0; e < elems_per_lane; ++e) {
+      acc[e] = acc[e] * inv_alpha_scale + p * static_cast<float>(V[base + e]);
+    }
+    m = m_new;
+  }
+
+  const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
+  T *o_row = O + static_cast<size_t>(b) * num_heads * head_dim +
+             static_cast<size_t>(head_idx) * head_dim +
+             lane * elems_per_lane;
+#pragma unroll
+  for (int e = 0; e < elems_per_lane; ++e) {
+    o_row[e] = static_cast<T>(acc[e] * inv_l);
+  }
+}
+
+template <typename T, int GQARatio>
+static cudaError_t
+LaunchGQADecodeWarpPerHead(const T *Q, const T *kv_buffer, T *O,
+                           const int *d_seq_ids, const int *d_kv_lens, int layer,
+                           int batch_size, int num_heads, int num_kv_heads,
+                           int head_dim, size_t slot_stride, size_t layer_stride,
+                           size_t kv_stride, float scale, cudaStream_t stream) {
+  const int blocks =
+      (num_heads + kFlashDecodeWarpsPerBlock - 1) / kFlashDecodeWarpsPerBlock;
+  dim3 grid(blocks, batch_size);
+  dim3 threads(kFlashDecodeWarpsPerBlock * 32);
+  FlashDecodeGQAWarpPerHeadKernel<T, GQARatio>
+      <<<grid, threads, 0, stream>>>(
+          Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, num_heads,
+          num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale);
+  return cudaGetLastError();
+}
+
 // Number of KV-length splits for parallel FlashDecode.
 // 8 splits provides sufficient SM saturation for Ada/Ampere GPUs (76-128 SMs)
 // while halving the split workspace memory vs the original 16-split design.
@@ -1158,6 +1275,44 @@ static cudaError_t LaunchGQADecode(const T *Q, const T *kv_buffer, T *O,
   return cudaGetLastError();
 }
 
+// Warp-per-head decode entry: preferred for decode contexts where the
+// full-KV scan by num_heads warps already saturates bandwidth (no split
+// workspace, single launch). Shape-static for CUDA graphs.
+template <typename T>
+cudaError_t FlashDecodeWarpPerHead(const T *Q, const T *kv_buffer, T *O,
+                                   const int *d_seq_ids, const int *d_kv_lens,
+                                   int layer, int batch_size, int num_heads,
+                                   int num_kv_heads, int head_dim,
+                                   size_t slot_stride, size_t layer_stride,
+                                   size_t kv_stride, float scale,
+                                   cudaStream_t stream) {
+  const int gqa_ratio = (num_kv_heads > 0 && num_heads > num_kv_heads)
+                            ? (num_heads / num_kv_heads)
+                            : 1;
+  switch (gqa_ratio) {
+  case 8:
+    return LaunchGQADecodeWarpPerHead<T, 8>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream);
+  case 4:
+    return LaunchGQADecodeWarpPerHead<T, 4>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream);
+  case 2:
+    return LaunchGQADecodeWarpPerHead<T, 2>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream);
+  default:
+    return LaunchGQADecodeWarpPerHead<T, 1>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream);
+  }
+}
+
 template <typename T>
 cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
                                        const int *d_seq_ids,
@@ -1215,6 +1370,17 @@ cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
       head_dim, slot_stride, layer_stride, kv_stride, scale);
   return cudaGetLastError();
 }
+
+template cudaError_t FlashDecodeWarpPerHead<half>(
+    const half *, const half *, half *, const int *, const int *, int, int,
+    int, int, int, size_t, size_t, size_t, float, cudaStream_t);
+template cudaError_t FlashDecodeWarpPerHead<float>(
+    const float *, const float *, float *, const int *, const int *, int, int,
+    int, int, int, size_t, size_t, size_t, float, cudaStream_t);
+template cudaError_t FlashDecodeWarpPerHead<__nv_bfloat16>(
+    const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *,
+    const int *, const int *, int, int, int, int, int, size_t, size_t,
+    size_t, float, cudaStream_t);
 
 template cudaError_t FlashDecodeMultiSeqStrided<half>(
     const half *, const half *, half *, const int *, const int *, int, int,

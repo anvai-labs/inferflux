@@ -2010,7 +2010,7 @@ bool FusedQuantGemm::GemvMmqMma(
   using namespace runtime::cuda::native;
   const auto &p = ResolveExecutionPolicy(policy);
   if (!p.enable_mmq_mma || !weight.data || !input || !output || !ds_act ||
-      !partials || M <= 1 || M > p.mmq_mma_max_batch || N <= 0 || K <= 0 ||
+      !partials || M < 2 || M > p.mmq_mma_max_batch || N <= 0 || K <= 0 ||
       static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
       static_cast<GGUF::TensorType>(weight.quant_type) !=
           GGUF::TensorType::Q4_K ||
