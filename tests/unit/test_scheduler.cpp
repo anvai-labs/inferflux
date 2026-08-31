@@ -668,6 +668,10 @@ TEST_CASE("Scheduler stub response with no backend", "[scheduler]") {
 
   REQUIRE(resp.no_backend);
   REQUIRE(!resp.completion.empty());
+  // Usage telemetry: duration is measured from accept even on the stub path;
+  // no prefix cache is attached so the cache split reports an explicit 0.
+  REQUIRE(resp.duration_ms >= 0.0);
+  REQUIRE(resp.cached_prompt_tokens == 0);
 }
 
 TEST_CASE("Scheduler with empty SingleModelRouter returns no_backend",
@@ -717,6 +721,48 @@ TEST_CASE("on_token callback fires on prefix cache hit", "[scheduler]") {
 
   REQUIRE(resp.no_backend);
   REQUIRE(!resp.completion.empty());
+  // Prefix matching happens in the backend's BPE token space, which needs a
+  // resolved backend; with none, the usage split reports an explicit 0.
+  REQUIRE(resp.cached_prompt_tokens == 0);
+  REQUIRE(resp.duration_ms >= 0.0);
+}
+
+TEST_CASE("Scheduler reports radix prefix hits as cached prompt tokens",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto prefix_cache = std::make_shared<RadixPrefixCache>(
+      cache, [](int) {}, RadixPrefixCacheLimits{1024, 12});
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<ReadyStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "cached-model";
+  info.path = "/tmp/cached.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  // Prime the trie with the exact BPE token sequence the stub backend's
+  // TokenizeForCache produces, on the same backend object the scheduler will
+  // resolve (node reuse requires backend identity).
+  prefix_cache->Insert(backend->TokenizeForCache("seed"), {100}, 0, backend);
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, prefix_cache);
+
+  InferenceRequest req;
+  req.prompt = "prefix cached prompt";
+  req.max_tokens = 2;
+  auto resp = scheduler.Generate(std::move(req)).get();
+
+  REQUIRE_FALSE(resp.no_backend);
+  // ReadyStubBackend::TokenizeForCache yields {1,2,3}; the trie holds that
+  // exact sequence, so the whole BPE prompt counts as cache-reused.
+  REQUIRE(resp.cached_prompt_tokens == 3);
+  REQUIRE(resp.cached_prompt_tokens <= resp.prompt_tokens);
+  REQUIRE(resp.duration_ms >= 0.0);
 }
 
 TEST_CASE("Scheduler clamps max_tokens=0 to 1", "[scheduler]") {

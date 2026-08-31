@@ -10,7 +10,7 @@ Key features of InferFlux include:
 
 *   **Continuous Batching:** A paged KV cache and a sophisticated scheduler enable efficient handling of multiple concurrent requests.
 *   **Speculative Decoding:** The server can use a smaller, faster "draft" model to generate candidate tokens, which are then verified by the primary model, potentially speeding up inference.
-*   **OpenAI-Compatible API:** The server exposes REST, gRPC, and WebSocket APIs that are compatible with the OpenAI API format, making it easy to integrate with existing tools and applications.
+*   **OpenAI-Compatible API:** The server exposes an HTTP/1.1 REST API (with SSE streaming) compatible with the OpenAI API format, making it easy to integrate with existing tools and applications.
 *   **Enterprise-Grade Security and Observability:**
     *   **Authentication:** Supports API keys and OIDC for secure access.
     *   **Authorization:** Implements Role-Based Access Control (RBAC) with different scopes for different API keys.

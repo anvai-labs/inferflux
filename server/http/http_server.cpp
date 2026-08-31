@@ -728,6 +728,25 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
   j["usage"] = {{"prompt_tokens", prompt_toks},
                 {"completion_tokens", total_completion_tokens},
                 {"total_tokens", prompt_toks + total_completion_tokens}};
+  // Per-request cache split and timings. cached_tokens is always emitted —
+  // an explicit 0 on a miss — and prompt_tokens stays inclusive of the cached
+  // portion; consumers derive fresh input as prompt − cached. All choices
+  // share one prompt, so results[0] carries the request-level numbers.
+  int cached_toks = 0;
+  double duration_ms = -1.0;
+  double ttft_ms = -1.0;
+  if (!results.empty()) {
+    cached_toks = results[0].cached_prompt_tokens;
+    duration_ms = results[0].duration_ms;
+    ttft_ms = results[0].time_to_first_token_ms;
+  }
+  j["usage"]["prompt_tokens_details"] = {{"cached_tokens", cached_toks}};
+  if (duration_ms >= 0.0) {
+    j["usage"]["duration_ms"] = duration_ms;
+  }
+  if (ttft_ms >= 0.0) {
+    j["usage"]["time_to_first_token_ms"] = ttft_ms;
+  }
 
   json choices = json::array();
   for (int i = 0; i < static_cast<int>(results.size()); ++i) {
@@ -1382,19 +1401,13 @@ bool HttpServer::ResolveSubject(const std::string &headers,
     ctx->scopes.insert("generate");
     return true;
   }
-  auto pos = headers.find("Authorization:");
-  if (pos == std::string::npos) {
+  // RFC 9110 §5.1/§11.1: field names and the auth-scheme are case-insensitive
+  // (lowercase "authorization" is what hyper/reqwest and most HTTP/2-era
+  // clients send).
+  std::string token = ExtractBearerToken(headers);
+  if (token.empty()) {
     return false;
   }
-  auto end = headers.find("\r\n", pos);
-  std::string line = headers.substr(pos, end - pos);
-  auto token_pos = line.find("Bearer");
-  if (token_pos == std::string::npos) {
-    return false;
-  }
-  std::string token = line.substr(token_pos + 6);
-  token.erase(0, token.find_first_not_of(' '));
-  token.erase(token.find_last_not_of(' ') + 1);
   if (auth_ && auth_->HasKeys()) {
     auto hash = ApiKeyAuth::HashKey(token);
     if (auth_->IsAllowedByHash(hash)) {
@@ -1490,25 +1503,17 @@ void HttpServer::HandleClient(ClientSession &session) {
   // Phase 2: parse Content-Length and read remaining body bytes.
   std::size_t body_start = header_end_pos + 4;
   std::size_t content_length = 0;
-  {
-    auto cl_pos = request.find("Content-Length:");
-    if (cl_pos == std::string::npos) {
-      cl_pos = request.find("content-length:");
-    }
-    if (cl_pos != std::string::npos && cl_pos < header_end_pos) {
-      auto val_start = cl_pos + 15; // strlen("Content-Length:")
-      while (val_start < header_end_pos && request[val_start] == ' ') {
-        ++val_start;
-      }
-      auto val_end = request.find("\r\n", val_start);
-      if (val_end != std::string::npos) {
-        try {
-          content_length =
-              std::stoull(request.substr(val_start, val_end - val_start));
-        } catch (const std::exception &ex) {
-          log::Debug("http_server", "Invalid Content-Length header: " +
-                                        std::string(ex.what()));
-        }
+  if (header_end_pos != std::string::npos) {
+    // Case-insensitive lookup over the header block only (RFC 9110 §5.1), so
+    // mixed-case spellings and body bytes cannot affect the parse.
+    std::string cl_value =
+        GetHeaderValue(request.substr(0, header_end_pos), "content-length");
+    if (!cl_value.empty()) {
+      try {
+        content_length = std::stoull(cl_value);
+      } catch (const std::exception &ex) {
+        log::Debug("http_server",
+                   "Invalid Content-Length header: " + std::string(ex.what()));
       }
     }
   }
@@ -3285,6 +3290,17 @@ void HttpServer::HandleClient(ClientSession &session) {
                              {"completion_tokens", result.completion_tokens},
                              {"total_tokens",
                               result.prompt_tokens + result.completion_tokens}};
+              // Same per-request telemetry as the non-streaming usage body:
+              // explicit cached 0 on a miss, TTFT only when streamed.
+              uc["usage"]["prompt_tokens_details"] = {
+                  {"cached_tokens", result.cached_prompt_tokens}};
+              if (result.duration_ms >= 0.0) {
+                uc["usage"]["duration_ms"] = result.duration_ms;
+              }
+              if (result.time_to_first_token_ms >= 0.0) {
+                uc["usage"]["time_to_first_token_ms"] =
+                    result.time_to_first_token_ms;
+              }
               SendAll(session, "data: " + uc.dump() + "\n\n");
             }
             SendAll(session, "data: [DONE]\n\n");

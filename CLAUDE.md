@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-InferFlux is a C++17 inference server delivering OpenAI-compatible REST/gRPC/WebSocket APIs across CUDA, ROCm, Metal (MPS), Vulkan, and CPU backends via a unified device abstraction. Models in GGUF and safetensors formats are loaded through an integrated llama.cpp backend. The project also ships `inferctl`, a CLI client with interactive chat, streaming, and admin commands.
+InferFlux is a C++17 inference server serving an OpenAI-compatible HTTP/1.1 REST API (SSE streaming included; no gRPC/WebSocket surface today) across CUDA, ROCm, Metal (MPS), Vulkan, and CPU backends via a unified device abstraction. Models in GGUF and safetensors formats are loaded through an integrated llama.cpp backend. The project also ships `inferctl`, a CLI client with interactive chat, streaming, and admin commands.
 
 Sibling instruction files at the repo root (`AGENTS.md`, `GEMINI.md`) cover the same ground for other agents — keep them consistent when conventions change.
 

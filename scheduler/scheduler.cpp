@@ -470,6 +470,28 @@ void SyncUnifiedDecodeStepProgress(InferenceRequest *req) {
   }
 }
 
+// Threads per-request usage telemetry (prefix-cache split, accept→last-token
+// duration, TTFT for streams) onto a finalized result. Cached tokens are
+// clamped to the reported prompt length so a stale radix match can never
+// exceed the prompt it is reported against.
+void FillResultUsageTelemetry(const InferenceRequest &req,
+                              InferenceResult *result) {
+  result->cached_prompt_tokens =
+      std::clamp(req.cache_matched_tokens, 0, result->prompt_tokens);
+  const auto epoch = std::chrono::steady_clock::time_point{};
+  if (req.accept_time == epoch) {
+    return; // Accept time unavailable; timings stay "not measured".
+  }
+  const auto now = std::chrono::steady_clock::now();
+  result->duration_ms =
+      std::chrono::duration<double, std::milli>(now - req.accept_time).count();
+  if (req.stream && req.first_token_time != epoch) {
+    result->time_to_first_token_ms = std::chrono::duration<double, std::milli>(
+                                         req.first_token_time - req.accept_time)
+                                         .count();
+  }
+}
+
 void FinalizeUnifiedDecodeStepResult(InferenceRequest *req,
                                      InferenceResult *result) {
   if (!req || !result) {
@@ -1151,6 +1173,7 @@ void Scheduler::DecodeWorkerLoop() {
         }
 
         FinalizeUnifiedDecodeStepResult(inference, &result);
+        FillResultUsageTelemetry(*inference, &result);
         {
           std::lock_guard<std::mutex> lock(queue_mutex_);
           if (inference->session_lease_acquired &&
@@ -1387,6 +1410,7 @@ void Scheduler::DecodeWorkerLoop() {
       if (!use_stepwise_decode) {
         inference->phase = RequestPhase::kFinished;
       }
+      FillResultUsageTelemetry(*inference, &result);
       pending->promise.set_value(std::move(result));
     }
 
@@ -1425,6 +1449,7 @@ std::future<InferenceResult> Scheduler::Generate(InferenceRequest request) {
   pending->inference.phase = RequestPhase::kPending;
   pending->inference.session_lease_acquired = false;
   pending->inference.enqueue_time = pending->enqueue_time;
+  pending->inference.accept_time = pending->enqueue_time;
   if (pending->inference.max_tokens <= 0) {
     pending->inference.max_tokens = 1;
   }
@@ -1863,6 +1888,10 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           cached_seq_id = lookup.sequence_id;
           matched_tokens = lookup.matched_tokens;
         }
+        // Per-request usage telemetry (usage.cached_tokens): only tokens
+        // whose KV blocks are actually reused count as cached — a partial
+        // trie match that cannot donate blocks reports zero.
+        inf.cache_matched_tokens = prefix_hit ? matched_tokens : 0;
 
         // PagedAttention Block Allocation: calculate additional blocks needed.
         std::size_t prompt_len = inf.bpe_prompt_tokens.size();
@@ -2426,6 +2455,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       ResetSequenceLease(inference);
     }
     inference->phase = RequestPhase::kFinished;
+    FillResultUsageTelemetry(*inference, &result);
     pending->promise.set_value(std::move(result));
     LogSequenceSlotEvent("promise_completed", *inference);
   }
