@@ -3808,17 +3808,31 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                 FusedDispatchGeometry{B, vocab_size_, hidden_size_, 1, true,
                                       true})) {
           if (fp32_residual_active_) {
-            FusedQuantGemm::FusedRmsNormQuantizeQ8_1(
-                d_residual_f32_, final_norm, d_act_q8_1_, B, hidden_size_,
-                rms_norm_eps_, stream_);
+            // S11b fused kernel writes BOTH the half norm (MMA input) and
+            // the Q8_1 blocks (dp4a fallback input) in one launch.
+            cuda_kernel::RmsNormMixedQuantQ8_1(
+                d_residual_f32_, final_norm, d_norm_out_, d_act_q8_1_, B,
+                hidden_size_, rms_norm_eps_, stream_);
+            // lm_head is Q6_K: MMA tensor-core at B >= min_batch
+            // (n_tiles=ceil(vocab/128) fills the SM array, splits=1, so
+            // the hidden-sized partials buffer is never touched).
+            lm_q8_1_ok = TryMmqMmaGemv<T>(
+                lm_raw, d_norm_out_, d_logits_typed_, d_act_q8_1_mmq_,
+                d_mma_partials_, B, vocab_size_, hidden_size_, stream_,
+                "lm_head", active_policy);
+            if (!lm_q8_1_ok) {
+              lm_q8_1_ok = FusedQuantGemm::GemvQ8_1(
+                  lm_raw, d_act_q8_1_, d_logits_typed_, B, vocab_size_,
+                  hidden_size_, stream_, active_policy);
+            }
           } else {
             FusedQuantGemm::FusedRmsNormQuantizeQ8_1(
                 d_residual_, final_norm, d_act_q8_1_, B, hidden_size_,
                 rms_norm_eps_, stream_);
+            lm_q8_1_ok = FusedQuantGemm::GemvQ8_1(
+                lm_raw, d_act_q8_1_, d_logits_typed_, B, vocab_size_,
+                hidden_size_, stream_, active_policy);
           }
-          lm_q8_1_ok = FusedQuantGemm::GemvQ8_1(
-              lm_raw, d_act_q8_1_, d_logits_typed_, B, vocab_size_,
-              hidden_size_, stream_, active_policy);
         }
       }
       if (!lm_q8_1_ok) {
