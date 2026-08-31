@@ -3286,7 +3286,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                 d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_,
                 head_dim_, kv_cache_->SlotStride(), kv_cache_->LayerStride(),
                 kv_cache_->KvStride(), attn_scale, stream_,
-                d_attn_split_workspace_, attn_split_workspace_bytes_);
+                d_attn_split_workspace_, attn_split_workspace_bytes_,
+                max_seq_len_);
           }
         } else {
           err = cuda_kernel::FlashDecodeMultiSeqIndirect<T>(
