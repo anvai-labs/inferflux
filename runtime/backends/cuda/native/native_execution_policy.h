@@ -68,10 +68,11 @@ struct NativeExecutionPolicy {
   bool enable_experimental_q81_grouped_mmq3{true};
   bool enable_downproj_mmq{false};
   int downproj_mmq_min_batch_override{-1};
-  // mma.sync Q6_K down-projection (S7): int8 tensor-core MMQ with
-  // deterministic K-split. Default off; A/B gate pending. When on, the
-  // down-proj MMQ tier prefers the MMA kernel for Q6_K weights.
-  bool enable_mmq_mma{false};
+  // mma.sync int8 tensor-core MMQ family (S7/S8): Q4_K gate/up+QKV+o
+  // and Q6_K down-proj at M >= 2. Default ON — interleaved 3-round c16
+  // A/B: +22/+31/+22% tok/s, ratio vs llama 0.62->0.84 / 0.71->0.87 /
+  // 0.68->0.76, zero classified failures.
+  bool enable_mmq_mma{true};
   // MMA only wins where the dp4a MMVQ tier stops being at the bandwidth
   // floor: measured -13% at c4 (M=4) vs the incumbent MMVQ, so the floor
   // M is 9 (the same batch range the dp4a MMQ threshold targets).
@@ -185,7 +186,7 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", false);
     policy.downproj_mmq_min_batch_override =
         ParseIntEnv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", -1, 1, 64);
-    policy.enable_mmq_mma = ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", false);
+    policy.enable_mmq_mma = ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", true);
     policy.mmq_mma_min_batch =
         ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 9, 1, 64);
     policy.mmq_mma_max_batch =
