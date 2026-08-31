@@ -476,7 +476,8 @@ bool TryQ8_1ProjectionGroup(
     const T *norm_weight, void *act_q8_1, int M, int K, float eps,
     cudaStream_t stream, const NativeExecutionPolicy *policy = nullptr,
     FusedQuantGemm::FfnProjOperator selected_op =
-        FusedQuantGemm::FfnProjOperator::kFallback) {
+        FusedQuantGemm::FfnProjOperator::kFallback,
+    bool q81_precomputed = false) {
   if constexpr (!std::is_same_v<T, half>) {
     (void)input;
     (void)norm_weight;
@@ -525,12 +526,17 @@ bool TryQ8_1ProjectionGroup(
       }
     }
 
-    // Quantize activations: fused RmsNorm+Quantize or standalone quantize
-    if (norm_weight) {
-      FusedQuantGemm::FusedRmsNormQuantizeQ8_1(input, norm_weight, act_q8_1, M,
-                                               K, eps, stream);
-    } else {
-      FusedQuantGemm::QuantizeRowQ8_1(input, act_q8_1, M, K, stream);
+    // Quantize activations: fused RmsNorm+Quantize or standalone quantize.
+    // Skipped when a producer epilogue already wrote act_q8_1 for this
+    // exact input (P2 pattern) — the standalone re-quantize was measured
+    // as 2 of the 5 per-layer-step quantize launches at c1.
+    if (!q81_precomputed) {
+      if (norm_weight) {
+        FusedQuantGemm::FusedRmsNormQuantizeQ8_1(input, norm_weight, act_q8_1,
+                                                 M, K, eps, stream);
+      } else {
+        FusedQuantGemm::QuantizeRowQ8_1(input, act_q8_1, M, K, stream);
+      }
     }
 
     const auto grouping = SelectSharedActivationGrouping(
@@ -2815,6 +2821,9 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
 
     // Transformer layers
     bool input_norm_precomputed = false;
+    // Loop-carry: the previous layer's P2 epilogue quantized d_norm_out_
+    // into d_act_q8_1_ — the QKV group must not re-quantize it.
+    bool input_q81_precomputed = false;
     for (int layer = 0; layer < num_layers_; layer++) {
       NVTX_SCOPE("Layer");
       // Bias-fold plumbing: assigned after the QKV projection below, read
@@ -2882,7 +2891,9 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                   }
                   return TryQ8_1ProjectionGroup(
                       qkv_plans, qkv_input, qkv_norm, d_act_q8_1_, B,
-                      hidden_size_, rms_norm_eps_, stream_, active_policy);
+                      hidden_size_, rms_norm_eps_, stream_, active_policy,
+                      FusedQuantGemm::FfnProjOperator::kFallback,
+                      input_q81_precomputed);
                 },
                 [&]() {
                   return TryPackedProjectionGroup(
@@ -3426,7 +3437,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                     return TryQ8_1ProjectionGroup(
                         ffn_plans, ffn_input, ffn_norm_weight, d_act_q8_1_, B,
                         hidden_size_, rms_norm_eps_, stream_, active_policy,
-                        ffn_selected_op);
+                        ffn_selected_op, ffn_q81_precomputed);
                   },
                   [&]() {
                     return TryPackedProjectionGroup(
@@ -3769,6 +3780,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                 hidden_size_, rms_norm_eps_, stream_);
           }
           input_norm_precomputed = true;
+          input_q81_precomputed = true;
         }
       }
       pt.ffn_down_ms += pt.Mark();
