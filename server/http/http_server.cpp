@@ -1382,19 +1382,13 @@ bool HttpServer::ResolveSubject(const std::string &headers,
     ctx->scopes.insert("generate");
     return true;
   }
-  auto pos = headers.find("Authorization:");
-  if (pos == std::string::npos) {
+  // RFC 9110 §5.1/§11.1: field names and the auth-scheme are case-insensitive
+  // (lowercase "authorization" is what hyper/reqwest and most HTTP/2-era
+  // clients send).
+  std::string token = ExtractBearerToken(headers);
+  if (token.empty()) {
     return false;
   }
-  auto end = headers.find("\r\n", pos);
-  std::string line = headers.substr(pos, end - pos);
-  auto token_pos = line.find("Bearer");
-  if (token_pos == std::string::npos) {
-    return false;
-  }
-  std::string token = line.substr(token_pos + 6);
-  token.erase(0, token.find_first_not_of(' '));
-  token.erase(token.find_last_not_of(' ') + 1);
   if (auth_ && auth_->HasKeys()) {
     auto hash = ApiKeyAuth::HashKey(token);
     if (auth_->IsAllowedByHash(hash)) {
@@ -1490,25 +1484,17 @@ void HttpServer::HandleClient(ClientSession &session) {
   // Phase 2: parse Content-Length and read remaining body bytes.
   std::size_t body_start = header_end_pos + 4;
   std::size_t content_length = 0;
-  {
-    auto cl_pos = request.find("Content-Length:");
-    if (cl_pos == std::string::npos) {
-      cl_pos = request.find("content-length:");
-    }
-    if (cl_pos != std::string::npos && cl_pos < header_end_pos) {
-      auto val_start = cl_pos + 15; // strlen("Content-Length:")
-      while (val_start < header_end_pos && request[val_start] == ' ') {
-        ++val_start;
-      }
-      auto val_end = request.find("\r\n", val_start);
-      if (val_end != std::string::npos) {
-        try {
-          content_length =
-              std::stoull(request.substr(val_start, val_end - val_start));
-        } catch (const std::exception &ex) {
-          log::Debug("http_server", "Invalid Content-Length header: " +
-                                        std::string(ex.what()));
-        }
+  if (header_end_pos != std::string::npos) {
+    // Case-insensitive lookup over the header block only (RFC 9110 §5.1), so
+    // mixed-case spellings and body bytes cannot affect the parse.
+    std::string cl_value =
+        GetHeaderValue(request.substr(0, header_end_pos), "content-length");
+    if (!cl_value.empty()) {
+      try {
+        content_length = std::stoull(cl_value);
+      } catch (const std::exception &ex) {
+        log::Debug("http_server",
+                   "Invalid Content-Length header: " + std::string(ex.what()));
       }
     }
   }

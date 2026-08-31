@@ -105,6 +105,29 @@ TEST_CASE("LookupHeaderValueForTest matches header names case-insensitively",
           "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01");
 }
 
+TEST_CASE("ExtractBearerToken parses any header or scheme casing",
+          "[http_server]") {
+  const std::string token = "dev-key-123";
+
+  // RFC 9110 §5.1 (field names) and §11.1 (auth-scheme) are case-insensitive.
+  REQUIRE(ExtractBearerToken("Authorization: Bearer " + token) == token);
+  REQUIRE(ExtractBearerToken("authorization: Bearer " + token) == token);
+  REQUIRE(ExtractBearerToken("AUTHORIZATION: bearer " + token) == token);
+  REQUIRE(ExtractBearerToken("Authorization: bEaReR   " + token) == token);
+
+  // Header sits among other headers, not first.
+  REQUIRE(ExtractBearerToken("Host: 127.0.0.1\r\n"
+                             "Content-Type: application/json\r\n"
+                             "authorization: Bearer " +
+                             token + "\r\n") == token);
+
+  // Non-bearer schemes, missing headers, and bare schemes yield no token.
+  REQUIRE(ExtractBearerToken("Authorization: Basic dXNlcjpwYXNz").empty());
+  REQUIRE(ExtractBearerToken("Content-Type: application/json").empty());
+  REQUIRE(ExtractBearerToken("Authorization: Bearer").empty());
+  REQUIRE(ExtractBearerToken("").empty());
+}
+
 TEST_CASE("HttpServer ready status reports healthy distributed decode pool",
           "[http_server]") {
   SimpleTokenizer tokenizer;
