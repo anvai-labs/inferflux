@@ -300,7 +300,8 @@ public:
                          runtime::cuda::native::BlockQ8_1MmqDs *ds_act,
                          float *partials, int M, int N, int K,
                          cudaStream_t stream,
-                         const NativeExecutionPolicy *policy = nullptr);
+                         const NativeExecutionPolicy *policy = nullptr,
+                         int max_m_override = -1);
 
   static bool DownProjMmqMma(const QuantizedWeightInfo &weight,
                              const runtime::cuda::native::BlockQ8_1Mmq *act_mmq,

@@ -78,6 +78,11 @@ struct NativeExecutionPolicy {
   // M is 9 (the same batch range the dp4a MMQ threshold targets).
   int mmq_mma_min_batch{9};
   int mmq_mma_max_batch{16};
+  // Prefill M ceiling for the MMA family (S12): prefill chunks (default
+  // chunked_prefill=512) run the grouped dp4a path at 422us/call without
+  // this. Decode keeps the 16 cap; larger M uses splits=1 (the heuristic
+  // counts y-tiles), so the partials buffer stays decode-sized.
+  int mmq_mma_max_prefill_batch{512};
   bool use_vectorized_loads{false};
   bool enable_fused_gate_up_silu{true};
   bool enable_adaptive_mmvq_threads{true};
@@ -191,6 +196,8 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 9, 1, 64);
     policy.mmq_mma_max_batch =
         ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH", 16, 1, 64);
+    policy.mmq_mma_max_prefill_batch = ParseIntEnv(
+        "INFERFLUX_CUDA_MMQ_MMA_MAX_PREFILL_BATCH", 512, 1, 512);
     policy.use_vectorized_loads =
         ParseBoolEnv("INFERFLUX_USE_VECTORIZED_LOADS", false);
     policy.enable_fused_gate_up_silu =
