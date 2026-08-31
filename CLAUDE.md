@@ -338,7 +338,7 @@ stale object files (WSL2 filesystem timestamp issue):
 - `INFERFLUX_CUDA_DISPATCH_PROBE` / `INFERFLUX_CUDA_DISPATCH_PROBE_FORCE_UNHEALTHY` — load-time reachability and controlled operator down-ranking; degraded state is visible in `/readyz`
 - `INFERFLUX_DISABLE_FUSED_GEMV=1`, `INFERFLUX_FORCE_CUBLAS=1`, `INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL=1` — dispatch overrides
 - `INFERFLUX_ENABLE_DOWNPROJ_MMQ` / `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH` — down-projection MMQ threshold
-- `INFERFLUX_CUDA_MMQ_MMA=1` / `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` — mma.sync int8 tensor-core Q6_K down-proj with deterministic K-split (default off; needs no MMQ layout transform)
+- `INFERFLUX_CUDA_MMQ_MMA` / `INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` / `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` — mma.sync int8 tensor-core MMQ family (Q4_K gate/up+QKV+o, Q6_K down-proj; M ≥ min-batch; default ON)
 - `INFERFLUX_MMVQ_MIN_WARPS` / `INFERFLUX_MMVQ_MAX_WARPS` / `INFERFLUX_ENABLE_ADAPTIVE_MMVQ_THREADS` — MMVQ occupancy tuning
 - `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_*` — experimental grouped/rowpair/rowquad kernel variants (default off)
 - `INFERFLUX_CUDA_DEQUANT_CACHE_POLICY` — dequantized-weight cache policy (memory contract; see `GGUFMemoryContractTests`)
