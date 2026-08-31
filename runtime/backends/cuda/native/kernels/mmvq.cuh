@@ -382,13 +382,17 @@ __global__ void inferflux_mmvq_q4k_accum_wide(
   }
   __syncthreads();
   if (tid == 0) {
+    // blockDim may be smaller than kMmvqWarps (work-aware launch): only
+    // the resident warps wrote their slots — combining the rest reads
+    // uninitialized shared memory.
+    const int num_warps = blockDim.x >> 5;
 #pragma unroll
     for (int c = 0; c < ncols; ++c) {
       const int row = col_base + c;
       if (row >= M)
         break;
       float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
+      for (int w = 0; w < num_warps; ++w)
         sum += warp_sums[c * kMmvqWarps + w];
       if constexpr (std::is_same_v<OutputT, float>) {
         if constexpr (UseAtomic) {
