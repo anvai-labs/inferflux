@@ -750,9 +750,12 @@ bool TryQ8_1MmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
                           const char *proj_name,
                           const NativeExecutionPolicy *policy) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
-  // M >= 2 everywhere: measured -12% at c1 with M=1 MMA for QKV/o
-  // (masked 16-row tiles + per-projection quantize/reduce launch pairs
-  // lose to the at-floor M=1 incumbents despite their 3-5x floor gap).
+  // M >= 2 for every projection family — measured three ways at c1:
+  // QKV+o (-12%), gate/up+o (-4%). The M=1 incumbents' floor gaps
+  // (fused gate/up 1.5x DRAM cold, o accum 3.5x) are real but smaller
+  // than the masked-tile + per-projection quantize/reduce launch
+  // overhead at M=1. Improving M=1 requires kernel work on the
+  // incumbents, not dispatch changes.
   if (!policy_ref.enable_mmq_mma || M < 2) {
     return false;
   }
