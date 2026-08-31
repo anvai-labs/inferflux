@@ -170,21 +170,36 @@ int main() {
       const dim3 grid(kN, M);
       const dim3 block(kWideWarps * 32);
       auto run_wide = [&] {
-        if (M == 1) {
+        if (M <= 1) {
           inferflux_mmvq_q4k_fused_gate_up_silu_wide<1>
               <<<grid, block, 0, s>>>(
                   static_cast<const block_q4_k *>(gate_info.data),
                   static_cast<const block_q4_k *>(up_info.data),
                   static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
         } else if (M <= 2) {
+          const dim3 g2(kN, (M + 1) / 2);
           inferflux_mmvq_q4k_fused_gate_up_silu_wide<2>
-              <<<grid, block, 0, s>>>(
+              <<<g2, block, 0, s>>>(
+                  static_cast<const block_q4_k *>(gate_info.data),
+                  static_cast<const block_q4_k *>(up_info.data),
+                  static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
+        } else if (M <= 4) {
+          const dim3 g4(kN, (M + 3) / 4);
+          inferflux_mmvq_q4k_fused_gate_up_silu_wide<4>
+              <<<g4, block, 0, s>>>(
+                  static_cast<const block_q4_k *>(gate_info.data),
+                  static_cast<const block_q4_k *>(up_info.data),
+                  static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
+        } else {
+          const dim3 g8(kN, (M + 7) / 8);
+          inferflux_mmvq_q4k_fused_gate_up_silu_wide<8>
+              <<<g8, block, 0, s>>>(
                   static_cast<const block_q4_k *>(gate_info.data),
                   static_cast<const block_q4_k *>(up_info.data),
                   static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
         }
       };
-      if (M <= 2) {
+      if (M <= 8) {
         // Reference: incumbent output.
         std::vector<half> ref(static_cast<size_t>(M) * kN);
         FusedQuantGemm::FusedGateUpSiluGemvQ8_1(gate_info, up_info, d_act_q8,
