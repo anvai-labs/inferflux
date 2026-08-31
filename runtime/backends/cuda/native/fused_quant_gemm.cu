@@ -1350,12 +1350,31 @@ bool DispatchQ8_1MmvqAccumF32Q4K(const void *data, const void *act_q8_1,
     const char *raw = std::getenv("INFERFLUX_CUDA_WIDE_ACCUM");
     return !raw || !(std::string(raw) == "0" || std::string(raw) == "false");
   }();
-  if (wide_enabled && M == 1) {
-    const dim3 grid(static_cast<unsigned>(N), 1);
-    inferflux_mmvq_q4k_accum_wide<1, float, true>
-        <<<grid, kMmvqWarps * 32, 0, stream>>>(
-            static_cast<const block_q4_k *>(data),
-            static_cast<const block_q8_1 *>(act_q8_1), output, N, K, M);
+  if (wide_enabled && M <= 8) {
+    const int ncols = (M <= 1) ? 1 : (M <= 2) ? 2 : (M <= 4) ? 4 : 8;
+    const dim3 grid(static_cast<unsigned>(N),
+                    static_cast<unsigned>((M + ncols - 1) / ncols));
+    const auto *w = static_cast<const block_q4_k *>(data);
+    const auto *ax = static_cast<const block_q8_1 *>(act_q8_1);
+    const dim3 block(kMmvqWarps * 32);
+    switch (ncols) {
+    case 1:
+      inferflux_mmvq_q4k_accum_wide<1, float, true>
+          <<<grid, block, 0, stream>>>(w, ax, output, N, K, M);
+      break;
+    case 2:
+      inferflux_mmvq_q4k_accum_wide<2, float, true>
+          <<<grid, block, 0, stream>>>(w, ax, output, N, K, M);
+      break;
+    case 4:
+      inferflux_mmvq_q4k_accum_wide<4, float, true>
+          <<<grid, block, 0, stream>>>(w, ax, output, N, K, M);
+      break;
+    default:
+      inferflux_mmvq_q4k_accum_wide<8, float, true>
+          <<<grid, block, 0, stream>>>(w, ax, output, N, K, M);
+      break;
+    }
     return cudaGetLastError() == cudaSuccess;
   }
   return DispatchMmvqAccumF32<block_q4_k, inferflux_mmvq_q4k_accum<1, float>,
@@ -2557,13 +2576,35 @@ bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
     const char *raw = std::getenv("INFERFLUX_CUDA_WIDE_GATE_UP");
     return !raw || !(std::string(raw) == "0" || std::string(raw) == "false");
   }();
-  if (wide_enabled && M == 1) {
-    const dim3 grid(static_cast<unsigned>(N), 1);
-    inferflux_mmvq_q4k_fused_gate_up_silu_wide<1>
-        <<<grid, kMmvqWarps * 32, 0, stream>>>(
-            static_cast<const block_q4_k *>(gate_raw.data),
-            static_cast<const block_q4_k *>(up_raw.data),
-            static_cast<const block_q8_1 *>(act_q8_1), output, N, K, M);
+  // Wide loads through M=8: the uint4 weight slices amortize across the
+  // ncols activation columns (the column loop reuses each slice), so the
+  // mid-M cohorts gain the same load-count reduction as M=1.
+  if (wide_enabled && M <= 8) {
+    const int ncols = (M <= 1) ? 1 : (M <= 2) ? 2 : (M <= 4) ? 4 : 8;
+    const dim3 grid(static_cast<unsigned>(N),
+                    static_cast<unsigned>((M + ncols - 1) / ncols));
+    const auto *gw = static_cast<const block_q4_k *>(gate_raw.data);
+    const auto *uw = static_cast<const block_q4_k *>(up_raw.data);
+    const auto *ax = static_cast<const block_q8_1 *>(act_q8_1);
+    const dim3 block(kMmvqWarps * 32);
+    switch (ncols) {
+    case 1:
+      inferflux_mmvq_q4k_fused_gate_up_silu_wide<1>
+          <<<grid, block, 0, stream>>>(gw, uw, ax, output, N, K, M);
+      break;
+    case 2:
+      inferflux_mmvq_q4k_fused_gate_up_silu_wide<2>
+          <<<grid, block, 0, stream>>>(gw, uw, ax, output, N, K, M);
+      break;
+    case 4:
+      inferflux_mmvq_q4k_fused_gate_up_silu_wide<4>
+          <<<grid, block, 0, stream>>>(gw, uw, ax, output, N, K, M);
+      break;
+    default:
+      inferflux_mmvq_q4k_fused_gate_up_silu_wide<8>
+          <<<grid, block, 0, stream>>>(gw, uw, ax, output, N, K, M);
+      break;
+    }
     return cudaGetLastError() == cudaSuccess;
   }
 
