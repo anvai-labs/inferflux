@@ -87,6 +87,10 @@ graph TD
 - Request/response headers are matched case-insensitively (RFC 9110 §5.1), including
   `Authorization` and its `Bearer` scheme (§11.1) — lowercase `authorization` from
   HTTP/2-era clients authenticates identically.
+- Streaming responses close the connection after the stream terminates (`Connection: close`
+  semantics once SSE completes), so clients and gateways pay one TCP handshake per streamed
+  call. Keep-alive across streams is not implemented; connection pooling only helps
+  non-streaming calls.
 - The `usage` object on `/v1/completions` and `/v1/chat/completions` carries per-request
   telemetry extensions alongside the OpenAI token counts (streaming sends them on the
   terminal usage frame when `stream_options.include_usage=true`):
