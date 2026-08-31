@@ -1212,7 +1212,8 @@ static cudaError_t LaunchGQADecode(const T *Q, const T *kv_buffer, T *O,
                                     size_t kv_stride, float scale,
                                     cudaStream_t stream,
                                     void *split_workspace = nullptr,
-                                    size_t split_workspace_bytes = 0) {
+                                    size_t split_workspace_bytes = 0,
+                                    int max_kv_hint = 0) {
   int threads = 1;
   while (threads < head_dim)
     threads <<= 1;
@@ -1220,8 +1221,18 @@ static cudaError_t LaunchGQADecode(const T *Q, const T *kv_buffer, T *O,
   const int num_warps = threads / 32;
   int smem = ComputeFA2SmemGQA(FA2_TILE_KV, head_dim, num_warps, GQARatio);
 
-  // Compute workspace needed for split-K
-  const int num_splits = kFlashDecodeSplits;
+  // Context-aware splits (S11): hint is the configured max sequence
+  // length (capture-static, CUDA-graph safe — never a device query).
+  // 512 = the FA2 KV tile granularity: below it a single split already
+  // covers a tile; above, splits scale with context. Splitting further
+  // than the CTAs the grid already provides only adds partial writes
+  // and the combine launch (measured #2 kernel at c16 before this).
+  // Measured (c16, max_seq 2048): 4 splits regressed slightly (0.38 ->
+  // 0.42s — halving the splits doubles each CTA's serial KV span). The
+  // win is only the short-context case: at <= 512 (one FA2 tile) the
+  // unsplit kernel skips the partial writes AND the combine launch.
+  const int num_splits =
+      (max_kv_hint > 0 && max_kv_hint <= 512) ? 1 : kFlashDecodeSplits;
   const size_t partial_O_bytes = static_cast<size_t>(batch_size) * num_kv_heads *
                                  num_splits * GQARatio * head_dim * sizeof(float);
   const size_t partial_scalar_bytes = static_cast<size_t>(batch_size) *
@@ -1229,8 +1240,11 @@ static cudaError_t LaunchGQADecode(const T *Q, const T *kv_buffer, T *O,
                                       sizeof(float);
   const size_t total_workspace = partial_O_bytes + 2 * partial_scalar_bytes;
 
-  // Use split-K path when workspace is available and large enough
-  if (split_workspace && split_workspace_bytes >= total_workspace) {
+  // Use split-K path when workspace is available and large enough.
+  // Single-split contexts skip both the partial writes and the combine
+  // launch by using the unsplit kernel directly.
+  if (split_workspace && split_workspace_bytes >= total_workspace &&
+      num_splits > 1) {
     ConfigureFA2Smem(FlashDecodeGQASplitKernel<T, GQARatio>, smem);
 
     float *partial_O = static_cast<float *>(split_workspace);
@@ -1323,7 +1337,8 @@ cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
                                        size_t kv_stride, float scale,
                                        cudaStream_t stream,
                                        void *split_workspace,
-                                       size_t split_workspace_bytes) {
+                                       size_t split_workspace_bytes,
+                                       int max_kv_hint) {
   // Use GQA-grouped kernel when multiple Q-heads share a KV head.
   // This reduces KV memory reads by gqa_ratio (e.g., 4x for ratio=4).
   const int gqa_ratio = (num_kv_heads > 0 && num_heads > num_kv_heads)
@@ -1335,21 +1350,21 @@ cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
                                   batch_size, num_heads, num_kv_heads, head_dim,
                                   slot_stride, layer_stride, kv_stride, scale,
                                   stream, split_workspace,
-                                  split_workspace_bytes);
+                                  split_workspace_bytes, max_kv_hint);
   }
   if (gqa_ratio == 4) {
     return LaunchGQADecode<T, 4>(Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
                                   batch_size, num_heads, num_kv_heads, head_dim,
                                   slot_stride, layer_stride, kv_stride, scale,
                                   stream, split_workspace,
-                                  split_workspace_bytes);
+                                  split_workspace_bytes, max_kv_hint);
   }
   if (gqa_ratio == 2) {
     return LaunchGQADecode<T, 2>(Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
                                   batch_size, num_heads, num_kv_heads, head_dim,
                                   slot_stride, layer_stride, kv_stride, scale,
                                   stream, split_workspace,
-                                  split_workspace_bytes);
+                                  split_workspace_bytes, max_kv_hint);
   }
 
   // Fallback: non-GQA or unsupported ratio — use per-head kernel
@@ -1385,11 +1400,11 @@ template cudaError_t FlashDecodeWarpPerHead<__nv_bfloat16>(
 template cudaError_t FlashDecodeMultiSeqStrided<half>(
     const half *, const half *, half *, const int *, const int *, int, int,
     int, int, int, size_t, size_t, size_t, float, cudaStream_t, void *,
-    size_t);
+    size_t, int);
 template cudaError_t FlashDecodeMultiSeqStrided<__nv_bfloat16>(
     const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, const int *,
     const int *, int, int, int, int, int, size_t, size_t, size_t, float,
-    cudaStream_t, void *, size_t);
+    cudaStream_t, void *, size_t, int);
 
 // ============================================================================
 // FlashDecodeMultiSeqIndirect: Build K/V pointer arrays from slot_base_ptrs,

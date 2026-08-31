@@ -56,7 +56,8 @@ cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
                                        size_t kv_stride, float scale,
                                        cudaStream_t stream = 0,
                                        void *split_workspace = nullptr,
-                                       size_t split_workspace_bytes = 0);
+                                       size_t split_workspace_bytes = 0,
+                                       int max_kv_hint = 0);
 
 /**
  * FlashDecodeMultiSeqIndirect: Batched decode attention using slot base
