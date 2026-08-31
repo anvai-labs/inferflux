@@ -2003,10 +2003,12 @@ bool FusedQuantGemm::DownProjMmq(const MmqWeightInfo &weight,
                   stream);
 }
 
-bool FusedQuantGemm::GemvMmqMma(
-    const QuantizedWeightInfo &weight, const half *input, half *output,
-    runtime::cuda::native::BlockQ8_1MmqDs *ds_act, float *partials, int M,
-    int N, int K, cudaStream_t stream, const NativeExecutionPolicy *policy) {
+bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
+                                const half *input, half *output,
+                                runtime::cuda::native::BlockQ8_1MmqDs *ds_act,
+                                float *partials, int M, int N, int K,
+                                cudaStream_t stream,
+                                const NativeExecutionPolicy *policy) {
   using namespace runtime::cuda::native;
   const auto &p = ResolveExecutionPolicy(policy);
   if (!p.enable_mmq_mma || !weight.data || !input || !output || !ds_act ||
@@ -2076,10 +2078,9 @@ bool FusedQuantGemm::GemvMmqMma(
   if (!logged) {
     logged = true;
     log::Info("fused_quant_gemm",
-              std::string("Using Q4_K MMA projection (M=") +
-                  std::to_string(M) + ", N=" + std::to_string(N) + ", K=" +
-                  std::to_string(K) + ", ksplit=" + std::to_string(splits) +
-                  ")");
+              std::string("Using Q4_K MMA projection (M=") + std::to_string(M) +
+                  ", N=" + std::to_string(N) + ", K=" + std::to_string(K) +
+                  ", ksplit=" + std::to_string(splits) + ")");
   }
   return true;
 }
@@ -2528,6 +2529,23 @@ bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
         "fused_quant_gemm",
         "Using fused gate+up+SiLU Q4_K MMVQ kernel (M=" + std::to_string(M) +
             ", N=" + std::to_string(N) + ", K=" + std::to_string(K) + ")");
+  }
+
+  // Wide-load variant at M=1: uint4 weight slices lift the incumbent from
+  // 68% to 95% DRAM (ncu cold: 109.1us -> 78.2us at the memory wall).
+  // Opt-in until the c1 A/B confirms end to end.
+  static const bool wide_enabled = [] {
+    const char *raw = std::getenv("INFERFLUX_CUDA_WIDE_GATE_UP");
+    return !raw || !(std::string(raw) == "0" || std::string(raw) == "false");
+  }();
+  if (wide_enabled && M == 1) {
+    const dim3 grid(static_cast<unsigned>(N), 1);
+    inferflux_mmvq_q4k_fused_gate_up_silu_wide<1>
+        <<<grid, kMmvqWarps * 32, 0, stream>>>(
+            static_cast<const block_q4_k *>(gate_raw.data),
+            static_cast<const block_q4_k *>(up_raw.data),
+            static_cast<const block_q8_1 *>(act_q8_1), output, N, K, M);
+    return cudaGetLastError() == cudaSuccess;
   }
 
   return DispatchMmvqFusedGateUpSilu<block_q4_k,

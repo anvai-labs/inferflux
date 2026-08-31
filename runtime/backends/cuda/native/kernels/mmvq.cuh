@@ -1791,15 +1791,33 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu_wide(
       up_acc[c] += __shfl_down_sync(0xFFFFFFFF, up_acc[c], offset);
     }
   }
+  // Cross-warp combine (the incumbent's pattern): each warp reduced only
+  // its own K-blocks — without this, every warp's lane 0 writes a partial
+  // and the last warp's zero clobbers the answer.
+  __shared__ float warp_gate[kMmvqWarps * ncols];
+  __shared__ float warp_up[kMmvqWarps * ncols];
   if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      warp_gate[c * kMmvqWarps + warp_id] = gate_acc[c];
+      warp_up[c * kMmvqWarps + warp_id] = up_acc[c];
+    }
+  }
+  __syncthreads();
+
+  if ((threadIdx.x >> 5) == 0 && lane == 0) {
 #pragma unroll
     for (int c = 0; c < ncols; ++c) {
       const int row = col_base + c;
       if (row < M) {
-        const float g = gate_acc[c];
+        float g = 0.0f, u = 0.0f;
+        for (int w2 = 0; w2 < kMmvqWarps; ++w2) {
+          g += warp_gate[c * kMmvqWarps + w2];
+          u += warp_up[c * kMmvqWarps + w2];
+        }
         const float silu = g / (1.0f + __expf(-g));
         output[static_cast<size_t>(row) * N + out_idx] =
-            static_cast<half>(silu * up_acc[c]);
+            static_cast<half>(silu * u);
       }
     }
   }
