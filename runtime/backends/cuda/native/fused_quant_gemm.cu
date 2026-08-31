@@ -2159,7 +2159,7 @@ bool FusedQuantGemm::DownProjMmqMma(
     const QuantizedWeightInfo &weight,
     const runtime::cuda::native::BlockQ8_1Mmq *act_mmq, half *output, int M,
     int N, int K, float *partials, cudaStream_t stream,
-    const NativeExecutionPolicy *policy) {
+    const NativeExecutionPolicy *policy, int max_m_override) {
   using namespace runtime::cuda::native;
   const auto &p = ResolveExecutionPolicy(policy);
   if (!p.enable_mmq_mma || !weight.data || !act_mmq || !output || !partials ||
@@ -2169,7 +2169,8 @@ bool FusedQuantGemm::DownProjMmqMma(
   }
   if (static_cast<GGUF::TensorType>(weight.quant_type) !=
           GGUF::TensorType::Q6_K ||
-      K % QK_K != 0 || M < p.mmq_mma_min_batch || M > p.mmq_mma_max_batch) {
+      K % QK_K != 0 || M < p.mmq_mma_min_batch ||
+      M > (max_m_override > 0 ? max_m_override : p.mmq_mma_max_batch)) {
     return false;
   }
 
@@ -2201,10 +2202,14 @@ bool FusedQuantGemm::DownProjMmqMma(
   if (sm_count <= 0) {
     return false;
   }
+  // y-tile-aware (see GemvMmqMma): prefill M already fills the SM array
+  // via grid.y — x-tile-only counting oversplits and would demand
+  // partials sized for prefill M.
   const int n_tiles = (N + kMmqY - 1) / kMmqY;
+  const int total_ctas = n_tiles * ((M + 15) / 16);
   int splits = 1;
-  if (n_tiles < sm_count) {
-    splits = std::min((sm_count + n_tiles - 1) / n_tiles,
+  if (total_ctas < sm_count) {
+    splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                       static_cast<int>(kMmqMmaMaxSplits));
   }
 

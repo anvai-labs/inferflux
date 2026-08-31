@@ -663,7 +663,7 @@ template <typename T>
 bool TryMmqMmaSiluMul(const QuantizedWeightInfo &, const T *, const T *, T *,
                       void *, float *, int, int, int, cudaStream_t,
                       const char * = nullptr,
-                      const NativeExecutionPolicy * = nullptr) {
+                      const NativeExecutionPolicy * = nullptr, int = -1) {
   return false;
 }
 
@@ -672,14 +672,16 @@ bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
                             const half *up, half *output, void *act_mmq,
                             float *partials, int M, int N, int K,
                             cudaStream_t stream, const char *proj_name,
-                            const NativeExecutionPolicy *policy) {
+                            const NativeExecutionPolicy *policy,
+                            int m_cap_override) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_mmq_mma || !weight.data || !gate || !up || !output ||
       !act_mmq || !partials || !FusedQuantGemm::CurrentDeviceSupportsMmqMma() ||
       InferfluxCudaOperatorHealth::Instance().IsUnhealthy(
           FusedQuantGemm::DownProjOperator::kMmq) ||
       M <= 0 || N <= 0 || K <= 0 || M < policy_ref.mmq_mma_min_batch ||
-      M > policy_ref.mmq_mma_max_batch ||
+      M > (m_cap_override > 0 ? m_cap_override
+                              : policy_ref.mmq_mma_max_batch) ||
       static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
       weight.quant_type !=
           static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
@@ -691,7 +693,7 @@ bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
       K, stream);
   const bool ok = FusedQuantGemm::DownProjMmqMma(
       weight, static_cast<const runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq),
-      output, M, N, K, partials, stream, policy);
+      output, M, N, K, partials, stream, policy, m_cap_override);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using MMA tensor-core Q6_K down-proj");
   }
@@ -704,7 +706,7 @@ bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
 template <typename T>
 bool TryMmqMmaGemv(const QuantizedWeightInfo &, const T *, T *, void *, float *,
                    int, int, int, cudaStream_t, const char * = nullptr,
-                   const NativeExecutionPolicy * = nullptr) {
+                   const NativeExecutionPolicy * = nullptr, int = -1) {
   return false;
 }
 
@@ -713,14 +715,16 @@ bool TryMmqMmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
                          half *output, void *act_mmq, float *partials, int M,
                          int N, int K, cudaStream_t stream,
                          const char *proj_name,
-                         const NativeExecutionPolicy *policy) {
+                         const NativeExecutionPolicy *policy,
+                         int m_cap_override) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
   if (!policy_ref.enable_mmq_mma || !weight.data || !input || !output ||
       !act_mmq || !partials || !FusedQuantGemm::CurrentDeviceSupportsMmqMma() ||
       InferfluxCudaOperatorHealth::Instance().IsUnhealthy(
           FusedQuantGemm::DownProjOperator::kMmq) ||
       M <= 0 || N <= 0 || K <= 0 || M < policy_ref.mmq_mma_min_batch ||
-      M > policy_ref.mmq_mma_max_batch ||
+      M > (m_cap_override > 0 ? m_cap_override
+                              : policy_ref.mmq_mma_max_batch) ||
       static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
       weight.quant_type !=
           static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
@@ -732,7 +736,7 @@ bool TryMmqMmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
       stream);
   const bool ok = FusedQuantGemm::DownProjMmqMma(
       weight, static_cast<const runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq),
-      output, M, N, K, partials, stream, policy);
+      output, M, N, K, partials, stream, policy, m_cap_override);
   if (ok && proj_name) {
     LogPackedGemmPath(proj_name, "using MMA tensor-core Q6_K down-proj");
   }
@@ -2236,7 +2240,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                            down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
                            d_act_q8_1_mmq_, d_mma_partials_, seq_len,
                            hidden_size_, intermediate_size_, stream_,
-                           "down_proj", &execution_policy_) ||
+                           "down_proj", &execution_policy_,
+                           execution_policy_.mmq_mma_max_prefill_batch) ||
                        TryMmqSiluMulGemv<T>(down_mmq, d_ffn_gate_, d_ffn_up_,
                                             d_ffn_down_, d_act_q8_1_, seq_len,
                                             hidden_size_, intermediate_size_,

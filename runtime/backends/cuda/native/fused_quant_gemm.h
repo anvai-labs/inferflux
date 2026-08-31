@@ -307,7 +307,8 @@ public:
                              const runtime::cuda::native::BlockQ8_1Mmq *act_mmq,
                              half *output, int M, int N, int K, float *partials,
                              cudaStream_t stream,
-                             const NativeExecutionPolicy *policy = nullptr);
+                             const NativeExecutionPolicy *policy = nullptr,
+                             int max_m_override = -1);
 
   /**
    * Build a tile-major MMQ layout for a quantized tensor.
