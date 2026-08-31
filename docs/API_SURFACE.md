@@ -84,6 +84,18 @@ graph TD
 - `/v1/models` and `/v1/models/{id}` are distinct from admin model lifecycle endpoints.
 - `session_id` is an optional InferFlux extension for `/v1/completions` and `/v1/chat/completions`;
   it is ignored unless `runtime.scheduler.session_handles.enabled=true` and does not change default stateless behavior.
+- Request/response headers are matched case-insensitively (RFC 9110 §5.1), including
+  `Authorization` and its `Bearer` scheme (§11.1) — lowercase `authorization` from
+  HTTP/2-era clients authenticates identically.
+- The `usage` object on `/v1/completions` and `/v1/chat/completions` carries per-request
+  telemetry extensions alongside the OpenAI token counts (streaming sends them on the
+  terminal usage frame when `stream_options.include_usage=true`):
+
+| Field | Meaning |
+|---|---|
+| `prompt_tokens_details.cached_tokens` | Prompt tokens served from the radix prefix cache / session KV reuse. Always present — an explicit `0` on a miss. `prompt_tokens` stays inclusive; fresh input = `prompt_tokens − cached_tokens`. |
+| `duration_ms` | Request accept → last token, server-measured. |
+| `time_to_first_token_ms` | Request accept → first token; streaming requests only. |
 
 `GET /v1/admin/pools` returns three top-level objects for automation symmetry:
 

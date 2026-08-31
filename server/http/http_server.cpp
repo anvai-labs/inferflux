@@ -728,6 +728,25 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
   j["usage"] = {{"prompt_tokens", prompt_toks},
                 {"completion_tokens", total_completion_tokens},
                 {"total_tokens", prompt_toks + total_completion_tokens}};
+  // Per-request cache split and timings. cached_tokens is always emitted —
+  // an explicit 0 on a miss — and prompt_tokens stays inclusive of the cached
+  // portion; consumers derive fresh input as prompt − cached. All choices
+  // share one prompt, so results[0] carries the request-level numbers.
+  int cached_toks = 0;
+  double duration_ms = -1.0;
+  double ttft_ms = -1.0;
+  if (!results.empty()) {
+    cached_toks = results[0].cached_prompt_tokens;
+    duration_ms = results[0].duration_ms;
+    ttft_ms = results[0].time_to_first_token_ms;
+  }
+  j["usage"]["prompt_tokens_details"] = {{"cached_tokens", cached_toks}};
+  if (duration_ms >= 0.0) {
+    j["usage"]["duration_ms"] = duration_ms;
+  }
+  if (ttft_ms >= 0.0) {
+    j["usage"]["time_to_first_token_ms"] = ttft_ms;
+  }
 
   json choices = json::array();
   for (int i = 0; i < static_cast<int>(results.size()); ++i) {
@@ -3271,6 +3290,17 @@ void HttpServer::HandleClient(ClientSession &session) {
                              {"completion_tokens", result.completion_tokens},
                              {"total_tokens",
                               result.prompt_tokens + result.completion_tokens}};
+              // Same per-request telemetry as the non-streaming usage body:
+              // explicit cached 0 on a miss, TTFT only when streamed.
+              uc["usage"]["prompt_tokens_details"] = {
+                  {"cached_tokens", result.cached_prompt_tokens}};
+              if (result.duration_ms >= 0.0) {
+                uc["usage"]["duration_ms"] = result.duration_ms;
+              }
+              if (result.time_to_first_token_ms >= 0.0) {
+                uc["usage"]["time_to_first_token_ms"] =
+                    result.time_to_first_token_ms;
+              }
               SendAll(session, "data: " + uc.dump() + "\n\n");
             }
             SendAll(session, "data: [DONE]\n\n");
