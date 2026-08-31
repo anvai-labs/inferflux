@@ -250,6 +250,10 @@ public:
   /// primitive used by the Q6_K MMA path (Turing / SM 7.5 or newer).
   static bool SupportsMmqMmaArchitecture(int sm_major, int sm_minor);
 
+  /// Select the vectorized Q6_K MMVQ decode path for a GPU/policy tuple.
+  static bool ShouldUseQ6KVectorizedDecode(int sm_major, int sm_minor, int M,
+                                           const NativeExecutionPolicy &policy);
+
   /// Runtime form of SupportsMmqMmaArchitecture for the active CUDA device.
   static bool CurrentDeviceSupportsMmqMma();
 

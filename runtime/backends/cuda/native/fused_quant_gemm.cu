@@ -1421,9 +1421,8 @@ bool DispatchQ8_1GemvAccumF32Q6K(const void *data, const void *act_q8_1,
   if (M <= 8) {
     const auto &policy = ResolveExecutionPolicy(nullptr);
     const auto &gpu = GetGpuProfile();
-    const bool auto_enable_small_ada =
-        gpu.initialized && gpu.sm_major == 8 && gpu.sm_minor == 9 && M <= 2;
-    if (policy.enable_q6k_vectorized || auto_enable_small_ada) {
+    if (FusedQuantGemm::ShouldUseQ6KVectorizedDecode(gpu.sm_major, gpu.sm_minor,
+                                                     M, policy)) {
       return DispatchQ8_1MmvqAccumF32Q6KVec(data, act_q8_1, output, M, N, K,
                                             stream);
     }
@@ -1475,9 +1474,8 @@ bool DispatchQ8_1GemvAccumQ6K(const void *data, const void *act_q8_1,
   if (M <= 8) {
     const auto &policy = ResolveExecutionPolicy(nullptr);
     const auto &gpu = GetGpuProfile();
-    const bool auto_enable_small_ada =
-        gpu.initialized && gpu.sm_major == 8 && gpu.sm_minor == 9 && M <= 2;
-    if (policy.enable_q6k_vectorized || auto_enable_small_ada) {
+    if (FusedQuantGemm::ShouldUseQ6KVectorizedDecode(gpu.sm_major, gpu.sm_minor,
+                                                     M, policy)) {
       return DispatchQ8_1MmvqAccumQ6KVec(data, act_q8_1, output, M, N, K,
                                          stream);
     }
@@ -1643,9 +1641,8 @@ bool DispatchQ8_1GemvQ6K(const void *data, const void *act_q8_1, half *output,
   if (M <= 8) {
     const auto &policy = ResolveExecutionPolicy(nullptr);
     const auto &gpu = GetGpuProfile();
-    const bool auto_enable_small_ada =
-        gpu.initialized && gpu.sm_major == 8 && gpu.sm_minor == 9 && M <= 2;
-    if (policy.enable_q6k_vectorized || auto_enable_small_ada) {
+    if (FusedQuantGemm::ShouldUseQ6KVectorizedDecode(gpu.sm_major, gpu.sm_minor,
+                                                     M, policy)) {
       return DispatchQ8_1MmvqQ6KVec(data, act_q8_1, output, M, N, K, stream);
     }
     return DispatchQ8_1MmvqQ6K(data, act_q8_1, output, M, N, K, stream);
@@ -1958,6 +1955,14 @@ void FusedQuantGemm::DestroyDownProjMmqLayout(const MmqWeightInfo &layout) {
 
 bool FusedQuantGemm::SupportsMmqMmaArchitecture(int sm_major, int sm_minor) {
   return sm_major > 7 || (sm_major == 7 && sm_minor >= 5);
+}
+
+bool FusedQuantGemm::ShouldUseQ6KVectorizedDecode(
+    int sm_major, int sm_minor, int M, const NativeExecutionPolicy &policy) {
+  if (M <= 0 || M > 8 || policy.disable_q6k_vectorized) {
+    return false;
+  }
+  return policy.enable_q6k_vectorized || (sm_major == 8 && sm_minor == 9);
 }
 
 bool FusedQuantGemm::CurrentDeviceSupportsMmqMma() {

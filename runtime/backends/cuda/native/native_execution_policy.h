@@ -93,6 +93,7 @@ struct NativeExecutionPolicy {
   bool enable_fused_gemv_norm_quant_epilogue{true}; // P2: validated
   bool enable_mmvq_bias_epilogue{false};            // P3
   bool enable_q6k_vectorized{false};                // P4
+  bool disable_q6k_vectorized{false};               // P4 rollback
   bool enable_gate_up_silu_q81_epilogue{false};     // P5
 
   // Precision: keep residual stream in FP32 to match llama.cpp numerical
@@ -215,6 +216,8 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_MMVQ_BIAS_EPILOGUE", false);
     policy.enable_q6k_vectorized =
         ParseBoolEnv("INFERFLUX_ENABLE_Q6K_VECTORIZED", false);
+    policy.disable_q6k_vectorized =
+        ParseBoolEnv("INFERFLUX_DISABLE_Q6K_VECTORIZED", false);
     policy.enable_gate_up_silu_q81_epilogue =
         ParseBoolEnv("INFERFLUX_ENABLE_GATE_UP_SILU_Q81_EPILOGUE", false);
     policy.enable_fp32_residual =
