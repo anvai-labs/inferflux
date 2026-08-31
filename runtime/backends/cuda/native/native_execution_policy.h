@@ -196,8 +196,8 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 9, 1, 64);
     policy.mmq_mma_max_batch =
         ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH", 16, 1, 64);
-    policy.mmq_mma_max_prefill_batch = ParseIntEnv(
-        "INFERFLUX_CUDA_MMQ_MMA_MAX_PREFILL_BATCH", 512, 1, 512);
+    policy.mmq_mma_max_prefill_batch =
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_PREFILL_BATCH", 512, 1, 512);
     policy.use_vectorized_loads =
         ParseBoolEnv("INFERFLUX_USE_VECTORIZED_LOADS", false);
     policy.enable_fused_gate_up_silu =
