@@ -1344,6 +1344,20 @@ bool DispatchQ8_1MmvqAccumQ8K(const void *data, const void *act_q8_1,
 bool DispatchQ8_1MmvqAccumF32Q4K(const void *data, const void *act_q8_1,
                                  float *output, int M, int N, int K,
                                  cudaStream_t stream) {
+  // Wide-load variant at M=1 (o_proj residual path): same uint4-slice
+  // template as the wide fused gate+up kernel. Opt-out mirrors it.
+  static const bool wide_enabled = [] {
+    const char *raw = std::getenv("INFERFLUX_CUDA_WIDE_ACCUM");
+    return !raw || !(std::string(raw) == "0" || std::string(raw) == "false");
+  }();
+  if (wide_enabled && M == 1) {
+    const dim3 grid(static_cast<unsigned>(N), 1);
+    inferflux_mmvq_q4k_accum_wide<1, float, true>
+        <<<grid, kMmvqWarps * 32, 0, stream>>>(
+            static_cast<const block_q4_k *>(data),
+            static_cast<const block_q8_1 *>(act_q8_1), output, N, K, M);
+    return cudaGetLastError() == cudaSuccess;
+  }
   return DispatchMmvqAccumF32<block_q4_k, inferflux_mmvq_q4k_accum<1, float>,
                               inferflux_mmvq_q4k_accum<2, float>,
                               inferflux_mmvq_q4k_accum<4, float>,
