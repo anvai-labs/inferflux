@@ -2839,8 +2839,18 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       // Batched Q/K/V projections with fused RmsNorm
       // FP32 residual: pre-normalize from FP32 → half d_norm_out_
       if (fp32_residual_active_ && !input_norm_precomputed) {
-        cuda_kernel::RmsNormMixed<T>(d_residual_f32_, input_norm, d_norm_out_,
-                                     B, hidden_size_, rms_norm_eps_, stream_);
+        if constexpr (std::is_same_v<T, half>) {
+          // Fold the quantize into the norm — the QKV group consumes
+          // d_act_q8_1_ via the q81_precomputed skip.
+          cuda_kernel::RmsNormMixedQuantQ8_1(
+              d_residual_f32_, input_norm, d_norm_out_, d_act_q8_1_, B,
+              hidden_size_, rms_norm_eps_, stream_);
+          input_q81_precomputed = true;
+        } else {
+          cuda_kernel::RmsNormMixed<T>(d_residual_f32_, input_norm,
+                                       d_norm_out_, B, hidden_size_,
+                                       rms_norm_eps_, stream_);
+        }
         input_norm_precomputed = true;
       }
       const T *qkv_input = input_norm_precomputed
@@ -3292,11 +3302,9 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             // FP32 residual: FinishNormQuantQ8_1 reads half residual, so we
             // pre-normalize from FP32 instead and set flags.
             if (fp32_residual_active_) {
-              cuda_kernel::RmsNormMixed<T>(d_residual_f32_, post_attn_norm,
-                                           d_norm_out_, B, hidden_size_,
-                                           rms_norm_eps_, stream_);
-              FusedQuantGemm::QuantizeRowQ8_1(d_norm_out_, d_act_q8_1_, B,
-                                              hidden_size_, stream_);
+              cuda_kernel::RmsNormMixedQuantQ8_1(
+                  d_residual_f32_, post_attn_norm, d_norm_out_, d_act_q8_1_,
+                  B, hidden_size_, rms_norm_eps_, stream_);
             } else {
               cuda_kernel::FinishNormQuantQ8_1(
                   d_residual_, post_attn_norm, d_norm_out_, d_act_q8_1_, B,
@@ -3769,11 +3777,9 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
           const T *next_input_norm =
               reinterpret_cast<const T *>(weights_->LayerInputNorm(layer + 1));
           if (fp32_residual_active_) {
-            cuda_kernel::RmsNormMixed<T>(d_residual_f32_, next_input_norm,
-                                         d_norm_out_, B, hidden_size_,
-                                         rms_norm_eps_, stream_);
-            FusedQuantGemm::QuantizeRowQ8_1(d_norm_out_, d_act_q8_1_, B,
-                                            hidden_size_, stream_);
+            cuda_kernel::RmsNormMixedQuantQ8_1(
+                d_residual_f32_, next_input_norm, d_norm_out_, d_act_q8_1_,
+                B, hidden_size_, rms_norm_eps_, stream_);
           } else {
             cuda_kernel::FinishNormQuantQ8_1(
                 d_residual_, next_input_norm, d_norm_out_, d_act_q8_1_, B,
