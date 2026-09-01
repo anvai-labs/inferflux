@@ -76,7 +76,12 @@ struct NativeExecutionPolicy {
   // MMA only wins where the dp4a MMVQ tier stops being at the bandwidth
   // floor: measured -13% at c4 (M=4) vs the incumbent MMVQ, so the floor
   // M is 9 (the same batch range the dp4a MMQ threshold targets).
-  int mmq_mma_min_batch{9};
+  // Q6_K MMA floor. Rig (benchmark_q6k_kernels, N=2048 K=11008): at M=4 the
+  // MMA kernel is ~1.6x and at M=8 ~4x faster than the best MMVQ variant
+  // (62us vs 102us, 48us vs 190us warm; MMA sits at the ~51us bandwidth
+  // floor at s=6). A/B at c8 decode: +15% tok/s. Below M=4 the row-quad
+  // family stays competitive with MMA's fixed launch/quantize overhead.
+  int mmq_mma_min_batch{4};
   int mmq_mma_max_batch{16};
   // Prefill M ceiling for the MMA family (S12): prefill chunks (default
   // chunked_prefill=512) run the grouped dp4a path at 422us/call without
@@ -193,7 +198,7 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", -1, 1, 64);
     policy.enable_mmq_mma = ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", true);
     policy.mmq_mma_min_batch =
-        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 9, 1, 64);
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 4, 1, 64);
     policy.mmq_mma_max_batch =
         ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH", 16, 1, 64);
     policy.mmq_mma_max_prefill_batch =

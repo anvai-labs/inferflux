@@ -172,6 +172,12 @@ For M=1 decode, each warp computes **two output columns** instead of one, halvin
 
 Tiled matrix-multiply kernels for the down projection, using 2D thread blocks. Gated behind `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH` for controlled rollout.
 
+The Q6_K MMA tensor-core family (`INFERFLUX_CUDA_MMQ_MMA`, default on) covers
+`M >= INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` (default 4, max 16). At the down-proj
+geometry (N=2048, K=11008) it is ~1.6x faster than the best MMVQ variant at
+M=4 and ~4x at M=8, sitting at the weight-stream bandwidth floor at higher
+K-splits. Above the max-batch cap the dp4a MMQ family takes over.
+
 ## 4) Dispatch Priority
 
 The transformer forward pass attempts dispatch paths in this order:
