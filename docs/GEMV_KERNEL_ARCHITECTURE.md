@@ -172,11 +172,16 @@ For M=1 decode, each warp computes **two output columns** instead of one, halvin
 
 Tiled matrix-multiply kernels for the down projection, using 2D thread blocks. Gated behind `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH` for controlled rollout.
 
-The Q6_K MMA tensor-core family (`INFERFLUX_CUDA_MMQ_MMA`, default on) covers
-`M >= INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` (default 4, max 16). At the down-proj
-geometry (N=2048, K=11008) it is ~1.6x faster than the best MMVQ variant at
-M=4 and ~4x at M=8, sitting at the weight-stream bandwidth floor at higher
-K-splits. Above the max-batch cap the dp4a MMQ family takes over.
+The MMA tensor-core family (`INFERFLUX_CUDA_MMQ_MMA`, default on) covers
+`M >= INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` (default 4, max 16) for BOTH down-proj
+quants: Q6_K (D4 activations via `SiluMulQuantizeQ8_1Mmq`) and, since S18,
+Q4_K (DS activations via `SiluMulQuantizeQ8_1MmqDs` + `DownProjMmqMmaQ4K`).
+Mixed-quant models (the ollama Q4_K_M recipe: per-layer Q4_K/Q6_K down-proj
+mix) take the same operator either way. At the down-proj geometry
+(N=2048, K=11008) the Q6_K variant is ~1.6x faster than the best MMVQ variant
+at M=4 and ~4x at M=8; the Q4_K variant measures 65-69us flat across M=4..16
+(1.9x its weight-traffic floor). Above the max-batch cap the dp4a MMQ family
+takes over.
 
 ## 4) Dispatch Priority
 
