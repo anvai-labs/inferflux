@@ -3187,6 +3187,14 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
           append_v_bias = v_bias;
         }
       }
+      // input_q81_precomputed is consume-once: the QKV group above may have
+      // skipped re-quantization based on it. Without this reset the flag
+      // stays true for the rest of the forward, so any later layer that
+      // skips the pre-layer norm+quant (a down-proj boundary precompute —
+      // e.g. the MMA down tier's non-accumulated residual) feeds the QKV
+      // group a stale d_act_q8_1_ and corrupts every Q/K/V from that layer
+      // on (the S30 batched-decode corruption).
+      input_q81_precomputed = false;
       pt.qkv_ms += pt.Mark();
 
       // RoPE + KV append (fused or separate)
@@ -3405,12 +3413,15 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         // Residual add (skip if accumulated directly)
         if (!o_accumulated) {
           if (fp32_residual_active_) {
-            // S20: split add+norm (see the down-proj residual note) — the
-            // fused variant corrupted batched decode at M>=4 with the MMA
-            // o-proj. The split sequence leaves ffn_norm_precomputed=false so
-            // the FFN pre-normalize below produces the norm.
-            cuda_kernel::ResidualAddMixed<T>(d_residual_f32_, d_norm_out_,
-                                             B * hidden_size_, stream_);
+            if (active_policy->enable_fused_residual_norm) {
+              cuda_kernel::ResidualAddRmsNormMixed<T>(
+                  d_residual_f32_, d_norm_out_, post_attn_norm, d_norm_out_, B,
+                  hidden_size_, rms_norm_eps_, stream_);
+              ffn_norm_precomputed = true;
+            } else {
+              cuda_kernel::ResidualAddMixed<T>(d_residual_f32_, d_norm_out_,
+                                               B * hidden_size_, stream_);
+            }
           } else {
             if (active_policy->enable_fused_residual_norm) {
               cuda_kernel::ResidualAddRmsNorm<T>(
@@ -3875,21 +3886,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       // Residual add (skip if accumulated directly)
       if (!down_accumulated) {
         if (fp32_residual_active_) {
-          // S20: the fused ResidualAddRmsNormMixed here corrupted batched
-          // decode whenever the down-proj ran non-accumulated (MMA tier at
-          // M>=4, or accumulate disabled) — deterministic output divergence
-          // vs the B=1 reference, cured by either split kernel sequence or
-          // FP32_RESIDUAL=0. The split sequence (add, then norm from the
-          // FP32 residual) is numerically identical and verified correct;
-          // keep it until the fused kernel's in-situ failure is understood.
-          if (layer < num_layers_ - 1) {
+          if (active_policy->enable_fused_residual_norm &&
+              layer < num_layers_ - 1) {
             const T *next_input_norm = reinterpret_cast<const T *>(
                 weights_->LayerInputNorm(layer + 1));
-            cuda_kernel::ResidualAddMixed<T>(d_residual_f32_, d_ffn_down_,
-                                             B * hidden_size_, stream_);
-            cuda_kernel::RmsNormMixed<T>(d_residual_f32_, next_input_norm,
-                                         d_norm_out_, B, hidden_size_,
-                                         rms_norm_eps_, stream_);
+            cuda_kernel::ResidualAddRmsNormMixed<T>(
+                d_residual_f32_, d_ffn_down_, next_input_norm, d_norm_out_, B,
+                hidden_size_, rms_norm_eps_, stream_);
             input_norm_precomputed = true;
           } else {
             cuda_kernel::ResidualAddMixed<T>(d_residual_f32_, d_ffn_down_,

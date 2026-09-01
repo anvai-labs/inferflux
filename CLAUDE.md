@@ -338,7 +338,7 @@ stale object files (WSL2 filesystem timestamp issue):
 - `INFERFLUX_CUDA_DISPATCH_PROBE` / `INFERFLUX_CUDA_DISPATCH_PROBE_FORCE_UNHEALTHY` — load-time reachability and controlled operator down-ranking; degraded state is visible in `/readyz`
 - `INFERFLUX_DISABLE_FUSED_GEMV=1`, `INFERFLUX_FORCE_CUBLAS=1`, `INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL=1` — dispatch overrides
 - `INFERFLUX_ENABLE_DOWNPROJ_MMQ` / `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH` — down-projection MMQ threshold
-- `INFERFLUX_CUDA_MMQ_MMA` / `INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` / `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` — mma.sync int8 tensor-core MMQ family. Gate/up/o/QKV MMA (M ≥ 2) default ON and probe-validated at M=2..8; the down-proj/lm-head MMA tier is default-OFF (min-batch defaults to 65) after S20 found deterministic batched-decode corruption at M ≥ 4 — re-enable with `INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH=4` for experiments only
+- `INFERFLUX_CUDA_MMQ_MMA` / `INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` / `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` — mma.sync int8 tensor-core MMQ family (Q4_K gate/up+QKV+o+down-proj, Q6_K down-proj; M ≥ min-batch, default 4; default ON — the S30 stale-`input_q81_precomputed` corruption that briefly forced the down-proj tier off is fixed, regression-gated by the batched-isolation probe)
 - `INFERFLUX_MMVQ_MIN_WARPS` / `INFERFLUX_MMVQ_MAX_WARPS` / `INFERFLUX_ENABLE_ADAPTIVE_MMVQ_THREADS` — MMVQ occupancy tuning
 - `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_*` — experimental grouped/rowpair/rowquad kernel variants (default off)
 - `INFERFLUX_CUDA_DEQUANT_CACHE_POLICY` — dequantized-weight cache policy (memory contract; see `GGUFMemoryContractTests`)
