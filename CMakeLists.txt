@@ -633,6 +633,13 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     CUDA_STANDARD 17
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   )
+  add_executable(test_fa2_prefill tests/unit/test_fa2_prefill.cu
+                           runtime/backends/cuda/kernels/flash_attention.cu)
+  target_include_directories(test_fa2_prefill PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(test_fa2_prefill PRIVATE CUDA::cudart)
+  add_test(NAME Fa2PrefillTests COMMAND test_fa2_prefill)
+  set_tests_properties(Fa2PrefillTests PROPERTIES LABELS "fa2_prefill")
   add_executable(test_mma_q4k tests/unit/test_mma_q4k.cu)
   target_include_directories(test_mma_q4k PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)

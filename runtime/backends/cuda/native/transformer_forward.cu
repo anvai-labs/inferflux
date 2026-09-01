@@ -2096,12 +2096,18 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
               [&]() {
                 if constexpr (std::is_same_v<T, half>) {
                   if (seq_len >= 2) {
-                    // Ensure the FFN norm is in d_norm_out_ before MMA.
-                    err = cuda_kernel::RmsNorm<T>(
-                        d_residual_, post_attn_norm, d_norm_out_, seq_len,
-                        hidden_size_, rms_norm_eps_, stream_);
-                    if (err != cudaSuccess) {
-                      return false;
+                    // Norm only when not already precomputed. With the
+                    // FP32 residual stream (default) the post-attn norm was
+                    // written to d_norm_out_ above and d_residual_ is a dead
+                    // buffer — re-norming from it would overwrite the good
+                    // values with zeros, blanking the whole FFN.
+                    if (ffn_norm_weight != nullptr) {
+                      err = cuda_kernel::RmsNorm<T>(
+                          d_residual_, post_attn_norm, d_norm_out_, seq_len,
+                          hidden_size_, rms_norm_eps_, stream_);
+                      if (err != cudaSuccess) {
+                        return false;
+                      }
                     }
                     const half *mma_in =
                         static_cast<const half *>(d_norm_out_);

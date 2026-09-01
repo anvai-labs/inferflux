@@ -288,6 +288,22 @@ int main() {
   TestShape(1, 256, 256, 1, 12345);
   TestShape(2, 300, 256, 1, 777);
   TestShape(16, 1024, 2048, 1, 4242);
+  // Production prefill geometries: gate/up (N=11008) and QKV (N=2048) at
+  // K=hidden. M=2..8 prefill is a real dispatch state (short prompts) and
+  // was previously untested — the zero-output regression lived here.
+  TestShape(2, 11008, 2048, 1, 20260831);
+  TestShape(3, 11008, 2048, 1, 20260832);
+  TestShape(4, 11008, 2048, 1, 20260833);
+  TestShape(8, 11008, 2048, 1, 20260834);
+  TestShape(2, 2048, 2048, 1, 20260835);
+  TestShape(5, 2048, 2048, 1, 20260836);
+  // Second y-tile (rows 16+) — prefill M 17..31 lands in a partial second
+  // tile with splits>=2 at QKV geometry; never covered before.
+  TestShape(17, 2048, 2048, 1, 20260837);
+  TestShape(18, 2048, 2048, 2, 20260838);
+  TestShape(18, 11008, 2048, 2, 20260839);
+  TestShape(20, 11008, 2048, 1, 20260840);
+  TestShape(33, 2048, 2048, 1, 20260841);
   TestShape(16, 11008, 2048, 1, 999);
   TestShape(16, 11008, 2048, 3, 555);
   TestShape(16, 11008, 2048, 6, 31337);
