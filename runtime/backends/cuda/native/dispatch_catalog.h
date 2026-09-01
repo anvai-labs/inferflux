@@ -21,6 +21,14 @@
 // by Prometheus operator counters showing packed_group at 100%). The
 // catalog exists to make that bug class impossible to write, merge, or
 // deploy silently.
+//
+// Known debt: kMmqMma covers the executor-driven down-proj sites only.
+// MMA executions that run inside inline projection chains — the batched
+// fused gate+up+SiLU down-proj (transformer_forward.cu), lm_head, and the
+// Q4_K gate/up/QKV/o-proj grouped lambdas — still bypass this catalog and
+// are not counted here. Extending those chains through the executor is the
+// follow-up; do not paper over the gap by recording labels outside the
+// catalog tables (that is the PR #30 incident pattern).
 
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "server/logging/logger.h"
@@ -60,10 +68,11 @@ enum class DownProjOperator {
   kQ81GemvRowQuad,
   kPackedGemv,
   kMmq,
+  kMmqMma, // mma.sync tensor-core MMQ (S7/S16): Q6_K, M in the MMA window
 };
 
 constexpr int kFfnProjOperatorCount = 7;
-constexpr int kDownProjOperatorCount = 8;
+constexpr int kDownProjOperatorCount = 9;
 static_assert(kFfnProjOperatorCount <= 16 && kDownProjOperatorCount <= 16,
               "operator health bitmasks are uint16");
 
@@ -127,6 +136,7 @@ constexpr std::array<DownOpInfo, kDownProjOperatorCount> kDownOpTable = {{
     {DownProjOperator::kPackedGemv, "packed_gemv", DispatchTier::kPacked, true,
      true},
     {DownProjOperator::kMmq, "mmq", DispatchTier::kMmq, true, true},
+    {DownProjOperator::kMmqMma, "mmq_mma", DispatchTier::kMmq, true, true},
 }};
 
 // ============================================================================
@@ -233,6 +243,8 @@ constexpr const char *DownSelectionLabel(DownProjOperator op) {
     return kDownOpTable[6].label;
   case DownProjOperator::kMmq:
     return kDownOpTable[7].label;
+  case DownProjOperator::kMmqMma:
+    return kDownOpTable[8].label;
   }
   return "unknown";
 }
@@ -282,7 +294,7 @@ constexpr std::array<const char *, 11> kFfnMetricLabels = {{
     "packed_group",
 }};
 
-constexpr std::array<const char *, 12> kDownMetricLabels = {{
+constexpr std::array<const char *, 13> kDownMetricLabels = {{
     "fallback",
     "q8_1_gemv",
     "q8_1_mmvq",
@@ -295,6 +307,7 @@ constexpr std::array<const char *, 12> kDownMetricLabels = {{
     "q8_1_gemv_row_pair_v2",
     "packed_gemv",
     "mmq",
+    "mmq_mma",
 }};
 
 constexpr bool FfnMetricLabelKnown(std::string_view label) {

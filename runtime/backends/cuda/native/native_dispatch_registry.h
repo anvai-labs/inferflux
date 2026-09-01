@@ -57,6 +57,11 @@ struct InferfluxCudaDownProjDispatchProfile {
   bool q81_ready{false};
   bool packed_ready{false};
   bool mmq_ready{false};
+  // mma.sync tensor-core tier (kMmqMma) is ready: policy enabled, Q6_K
+  // weights, M inside the MMA window, K a multiple of 256, and the device
+  // has tensor cores. Independent of mmq_ready (dp4a MMQ); when both are
+  // ready the kMmqMma rule outranks kMmq.
+  bool mma_ready{false};
   InferfluxCudaDispatchBucket m_bucket{InferfluxCudaDispatchBucket::k1};
   InferfluxCudaDispatchBucket n_bucket{InferfluxCudaDispatchBucket::k1};
   InferfluxCudaDispatchBucket k_bucket{InferfluxCudaDispatchBucket::k1};
@@ -82,7 +87,7 @@ std::string DescribeInferfluxCudaFfnDispatchDecision(
 InferfluxCudaDownProjDispatchProfile BuildInferfluxCudaDownProjDispatchProfile(
     InferfluxCudaDispatchPhase phase, int quant_type,
     const FusedDispatchGeometry &geometry, bool q81_ready, bool packed_ready,
-    bool mmq_ready);
+    bool mmq_ready, bool mma_ready);
 
 InferfluxCudaDownProjDispatchDecision
 SelectInferfluxCudaDownProjDispatchDecision(

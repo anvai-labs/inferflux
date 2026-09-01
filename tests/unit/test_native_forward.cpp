@@ -7456,6 +7456,61 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "InferfluxCudaDispatchPolicy: down-proj registry promotes Q6_K MMA-window "
+    "decode to the tensor-core operator",
+    "[native_forward]") {
+  NativeExecutionPolicy policy;
+  const int q6k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+  const QuantizedWeightInfo raw{reinterpret_cast<const void *>(0x1), q6k,
+                                2048LL * 11008LL};
+  const MmqWeightInfo mmq{};
+
+  // Inside the MMA window (mmq_mma_min_batch..max_batch) the tensor-core
+  // operator outranks everything — but only on tensor-core hardware; the
+  // CPU-only fallback keeps the Q8_1 ladder.
+  const FusedQuantGemm::DownProjOperator window_expect =
+      FusedQuantGemm::CurrentDeviceSupportsMmqMma()
+          ? FusedQuantGemm::DownProjOperator::kMmqMma
+          : FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad;
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{8, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == window_expect);
+
+  // Policy off falls back down the ladder — never a tier-mismatched
+  // selection.
+  policy.enable_mmq_mma = false;
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{8, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad);
+
+  // Below the MMA window the Q8_1 ladder is untouched even with MMA armed
+  // (M=2 takes the geometry-gated row-pair hot-fixed rule).
+  policy.enable_mmq_mma = true;
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
+
+  // Prefill chunks above the fused-path M ceiling select the dense
+  // fallback — the executor never attempts a fused tier there, so the
+  // MMA-with-prefill-ceiling executions live in the inline
+  // fused-gate+up+SiLU chain, outside this catalog (documented debt in
+  // dispatch_catalog.h).
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw, mmq, InferfluxCudaDispatchPhase::kPrefill,
+              FusedDispatchGeometry{512, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == FusedQuantGemm::DownProjOperator::kFallback);
+}
+
+TEST_CASE(
     "InferfluxCudaLinearExecutor: FFN helper falls back from Q8_1 to packed "
     "without invoking generic path",
     "[native_forward]") {
@@ -7582,6 +7637,10 @@ TEST_CASE(
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 1, 2048,
       11008,
       [&]() {
+        calls.emplace_back("mma");
+        return false;
+      },
+      [&]() {
         calls.emplace_back("mmq");
         return false;
       },
@@ -7601,8 +7660,9 @@ TEST_CASE(
       &summary);
 
   REQUIRE(ok);
-  REQUIRE(calls ==
-          std::vector<std::string>{"q81", "mmq", "packed", "fallback"});
+  REQUIRE(calls == std::vector<std::string>{"q81", "mma", "mmq", "packed",
+                                            "fallback"});
+  REQUIRE_FALSE(summary.used_mmq_mma);
   REQUIRE_FALSE(summary.used_mmq);
   REQUIRE_FALSE(summary.used_q81);
   REQUIRE_FALSE(summary.used_packed);
@@ -7687,13 +7747,15 @@ TEST_CASE("InferfluxCudaLinearExecutor: every down-proj operator reaches its "
           "tier when available",
           "[native_forward][dispatch_reachability]") {
   using Op = FusedQuantGemm::DownProjOperator;
-  const std::array<Op, 8> kAllDownOps = {
+  const std::array<Op, 9> kAllDownOps = {
       Op::kFallback,        Op::kQ81Gemv,
       Op::kQ81GemvHotFixed, Op::kQ81GemvRowPairHotFixed,
       Op::kQ81GemvRowPair,  Op::kQ81GemvRowQuad,
-      Op::kPackedGemv,      Op::kMmq};
+      Op::kPackedGemv,      Op::kMmq,
+      Op::kMmqMma};
 
   for (const Op op : kAllDownOps) {
+    bool mma_called = false;
     bool mmq_called = false;
     bool q81_called = false;
     bool packed_called = false;
@@ -7704,6 +7766,10 @@ TEST_CASE("InferfluxCudaLinearExecutor: every down-proj operator reaches its "
         op, "decode", "q4_k",
         static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 4,
         2048, 11008,
+        [&]() {
+          mma_called = true;
+          return true;
+        },
         [&]() {
           mmq_called = true;
           return true;
@@ -7733,13 +7799,25 @@ TEST_CASE("InferfluxCudaLinearExecutor: every down-proj operator reaches its "
     case Op::kQ81GemvRowQuad:
       REQUIRE(q81_called);
       REQUIRE_FALSE(mmq_called);
+      REQUIRE_FALSE(mma_called);
       REQUIRE(summary.used_q81);
       REQUIRE(summary.actual_op == op);
       break;
     case Op::kMmq:
       REQUIRE(mmq_called);
       REQUIRE_FALSE(q81_called);
+      REQUIRE_FALSE(mma_called);
       REQUIRE(summary.used_mmq);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kMmqMma:
+      // The tensor-core selection must reach the MMA lambda — this is the
+      // assertion that fails if the executor lets kMmqMma degrade to the
+      // dp4a catch-all (the kQ81GroupMmq3 incident shape).
+      REQUIRE(mma_called);
+      REQUIRE_FALSE(mmq_called);
+      REQUIRE_FALSE(q81_called);
+      REQUIRE(summary.used_mmq_mma);
       REQUIRE(summary.actual_op == op);
       break;
     case Op::kPackedGemv:
@@ -7796,6 +7874,9 @@ TEST_CASE("FusedQuantGemm: metric names distinguish V2 hot-path variants",
   REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
               FusedQuantGemm::DownProjOperator::kMmq, q4k, 2, 11008) ==
           std::string("mmq"));
+  REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
+              FusedQuantGemm::DownProjOperator::kMmqMma, q6k, 8, 11008) ==
+          std::string("mmq_mma"));
 }
 
 TEST_CASE("cuda_kernel::QuantizeRowsSymmetric quantizes once per row with "
