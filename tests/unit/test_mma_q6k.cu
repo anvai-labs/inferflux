@@ -198,7 +198,10 @@ void TestShape(int M, int N, int K, int ksplits, uint32_t seed) {
         }
       }
       const float got = __half2float(out[static_cast<size_t>(j) * N + col]);
-      const double rel = std::fabs((got - ref) / (ref == 0.0 ? 1.0 : ref));
+      // Denominator floor: outputs near zero (cancellation) would otherwise
+      // blow up a pure relative error on fp16-noise deltas.
+      const double denom = std::fabs(ref) > 0.01 ? std::fabs(ref) : 0.01;
+      const double rel = std::fabs((got - ref) / denom);
       max_rel = std::max(max_rel, rel);
       ++n_checked;
     }
@@ -275,6 +278,12 @@ int main() {
   TestShape(16, 2048, 11008, 1, 999);
   TestShape(16, 2048, 11008, 3, 555); // K-split with reduce
   TestShape(16, 2048, 11008, 6, 31337);
+  // Multi-y-tile M (second tile only exists when M > 16) — the writeback
+  // row-offset regression lived here; also prefill decode shapes.
+  TestShape(17, 2048, 11008, 1, 20260843);
+  TestShape(18, 2048, 11008, 1, 20260844);
+  TestShape(18, 2048, 2048, 1, 20260845);
+  TestShape(33, 2048, 11008, 1, 20260846);
 
   printf("%s (%d failures)\n", g_failures ? "RESULT: FAIL" : "RESULT: PASS",
          g_failures);

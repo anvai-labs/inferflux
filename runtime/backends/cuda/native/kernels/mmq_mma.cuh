@@ -506,11 +506,15 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
         if (i > tile_x_max_i || j > tile_y_max_j) {
           continue;
         }
+        // j is tile-local: y-tiles beyond the first (blockIdx.y > 0, only
+        // reached when M > mmq_x) must offset the output row or they
+        // clobber rows 0..mmq_x-1 and leave rows mmq_x.. unwritten.
+        const int row = jt * mmq_x + j;
         if (ksplits == 1) {
-          out[static_cast<size_t>(j) * N + it * kMmqY + i] =
+          out[static_cast<size_t>(row) * N + it * kMmqY + i] =
               __float2half(sum[(j0 / TileC::J + n) * TileC::ne + l]);
         } else {
-          partials[(static_cast<size_t>(blockIdx.z) * M + j) * N +
+          partials[(static_cast<size_t>(blockIdx.z) * M + row) * N +
                    it * kMmqY + i] =
               sum[(j0 / TileC::J + n) * TileC::ne + l];
         }
@@ -827,12 +831,15 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
         if (i > tile_x_max_i || j > tile_y_max_j) {
           continue;
         }
+        // j is tile-local: offset by the y-tile or rows >= mmq_x are never
+        // written and rows < mmq_x get clobbered (same fix as Q4_K).
+        const int row = jt * mmq_x + j;
         if (ksplits == 1) {
-          out[static_cast<size_t>(j) * N + it * kMmqY + i] =
+          out[static_cast<size_t>(row) * N + it * kMmqY + i] =
               __float2half(sum[(j0 / TileC::J + n) * TileC::ne + l]);
         } else {
-          partials[(static_cast<size_t>(blockIdx.z) * M + j) * N + it * kMmqY +
-                   i] = sum[(j0 / TileC::J + n) * TileC::ne + l];
+          partials[(static_cast<size_t>(blockIdx.z) * M + row) * N +
+                   it * kMmqY + i] = sum[(j0 / TileC::J + n) * TileC::ne + l];
         }
       }
     }
