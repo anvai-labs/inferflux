@@ -197,8 +197,17 @@ struct NativeExecutionPolicy {
     policy.downproj_mmq_min_batch_override =
         ParseIntEnv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", -1, 1, 64);
     policy.enable_mmq_mma = ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", true);
+    // Down-proj/lm-head MMA tier default-off (S20): the tier produced
+    // deterministic wrong logits at M>=4 in batched decode (probe ops
+    // T/W/X at N>=4; cured by INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH=64 and by
+    // disabling the tier via dispatch health). The kernel, quantizers,
+    // split-K reduce, and the residual chain each pass standalone rigs —
+    // the failure only reproduces in the full forward. Gate/up/o/QKV MMA
+    // (M>=2, TryQ8_1MmaGemv) is unaffected and stays enabled. Re-enable the
+    // down-proj tier with INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH=4 once the
+    // in-situ corruption is root-caused.
     policy.mmq_mma_min_batch =
-        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 4, 1, 64);
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 65, 1, 512);
     policy.mmq_mma_max_batch =
         ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH", 16, 1, 64);
     policy.mmq_mma_max_prefill_batch =

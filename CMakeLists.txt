@@ -713,6 +713,7 @@ add_executable(inferflux_tests
   tests/unit/test_batch_analyzer.cpp
   tests/unit/test_backend_interface.cpp
   tests/unit/test_native_bootstrap_config.cpp
+  tests/unit/test_decode_relay_fingerprint.cpp
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_startup_advisor.cpp
@@ -759,6 +760,14 @@ if(ENABLE_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/external
   )
   target_link_libraries(inferflux_first_token_probe PRIVATE inferflux_core)
+
+  add_executable(inferflux_batched_isolation_probe
+    tests/tools/batched_isolation_probe.cpp
+  )
+  target_include_directories(inferflux_batched_isolation_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+  )
+  target_link_libraries(inferflux_batched_isolation_probe PRIVATE inferflux_core)
 
   add_executable(inferflux_attention_profile_probe
     tests/tools/attention_profile_probe.cpp
