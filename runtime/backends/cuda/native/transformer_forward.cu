@@ -678,7 +678,7 @@ bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
   if (!policy_ref.enable_mmq_mma || !weight.data || !gate || !up || !output ||
       !act_mmq || !partials || !FusedQuantGemm::CurrentDeviceSupportsMmqMma() ||
       InferfluxCudaOperatorHealth::Instance().IsUnhealthy(
-          FusedQuantGemm::DownProjOperator::kMmq) ||
+          FusedQuantGemm::DownProjOperator::kMmqMma) ||
       M <= 0 || N <= 0 || K <= 0 || M < policy_ref.mmq_mma_min_batch ||
       M > (m_cap_override > 0 ? m_cap_override
                               : policy_ref.mmq_mma_max_batch) ||
@@ -721,7 +721,7 @@ bool TryMmqMmaGemv<half>(const QuantizedWeightInfo &weight, const half *input,
   if (!policy_ref.enable_mmq_mma || !weight.data || !input || !output ||
       !act_mmq || !partials || !FusedQuantGemm::CurrentDeviceSupportsMmqMma() ||
       InferfluxCudaOperatorHealth::Instance().IsUnhealthy(
-          FusedQuantGemm::DownProjOperator::kMmq) ||
+          FusedQuantGemm::DownProjOperator::kMmqMma) ||
       M <= 0 || N <= 0 || K <= 0 || M < policy_ref.mmq_mma_min_batch ||
       M > (m_cap_override > 0 ? m_cap_override
                               : policy_ref.mmq_mma_max_batch) ||
@@ -2243,12 +2243,14 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
               down_raw.quant_type, seq_len, hidden_size_, intermediate_size_,
               [&]() {
                 return TryMmqMmaSiluMul<T>(
-                           down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-                           d_act_q8_1_mmq_, d_mma_partials_, seq_len,
-                           hidden_size_, intermediate_size_, stream_,
-                           "down_proj", &execution_policy_,
-                           execution_policy_.mmq_mma_max_prefill_batch) ||
-                       TryMmqSiluMulGemv<T>(down_mmq, d_ffn_gate_, d_ffn_up_,
+                    down_raw, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                    d_act_q8_1_mmq_, d_mma_partials_, seq_len, hidden_size_,
+                    intermediate_size_, stream_, "down_proj",
+                    &execution_policy_,
+                    execution_policy_.mmq_mma_max_prefill_batch);
+              },
+              [&]() {
+                return TryMmqSiluMulGemv<T>(down_mmq, d_ffn_gate_, d_ffn_up_,
                                             d_ffn_down_, d_act_q8_1_, seq_len,
                                             hidden_size_, intermediate_size_,
                                             stream_, "down_proj",
@@ -2303,7 +2305,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 // fusion)
                 bool down_ok = false;
                 if (down_selected_op ==
-                    FusedQuantGemm::DownProjOperator::kMmq) {
+                        FusedQuantGemm::DownProjOperator::kMmq ||
+                    down_selected_op ==
+                        FusedQuantGemm::DownProjOperator::kMmqMma) {
                   down_ok = TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
                                           d_act_q8_1_, seq_len, hidden_size_,
                                           intermediate_size_, stream_,
@@ -2639,8 +2643,10 @@ template <typename T> std::string LlamaForwardTyped<T>::ProbeDispatchPaths() {
                                      d_ffn_down_, d_act_q8_1_mmq_,
                                      d_mma_partials_, M, hidden_size_,
                                      intermediate_size_, stream_,
-                                     "down_proj_probe", &execution_policy_) ||
-                 TryMmqSiluMulGemv<T>(down_mmq, d_ffn_gate_, d_ffn_up_,
+                                     "down_proj_probe", &execution_policy_);
+        },
+        [&]() {
+          return TryMmqSiluMulGemv<T>(down_mmq, d_ffn_gate_, d_ffn_up_,
                                       d_ffn_down_, d_act_q8_1_, M, hidden_size_,
                                       intermediate_size_, stream_,
                                       "down_proj_probe", &execution_policy_);
@@ -3738,11 +3744,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                                d_ffn_down_, d_act_q8_1_mmq_,
                                                d_mma_partials_, B, hidden_size_,
                                                intermediate_size_, stream_,
-                                               "down_proj", active_policy) ||
-                           TryMmqSiluMulGemv<T>(
-                               down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
-                               d_act_q8_1_, B, hidden_size_, intermediate_size_,
-                               stream_, "down_proj", active_policy);
+                                               "down_proj", active_policy);
+                  },
+                  [&]() {
+                    return TryMmqSiluMulGemv<T>(
+                        down_mmq, d_ffn_gate_, d_ffn_up_, d_ffn_down_,
+                        d_act_q8_1_, B, hidden_size_, intermediate_size_,
+                        stream_, "down_proj", active_policy);
                   },
                   [&]() {
                     if constexpr (std::is_same_v<T, half>) {
@@ -3782,7 +3790,9 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
 
                     bool down_ok = false;
                     if (down_selected_op ==
-                        FusedQuantGemm::DownProjOperator::kMmq) {
+                            FusedQuantGemm::DownProjOperator::kMmq ||
+                        down_selected_op ==
+                            FusedQuantGemm::DownProjOperator::kMmqMma) {
                       down_ok =
                           TryMmqGemv<T>(down_mmq, d_ffn_gate_, d_ffn_down_,
                                         d_act_q8_1_, B, hidden_size_,

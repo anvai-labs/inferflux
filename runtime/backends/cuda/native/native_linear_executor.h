@@ -171,24 +171,42 @@ bool ExecuteInferfluxCudaFfnProjectionStage(
 
 struct NativeDownProjExecutionSummary {
   DownProjOperator actual_op{DownProjOperator::kFallback};
+  bool used_mmq_mma{false};
   bool used_mmq{false};
   bool used_q81{false};
   bool used_packed{false};
 };
 
-template <typename TryMmqFn, typename TryQ81Fn, typename TryPackedFn,
-          typename FallbackFn, typename LogFn>
+template <typename TryMmqMmaFn, typename TryMmqFn, typename TryQ81Fn,
+          typename TryPackedFn, typename FallbackFn, typename LogFn>
 bool ExecuteInferfluxCudaDownProjStage(
     DownProjOperator selected_op, const char *phase,
     const std::string &quant_label, int quant_type, int batch_rows,
-    int hidden_size, int intermediate_size, TryMmqFn &&try_mmq,
-    TryQ81Fn &&try_q81, TryPackedFn &&try_packed, FallbackFn &&run_fallback,
-    LogFn &&log_selected_operator,
+    int hidden_size, int intermediate_size, TryMmqMmaFn &&try_mmq_mma,
+    TryMmqFn &&try_mmq, TryQ81Fn &&try_q81, TryPackedFn &&try_packed,
+    FallbackFn &&run_fallback, LogFn &&log_selected_operator,
     NativeDownProjExecutionSummary *summary = nullptr,
     const NativeExecutionPolicy *policy = nullptr) {
   NativeDownProjExecutionSummary local_summary;
 
   switch (selected_op) {
+  case DownProjOperator::kMmqMma:
+    // Tensor-core tier selected: MMA first, then the dp4a MMQ, then Q8_1.
+    local_summary.used_mmq_mma = std::forward<TryMmqMmaFn>(try_mmq_mma)();
+    if (local_summary.used_mmq_mma) {
+      local_summary.actual_op = DownProjOperator::kMmqMma;
+      break;
+    }
+    local_summary.used_mmq = std::forward<TryMmqFn>(try_mmq)();
+    if (local_summary.used_mmq) {
+      local_summary.actual_op = DownProjOperator::kMmq;
+      break;
+    }
+    local_summary.used_q81 = std::forward<TryQ81Fn>(try_q81)();
+    if (local_summary.used_q81) {
+      local_summary.actual_op = DownProjOperator::kQ81Gemv;
+    }
+    break;
   case DownProjOperator::kMmq:
     local_summary.used_mmq = std::forward<TryMmqFn>(try_mmq)();
     if (local_summary.used_mmq) {
@@ -220,9 +238,18 @@ bool ExecuteInferfluxCudaDownProjStage(
       local_summary.actual_op = selected_op;
     }
     if (!local_summary.used_q81) {
-      local_summary.used_mmq = std::forward<TryMmqFn>(try_mmq)();
-      if (local_summary.used_mmq) {
-        local_summary.actual_op = DownProjOperator::kMmq;
+      // MMA before dp4a — the prefill sites allow MMA above the decode
+      // window (mmq_mma_max_prefill_batch), so an MMA attempt can still
+      // succeed under a Q8_1 selection. Keep the historical order.
+      local_summary.used_mmq_mma = std::forward<TryMmqMmaFn>(try_mmq_mma)();
+      if (local_summary.used_mmq_mma) {
+        local_summary.actual_op = DownProjOperator::kMmqMma;
+      }
+      if (!local_summary.used_mmq_mma) {
+        local_summary.used_mmq = std::forward<TryMmqFn>(try_mmq)();
+        if (local_summary.used_mmq) {
+          local_summary.actual_op = DownProjOperator::kMmq;
+        }
       }
     }
     break;
@@ -231,8 +258,8 @@ bool ExecuteInferfluxCudaDownProjStage(
     break;
   }
 
-  if (!local_summary.used_mmq && !local_summary.used_q81 &&
-      !local_summary.used_packed &&
+  if (!local_summary.used_mmq_mma && !local_summary.used_mmq &&
+      !local_summary.used_q81 && !local_summary.used_packed &&
       selected_op != DownProjOperator::kPackedGemv &&
       selected_op != DownProjOperator::kFallback) {
     local_summary.used_packed = std::forward<TryPackedFn>(try_packed)();
@@ -281,8 +308,8 @@ bool ExecuteInferfluxCudaDownProjStage(
     *summary = local_summary;
   }
 
-  if (!local_summary.used_mmq && !local_summary.used_q81 &&
-      !local_summary.used_packed) {
+  if (!local_summary.used_mmq_mma && !local_summary.used_mmq &&
+      !local_summary.used_q81 && !local_summary.used_packed) {
     return std::forward<FallbackFn>(run_fallback)();
   }
   return true;

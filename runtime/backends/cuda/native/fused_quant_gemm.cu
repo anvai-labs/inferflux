@@ -1048,7 +1048,7 @@ FusedQuantGemm::DownProjOperator FusedQuantGemm::SelectDownProjOperator(
                                             geometry.K);
   const auto profile = BuildInferfluxCudaDownProjDispatchProfile(
       InferfluxCudaDispatchPhase::kUnknown, quant_type, geometry, q81_ready,
-      packed_ready, mmq_ready);
+      packed_ready, mmq_ready, /*mma_ready=*/false);
   const auto decision =
       SelectInferfluxCudaDownProjDispatchDecision(profile, resolved_policy);
   selected = decision.op;
