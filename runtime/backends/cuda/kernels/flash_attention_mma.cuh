@@ -85,23 +85,24 @@ __device__ __forceinline__ int mma_frag_col(int l, int lane) {
 __device__ __forceinline__ void load_mma_a_16x16(
     int (&A)[4], const half *src, int row0, int k0, int stride) {
   const int lane = threadIdx.x % 32;
-  // A fragment layout for m16n8k16, I_MAJOR:
-  //   A has 4 half2 per thread (8 half values covering 16x16 logical).
+  // A fragment layout for m16n8k16 (PTX ISA, I_MAJOR):
+  //   groupID = lane / 4, threadID_in_group = lane % 4.
   //   Register l holds half2 at logical position:
-  //     row = ((l / 2) * 8) + (lane / 4)
-  //     col = ((lane % 4) * 2) + (l % 2) * ... but for A (K dim), it's packed
-  // Use the NVIDIA-specified layout: thread (lane) holds:
-  //   A[0] = {src[row0 + lane/4, k0 + (lane%4)*2], src[row0 + lane/4, k0 + (lane%4)*2 + 1]}
-  //   A[1] = {src[row0 + lane/4, k0 + (lane%4)*2 + 8], src[row0 + lane/4, k0 + (lane%4)*2 + 9]}
-  //   A[2] = {src[row0 + lane/4 + 8, k0 + (lane%4)*2], ...}
-  //   A[3] = {src[row0 + lane/4 + 8, k0 + (lane%4)*2 + 8], ...}
+  //     A[0] = (row = groupID,     col = tig*2 + {0,1})
+  //     A[1] = (row = groupID + 8, col = tig*2 + {0,1})
+  //     A[2] = (row = groupID,     col = tig*2 + 8 + {0,1})
+  //     A[3] = (row = groupID + 8, col = tig*2 + 8 + {0,1})
+  // NOTE: registers 1 and 2 differ from each other by ROW first — swapping
+  // them (row+8 in reg 2, col+8 in reg 1) silently exchanges each row's
+  // dims 8..15 with the next row's dims 0..7 (verified empirically with
+  // one-hot probes; see test_fa2_prefill.cu).
   const int row_lo = row0 + lane / 4;
   const int row_hi = row_lo + 8;
   const int col_base = k0 + (lane % 4) * 2;
 
   const half *r0 = src + row_lo * stride + col_base;
-  const half *r1 = src + row_lo * stride + col_base + 8;
-  const half *r2 = src + row_hi * stride + col_base;
+  const half *r1 = src + row_hi * stride + col_base;
+  const half *r2 = src + row_lo * stride + col_base + 8;
   const half *r3 = src + row_hi * stride + col_base + 8;
 
   A[0] = *reinterpret_cast<const int *>(r0);
