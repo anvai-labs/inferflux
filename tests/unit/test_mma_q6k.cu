@@ -274,6 +274,11 @@ int main() {
   TestUniform();
   TestShape(1, 256, 256, 1, 12345);
   TestShape(2, 300, 256, 1, 777); // tail N tile (300 % 128 != 0)
+  // Decode batch sizes at production down-proj geometry — the MMA window
+  // extends down to M=4 (mmq_mma_min_batch), so these rows must be covered.
+  TestShape(4, 2048, 11008, 1, 20260847);
+  TestShape(6, 2048, 11008, 1, 20260848);
+  TestShape(8, 2048, 11008, 1, 20260849);
   TestShape(16, 2048, 2048, 1, 4242);
   TestShape(16, 2048, 11008, 1, 999);
   TestShape(16, 2048, 11008, 3, 555); // K-split with reduce
