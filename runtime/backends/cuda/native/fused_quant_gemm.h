@@ -280,6 +280,27 @@ public:
                          runtime::cuda::native::BlockQ8_1Mmq *output, int M,
                          int K, cudaStream_t stream);
 
+  /** Fused SwiGLU + DS quantization for the Q4_K MMA down-projection. */
+  static void SiluMulQuantizeQ8_1MmqDs(
+      const half *gate, const half *up,
+      runtime::cuda::native::BlockQ8_1MmqDs *output, int M, int K,
+      cudaStream_t stream);
+
+  /**
+   * Q4_K MMA down-projection (S18): out[M, N] = silu(gate)*up x W[N, K]^T
+   * for Q4_K W in raw row-major layout, consuming the DS activation buffer
+   * produced by SiluMulQuantizeQ8_1MmqDs. Mirrors DownProjMmqMma (Q6_K):
+   * raw weights, M in [mmq_mma_min_batch, max], K-split partials sized
+   * kMmqMmaMaxSplits * M * N floats. Returns false when unsupported so the
+   * caller falls back to the dp4a MMQ / Q8_1 tiers.
+   */
+  static bool DownProjMmqMmaQ4K(const QuantizedWeightInfo &weight,
+                                const runtime::cuda::native::BlockQ8_1MmqDs *ds_act,
+                                half *output, int M, int N, int K,
+                                float *partials, cudaStream_t stream,
+                                const NativeExecutionPolicy *policy = nullptr,
+                                int max_m_override = -1);
+
   /**
    * MMA down-projection: out[M, N] = act[M, K] x W[N, K]^T for Q6_K W in
    * raw row-major super-block layout. K-split fills the SM array when the

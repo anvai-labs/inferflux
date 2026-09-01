@@ -24,6 +24,7 @@
 using inferflux::runtime::cuda::native::BlockQ8_1MmqDs;
 using inferflux::runtime::cuda::native::InferfluxMmqQ4KMma;
 using inferflux::runtime::cuda::native::QuantizeRowQ8_1MmqDsKernel;
+using inferflux::runtime::cuda::native::SiluMulQuantizeQ8_1MmqDsKernel;
 using inferflux::runtime::cuda::native::block_q4_k;
 using inferflux::runtime::cuda::native::kMmqMmaTileXKQ81;
 using inferflux::runtime::cuda::native::kMmqMmaWarps;
@@ -78,6 +79,42 @@ void QuantizeDsHost(const std::vector<half> &x, int K,
       for (int i = 0; i < 32; ++i) {
         const float v = __half2float(
             x[static_cast<size_t>(row) * K + g * 128 + sub * 32 + i]);
+        const int q = nearbyintf(v * d_inv);
+        grp.qs[sub * 32 + i] = static_cast<int8_t>(q);
+        sum32 += q;
+      }
+      grp.ds[sub] =
+          make_half2(__float2half_rn(d), __float2half_rn(d * sum32));
+    }
+  }
+}
+
+// Host emulation of the fused SwiGLU DS quantizer: quantizes
+// silu(gate)*up elementwise, matching device float ops.
+void SiluMulQuantizeDsHost(const std::vector<half> &gate,
+                           const std::vector<half> &up, int K,
+                           std::vector<BlockQ8_1MmqDs> &row_major, int row) {
+  const int groups = K / 128;
+  for (int g = 0; g < groups; ++g) {
+    BlockQ8_1MmqDs &grp = row_major[static_cast<size_t>(row) * groups + g];
+    for (int sub = 0; sub < 4; ++sub) {
+      float amax = 0.0f;
+      for (int i = 0; i < 32; ++i) {
+        const float gv = __half2float(
+            gate[static_cast<size_t>(row) * K + g * 128 + sub * 32 + i]);
+        const float uv = __half2float(
+            up[static_cast<size_t>(row) * K + g * 128 + sub * 32 + i]);
+        amax = fmaxf(amax, fabsf(gv * uv / (1.0f + expf(-gv))));
+      }
+      const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+      const float d_inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+      float sum32 = 0.0f;
+      for (int i = 0; i < 32; ++i) {
+        const float gv = __half2float(
+            gate[static_cast<size_t>(row) * K + g * 128 + sub * 32 + i]);
+        const float uv = __half2float(
+            up[static_cast<size_t>(row) * K + g * 128 + sub * 32 + i]);
+        const float v = gv * uv / (1.0f + expf(-gv));
         const int q = nearbyintf(v * d_inv);
         grp.qs[sub * 32 + i] = static_cast<int8_t>(q);
         sum32 += q;
@@ -260,15 +297,64 @@ void TestShape(int M, int N, int K, int ks, uint32_t seed) {
     }
 
   // Q8_1-family tolerance: activations carry half-precision {d, d*sum}
-  // scales (llama's layout) vs Q6's float d4 — 2e-2 empirical precision
-  // bound; structural correctness is gated by the uniform-exact test.
-  const bool ok = max_rel < 2e-2;
-  printf("M=%-2d N=%-6d K=%-5d ks=%d max_rel=%.3e  %s\n", M, N, K, ks,
-         max_rel, ok ? "PASS" : "FAIL");
+  // scales (llama's layout) vs Q6's float d4, so the residual grows with
+  // dot length — measured ~1.2e-2 at K=2048 and ~2.1-3.0e-2 at the
+  // down-proj K=11008 (same numeric class as llama.cpp's
+  // vec_dot_q4_K_q8_1). Structural correctness is gated by the
+  // uniform-exact test, not this bound.
+  const double tol = K >= 8192 ? 4e-2 : 2e-2;
+  const bool ok = max_rel < tol;
+  printf("M=%-2d N=%-6d K=%-5d ks=%d max_rel=%.3e (tol %.0e) %s\n", M, N, K,
+         ks, max_rel, tol, ok ? "PASS" : "FAIL");
   if (!ok)
     ++g_fail;
   cudaFree(buf.w); cudaFree(buf.a); cudaFree(buf.acts); cudaFree(buf.out);
   cudaFree(buf.partials);
+}
+
+// Fused SwiGLU DS quantizer (S18 down-proj input path) vs host emulation,
+// byte-exact.
+void TestSiluMulQuantizer(int M, int K, uint32_t seed) {
+  std::vector<half> gate(static_cast<size_t>(M) * K), up(gate.size());
+  for (auto &v : gate)
+    v = __float2half(4.0f * (static_cast<int>(Lcg(seed) % 2001) - 1000) /
+                     1000.0f);
+  for (auto &v : up)
+    v = __float2half(2.0f * (static_cast<int>(Lcg(seed) % 2001) - 1000) /
+                     1000.0f);
+  const int groups = K / 128;
+  std::vector<BlockQ8_1MmqDs> row_major(static_cast<size_t>(M) * groups);
+  for (int r = 0; r < M; ++r)
+    SiluMulQuantizeDsHost(gate, up, K, row_major, r);
+  std::vector<BlockQ8_1MmqDs> gm(row_major.size());
+  for (int r = 0; r < M; ++r)
+    for (int g = 0; g < groups; ++g)
+      gm[static_cast<size_t>(g) * M + r] =
+          row_major[static_cast<size_t>(r) * groups + g];
+
+  half *dg, *du;
+  BlockQ8_1MmqDs *da;
+  cudaMalloc(&dg, gate.size() * sizeof(half));
+  cudaMalloc(&du, up.size() * sizeof(half));
+  cudaMalloc(&da, gm.size() * sizeof(BlockQ8_1MmqDs));
+  cudaMemcpy(dg, gate.data(), gate.size() * sizeof(half),
+             cudaMemcpyHostToDevice);
+  cudaMemcpy(du, up.data(), up.size() * sizeof(half),
+             cudaMemcpyHostToDevice);
+  dim3 qgrid((groups + 3) / 4, M);
+  SiluMulQuantizeQ8_1MmqDsKernel<<<qgrid, 128>>>(dg, du, da, K, M);
+  std::vector<BlockQ8_1MmqDs> dev(gm.size());
+  cudaMemcpy(dev.data(), da, dev.size() * sizeof(BlockQ8_1MmqDs),
+             cudaMemcpyDeviceToHost);
+  const bool ok = std::memcmp(dev.data(), gm.data(),
+                              dev.size() * sizeof(BlockQ8_1MmqDs)) == 0;
+  printf("M=%-2d K=%-5d silu-mul DS quantizer == host: %s\n", M, K,
+         ok ? "PASS" : "FAIL");
+  if (!ok)
+    ++g_fail;
+  cudaFree(dg);
+  cudaFree(du);
+  cudaFree(da);
 }
 
 } // namespace
@@ -307,6 +393,19 @@ int main() {
   TestShape(16, 11008, 2048, 1, 999);
   TestShape(16, 11008, 2048, 3, 555);
   TestShape(16, 11008, 2048, 6, 31337);
+  // Production down-proj geometry (S18): N=hidden, K=intermediate. Mixed
+  // quants (ollama Q4_K_M) carry per-layer Q4_K down-proj tensors that run
+  // this path at decode M=4..16; ks=3 matches the production split
+  // heuristic (16 N-tiles under 48 SMs).
+  printf("== down-proj geometry ==\n");
+  TestShape(4, 2048, 11008, 1, 20260850);
+  TestShape(6, 2048, 11008, 1, 20260851);
+  TestShape(8, 2048, 11008, 1, 20260852);
+  TestShape(16, 2048, 11008, 3, 20260853);
+  TestShape(17, 2048, 11008, 1, 20260854); // partial second y-tile
+  printf("== silu-mul DS quantizer ==\n");
+  TestSiluMulQuantizer(4, 11008, 20260855);
+  TestSiluMulQuantizer(16, 11008, 20260856);
   printf("RESULT: %s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
   return g_fail ? 1 : 0;
 }

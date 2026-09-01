@@ -254,6 +254,72 @@ static __global__ void QuantizeRowQ8_1MmqDsKernel(
   }
 }
 
+// Fused SwiGLU + DS quantizer for the Q4_K MMA down-projection (S18):
+// gate/up[M, K] -> silu(gate)*up quantized to BlockQ8_1MmqDs[M, K/128],
+// group-major. Same thread mapping and scale contract as
+// QuantizeRowQ8_1MmqDsKernel; reading gate/up without overwriting them
+// keeps the Q8_1-tier fallback valid when the MMA launch later declines
+// (a separate SiluMul pass would corrupt the gate buffer for that path).
+static __global__ void SiluMulQuantizeQ8_1MmqDsKernel(
+    const half *__restrict__ gate, const half *__restrict__ up,
+    BlockQ8_1MmqDs *__restrict__ y, int K, int total_rows) {
+  const int row = blockIdx.y;
+  if (row >= total_rows)
+    return;
+  const int t = threadIdx.x; // 0..127
+  const int groups_per_row = K / 128;
+  const int group = blockIdx.x * 4 + t / 32;
+  if (group >= groups_per_row) {
+    return;
+  }
+  BlockQ8_1MmqDs &grp =
+      y[static_cast<size_t>(group) * total_rows + row];
+  const int lane = t % 32;
+
+  const int base = row * K + group * 128 + 4 * lane;
+  float vals[4];
+#pragma unroll
+  for (int j = 0; j < 4; j += 2) {
+    const half2 g2 = *reinterpret_cast<const half2 *>(&gate[base + j]);
+    const half2 u2 = *reinterpret_cast<const half2 *>(&up[base + j]);
+    const float g0 = __half2float(__low2half(g2));
+    const float g1 = __half2float(__high2half(g2));
+    vals[j] = g0 * __half2float(__low2half(u2)) / (1.0f + __expf(-g0));
+    vals[j + 1] = g1 * __half2float(__high2half(u2)) / (1.0f + __expf(-g1));
+  }
+
+  float amax = fabsf(vals[0]);
+  amax = fmaxf(amax, fabsf(vals[1]));
+  amax = fmaxf(amax, fabsf(vals[2]));
+  amax = fmaxf(amax, fabsf(vals[3]));
+#pragma unroll
+  for (int off = 4; off > 0; off >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, off));
+  }
+
+  const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+  const float d_inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+  char4 q;
+  q.x = __float2int_rn(vals[0] * d_inv);
+  q.y = __float2int_rn(vals[1] * d_inv);
+  q.z = __float2int_rn(vals[2] * d_inv);
+  q.w = __float2int_rn(vals[3] * d_inv);
+  reinterpret_cast<char4 *>(grp.qs)[lane] = q;
+
+  // d*sum(qs) reduced across the 8-lane group.
+  const float sum4 = (static_cast<float>(q.x) + static_cast<float>(q.y) +
+                      static_cast<float>(q.z) + static_cast<float>(q.w));
+  float sum32 = sum4;
+#pragma unroll
+  for (int off = 4; off > 0; off >>= 1) {
+    sum32 += __shfl_xor_sync(0xFFFFFFFF, sum32, off);
+  }
+  if (lane % 8 == 0) {
+    grp.ds[lane / 8] =
+        make_half2(__float2half_rn(d), __float2half_rn(d * sum32));
+  }
+}
+
 // Weight staging: Q4_K -> nibble-split int8 x_qs tile + half2 x_dm.
 // Port of load_tiles_q4_K (mmq.cuh:1984-2091), MMA branch.
 template <int mmq_y>
