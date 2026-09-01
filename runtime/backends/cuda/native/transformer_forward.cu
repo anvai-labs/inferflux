@@ -656,9 +656,10 @@ bool TryMmqSiluMulGemv<half>(const MmqWeightInfo &weight, const half *gate,
   return ok;
 }
 
-// MMA tensor-core down-proj (S7): Q6_K only, raw row-major weights, D4
-// activations. Returns false (unchanged dispatch) unless
-// INFERFLUX_CUDA_MMQ_MMA=1 — callers fall through to the dp4a MMQ tier.
+// MMA tensor-core down-proj (S7/S18): Q6_K (D4 activations) and Q4_K (DS
+// activations), raw row-major weights. Returns false (unchanged dispatch)
+// unless INFERFLUX_CUDA_MMQ_MMA=1 — callers fall through to the dp4a MMQ
+// tier.
 template <typename T>
 bool TryMmqMmaSiluMul(const QuantizedWeightInfo &, const T *, const T *, T *,
                       void *, float *, int, int, int, cudaStream_t,
@@ -675,6 +676,11 @@ bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
                             const NativeExecutionPolicy *policy,
                             int m_cap_override) {
   const auto &policy_ref = ResolveInferfluxCudaExecutionPolicy(policy);
+  const auto quant_type =
+      static_cast<runtime::cuda::native::GGUF::TensorType>(weight.quant_type);
+  const bool mma_quant =
+      quant_type == runtime::cuda::native::GGUF::TensorType::Q6_K ||
+      quant_type == runtime::cuda::native::GGUF::TensorType::Q4_K;
   if (!policy_ref.enable_mmq_mma || !weight.data || !gate || !up || !output ||
       !act_mmq || !partials || !FusedQuantGemm::CurrentDeviceSupportsMmqMma() ||
       InferfluxCudaOperatorHealth::Instance().IsUnhealthy(
@@ -683,19 +689,38 @@ bool TryMmqMmaSiluMul<half>(const QuantizedWeightInfo &weight, const half *gate,
       M > (m_cap_override > 0 ? m_cap_override
                               : policy_ref.mmq_mma_max_batch) ||
       static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
-      weight.quant_type !=
-          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
+      !mma_quant) {
     return false;
   }
 
-  FusedQuantGemm::SiluMulQuantizeQ8_1Mmq(
-      gate, up, static_cast<runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq), M,
-      K, stream);
-  const bool ok = FusedQuantGemm::DownProjMmqMma(
-      weight, static_cast<const runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq),
-      output, M, N, K, partials, stream, policy, m_cap_override);
+  bool ok = false;
+  if (quant_type == runtime::cuda::native::GGUF::TensorType::Q6_K) {
+    FusedQuantGemm::SiluMulQuantizeQ8_1Mmq(
+        gate, up, static_cast<runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq),
+        M, K, stream);
+    ok = FusedQuantGemm::DownProjMmqMma(
+        weight,
+        static_cast<const runtime::cuda::native::BlockQ8_1Mmq *>(act_mmq),
+        output, M, N, K, partials, stream, policy, m_cap_override);
+  } else {
+    // Q4_K (S18): DS-quantized activations + the Q4_K MMA kernel. The fused
+    // SwiGLU quantizer reads gate/up without overwriting them, so a declined
+    // launch still leaves the Q8_1-tier fallback numerically valid.
+    FusedQuantGemm::SiluMulQuantizeQ8_1MmqDs(
+        gate, up,
+        static_cast<runtime::cuda::native::BlockQ8_1MmqDs *>(act_mmq), M, K,
+        stream);
+    ok = FusedQuantGemm::DownProjMmqMmaQ4K(
+        weight,
+        static_cast<const runtime::cuda::native::BlockQ8_1MmqDs *>(act_mmq),
+        output, M, N, K, partials, stream, policy, m_cap_override);
+  }
   if (ok && proj_name) {
-    LogPackedGemmPath(proj_name, "using MMA tensor-core Q6_K down-proj");
+    LogPackedGemmPath(proj_name, quant_type ==
+                                         runtime::cuda::native::GGUF::
+                                             TensorType::Q6_K
+                                     ? "using MMA tensor-core Q6_K down-proj"
+                                     : "using MMA tensor-core Q4_K down-proj");
   }
   return ok;
 }

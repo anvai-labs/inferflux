@@ -7441,11 +7441,17 @@ TEST_CASE(
               FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
               /*allow_fused_quantized_matmul=*/true,
               policy) == FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed);
+  // M=4 Q4_K decode now takes the tensor-core operator too (S18 extended
+  // the MMA window beyond Q6_K); non-MMA hardware keeps the Q8_1 ladder.
+  const FusedQuantGemm::DownProjOperator q4k_m4_expect =
+      FusedQuantGemm::CurrentDeviceSupportsMmqMma()
+          ? FusedQuantGemm::DownProjOperator::kMmqMma
+          : FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad;
   REQUIRE(SelectInferfluxCudaDownProjOperator(
               raw, mmq, InferfluxCudaDispatchPhase::kDecode,
               FusedDispatchGeometry{4, 2048, 11008, 1, true, false},
               /*allow_fused_quantized_matmul=*/true,
-              policy) == FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad);
+              policy) == q4k_m4_expect);
 
   policy.enable_experimental_q81_downproj_rowpair_hot_fixed = true;
   REQUIRE(SelectInferfluxCudaDownProjOperator(
@@ -7462,8 +7468,12 @@ TEST_CASE(
   NativeExecutionPolicy policy;
   const int q6k =
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+  const int q4k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
   const QuantizedWeightInfo raw{reinterpret_cast<const void *>(0x1), q6k,
                                 2048LL * 11008LL};
+  const QuantizedWeightInfo raw_q4{reinterpret_cast<const void *>(0x1), q4k,
+                                   2048LL * 11008LL};
   const MmqWeightInfo mmq{};
 
   // Inside the MMA window (mmq_mma_min_batch..max_batch) the tensor-core
@@ -7479,11 +7489,25 @@ TEST_CASE(
               /*allow_fused_quantized_matmul=*/true,
               policy) == window_expect);
 
+  // S18: Q4_K down-proj joins the same window — the ollama Q4_K_M recipe
+  // mixes per-layer Q4_K/Q6_K down-proj tensors, so both quants must
+  // promote identically.
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw_q4, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{8, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == window_expect);
+
   // Policy off falls back down the ladder — never a tier-mismatched
   // selection.
   policy.enable_mmq_mma = false;
   REQUIRE(SelectInferfluxCudaDownProjOperator(
               raw, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{8, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad);
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw_q4, mmq, InferfluxCudaDispatchPhase::kDecode,
               FusedDispatchGeometry{8, 2048, 11008, 1, true, false},
               /*allow_fused_quantized_matmul=*/true,
               policy) == FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad);

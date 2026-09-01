@@ -68,7 +68,7 @@ enum class DownProjOperator {
   kQ81GemvRowQuad,
   kPackedGemv,
   kMmq,
-  kMmqMma, // mma.sync tensor-core MMQ (S7/S16): Q6_K, M in the MMA window
+  kMmqMma, // mma.sync tensor-core MMQ (S7/S16/S18): Q6_K or Q4_K, M in window
 };
 
 constexpr int kFfnProjOperatorCount = 7;
