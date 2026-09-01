@@ -1,5 +1,6 @@
 #pragma once
 
+#include "runtime/backends/cuda/decode_relay_fingerprint.h"
 #include "runtime/backends/cuda/inferflux_cuda_runtime.h"
 #include "runtime/backends/cuda/native/decode_burst.h"
 #include "runtime/backends/cuda/native/model_loader.h"
@@ -329,7 +330,26 @@ private:
   // Per-sequence recent token history for repetition penalty.
   // Maps sequence_id → circular buffer of last N generated tokens.
   static constexpr int kPenaltyWindowSize = 64;
-  std::unordered_map<int, std::vector<int>> sequence_recent_tokens_;
+  // Mutated from the decode path (under shared_pipeline_mutex_) AND from the
+  // sequence-release paths, which run on scheduler/eviction threads and hold
+  // no pipeline lock. History MUST be erased wherever the KV slot is cleared:
+  // it is keyed by sequence_id (a KV slot), so a stale entry makes the next
+  // request on that slot sample under the previous request's tokens — with
+  // the implicit greedy 1.15 penalty this visibly corrupts the very first
+  // generated token.
+  void ClearSequenceRecentTokens(int sequence_id);
+
+  mutable std::mutex sequence_recent_tokens_mutex_;
+  // Per-slot repetition-penalty history. The generation tag invalidates the
+  // history when a slot is recycled for a new request: the scheduler bumps
+  // sequence_generation on reuse, and keying by slot id alone would bias the
+  // new request's first tokens with the previous request's tokens (probe op
+  // X reproduces this deterministically).
+  struct SequenceRecentTokens {
+    uint64_t generation{0};
+    std::vector<int> tokens;
+  };
+  std::unordered_map<int, SequenceRecentTokens> sequence_recent_tokens_;
 
   // Device logits buffer
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -418,6 +438,13 @@ private:
   // Atomic to prevent TOCTOU races with concurrent scheduler threads.
   std::atomic<bool> decode_relay_active_{false};
   std::atomic<int> decode_relay_batch_size_{0};
+  // Identity of the batch the relay is armed for (see
+  // decode_relay_fingerprint.h). Batch size alone is not a valid guard: a
+  // different batch of the same size would inherit the previous batch's device
+  // metadata and decode on the departed sequences' KV slots. Guarded by
+  // shared_pipeline_mutex_ (the standard decode path holds it across
+  // guard-check and re-arm).
+  cuda::DecodeRelayFingerprint decode_relay_armed_;
   int *d_eos_flag_{nullptr}; // [1] device flag for EOS detection
 
   /**

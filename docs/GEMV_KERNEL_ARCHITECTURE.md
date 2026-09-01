@@ -173,15 +173,27 @@ For M=1 decode, each warp computes **two output columns** instead of one, halvin
 Tiled matrix-multiply kernels for the down projection, using 2D thread blocks. Gated behind `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH` for controlled rollout.
 
 The MMA tensor-core family (`INFERFLUX_CUDA_MMQ_MMA`, default on) covers
-`M >= INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` (default 4, max 16) for BOTH down-proj
-quants: Q6_K (D4 activations via `SiluMulQuantizeQ8_1Mmq`) and, since S18,
-Q4_K (DS activations via `SiluMulQuantizeQ8_1MmqDs` + `DownProjMmqMmaQ4K`).
-Mixed-quant models (the ollama Q4_K_M recipe: per-layer Q4_K/Q6_K down-proj
-mix) take the same operator either way. At the down-proj geometry
-(N=2048, K=11008) the Q6_K variant is ~1.6x faster than the best MMVQ variant
-at M=4 and ~4x at M=8; the Q4_K variant measures 65-69us flat across M=4..16
-(1.9x its weight-traffic floor). Above the max-batch cap the dp4a MMQ family
-takes over.
+`M >= INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` for BOTH down-proj quants: Q6_K (D4
+activations via `SiluMulQuantizeQ8_1Mmq`) and, since S18, Q4_K (DS activations
+via `SiluMulQuantizeQ8_1MmqDs` + `DownProjMmqMmaQ4K`). Mixed-quant models (the
+ollama Q4_K_M recipe: per-layer Q4_K/Q6_K down-proj mix) take the same operator
+either way. At the down-proj geometry (N=2048, K=11008) the Q6_K variant is
+~1.6x faster than the best MMVQ variant at M=4 and ~4x at M=8; the Q4_K variant
+measures 65-69us flat across M=4..16 (1.9x its weight-traffic floor). Above the
+max-batch cap the dp4a MMQ family takes over.
+
+**Down-proj/lm-head MMA tier default-off (S20).** The tier produced
+deterministic wrong logits at M>=4 in batched decode (reproduced by
+`tests/tools/batched_isolation_probe.cpp` ops T/W/X at N>=4; every token after
+the first diverges from the B=1 reference). The kernel, both quantizers, the
+split-K reduce, and the residual chain each pass standalone rigs — including
+the exact production shapes — so the failure only reproduces in the full
+forward. `INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` therefore defaults to 65 (no
+production batch engages the tier; kv_max_batch is 16), disabling the
+down-proj/lm-head MMA path until the in-situ corruption is root-caused. The
+gate/up/o/QKV MMA paths (`TryQ8_1MmaGemv`, M>=2) are unaffected — they were
+exonerated at M=2..8 by the same probe. Set
+`INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH=4` to re-enable the tier for experiments.
 
 ## 4) Dispatch Priority
 
