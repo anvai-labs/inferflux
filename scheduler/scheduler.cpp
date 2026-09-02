@@ -24,6 +24,16 @@ namespace inferflux {
 
 namespace {
 
+bool FairnessTraceEnabled() {
+  static const bool enabled = []() {
+    const char *value = std::getenv("INFERFLUX_DEBUG_FAIRNESS");
+    return value && std::string_view(value) != "0" &&
+           std::string_view(value) != "false" &&
+           std::string_view(value) != "FALSE";
+  }();
+  return enabled;
+}
+
 bool SequenceSlotDebugEnabled() {
   static const bool enabled = []() {
     const char *value = std::getenv("INFERFLUX_DEBUG_SEQUENCE_SLOTS");
@@ -35,11 +45,16 @@ bool SequenceSlotDebugEnabled() {
 }
 
 bool StickyDecodeAccumulationWaitEnabled() {
-  const char *value =
-      std::getenv("INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT");
-  return value && std::string_view(value) != "0" &&
-         std::string_view(value) != "false" &&
-         std::string_view(value) != "FALSE";
+  // Cached: this is consulted every DecodeWorkerLoop iteration — a getenv +
+  // string compares per token is pure hot-path waste.
+  static const bool enabled = []() {
+    const char *value =
+        std::getenv("INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT");
+    return value && std::string_view(value) != "0" &&
+           std::string_view(value) != "false" &&
+           std::string_view(value) != "FALSE";
+  }();
+  return enabled;
 }
 
 std::string RequestPhaseDebugString(RequestPhase phase) {
@@ -296,7 +311,7 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
     if (!outputs[0].ok) {
       return false;
     }
-    final_output = outputs[0];
+    final_output = std::move(outputs[0]);
     chunk_start = chunk_end;
   }
 
@@ -1781,7 +1796,13 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   }
 
   metrics_->SetDecodeQueueDepth(static_cast<int>(selection.pending.size()));
-  ApplyFairness(&selection);
+  {
+    // ApplyFairness iterates/mutates the pending queues under its calling
+    // contract; ProcessBatch runs outside the BuildBatchLocked lock scope,
+    // so take queue_mutex_ here to pair with Generate()/DecodeWorkerLoop.
+    std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+    ApplyFairness(&selection);
+  }
   ResolveBackends(selection.pending);
   auto batch_start = std::chrono::steady_clock::now();
   selection.batch.batch_id =
@@ -2256,7 +2277,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       metrics_decode_requests);
 
   if (use_decode_workers_) {
-    metrics_->SetDecodeQueueDepth(static_cast<int>(pending_decode_.size()));
+    // Split mode: decode workers mutate pending_decode_ under queue_mutex_;
+    // read the depth under the same lock (formal UB otherwise, and a torn
+    // count is a misleading metric).
+    int decode_depth = 0;
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      decode_depth = static_cast<int>(pending_decode_.size());
+    }
+    metrics_->SetDecodeQueueDepth(decode_depth);
   }
   if (use_decode_workers_ && decode_ready.empty()) {
     return;
@@ -2385,6 +2414,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
            remaining = inference->fairness.remaining_decode_tokens,
            slice = inference->fairness.last_timeslice_tokens, slice_tokens](
               const std::string &name, const SpanContext &ctx, double ms) {
+            if (!FairnessTraceEnabled()) {
+              return;
+            }
             std::cout << "[fairness] " << name << " request=" << req_id
                       << " trace=" << ctx.trace_id << " limit=" << slice
                       << " generated=" << slice_tokens
@@ -2469,6 +2501,12 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       UpdateQueueDepthLocked();
     }
     prefill_cv_.notify_one();
+    // Split mode: decode workers wait on decode_cv_ (unbounded when
+    // batch_accumulation_ms > 0) — notifying only prefill_cv_ left a
+    // fairness-yielded request stranded until an unrelated prefill fired.
+    if (use_decode_workers_) {
+      decode_cv_.notify_one();
+    }
   }
   auto batch_exec_end = std::chrono::steady_clock::now();
   double exec_ms =
@@ -2486,6 +2524,12 @@ void Scheduler::UpdateQueueDepthLocked() const {
   metrics_->SetDecodeQueueDepth(decode_depth);
 }
 
+// CALLING CONTRACT: callers must hold queue_mutex_ (or otherwise exclude
+// Generate()/DecodeWorkerLoop queue mutations). The WorkerLoop's ProcessBatch
+// call site takes the lock; tests drive it under the same lock via
+// SchedulerTestAccess. This function iterates and mutates
+// pending_prefill_/pending_decode_ and pairs fairness_controller_ reads with
+// UpdateFairnessConfig's writes (same mutex).
 void Scheduler::ApplyFairness(BatchSelection *selection) {
   if (!selection || selection->pending.empty()) {
     return;
@@ -2507,6 +2551,9 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
           [req_id = pending->inference.id,
            remaining = pending->inference.fairness.remaining_decode_tokens](
               const std::string &name, const SpanContext &ctx, double ms) {
+            if (!FairnessTraceEnabled()) {
+              return;
+            }
             std::cout << "[fairness] " << name << " request=" << req_id
                       << " trace=" << ctx.trace_id << " remaining=" << remaining
                       << " duration_ms=" << ms << std::endl;
@@ -2521,6 +2568,12 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
     bool from_decode{false};
     std::size_t index{0};
   };
+  // Snapshot the queues under queue_mutex_: Scheduler::Generate() pushes
+  // into pending_prefill_ (HTTP workers) and DecodeWorkerLoop erases from
+  // pending_decode_ under the same mutex — touching the vectors unlocked
+  // here was a data race (vector realloc during iteration = UB). Only the
+  // snapshot and the swap mutation below hold the lock; the fairness
+  // evaluation runs on the local copies.
   std::vector<QueueItem> queue_refs;
   queue_refs.reserve(pending_prefill_.size() + pending_decode_.size());
   for (std::size_t i = 0; i < pending_prefill_.size(); ++i) {

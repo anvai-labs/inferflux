@@ -1136,7 +1136,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
           step_ok = false;
         } else {
           for (std::size_t i = 0; i < decode_positions.size(); ++i) {
-            step[decode_positions[i]] = decode_outputs[i];
+            step[decode_positions[i]] = std::move(decode_outputs[i]);
           }
         }
       }
@@ -1149,7 +1149,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
           step_ok = false;
         } else {
           for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
-            step[prefill_positions[i]] = prefill_outputs[i];
+            step[prefill_positions[i]] = std::move(prefill_outputs[i]);
           }
         }
       }
@@ -1531,7 +1531,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
         step_ok = false;
       } else {
         for (std::size_t i = 0; i < decode_positions.size(); ++i) {
-          step_outputs[decode_positions[i]] = decode_outputs[i];
+          step_outputs[decode_positions[i]] = std::move(decode_outputs[i]);
         }
       }
     }
@@ -1544,7 +1544,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
         step_ok = false;
       } else {
         for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
-          step_outputs[prefill_positions[i]] = prefill_outputs[i];
+          step_outputs[prefill_positions[i]] = std::move(prefill_outputs[i]);
         }
       }
     }

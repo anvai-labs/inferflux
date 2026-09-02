@@ -196,8 +196,9 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
         return nullptr;
       }
       tensor_->dequantized_gpu = d_dequantized;
-      if (dequant_dirty_flag_)
-        *dequant_dirty_flag_ = true;
+      // F32->F16 conversions are permanent (retained by ClearDequantizedCache)
+      // — do not dirty the batch-scoped flag; it exists to gate the per-batch
+      // cleanup's 3-stream sync before freeing QUANTIZED projection caches.
       return d_dequantized;
     }
     log::Error("gguf_weight_accessor",
@@ -1113,10 +1114,11 @@ void GGUFModelLoader::ClearDequantizedCache() {
         CheckCudaStatus(cudaFree(tensor.dequantized_gpu), "gguf_loader",
                         "cudaFree(tensor.dequantized_gpu:" + name + ")");
         tensor.dequantized_gpu = nullptr;
-      } else {
-        // Retained entries mean we still have dequantized data
-        has_dequantized_entries_ = true;
       }
+      // Retained entries are never freed, so they must NOT re-set the flag:
+      // has_dequantized_entries_ exists to tell the per-batch cleanup when a
+      // freeable (batch-scoped) dequant happened, and permanently-true made
+      // the cleanup issue 3 stream syncs after EVERY batch.
     }
   }
 }

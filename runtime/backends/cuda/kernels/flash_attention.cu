@@ -775,7 +775,8 @@ __global__ void FlashDecodeMultiSeqStridedGQAKernel(
 template <typename T, int GQARatio>
 __global__ void FlashDecodeGQASplitKernel(
     const T *__restrict__ Q, const T *__restrict__ kv_buffer,
-    float *__restrict__ partial_O,   // [B, num_kv_heads, num_splits, GQARatio, head_dim]
+    float *__restrict__ partial_O,   // [B, num_kv_heads, num_splits, GQARatio,
+                                     // head_dim]
     float *__restrict__ partial_max, // [B, num_kv_heads, num_splits, GQARatio]
     float *__restrict__ partial_sum, // [B, num_kv_heads, num_splits, GQARatio]
     const int *__restrict__ seq_ids, const int *__restrict__ kv_lens, int layer,
@@ -853,9 +854,10 @@ __global__ void FlashDecodeGQASplitKernel(
     for (int i = d; i < total_elements; i += num_threads) {
       const int t = i / head_dim;
       const int dim = i % head_dim;
-      const size_t kv_offset = static_cast<size_t>(kv_start + t) *
-                                   static_cast<size_t>(kv_stride_elems) +
-                               static_cast<size_t>(kv_head_idx * head_dim + dim);
+      const size_t kv_offset =
+          static_cast<size_t>(kv_start + t) *
+              static_cast<size_t>(kv_stride_elems) +
+          static_cast<size_t>(kv_head_idx * head_dim + dim);
       s_k[i] = DtypeTraits<T>::to_float(K[kv_offset]);
       s_v[i] = DtypeTraits<T>::to_float(V[kv_offset]);
     }
@@ -930,10 +932,9 @@ __global__ void FlashDecodeGQASplitKernel(
 // Grid: (B, num_heads)  Block: head_dim threads
 template <typename T>
 __global__ void FlashDecodeReduceSplitsKernel(
-    const float *__restrict__ partial_O,
-    const float *__restrict__ partial_max,
-    const float *__restrict__ partial_sum, T *__restrict__ O,
-    int num_heads, int num_kv_heads, int head_dim, int num_splits) {
+    const float *__restrict__ partial_O, const float *__restrict__ partial_max,
+    const float *__restrict__ partial_sum, T *__restrict__ O, int num_heads,
+    int num_kv_heads, int head_dim, int num_splits) {
   const int b = blockIdx.x;
   const int head_idx = blockIdx.y;
   const int d = threadIdx.x;
@@ -959,6 +960,12 @@ __global__ void FlashDecodeReduceSplitsKernel(
   for (int s = 0; s < num_splits; s++) {
     const size_t idx = (split_base + s) * gqa_ratio + h;
     float m = partial_max[idx];
+    if (m == -INFINITY) {
+      // Empty split (no KV range): its partial_O slice was never written,
+      // and 0 * stale_value is NaN if the reused workspace ever held
+      // NaN/Inf. The split contributes zero weight — skip it entirely.
+      continue;
+    }
     float sm = partial_sum[idx];
     float weight = expf(m - global_max) * sm;
     float o_val = partial_O[idx * head_dim + d];
@@ -968,8 +975,8 @@ __global__ void FlashDecodeReduceSplitsKernel(
   }
 
   O[b * num_heads * head_dim + head_idx * head_dim + d] =
-      DtypeTraits<T>::from_float(
-          (global_sum > 0.0f) ? (o_final / global_sum) : 0.0f);
+      DtypeTraits<T>::from_float((global_sum > 0.0f) ? (o_final / global_sum)
+                                                     : 0.0f);
 }
 
 template <typename T>
@@ -1094,8 +1101,8 @@ __global__ void FlashDecodeGQAWarpPerHeadKernel(
     const int *__restrict__ seq_ids, const int *__restrict__ kv_lens, int layer,
     int num_heads, int num_kv_heads, int head_dim, size_t slot_stride,
     size_t layer_stride, size_t kv_stride, float scale) {
-  const int warp = (blockIdx.x * kFlashDecodeWarpsPerBlock) +
-                   (threadIdx.x / 32);
+  const int warp =
+      (blockIdx.x * kFlashDecodeWarpsPerBlock) + (threadIdx.x / 32);
   const int lane = threadIdx.x & 31;
   const int b = blockIdx.y;
   if (warp >= num_heads) {
@@ -1121,8 +1128,8 @@ __global__ void FlashDecodeGQAWarpPerHeadKernel(
   const T *K = kv_buffer + seq_offset + layer_offset;
   const T *V = K + kv_stride;
   const int kv_row_elems = num_kv_heads * head_dim;
-  const size_t kv_head_off = static_cast<size_t>(kv_head_idx) * head_dim +
-                             lane * elems_per_lane;
+  const size_t kv_head_off =
+      static_cast<size_t>(kv_head_idx) * head_dim + lane * elems_per_lane;
 
   // Q fragment.
   float q[8];
@@ -1167,8 +1174,7 @@ __global__ void FlashDecodeGQAWarpPerHeadKernel(
 
   const float inv_l = l > 0.0f ? 1.0f / l : 0.0f;
   T *o_row = O + static_cast<size_t>(b) * num_heads * head_dim +
-             static_cast<size_t>(head_idx) * head_dim +
-             lane * elems_per_lane;
+             static_cast<size_t>(head_idx) * head_dim + lane * elems_per_lane;
 #pragma unroll
   for (int e = 0; e < elems_per_lane; ++e) {
     o_row[e] = static_cast<T>(acc[e] * inv_l);
@@ -1176,20 +1182,18 @@ __global__ void FlashDecodeGQAWarpPerHeadKernel(
 }
 
 template <typename T, int GQARatio>
-static cudaError_t
-LaunchGQADecodeWarpPerHead(const T *Q, const T *kv_buffer, T *O,
-                           const int *d_seq_ids, const int *d_kv_lens, int layer,
-                           int batch_size, int num_heads, int num_kv_heads,
-                           int head_dim, size_t slot_stride, size_t layer_stride,
-                           size_t kv_stride, float scale, cudaStream_t stream) {
+static cudaError_t LaunchGQADecodeWarpPerHead(
+    const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,
+    const int *d_kv_lens, int layer, int batch_size, int num_heads,
+    int num_kv_heads, int head_dim, size_t slot_stride, size_t layer_stride,
+    size_t kv_stride, float scale, cudaStream_t stream) {
   const int blocks =
       (num_heads + kFlashDecodeWarpsPerBlock - 1) / kFlashDecodeWarpsPerBlock;
   dim3 grid(blocks, batch_size);
   dim3 threads(kFlashDecodeWarpsPerBlock * 32);
-  FlashDecodeGQAWarpPerHeadKernel<T, GQARatio>
-      <<<grid, threads, 0, stream>>>(
-          Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, num_heads,
-          num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale);
+  FlashDecodeGQAWarpPerHeadKernel<T, GQARatio><<<grid, threads, 0, stream>>>(
+      Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, num_heads, num_kv_heads,
+      head_dim, slot_stride, layer_stride, kv_stride, scale);
   return cudaGetLastError();
 }
 
@@ -1204,16 +1208,13 @@ constexpr int kFlashDecodeSplitThreshold = 128;
 
 // Launch GQA-grouped decode kernel for a specific GQA ratio.
 template <typename T, int GQARatio>
-static cudaError_t LaunchGQADecode(const T *Q, const T *kv_buffer, T *O,
-                                    const int *d_seq_ids, const int *d_kv_lens,
-                                    int layer, int batch_size, int num_heads,
-                                    int num_kv_heads, int head_dim,
-                                    size_t slot_stride, size_t layer_stride,
-                                    size_t kv_stride, float scale,
-                                    cudaStream_t stream,
-                                    void *split_workspace = nullptr,
-                                    size_t split_workspace_bytes = 0,
-                                    int max_kv_hint = 0) {
+static cudaError_t
+LaunchGQADecode(const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,
+                const int *d_kv_lens, int layer, int batch_size, int num_heads,
+                int num_kv_heads, int head_dim, size_t slot_stride,
+                size_t layer_stride, size_t kv_stride, float scale,
+                cudaStream_t stream, void *split_workspace = nullptr,
+                size_t split_workspace_bytes = 0, int max_kv_hint = 0) {
   int threads = 1;
   while (threads < head_dim)
     threads <<= 1;
@@ -1233,8 +1234,9 @@ static cudaError_t LaunchGQADecode(const T *Q, const T *kv_buffer, T *O,
   // unsplit kernel skips the partial writes AND the combine launch.
   const int num_splits =
       (max_kv_hint > 0 && max_kv_hint <= 512) ? 1 : kFlashDecodeSplits;
-  const size_t partial_O_bytes = static_cast<size_t>(batch_size) * num_kv_heads *
-                                 num_splits * GQARatio * head_dim * sizeof(float);
+  const size_t partial_O_bytes = static_cast<size_t>(batch_size) *
+                                 num_kv_heads * num_splits * GQARatio *
+                                 head_dim * sizeof(float);
   const size_t partial_scalar_bytes = static_cast<size_t>(batch_size) *
                                       num_kv_heads * num_splits * GQARatio *
                                       sizeof(float);
@@ -1248,19 +1250,17 @@ static cudaError_t LaunchGQADecode(const T *Q, const T *kv_buffer, T *O,
     ConfigureFA2Smem(FlashDecodeGQASplitKernel<T, GQARatio>, smem);
 
     float *partial_O = static_cast<float *>(split_workspace);
-    float *partial_max =
-        reinterpret_cast<float *>(reinterpret_cast<char *>(split_workspace) +
-                                  partial_O_bytes);
+    float *partial_max = reinterpret_cast<float *>(
+        reinterpret_cast<char *>(split_workspace) + partial_O_bytes);
     float *partial_sum =
         reinterpret_cast<float *>(reinterpret_cast<char *>(split_workspace) +
                                   partial_O_bytes + partial_scalar_bytes);
 
     dim3 grid(batch_size, num_kv_heads, num_splits);
-    FlashDecodeGQASplitKernel<T, GQARatio>
-        <<<grid, threads, smem, stream>>>(
-            Q, kv_buffer, partial_O, partial_max, partial_sum, d_seq_ids,
-            d_kv_lens, layer, num_heads, num_kv_heads, head_dim, num_splits,
-            slot_stride, layer_stride, kv_stride, scale);
+    FlashDecodeGQASplitKernel<T, GQARatio><<<grid, threads, smem, stream>>>(
+        Q, kv_buffer, partial_O, partial_max, partial_sum, d_seq_ids, d_kv_lens,
+        layer, num_heads, num_kv_heads, head_dim, num_splits, slot_stride,
+        layer_stride, kv_stride, scale);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess)
@@ -1293,13 +1293,12 @@ static cudaError_t LaunchGQADecode(const T *Q, const T *kv_buffer, T *O,
 // full-KV scan by num_heads warps already saturates bandwidth (no split
 // workspace, single launch). Shape-static for CUDA graphs.
 template <typename T>
-cudaError_t FlashDecodeWarpPerHead(const T *Q, const T *kv_buffer, T *O,
-                                   const int *d_seq_ids, const int *d_kv_lens,
-                                   int layer, int batch_size, int num_heads,
-                                   int num_kv_heads, int head_dim,
-                                   size_t slot_stride, size_t layer_stride,
-                                   size_t kv_stride, float scale,
-                                   cudaStream_t stream) {
+cudaError_t
+FlashDecodeWarpPerHead(const T *Q, const T *kv_buffer, T *O,
+                       const int *d_seq_ids, const int *d_kv_lens, int layer,
+                       int batch_size, int num_heads, int num_kv_heads,
+                       int head_dim, size_t slot_stride, size_t layer_stride,
+                       size_t kv_stride, float scale, cudaStream_t stream) {
   const int gqa_ratio = (num_kv_heads > 0 && num_heads > num_kv_heads)
                             ? (num_heads / num_kv_heads)
                             : 1;
@@ -1328,17 +1327,12 @@ cudaError_t FlashDecodeWarpPerHead(const T *Q, const T *kv_buffer, T *O,
 }
 
 template <typename T>
-cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
-                                       const int *d_seq_ids,
-                                       const int *d_kv_lens, int layer,
-                                       int batch_size, int num_heads,
-                                       int num_kv_heads, int head_dim,
-                                       size_t slot_stride, size_t layer_stride,
-                                       size_t kv_stride, float scale,
-                                       cudaStream_t stream,
-                                       void *split_workspace,
-                                       size_t split_workspace_bytes,
-                                       int max_kv_hint) {
+cudaError_t FlashDecodeMultiSeqStrided(
+    const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,
+    const int *d_kv_lens, int layer, int batch_size, int num_heads,
+    int num_kv_heads, int head_dim, size_t slot_stride, size_t layer_stride,
+    size_t kv_stride, float scale, cudaStream_t stream, void *split_workspace,
+    size_t split_workspace_bytes, int max_kv_hint) {
   // Use GQA-grouped kernel when multiple Q-heads share a KV head.
   // This reduces KV memory reads by gqa_ratio (e.g., 4x for ratio=4).
   const int gqa_ratio = (num_kv_heads > 0 && num_heads > num_kv_heads)
@@ -1346,25 +1340,22 @@ cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
                             : 1;
 
   if (gqa_ratio == 8) {
-    return LaunchGQADecode<T, 8>(Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
-                                  batch_size, num_heads, num_kv_heads, head_dim,
-                                  slot_stride, layer_stride, kv_stride, scale,
-                                  stream, split_workspace,
-                                  split_workspace_bytes, max_kv_hint);
+    return LaunchGQADecode<T, 8>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream, split_workspace, split_workspace_bytes, max_kv_hint);
   }
   if (gqa_ratio == 4) {
-    return LaunchGQADecode<T, 4>(Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
-                                  batch_size, num_heads, num_kv_heads, head_dim,
-                                  slot_stride, layer_stride, kv_stride, scale,
-                                  stream, split_workspace,
-                                  split_workspace_bytes, max_kv_hint);
+    return LaunchGQADecode<T, 4>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream, split_workspace, split_workspace_bytes, max_kv_hint);
   }
   if (gqa_ratio == 2) {
-    return LaunchGQADecode<T, 2>(Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
-                                  batch_size, num_heads, num_kv_heads, head_dim,
-                                  slot_stride, layer_stride, kv_stride, scale,
-                                  stream, split_workspace,
-                                  split_workspace_bytes, max_kv_hint);
+    return LaunchGQADecode<T, 2>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream, split_workspace, split_workspace_bytes, max_kv_hint);
   }
 
   // Fallback: non-GQA or unsupported ratio — use per-head kernel
@@ -1386,21 +1377,24 @@ cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
   return cudaGetLastError();
 }
 
-template cudaError_t FlashDecodeWarpPerHead<half>(
-    const half *, const half *, half *, const int *, const int *, int, int,
-    int, int, int, size_t, size_t, size_t, float, cudaStream_t);
-template cudaError_t FlashDecodeWarpPerHead<float>(
-    const float *, const float *, float *, const int *, const int *, int, int,
-    int, int, int, size_t, size_t, size_t, float, cudaStream_t);
+template cudaError_t FlashDecodeWarpPerHead<half>(const half *, const half *,
+                                                  half *, const int *,
+                                                  const int *, int, int, int,
+                                                  int, int, size_t, size_t,
+                                                  size_t, float, cudaStream_t);
+template cudaError_t FlashDecodeWarpPerHead<float>(const float *, const float *,
+                                                   float *, const int *,
+                                                   const int *, int, int, int,
+                                                   int, int, size_t, size_t,
+                                                   size_t, float, cudaStream_t);
 template cudaError_t FlashDecodeWarpPerHead<__nv_bfloat16>(
-    const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *,
-    const int *, const int *, int, int, int, int, int, size_t, size_t,
-    size_t, float, cudaStream_t);
+    const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, const int *,
+    const int *, int, int, int, int, int, size_t, size_t, size_t, float,
+    cudaStream_t);
 
 template cudaError_t FlashDecodeMultiSeqStrided<half>(
-    const half *, const half *, half *, const int *, const int *, int, int,
-    int, int, int, size_t, size_t, size_t, float, cudaStream_t, void *,
-    size_t, int);
+    const half *, const half *, half *, const int *, const int *, int, int, int,
+    int, int, size_t, size_t, size_t, float, cudaStream_t, void *, size_t, int);
 template cudaError_t FlashDecodeMultiSeqStrided<__nv_bfloat16>(
     const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *, const int *,
     const int *, int, int, int, int, int, size_t, size_t, size_t, float,
@@ -1414,9 +1408,8 @@ template cudaError_t FlashDecodeMultiSeqStrided<__nv_bfloat16>(
 
 template <typename T>
 __global__ void BuildKVPtrsFromSlotsKernel(
-    T *const *__restrict__ slot_base_ptrs,
-    const int *__restrict__ seq_ids, int layer, int batch_size,
-    size_t layer_stride, size_t kv_stride,
+    T *const *__restrict__ slot_base_ptrs, const int *__restrict__ seq_ids,
+    int layer, int batch_size, size_t layer_stride, size_t kv_stride,
     const T **__restrict__ out_k_ptrs, const T **__restrict__ out_v_ptrs) {
   const int b = blockIdx.x * blockDim.x + threadIdx.x;
   if (b >= batch_size)
@@ -1428,12 +1421,13 @@ __global__ void BuildKVPtrsFromSlotsKernel(
 }
 
 template <typename T>
-cudaError_t FlashDecodeMultiSeqIndirect(
-    const T *Q, T *const *slot_base_ptrs, T *O, const int *d_seq_ids,
-    const int *d_kv_lens, int layer, int batch_size, int num_heads,
-    int num_kv_heads, int head_dim, size_t layer_stride, size_t kv_stride,
-    float scale, cudaStream_t stream, void *ptr_workspace,
-    size_t ptr_workspace_bytes) {
+cudaError_t
+FlashDecodeMultiSeqIndirect(const T *Q, T *const *slot_base_ptrs, T *O,
+                            const int *d_seq_ids, const int *d_kv_lens,
+                            int layer, int batch_size, int num_heads,
+                            int num_kv_heads, int head_dim, size_t layer_stride,
+                            size_t kv_stride, float scale, cudaStream_t stream,
+                            void *ptr_workspace, size_t ptr_workspace_bytes) {
   // ptr_workspace must hold 2 * batch_size * sizeof(T*)
   const size_t required = 2 * static_cast<size_t>(batch_size) * sizeof(T *);
   if (!ptr_workspace || ptr_workspace_bytes < required) {
@@ -1454,18 +1448,18 @@ cudaError_t FlashDecodeMultiSeqIndirect(
     return err;
 
   // Dispatch to existing pointer-based FlashDecode
-  return FlashDecodeMultiSeq<T>(Q, d_k_ptrs, d_v_ptrs, O, d_kv_lens,
-                                batch_size, num_heads, num_kv_heads, head_dim,
-                                scale, stream);
+  return FlashDecodeMultiSeq<T>(Q, d_k_ptrs, d_v_ptrs, O, d_kv_lens, batch_size,
+                                num_heads, num_kv_heads, head_dim, scale,
+                                stream);
 }
 
 template cudaError_t FlashDecodeMultiSeqIndirect<half>(
     const half *, half *const *, half *, const int *, const int *, int, int,
     int, int, int, size_t, size_t, float, cudaStream_t, void *, size_t);
 template cudaError_t FlashDecodeMultiSeqIndirect<__nv_bfloat16>(
-    const __nv_bfloat16 *, __nv_bfloat16 *const *, __nv_bfloat16 *,
-    const int *, const int *, int, int, int, int, int, size_t, size_t, float,
-    cudaStream_t, void *, size_t);
+    const __nv_bfloat16 *, __nv_bfloat16 *const *, __nv_bfloat16 *, const int *,
+    const int *, int, int, int, int, int, size_t, size_t, float, cudaStream_t,
+    void *, size_t);
 
 // ============================================================================
 // Split decode attention: parallelizes the GQA kernel over BOTH the Q-heads
