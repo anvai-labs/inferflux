@@ -2171,6 +2171,40 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
   log::Info("inferflux_cuda_executor",
             "InferFlux CUDA model loaded successfully");
   model_loaded_ = true;
+  // Warm the lane-overlap path with one throwaway mixed batch (no traffic
+  // exists yet, so scratch slots 0/1 are safe). The FIRST lane-overlap call
+  // in a process is the only one that can corrupt its first prefilled row
+  // (~35% of processes under some machine states, bimodal wrong first
+  // token; batched-isolation probe op S with lane overlap reproduces).
+  // Later mixed calls were never observed to corrupt. Executing the first
+  // mixed call here absorbs it; the probe would catch any regression of
+  // this warm-up. Cleared like a normal release: KV clear + penalty
+  // history + relay invalidation.
+  if (overlap_enabled_ && model_config_.vocab_size > 0) {
+    // The prefill row must clear min_prefill_tokens_ (256 with server
+    // defaults) or the mixed call falls back to the standard path and the
+    // lanes never engage; the decode row must request logits to be
+    // classified as decode.
+    UnifiedBatchInput warm_prefill;
+    warm_prefill.sequence_id = 0;
+    warm_prefill.n_past = 0;
+    warm_prefill.tokens.assign(
+        static_cast<size_t>(std::max(256, min_prefill_tokens_)), 1);
+    warm_prefill.request_logits = false;
+    warm_prefill.request_id = -1;
+    UnifiedBatchInput warm_decode;
+    warm_decode.sequence_id = 1;
+    warm_decode.n_past = 1;
+    warm_decode.tokens = {1};
+    warm_decode.request_logits = true;
+    warm_decode.request_id = -1;
+    (void)ExecuteUnifiedBatch({warm_prefill, warm_decode});
+    NativeFreeSequence(0);
+    NativeFreeSequence(1);
+    log::Info("inferflux_cuda_executor",
+              "Lane-overlap path warmed with a throwaway mixed batch");
+  }
+
   return true;
 }
 
