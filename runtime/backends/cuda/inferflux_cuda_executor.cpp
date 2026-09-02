@@ -837,6 +837,10 @@ InferfluxCudaExecutor::~InferfluxCudaExecutor() {
     cudaEventDestroy(sampling_start_);
   if (sampling_stop_)
     cudaEventDestroy(sampling_stop_);
+  if (d_eos_flag_) {
+    cudaFree(d_eos_flag_);
+    d_eos_flag_ = nullptr;
+  }
   if (decode_stream_)
     cudaStreamDestroy(decode_stream_);
   if (prefill_stream_)
@@ -3383,7 +3387,11 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       }
       if (!model_forward_->Forward(input.tokens, input.n_past,
                                    input.sequence_id, d_logits_)) {
+        // KV rows for this sequence were not written — reporting ok here
+        // would let the scheduler decode on stale/zero cache with no error
+        // signal (match the request_logits branch, which fails the row).
         log::Error("inferflux_cuda_executor", "Forward pass failed");
+        continue;
       }
       if (record_prefill_timing) {
         cudaEventRecord(forward_stop_, compute_stream_);
@@ -3402,10 +3410,10 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
               std::memory_order_relaxed);
         }
       } else {
-        // No timing — just sync stream to ensure forward completes
-        runtime::cuda::native::TracedCudaStreamSynchronize(
-            runtime::cuda::native::SyncTraceSite::kPrefillForwardDrain,
-            compute_stream_);
+        // No per-prefill stream drain: all prefills in this loop are
+        // stream-ordered on compute_stream_, and the batch-scoped cleanup
+        // synchronizes before releasing any shared scratch. Draining per
+        // prefill only blocked the host (and concurrent lane submission).
         GlobalMetrics().RecordInferfluxCudaForwardShape(is_decode,
                                                         batch_tokens);
       }
@@ -4170,14 +4178,20 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id, int n_past_start,
     return 0; // Device-side relay not supported
   }
 
-  // Allocate device-side EOS flag if needed
+  // Allocate device-side EOS flag once (checked; previously the result was
+  // ignored and the allocation was never freed).
   if (!d_eos_flag_) {
-    cudaMalloc(&d_eos_flag_, sizeof(int));
+    if (cudaMalloc(&d_eos_flag_, sizeof(int)) != cudaSuccess) {
+      d_eos_flag_ = nullptr;
+      return 0;
+    }
   }
 
   // Allocate device-side token accumulation buffer
   int *d_token_buf = nullptr;
-  cudaMalloc(&d_token_buf, n_tokens * sizeof(int));
+  if (cudaMalloc(&d_token_buf, n_tokens * sizeof(int)) != cudaSuccess) {
+    return 0;
+  }
   if (!d_token_buf) {
     return 0;
   }
