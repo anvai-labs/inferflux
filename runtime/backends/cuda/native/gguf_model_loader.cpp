@@ -257,6 +257,19 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
     return nullptr;
   }
 
+  // The dequantized cache is SHARED through the loader tensor: every weight
+  // map (primary + lane-overlap replicas) receives this pointer, and readers
+  // may launch on a different (non-blocking) stream than the one this dequant
+  // runs on. Without this sync the pointer is cached and handed to other
+  // streams while the dequant kernel is still writing — the lane-overlap
+  // first-mixed-call corruption read partially-dequantized weights (bit
+  // identical across processes; see the batched-isolation probe).
+  if (!CheckCudaStatus(cudaStreamSynchronize(stream), "gguf_weight_accessor",
+                       "cudaStreamSynchronize(dequantized cache)")) {
+    cudaFree(d_dequantized);
+    return nullptr;
+  }
+
   // Cache result
   tensor_->dequantized_gpu = d_dequantized;
   if (dequant_dirty_flag_)
