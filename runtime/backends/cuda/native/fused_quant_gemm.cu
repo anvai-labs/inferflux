@@ -1048,7 +1048,7 @@ FusedQuantGemm::DownProjOperator FusedQuantGemm::SelectDownProjOperator(
                                             geometry.K);
   const auto profile = BuildInferfluxCudaDownProjDispatchProfile(
       InferfluxCudaDispatchPhase::kUnknown, quant_type, geometry, q81_ready,
-      packed_ready, mmq_ready);
+      packed_ready, mmq_ready, /*mma_ready=*/false);
   const auto decision =
       SelectInferfluxCudaDownProjDispatchDecision(profile, resolved_policy);
   selected = decision.op;
@@ -1344,6 +1344,46 @@ bool DispatchQ8_1MmvqAccumQ8K(const void *data, const void *act_q8_1,
 bool DispatchQ8_1MmvqAccumF32Q4K(const void *data, const void *act_q8_1,
                                  float *output, int M, int N, int K,
                                  cudaStream_t stream) {
+  // Wide-load variant at M=1 (o_proj residual path): same uint4-slice
+  // template as the wide fused gate+up kernel. Opt-out mirrors it.
+  static const bool wide_enabled = [] {
+    const char *raw = std::getenv("INFERFLUX_CUDA_WIDE_ACCUM");
+    return !raw || !(std::string(raw) == "0" || std::string(raw) == "false");
+  }();
+  if (wide_enabled && M <= 8) {
+    const int ncols = (M <= 1) ? 1 : (M <= 2) ? 2 : (M <= 4) ? 4 : 8;
+    const dim3 grid(static_cast<unsigned>(N),
+                    static_cast<unsigned>((M + ncols - 1) / ncols));
+    const auto *w = static_cast<const block_q4_k *>(data);
+    const auto *ax = static_cast<const block_q8_1 *>(act_q8_1);
+    // Size warps to the actual work: each warp's quartet covers 4
+    // super-blocks, so small K leaves the tail warps idle (K=2048 -> 8
+    // blocks -> 2 of 4 warps idle). Rig: 10.7us -> 6.6us at K=2048.
+    // Never below 2 warps: 1 warp cannot cover 8 blocks (the 32-thread
+    // rig "win" was computing half the sum).
+    const int warps =
+        std::max(2, std::min(kMmvqWarps, (K / QK_K + 3) / 4));
+    const dim3 block(warps * 32);
+    switch (ncols) {
+    case 1:
+      inferflux_mmvq_q4k_accum_wide<1, float, true>
+          <<<grid, block, 0, stream>>>(w, ax, output, N, K, M);
+      break;
+    case 2:
+      inferflux_mmvq_q4k_accum_wide<2, float, true>
+          <<<grid, block, 0, stream>>>(w, ax, output, N, K, M);
+      break;
+    case 4:
+      inferflux_mmvq_q4k_accum_wide<4, float, true>
+          <<<grid, block, 0, stream>>>(w, ax, output, N, K, M);
+      break;
+    default:
+      inferflux_mmvq_q4k_accum_wide<8, float, true>
+          <<<grid, block, 0, stream>>>(w, ax, output, N, K, M);
+      break;
+    }
+    return cudaGetLastError() == cudaSuccess;
+  }
   return DispatchMmvqAccumF32<block_q4_k, inferflux_mmvq_q4k_accum<1, float>,
                               inferflux_mmvq_q4k_accum<2, float>,
                               inferflux_mmvq_q4k_accum<4, float>,
@@ -1407,9 +1447,8 @@ bool DispatchQ8_1GemvAccumF32Q6K(const void *data, const void *act_q8_1,
   if (M <= 8) {
     const auto &policy = ResolveExecutionPolicy(nullptr);
     const auto &gpu = GetGpuProfile();
-    const bool auto_enable_small_ada =
-        gpu.initialized && gpu.sm_major == 8 && gpu.sm_minor == 9 && M <= 2;
-    if (policy.enable_q6k_vectorized || auto_enable_small_ada) {
+    if (FusedQuantGemm::ShouldUseQ6KVectorizedDecode(gpu.sm_major, gpu.sm_minor,
+                                                     M, policy)) {
       return DispatchQ8_1MmvqAccumF32Q6KVec(data, act_q8_1, output, M, N, K,
                                             stream);
     }
@@ -1461,9 +1500,8 @@ bool DispatchQ8_1GemvAccumQ6K(const void *data, const void *act_q8_1,
   if (M <= 8) {
     const auto &policy = ResolveExecutionPolicy(nullptr);
     const auto &gpu = GetGpuProfile();
-    const bool auto_enable_small_ada =
-        gpu.initialized && gpu.sm_major == 8 && gpu.sm_minor == 9 && M <= 2;
-    if (policy.enable_q6k_vectorized || auto_enable_small_ada) {
+    if (FusedQuantGemm::ShouldUseQ6KVectorizedDecode(gpu.sm_major, gpu.sm_minor,
+                                                     M, policy)) {
       return DispatchQ8_1MmvqAccumQ6KVec(data, act_q8_1, output, M, N, K,
                                          stream);
     }
@@ -1629,9 +1667,8 @@ bool DispatchQ8_1GemvQ6K(const void *data, const void *act_q8_1, half *output,
   if (M <= 8) {
     const auto &policy = ResolveExecutionPolicy(nullptr);
     const auto &gpu = GetGpuProfile();
-    const bool auto_enable_small_ada =
-        gpu.initialized && gpu.sm_major == 8 && gpu.sm_minor == 9 && M <= 2;
-    if (policy.enable_q6k_vectorized || auto_enable_small_ada) {
+    if (FusedQuantGemm::ShouldUseQ6KVectorizedDecode(gpu.sm_major, gpu.sm_minor,
+                                                     M, policy)) {
       return DispatchQ8_1MmvqQ6KVec(data, act_q8_1, output, M, N, K, stream);
     }
     return DispatchQ8_1MmvqQ6K(data, act_q8_1, output, M, N, K, stream);
@@ -1946,6 +1983,14 @@ bool FusedQuantGemm::SupportsMmqMmaArchitecture(int sm_major, int sm_minor) {
   return sm_major > 7 || (sm_major == 7 && sm_minor >= 5);
 }
 
+bool FusedQuantGemm::ShouldUseQ6KVectorizedDecode(
+    int sm_major, int sm_minor, int M, const NativeExecutionPolicy &policy) {
+  if (M <= 0 || M > 8 || policy.disable_q6k_vectorized) {
+    return false;
+  }
+  return policy.enable_q6k_vectorized || (sm_major == 8 && sm_minor == 9);
+}
+
 bool FusedQuantGemm::CurrentDeviceSupportsMmqMma() {
   const auto &gpu = GetGpuProfile();
   return gpu.initialized &&
@@ -2003,6 +2048,95 @@ bool FusedQuantGemm::DownProjMmq(const MmqWeightInfo &weight,
                   stream);
 }
 
+bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
+                                const half *input, half *output,
+                                runtime::cuda::native::BlockQ8_1MmqDs *ds_act,
+                                float *partials, int M, int N, int K,
+                                cudaStream_t stream,
+                                const NativeExecutionPolicy *policy,
+                                int max_m_override) {
+  using namespace runtime::cuda::native;
+  const auto &p = ResolveExecutionPolicy(policy);
+  const int m_cap =
+      max_m_override > 0 ? max_m_override : p.mmq_mma_max_batch;
+  if (!p.enable_mmq_mma || !weight.data || !input || !output || !ds_act ||
+      !partials || M < 2 || M > m_cap || N <= 0 || K <= 0 ||
+      static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
+      static_cast<GGUF::TensorType>(weight.quant_type) !=
+          GGUF::TensorType::Q4_K ||
+      K % QK_K != 0) {
+    return false;
+  }
+
+  static bool smem_configured = false;
+  static size_t configured_smem = 0;
+  const size_t smem = MmqSmemInts(16) * sizeof(int);
+  if (!smem_configured || configured_smem != smem) {
+    if (cudaFuncSetAttribute(InferfluxMmqQ4KMma<16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(smem)) != cudaSuccess) {
+      return false;
+    }
+    smem_configured = true;
+    configured_smem = smem;
+  }
+
+  // CUDA-graph safety: no per-call device queries (cudaGetDeviceProperties
+  // during stream capture aborts the capture, silently dropping decode into
+  // eager mode — measured -22% e2e despite the kernels being 40% faster).
+  // SM count is process-static.
+  static int sm_count = [] {
+    cudaDeviceProp prop{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+      return 0;
+    }
+    return prop.multiProcessorCount;
+  }();
+  if (sm_count <= 0) {
+    return false;
+  }
+  // Splits only when the TOTAL grid (x-tiles x y-tiles) under-occupies:
+  // counting x-tiles alone oversplits at prefill M (y-tiles already fill
+  // the SM array) and would demand partials sized for prefill M.
+  const int n_tiles = (N + kMmqY - 1) / kMmqY;
+  const int total_ctas = n_tiles * ((M + 15) / 16);
+  int splits = std::min((sm_count + total_ctas - 1) / total_ctas,
+                        static_cast<int>(kMmqMmaMaxSplits));
+  if (M > 8 && M <= p.mmq_mma_max_batch) {
+    splits = std::max(splits, 2); // decode M=16 tail-wave balance (2.5x)
+  }
+
+  dim3 qgrid((K / 128 + 3) / 4, M);
+  QuantizeRowQ8_1MmqDsKernel<<<qgrid, 128, 0, stream>>>(input, ds_act, K, M);
+
+  dim3 grid(n_tiles, (M + 15) / 16, splits);
+  InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
+      static_cast<const char *>(weight.data), ds_act, output, N, K, M,
+      splits > 1 ? partials : nullptr, splits);
+  if (splits > 1) {
+    const size_t mn = static_cast<size_t>(M) * N;
+    const int rthreads = 256;
+    const size_t rblocks = (mn + rthreads - 1) / rthreads;
+    ReduceMmqKSplit<<<rblocks, rthreads, 0, stream>>>(partials, output, splits,
+                                                      mn);
+  }
+  if (cudaPeekAtLastError() != cudaSuccess) {
+    return false;
+  }
+
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    log::Info("fused_quant_gemm",
+              std::string("Using Q4_K MMA projection (M=") + std::to_string(M) +
+                  ", N=" + std::to_string(N) + ", K=" + std::to_string(K) +
+                  ", ksplit=" + std::to_string(splits) + ")");
+  }
+  return true;
+}
+
 void FusedQuantGemm::QuantizeRowQ8_1Mmq(
     const half *input, runtime::cuda::native::BlockQ8_1Mmq *output, int M,
     int K, cudaStream_t stream) {
@@ -2021,11 +2155,102 @@ void FusedQuantGemm::SiluMulQuantizeQ8_1Mmq(
                                                          M);
 }
 
+void FusedQuantGemm::SiluMulQuantizeQ8_1MmqDs(
+    const half *gate, const half *up,
+    runtime::cuda::native::BlockQ8_1MmqDs *output, int M, int K,
+    cudaStream_t stream) {
+  using namespace runtime::cuda::native;
+  dim3 grid((K / 128 + 3) / 4, M);
+  SiluMulQuantizeQ8_1MmqDsKernel<<<grid, 128, 0, stream>>>(gate, up, output, K,
+                                                           M);
+}
+
+bool FusedQuantGemm::DownProjMmqMmaQ4K(
+    const QuantizedWeightInfo &weight,
+    const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *output, int M,
+    int N, int K, float *partials, cudaStream_t stream,
+    const NativeExecutionPolicy *policy, int max_m_override) {
+  using namespace runtime::cuda::native;
+  const auto &p = ResolveExecutionPolicy(policy);
+  if (!p.enable_mmq_mma || !weight.data || !ds_act || !output || !partials ||
+      !CurrentDeviceSupportsMmqMma() || M <= 0 || N <= 0 || K <= 0 ||
+      static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements)) {
+    return false;
+  }
+  if (static_cast<GGUF::TensorType>(weight.quant_type) !=
+          GGUF::TensorType::Q4_K ||
+      K % QK_K != 0 || M < p.mmq_mma_min_batch ||
+      M > (max_m_override > 0 ? max_m_override : p.mmq_mma_max_batch)) {
+    return false;
+  }
+
+  static bool smem_configured = false;
+  static size_t configured_smem = 0;
+  const size_t smem = MmqSmemInts(16) * sizeof(int);
+  if (!smem_configured || configured_smem != smem) {
+    if (cudaFuncSetAttribute(InferfluxMmqQ4KMma<16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(smem)) != cudaSuccess) {
+      return false;
+    }
+    smem_configured = true;
+    configured_smem = smem;
+  }
+
+  // Same y-tile-aware split heuristic as the Q6_K sibling (see
+  // DownProjMmqMma): CUDA-graph-safe process-static SM count.
+  static int sm_count = [] {
+    cudaDeviceProp prop{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+      return 0;
+    }
+    return prop.multiProcessorCount;
+  }();
+  if (sm_count <= 0) {
+    return false;
+  }
+  const int n_tiles = (N + kMmqY - 1) / kMmqY;
+  const int total_ctas = n_tiles * ((M + 15) / 16);
+  int splits = 1;
+  if (total_ctas < sm_count) {
+    splits = std::min((sm_count + total_ctas - 1) / total_ctas,
+                      static_cast<int>(kMmqMmaMaxSplits));
+  }
+
+  dim3 grid(n_tiles, (M + 15) / 16, splits);
+  InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
+      static_cast<const char *>(weight.data), ds_act, output, N, K, M,
+      splits > 1 ? partials : nullptr, splits);
+  if (splits > 1) {
+    const size_t mn = static_cast<size_t>(M) * N;
+    const int rthreads = 256;
+    const size_t rblocks = (mn + rthreads - 1) / rthreads;
+    ReduceMmqKSplit<<<rblocks, rthreads, 0, stream>>>(partials, output, splits,
+                                                      mn);
+  }
+  if (cudaPeekAtLastError() != cudaSuccess) {
+    return false;
+  }
+
+  static bool logged = false;
+  if (!logged) {
+    logged = true;
+    log::Info("fused_quant_gemm",
+              std::string("Using MMA tensor-core Q4_K down-proj (M=") +
+                  std::to_string(M) + ", N=" + std::to_string(N) +
+                  ", K=" + std::to_string(K) +
+                  ", ksplit=" + std::to_string(splits) + ")");
+  }
+  return true;
+}
+
 bool FusedQuantGemm::DownProjMmqMma(
     const QuantizedWeightInfo &weight,
     const runtime::cuda::native::BlockQ8_1Mmq *act_mmq, half *output, int M,
     int N, int K, float *partials, cudaStream_t stream,
-    const NativeExecutionPolicy *policy) {
+    const NativeExecutionPolicy *policy, int max_m_override) {
   using namespace runtime::cuda::native;
   const auto &p = ResolveExecutionPolicy(policy);
   if (!p.enable_mmq_mma || !weight.data || !act_mmq || !output || !partials ||
@@ -2035,7 +2260,8 @@ bool FusedQuantGemm::DownProjMmqMma(
   }
   if (static_cast<GGUF::TensorType>(weight.quant_type) !=
           GGUF::TensorType::Q6_K ||
-      K % QK_K != 0 || M < p.mmq_mma_min_batch || M > p.mmq_mma_max_batch) {
+      K % QK_K != 0 || M < p.mmq_mma_min_batch ||
+      M > (max_m_override > 0 ? max_m_override : p.mmq_mma_max_batch)) {
     return false;
   }
 
@@ -2054,16 +2280,27 @@ bool FusedQuantGemm::DownProjMmqMma(
 
   // K-split only when the N-tile grid alone under-occupies the device:
   // one block per super-block slice keeps the deterministic reduce cheap.
-  cudaDeviceProp prop{};
-  int device = 0;
-  if (cudaGetDevice(&device) != cudaSuccess ||
-      cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
+  // CUDA-graph safety: process-static SM count (see GemvMmqMma).
+  static int sm_count = [] {
+    cudaDeviceProp prop{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+      return 0;
+    }
+    return prop.multiProcessorCount;
+  }();
+  if (sm_count <= 0) {
     return false;
   }
+  // y-tile-aware (see GemvMmqMma): prefill M already fills the SM array
+  // via grid.y — x-tile-only counting oversplits and would demand
+  // partials sized for prefill M.
   const int n_tiles = (N + kMmqY - 1) / kMmqY;
+  const int total_ctas = n_tiles * ((M + 15) / 16);
   int splits = 1;
-  if (n_tiles < prop.multiProcessorCount) {
-    splits = std::min((prop.multiProcessorCount + n_tiles - 1) / n_tiles,
+  if (total_ctas < sm_count) {
+    splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                       static_cast<int>(kMmqMmaMaxSplits));
   }
 
@@ -2440,6 +2677,47 @@ bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
         "fused_quant_gemm",
         "Using fused gate+up+SiLU Q4_K MMVQ kernel (M=" + std::to_string(M) +
             ", N=" + std::to_string(N) + ", K=" + std::to_string(K) + ")");
+  }
+
+  // Wide-load variant at M=1: uint4 weight slices lift the incumbent from
+  // 68% to 95% DRAM (ncu cold: 109.1us -> 78.2us at the memory wall).
+  // DEFAULT ON (the c1 A/B confirmed end to end: kernel-exact on random
+  // data, c1 ratio 0.77 -> 0.85); set INFERFLUX_CUDA_WIDE_GATE_UP=0 to
+  // opt out.
+  static const bool wide_enabled = [] {
+    const char *raw = std::getenv("INFERFLUX_CUDA_WIDE_GATE_UP");
+    return !raw || !(std::string(raw) == "0" || std::string(raw) == "false");
+  }();
+  // Wide loads through M=8: the uint4 weight slices amortize across the
+  // ncols activation columns (the column loop reuses each slice), so the
+  // mid-M cohorts gain the same load-count reduction as M=1.
+  if (wide_enabled && M <= 8) {
+    const int ncols = (M <= 1) ? 1 : (M <= 2) ? 2 : (M <= 4) ? 4 : 8;
+    const dim3 grid(static_cast<unsigned>(N),
+                    static_cast<unsigned>((M + ncols - 1) / ncols));
+    const auto *gw = static_cast<const block_q4_k *>(gate_raw.data);
+    const auto *uw = static_cast<const block_q4_k *>(up_raw.data);
+    const auto *ax = static_cast<const block_q8_1 *>(act_q8_1);
+    const dim3 block(kMmvqWarps * 32);
+    switch (ncols) {
+    case 1:
+      inferflux_mmvq_q4k_fused_gate_up_silu_wide<1>
+          <<<grid, block, 0, stream>>>(gw, uw, ax, output, N, K, M);
+      break;
+    case 2:
+      inferflux_mmvq_q4k_fused_gate_up_silu_wide<2>
+          <<<grid, block, 0, stream>>>(gw, uw, ax, output, N, K, M);
+      break;
+    case 4:
+      inferflux_mmvq_q4k_fused_gate_up_silu_wide<4>
+          <<<grid, block, 0, stream>>>(gw, uw, ax, output, N, K, M);
+      break;
+    default:
+      inferflux_mmvq_q4k_fused_gate_up_silu_wide<8>
+          <<<grid, block, 0, stream>>>(gw, uw, ax, output, N, K, M);
+      break;
+    }
+    return cudaGetLastError() == cudaSuccess;
   }
 
   return DispatchMmvqFusedGateUpSilu<block_q4_k,

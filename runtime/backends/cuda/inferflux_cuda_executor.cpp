@@ -837,6 +837,10 @@ InferfluxCudaExecutor::~InferfluxCudaExecutor() {
     cudaEventDestroy(sampling_start_);
   if (sampling_stop_)
     cudaEventDestroy(sampling_stop_);
+  if (d_eos_flag_) {
+    cudaFree(d_eos_flag_);
+    d_eos_flag_ = nullptr;
+  }
   if (decode_stream_)
     cudaStreamDestroy(decode_stream_);
   if (prefill_stream_)
@@ -1251,6 +1255,17 @@ void InferfluxCudaExecutor::DestroyLaneOverlapResourcesUnlocked() {
     }
     d_prefill_logits_ = nullptr;
   }
+}
+
+void InferfluxCudaExecutor::ClearSequenceRecentTokens(int sequence_id) {
+  // Called wherever a sequence's KV slot is cleared (all release lifecycle
+  // paths). The armed decode relay may reference this sequence; dropping it
+  // is a plain atomic store (no pipeline mutex needed here) and merely costs
+  // one H2D metadata upload on the next decode — under-invalidation is the
+  // corruption bug, over-invalidation is cheap.
+  decode_relay_active_.store(false);
+  std::lock_guard<std::mutex> lock(sequence_recent_tokens_mutex_);
+  sequence_recent_tokens_.erase(sequence_id);
 }
 
 bool InferfluxCudaExecutor::CanRunLaneOverlap() const {
@@ -2160,6 +2175,56 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
   log::Info("inferflux_cuda_executor",
             "InferFlux CUDA model loaded successfully");
   model_loaded_ = true;
+  // Warm the lane-overlap path with one throwaway mixed batch (no traffic
+  // exists yet, so scratch slots 0/1 are safe). The FIRST lane-overlap call
+  // in a process is the only one that can corrupt its first prefilled row
+  // (~35% of processes under some machine states, bimodal wrong first
+  // token; batched-isolation probe op S with lane overlap reproduces).
+  // Later mixed calls were never observed to corrupt. Executing the first
+  // mixed call here absorbs it; the probe would catch any regression of
+  // this warm-up. Cleared like a normal release: KV clear + penalty
+  // history + relay invalidation.
+  if (overlap_enabled_ && model_config_.vocab_size > 0) {
+    // The prefill row must clear min_prefill_tokens_ (256 with server
+    // defaults) or the mixed call falls back to the standard path and the
+    // lanes never engage; the decode row must request logits to be
+    // classified as decode.
+    UnifiedBatchInput warm_prefill;
+    warm_prefill.sequence_id = 0;
+    warm_prefill.n_past = 0;
+    // Clamp to the KV cache's max sequence length: with a small auto-tuned
+    // max_seq (< 256) the warm Forward would fail its length check and the
+    // warm-up would silently no-op, re-exposing the first-mixed-call
+    // corruption it exists to absorb.
+    const int warm_len = std::min(std::max(256, min_prefill_tokens_),
+                                  kv_cache_ ? kv_cache_->MaxSeqLen()
+                                            : std::numeric_limits<int>::max());
+    warm_prefill.tokens.assign(static_cast<size_t>(warm_len), 1);
+    warm_prefill.request_logits = false;
+    warm_prefill.request_id = -1;
+    UnifiedBatchInput warm_decode;
+    warm_decode.sequence_id = 1;
+    warm_decode.n_past = 1;
+    warm_decode.tokens = {1};
+    warm_decode.request_logits = true;
+    warm_decode.request_id = -1;
+    const auto warm_outputs = ExecuteUnifiedBatch({warm_prefill, warm_decode});
+    bool warm_ok = !warm_outputs.empty();
+    for (const auto &wo : warm_outputs) {
+      warm_ok = warm_ok && wo.ok;
+    }
+    NativeFreeSequence(0);
+    NativeFreeSequence(1);
+    if (warm_ok) {
+      log::Info("inferflux_cuda_executor",
+                "Lane-overlap path warmed with a throwaway mixed batch");
+    } else {
+      log::Warn("inferflux_cuda_executor",
+                "Lane-overlap warm batch FAILED - the first real mixed batch "
+                "may hit the first-call corruption path");
+    }
+  }
+
   return true;
 }
 
@@ -2580,6 +2645,11 @@ InferfluxCudaExecutor::ExecuteUnifiedBatchWithOverlap(
     total_prefill_tokens += static_cast<int>(inputs[idx].tokens.size());
   }
 
+  // Reclaim lane slots abandoned by timeout fallbacks (well past the 5 s
+  // collect deadline) so leaked entries cannot permanently exhaust a lane's
+  // pending budget and silently disable overlap.
+  (void)lane_dispatcher_.SweepAbandoned(std::chrono::seconds(30));
+
   if (total_prefill_tokens < min_prefill_tokens_ || prefill_indices.empty() ||
       decode_indices.empty()) {
     // Fall back to standard execution
@@ -2823,6 +2893,10 @@ UnifiedBurstResult InferfluxCudaExecutor::NativeExecuteUnifiedBatchBurst(
   // ExecuteUnifiedBatch path).
   std::lock_guard<std::mutex> shared_pipeline_lock(shared_pipeline_mutex_);
 
+  // The burst drives d_batch_meta_ with its own relay; the primary decode
+  // relay's armed fingerprint no longer describes device state.
+  decode_relay_active_.store(false);
+
   if (!burst_controller_.EnsureResources(compute_stream_)) {
     log::Warn("inferflux_cuda_executor",
               "DecodeBurst: resource allocation failed");
@@ -2997,6 +3071,10 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
 
   // Check for mixed workload and use overlap path if enabled
   if (allow_overlap && HasMixedWorkload(inputs)) {
+    // The overlap path decodes and prefills on lanes, which do not run (or
+    // advance) the primary decode relay's device metadata. Invalidate the
+    // relay so a later primary decode cannot replay against lane-era state.
+    decode_relay_active_ = false;
     auto outputs = ExecuteUnifiedBatchWithOverlap(inputs);
     MaybeRefreshMemoryLedger();
     return outputs;
@@ -3094,12 +3172,26 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         cudaEventRecord(forward_start_, compute_stream_);
       }
 
-      // Device-side token relay: if the relay is active and batch config
+      // Device-side token relay: if the relay is active and the batch identity
       // matches, replay the CUDA graph without H2D metadata upload.
       // DeviceTokenRelay already updated the graph input buffers on device
       // during the previous token's post-sampling step.
+      //
+      // Batch size alone is NOT a valid guard: a different batch of the same
+      // size (request finished + another admitted) would inherit the departed
+      // batch's device metadata — token/n_past/seq_id — and decode on the
+      // departed sequences' KV slots, emitting their continuation
+      // (deterministic repro: batched_isolation_probe op W).
+      std::vector<uint64_t> chunk_generations(static_cast<size_t>(B));
+      for (int b = 0; b < B; ++b) {
+        chunk_generations[static_cast<size_t>(b)] =
+            decode_group[offset + static_cast<size_t>(b)].sequence_generation;
+      }
       bool fwd_ok = false;
-      if (decode_relay_active_ && decode_relay_batch_size_ == B) {
+      if (decode_relay_active_ &&
+          DecodeRelayIdentityMatches(decode_relay_armed_, batch_seq_ids,
+                                     chunk_generations, batch_n_past,
+                                     batch_tokens, static_cast<size_t>(B))) {
         fwd_ok = model_forward_->BatchForwardReplay(d_logits_, B);
         if (!fwd_ok) {
           // Graph replay failed — fall back to full BatchForward
@@ -3137,11 +3229,20 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
         }
         if (eff_rep == 1.0f && eff_freq == 0.0f && sp.presence_penalty == 0.0f)
           continue;
-        auto it = sequence_recent_tokens_.find(entry.sequence_id);
-        if (it == sequence_recent_tokens_.end() || it->second.empty())
-          continue;
+        std::vector<int> recent;
+        {
+          std::lock_guard<std::mutex> lock(sequence_recent_tokens_mutex_);
+          auto it = sequence_recent_tokens_.find(entry.sequence_id);
+          // Ignore history left by a previous generation of this slot.
+          if (it == sequence_recent_tokens_.end() ||
+              it->second.generation != entry.sequence_generation ||
+              it->second.tokens.empty()) {
+            continue;
+          }
+          recent = it->second.tokens;
+        }
         std::unordered_map<int, int> freq;
-        for (int t : it->second)
+        for (int t : recent)
           freq[t]++;
         std::vector<int> ids, counts;
         ids.reserve(freq.size());
@@ -3158,25 +3259,50 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
                                    batch_top_ps, batch_seeds);
       sampler_->CollectSampleBatch(&sampled_tokens);
       // Record sampled tokens in per-sequence histories.
-      for (int b = 0; b < B; ++b) {
-        const auto &entry = decode_group[offset + static_cast<size_t>(b)];
-        auto &history = sequence_recent_tokens_[entry.sequence_id];
-        history.push_back(sampled_tokens[b]);
-        if (static_cast<int>(history.size()) > kPenaltyWindowSize) {
-          history.erase(history.begin());
+      {
+        std::lock_guard<std::mutex> lock(sequence_recent_tokens_mutex_);
+        for (int b = 0; b < B; ++b) {
+          const auto &entry = decode_group[offset + static_cast<size_t>(b)];
+          auto &history = sequence_recent_tokens_[entry.sequence_id];
+          if (history.generation != entry.sequence_generation) {
+            // Slot recycled for a new request: start a fresh window.
+            history.generation = entry.sequence_generation;
+            history.tokens.clear();
+          }
+          history.tokens.push_back(sampled_tokens[b]);
+          if (static_cast<int>(history.tokens.size()) > kPenaltyWindowSize) {
+            history.tokens.erase(history.tokens.begin());
+          }
         }
       }
 
       // Set up device-side relay for the NEXT decode token: copy sampled
       // token IDs directly to the graph's input buffer on device and
       // increment n_past, avoiding the H2D metadata upload next iteration.
+      // Arm only when this decode group fit in a single chunk — a later
+      // chunk's DeviceTokenRelay overwrites the same metadata rows the
+      // earlier chunk relayed — and record the full identity fingerprint so
+      // the guard above can reject a different batch of the same size.
       if (model_forward_->GetBatchMetaDevice() &&
-          model_forward_->GetMaxBatchSize() > 0) {
+          model_forward_->GetMaxBatchSize() > 0 &&
+          decode_group.size() <= static_cast<size_t>(decode_batch_capacity)) {
         cuda_kernel::DeviceTokenRelay(
             sampler_->DeviceResultBatch(), model_forward_->GetBatchMetaDevice(),
             B, model_forward_->GetMaxBatchSize(), compute_stream_);
         decode_relay_active_ = true;
         decode_relay_batch_size_ = B;
+        decode_relay_armed_.seq_ids.assign(batch_seq_ids.begin(),
+                                           batch_seq_ids.begin() + B);
+        decode_relay_armed_.generations = chunk_generations;
+        decode_relay_armed_.next_n_past.resize(static_cast<size_t>(B));
+        decode_relay_armed_.tokens.assign(batch_tokens.begin(),
+                                          batch_tokens.begin() + B);
+        for (int b = 0; b < B; ++b) {
+          decode_relay_armed_.next_n_past[static_cast<size_t>(b)] =
+              batch_n_past[b] + 1;
+        }
+      } else {
+        decode_relay_active_ = false;
       }
 
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -3284,7 +3410,11 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       }
       if (!model_forward_->Forward(input.tokens, input.n_past,
                                    input.sequence_id, d_logits_)) {
+        // KV rows for this sequence were not written — reporting ok here
+        // would let the scheduler decode on stale/zero cache with no error
+        // signal (match the request_logits branch, which fails the row).
         log::Error("inferflux_cuda_executor", "Forward pass failed");
+        continue;
       }
       if (record_prefill_timing) {
         cudaEventRecord(forward_stop_, compute_stream_);
@@ -3303,10 +3433,10 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
               std::memory_order_relaxed);
         }
       } else {
-        // No timing — just sync stream to ensure forward completes
-        runtime::cuda::native::TracedCudaStreamSynchronize(
-            runtime::cuda::native::SyncTraceSite::kPrefillForwardDrain,
-            compute_stream_);
+        // No per-prefill stream drain: all prefills in this loop are
+        // stream-ordered on compute_stream_, and the batch-scoped cleanup
+        // synchronizes before releasing any shared scratch. Draining per
+        // prefill only blocked the host (and concurrent lane submission).
         GlobalMetrics().RecordInferfluxCudaForwardShape(is_decode,
                                                         batch_tokens);
       }
@@ -3343,7 +3473,17 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       // apply a minimal default penalty to prevent degenerate repetition
       // loops that occur with some instruct-tuned models.
       {
-        auto &history = sequence_recent_tokens_[input.sequence_id];
+        std::vector<int> recent_history;
+        {
+          std::lock_guard<std::mutex> lock(sequence_recent_tokens_mutex_);
+          auto hit = sequence_recent_tokens_.find(input.sequence_id);
+          // Ignore history left by a previous generation of this slot.
+          if (hit != sequence_recent_tokens_.end() &&
+              hit->second.generation == input.sequence_generation) {
+            recent_history = hit->second.tokens;
+          }
+        }
+        auto &history = recent_history;
         float eff_rep_penalty = input.sampling.repetition_penalty;
         float eff_freq_penalty = input.sampling.frequency_penalty;
         if (input.sampling.temperature == 0.0f && eff_rep_penalty == 1.0f &&
@@ -3376,10 +3516,15 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       int token_id = sampler_->CollectSample();
       // Record token in per-sequence history for future penalty application
       {
+        std::lock_guard<std::mutex> lock(sequence_recent_tokens_mutex_);
         auto &history = sequence_recent_tokens_[input.sequence_id];
-        history.push_back(token_id);
-        if (static_cast<int>(history.size()) > kPenaltyWindowSize) {
-          history.erase(history.begin());
+        if (history.generation != input.sequence_generation) {
+          history.generation = input.sequence_generation;
+          history.tokens.clear();
+        }
+        history.tokens.push_back(token_id);
+        if (static_cast<int>(history.tokens.size()) > kPenaltyWindowSize) {
+          history.tokens.erase(history.tokens.begin());
         }
       }
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
@@ -3441,6 +3586,15 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
                        token_id, tokenizer_.get(), execution_policy_);
       output.ok = true;
     }
+  }
+
+  // A prefill in this call ran AFTER the decode group armed the relay. The
+  // prefill's Forward mutates forward/graph state (and may itself recapture
+  // the decode graph), so the armed relay must not survive the call. (The
+  // pre-loop invalidation above cannot catch this: it runs before the decode
+  // group re-arms.)
+  if (!prefill_indices.empty()) {
+    decode_relay_active_ = false;
   }
 
   MaybeRefreshMemoryLedger();
@@ -3697,7 +3851,7 @@ void InferfluxCudaExecutor::NativeFreeSequence(int sequence_id) {
                     "cudaStreamSynchronize(prefill_stream_,free_sequence)");
   }
   kv_cache_->ClearSequence(sequence_id);
-  sequence_recent_tokens_.erase(sequence_id);
+  ClearSequenceRecentTokens(sequence_id);
 #endif
 }
 
@@ -3755,6 +3909,7 @@ InferfluxCudaExecutor::NativeBeginFreeSequence(int sequence_id) {
 
   if (!pending.compute_done && !pending.decode_done && !pending.prefill_done) {
     kv_cache_->ClearSequence(sequence_id);
+    ClearSequenceRecentTokens(sequence_id);
     return {};
   }
 
@@ -3837,6 +3992,7 @@ bool InferfluxCudaExecutor::NativePollFreeSequence(
   }
 
   kv_cache_->ClearSequence(pending.sequence_id);
+  ClearSequenceRecentTokens(pending.sequence_id);
   if (pending.compute_done) {
     cudaEventDestroy(pending.compute_done);
   }
@@ -3862,6 +4018,9 @@ void InferfluxCudaExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
   if (src_seq == dst_seq) {
     return;
   }
+  // Writing a prefix into dst_seq's slot invalidates any armed decode relay
+  // for it.
+  decode_relay_active_.store(false);
   if (!kv_cache_->CopySequencePrefix(src_seq, dst_seq, n_tokens,
                                      compute_stream_)) {
     log::Warn("inferflux_cuda_executor",
@@ -3899,6 +4058,8 @@ bool InferfluxCudaExecutor::NativeHydrateSequence(
   if (!kv_cache_ || dest_sequence_id < 0 || blob.empty()) {
     return false;
   }
+  // Hydrating a slot rewrites its KV; invalidate any armed decode relay.
+  decode_relay_active_.store(false);
   return kv_cache_->HydrateSequence(dest_sequence_id, blob, compute_stream_);
 #else
   (void)dest_sequence_id;
@@ -4027,6 +4188,10 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id, int n_past_start,
   }
   std::lock_guard<std::mutex> lock(shared_pipeline_mutex_);
 
+  // This burst drives d_batch_meta_ with its own relay loop; the primary
+  // decode relay's armed fingerprint no longer describes device state.
+  decode_relay_active_.store(false);
+
   out_tokens->clear();
   out_tokens->reserve(n_tokens);
 
@@ -4036,15 +4201,18 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id, int n_past_start,
     return 0; // Device-side relay not supported
   }
 
-  // Allocate device-side EOS flag if needed
+  // Allocate device-side EOS flag once (checked; previously the result was
+  // ignored and the allocation was never freed).
   if (!d_eos_flag_) {
-    cudaMalloc(&d_eos_flag_, sizeof(int));
+    if (cudaMalloc(&d_eos_flag_, sizeof(int)) != cudaSuccess) {
+      d_eos_flag_ = nullptr;
+      return 0;
+    }
   }
 
   // Allocate device-side token accumulation buffer
   int *d_token_buf = nullptr;
-  cudaMalloc(&d_token_buf, n_tokens * sizeof(int));
-  if (!d_token_buf) {
+  if (cudaMalloc(&d_token_buf, n_tokens * sizeof(int)) != cudaSuccess) {
     return 0;
   }
 

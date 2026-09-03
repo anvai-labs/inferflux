@@ -24,6 +24,16 @@ namespace inferflux {
 
 namespace {
 
+bool FairnessTraceEnabled() {
+  static const bool enabled = []() {
+    const char *value = std::getenv("INFERFLUX_DEBUG_FAIRNESS");
+    return value && std::string_view(value) != "0" &&
+           std::string_view(value) != "false" &&
+           std::string_view(value) != "FALSE";
+  }();
+  return enabled;
+}
+
 bool SequenceSlotDebugEnabled() {
   static const bool enabled = []() {
     const char *value = std::getenv("INFERFLUX_DEBUG_SEQUENCE_SLOTS");
@@ -35,11 +45,16 @@ bool SequenceSlotDebugEnabled() {
 }
 
 bool StickyDecodeAccumulationWaitEnabled() {
-  const char *value =
-      std::getenv("INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT");
-  return value && std::string_view(value) != "0" &&
-         std::string_view(value) != "false" &&
-         std::string_view(value) != "FALSE";
+  // Cached: this is consulted every DecodeWorkerLoop iteration — a getenv +
+  // string compares per token is pure hot-path waste.
+  static const bool enabled = []() {
+    const char *value =
+        std::getenv("INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT");
+    return value && std::string_view(value) != "0" &&
+           std::string_view(value) != "false" &&
+           std::string_view(value) != "FALSE";
+  }();
+  return enabled;
 }
 
 std::string RequestPhaseDebugString(RequestPhase phase) {
@@ -296,7 +311,7 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
     if (!outputs[0].ok) {
       return false;
     }
-    final_output = outputs[0];
+    final_output = std::move(outputs[0]);
     chunk_start = chunk_end;
   }
 
@@ -467,6 +482,28 @@ void SyncUnifiedDecodeStepProgress(InferenceRequest *req) {
   if (ShouldContinueUnifiedDecodeStep(*req)) {
     req->first_token = req->execution.current_token;
     req->first_piece.clear();
+  }
+}
+
+// Threads per-request usage telemetry (prefix-cache split, accept→last-token
+// duration, TTFT for streams) onto a finalized result. Cached tokens are
+// clamped to the reported prompt length so a stale radix match can never
+// exceed the prompt it is reported against.
+void FillResultUsageTelemetry(const InferenceRequest &req,
+                              InferenceResult *result) {
+  result->cached_prompt_tokens =
+      std::clamp(req.cache_matched_tokens, 0, result->prompt_tokens);
+  const auto epoch = std::chrono::steady_clock::time_point{};
+  if (req.accept_time == epoch) {
+    return; // Accept time unavailable; timings stay "not measured".
+  }
+  const auto now = std::chrono::steady_clock::now();
+  result->duration_ms =
+      std::chrono::duration<double, std::milli>(now - req.accept_time).count();
+  if (req.stream && req.first_token_time != epoch) {
+    result->time_to_first_token_ms = std::chrono::duration<double, std::milli>(
+                                         req.first_token_time - req.accept_time)
+                                         .count();
   }
 }
 
@@ -802,430 +839,438 @@ std::size_t Scheduler::CountCompatiblePendingDecodeLocked(
   return compatible;
 }
 
+// Fail every queued request with an error result. Called when a worker loop
+// dies by exception: without this, requests still in the pending queues hang
+// forever (their futures are only satisfied inside the worker loops) and the
+// HTTP workers block in future.get() — wedging the whole HTTP surface.
+void Scheduler::FailAllQueuedLocked() {
+  auto fail = [](const std::shared_ptr<PendingRequest> &pending) {
+    if (!pending || !pending->promise_valid) {
+      return;
+    }
+    InferenceResult result;
+    result.completion.clear();
+    result.no_backend = true; // surfaces as the standard 503-style failure
+    pending->promise.set_value(std::move(result));
+    pending->promise_valid = false;
+  };
+  for (auto &pending : pending_prefill_) {
+    fail(pending);
+  }
+  pending_prefill_.clear();
+  for (auto &pending : pending_decode_) {
+    fail(pending);
+  }
+  pending_decode_.clear();
+  UpdateQueueDepthLocked();
+}
+
 void Scheduler::DecodeWorkerLoop() {
-  // Register as a live worker; deregister on any exit path (stop signal or
-  // uncaught exception), so HttpServer::LiveDecodeWorkers() accurately reflects
-  // pool health rather than the static startup flag.
-  live_decode_workers_.fetch_add(1, std::memory_order_relaxed);
-  struct LiveGuard {
-    std::atomic<int> &counter;
-    ~LiveGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
-  } live_guard{live_decode_workers_};
+  // Exception envelope: an escapee (e.g. bad_alloc on a huge request) would
+  // call std::terminate and take the whole server down; every other worker
+  // loop in this file is similarly guarded below.
+  try {
 
-  std::vector<std::shared_ptr<PendingRequest>> batch;
-  std::shared_ptr<LlamaCppBackend> sticky_step_backend;
+    // Register as a live worker; deregister on any exit path (stop signal or
+    // uncaught exception), so HttpServer::LiveDecodeWorkers() accurately
+    // reflects pool health rather than the static startup flag.
+    live_decode_workers_.fetch_add(1, std::memory_order_relaxed);
+    struct LiveGuard {
+      std::atomic<int> &counter;
+      ~LiveGuard() { counter.fetch_sub(1, std::memory_order_relaxed); }
+    } live_guard{live_decode_workers_};
 
-  while (true) {
-    {
-      std::unique_lock<std::mutex> lock(queue_mutex_);
-      constexpr auto kDisaggTransportPollInterval =
-          std::chrono::milliseconds(10);
-      const std::size_t accumulation_target =
-          config_.min_batch_size <= 1
-              ? 1
-              : std::max<std::size_t>(
-                    2, static_cast<std::size_t>(config_.min_batch_size));
-      const bool sticky_accumulation_wait_enabled =
-          StickyDecodeAccumulationWaitEnabled();
+    std::vector<std::shared_ptr<PendingRequest>> batch;
+    std::shared_ptr<LlamaCppBackend> sticky_step_backend;
 
-      // Batch accumulation for decode workers
-      auto has_transport_work = [&] {
-        return disagg_config_.kv_transport &&
-               disagg_config_.kv_transport->Size() > 0;
-      };
-      auto has_work = [&] {
-        return stop_ || !batch.empty() || !pending_decode_.empty() ||
-               has_transport_work();
-      };
-      auto has_min_decode_batch = [&] {
-        if (stop_) {
-          return true;
-        }
-        if (!batch.empty()) {
-          return true;
-        }
-        return pending_decode_.size() >= accumulation_target;
-      };
+    while (true) {
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        constexpr auto kDisaggTransportPollInterval =
+            std::chrono::milliseconds(10);
+        const std::size_t accumulation_target =
+            config_.min_batch_size <= 1
+                ? 1
+                : std::max<std::size_t>(
+                      2, static_cast<std::size_t>(config_.min_batch_size));
+        const bool sticky_accumulation_wait_enabled =
+            StickyDecodeAccumulationWaitEnabled();
 
-      if (config_.batch_accumulation_ms > 0) {
-        if (disagg_config_.kv_transport) {
+        // Batch accumulation for decode workers
+        auto has_transport_work = [&] {
+          return disagg_config_.kv_transport &&
+                 disagg_config_.kv_transport->Size() > 0;
+        };
+        auto has_work = [&] {
+          return stop_ || !batch.empty() || !pending_decode_.empty() ||
+                 has_transport_work();
+        };
+        auto has_min_decode_batch = [&] {
+          if (stop_) {
+            return true;
+          }
+          if (!batch.empty()) {
+            return true;
+          }
+          return pending_decode_.size() >= accumulation_target;
+        };
+
+        if (config_.batch_accumulation_ms > 0) {
+          if (disagg_config_.kv_transport) {
+            while (!stop_ && batch.empty() && pending_decode_.empty() &&
+                   !has_transport_work()) {
+              decode_cv_.wait_for(lock, kDisaggTransportPollInterval);
+            }
+            if (!stop_ && batch.empty() && !pending_decode_.empty()) {
+              const auto deadline =
+                  std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(config_.batch_accumulation_ms);
+              while (!stop_) {
+                if (has_transport_work()) {
+                  break;
+                }
+                if (has_min_decode_batch()) {
+                  break;
+                }
+                if (std::chrono::steady_clock::now() >= deadline) {
+                  break;
+                }
+                decode_cv_.wait_for(lock, kDisaggTransportPollInterval);
+              }
+            }
+          } else {
+            decode_cv_.wait(lock, has_work);
+            if (!stop_ && batch.empty() && !pending_decode_.empty()) {
+              const auto deadline =
+                  std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(config_.batch_accumulation_ms);
+              while (!stop_ && !has_min_decode_batch()) {
+                if (decode_cv_.wait_until(lock, deadline) ==
+                    std::cv_status::timeout) {
+                  break;
+                }
+              }
+            }
+          }
+        } else if (disagg_config_.kv_transport) {
           while (!stop_ && batch.empty() && pending_decode_.empty() &&
                  !has_transport_work()) {
             decode_cv_.wait_for(lock, kDisaggTransportPollInterval);
           }
-          if (!stop_ && batch.empty() && !pending_decode_.empty()) {
-            const auto deadline =
-                std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(config_.batch_accumulation_ms);
-            while (!stop_) {
-              if (has_transport_work()) {
-                break;
-              }
-              if (has_min_decode_batch()) {
-                break;
-              }
-              if (std::chrono::steady_clock::now() >= deadline) {
-                break;
-              }
-              decode_cv_.wait_for(lock, kDisaggTransportPollInterval);
-            }
-          }
         } else {
           decode_cv_.wait(lock, has_work);
-          if (!stop_ && batch.empty() && !pending_decode_.empty()) {
+        }
+
+        if (stop_ && batch.empty() && pending_decode_.empty() &&
+            !has_transport_work()) {
+          break;
+        }
+
+        const std::size_t max_batch_size =
+            static_cast<std::size_t>(config_.max_batch_size);
+        if (batch.empty()) {
+          const std::size_t ready_before = pending_decode_.size();
+          std::size_t n = std::min(ready_before, max_batch_size);
+          batch.assign(pending_decode_.begin(),
+                       pending_decode_.begin() +
+                           static_cast<std::ptrdiff_t>(n));
+          pending_decode_.erase(pending_decode_.begin(),
+                                pending_decode_.begin() +
+                                    static_cast<std::ptrdiff_t>(n));
+          metrics_->RecordDecodeAssemblySnapshot("worker_initial", ready_before,
+                                                 batch.size(), 0, 0);
+        } else if (batch.size() < max_batch_size && sticky_step_backend) {
+          const std::size_t ready_before = pending_decode_.size();
+          const std::size_t compatible_before =
+              CountCompatiblePendingDecodeLocked(sticky_step_backend);
+          std::size_t merged = AppendCompatiblePendingDecodeLocked(
+              &batch, sticky_step_backend, max_batch_size);
+          if (sticky_accumulation_wait_enabled &&
+              config_.batch_accumulation_ms > 0 && merged == 0 &&
+              batch.size() < max_batch_size &&
+              batch.size() < accumulation_target) {
+            auto compatible_pending_decode = [&]() {
+              return std::any_of(
+                  pending_decode_.begin(), pending_decode_.end(),
+                  [&](const std::shared_ptr<PendingRequest> &pending) {
+                    return CanAppendToStickyStepBatchLocked(
+                        pending, sticky_step_backend);
+                  });
+            };
             const auto deadline =
                 std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(config_.batch_accumulation_ms);
-            while (!stop_ && !has_min_decode_batch()) {
+            while (!stop_ && !has_transport_work() &&
+                   !compatible_pending_decode() &&
+                   std::chrono::steady_clock::now() < deadline) {
               if (decode_cv_.wait_until(lock, deadline) ==
                   std::cv_status::timeout) {
                 break;
               }
             }
-          }
-        }
-      } else if (disagg_config_.kv_transport) {
-        while (!stop_ && batch.empty() && pending_decode_.empty() &&
-               !has_transport_work()) {
-          decode_cv_.wait_for(lock, kDisaggTransportPollInterval);
-        }
-      } else {
-        decode_cv_.wait(lock, has_work);
-      }
-
-      if (stop_ && batch.empty() && pending_decode_.empty() &&
-          !has_transport_work()) {
-        break;
-      }
-
-      const std::size_t max_batch_size =
-          static_cast<std::size_t>(config_.max_batch_size);
-      if (batch.empty()) {
-        const std::size_t ready_before = pending_decode_.size();
-        std::size_t n = std::min(ready_before, max_batch_size);
-        batch.assign(pending_decode_.begin(),
-                     pending_decode_.begin() + static_cast<std::ptrdiff_t>(n));
-        pending_decode_.erase(pending_decode_.begin(),
-                              pending_decode_.begin() +
-                                  static_cast<std::ptrdiff_t>(n));
-        metrics_->RecordDecodeAssemblySnapshot("worker_initial", ready_before,
-                                               batch.size(), 0, 0);
-      } else if (batch.size() < max_batch_size && sticky_step_backend) {
-        const std::size_t ready_before = pending_decode_.size();
-        const std::size_t compatible_before =
-            CountCompatiblePendingDecodeLocked(sticky_step_backend);
-        std::size_t merged = AppendCompatiblePendingDecodeLocked(
-            &batch, sticky_step_backend, max_batch_size);
-        if (sticky_accumulation_wait_enabled &&
-            config_.batch_accumulation_ms > 0 && merged == 0 &&
-            batch.size() < max_batch_size &&
-            batch.size() < accumulation_target) {
-          auto compatible_pending_decode = [&]() {
-            return std::any_of(
-                pending_decode_.begin(), pending_decode_.end(),
-                [&](const std::shared_ptr<PendingRequest> &pending) {
-                  return CanAppendToStickyStepBatchLocked(pending,
-                                                          sticky_step_backend);
-                });
-          };
-          const auto deadline =
-              std::chrono::steady_clock::now() +
-              std::chrono::milliseconds(config_.batch_accumulation_ms);
-          while (!stop_ && !has_transport_work() &&
-                 !compatible_pending_decode() &&
-                 std::chrono::steady_clock::now() < deadline) {
-            if (decode_cv_.wait_until(lock, deadline) ==
-                std::cv_status::timeout) {
-              break;
+            if (!stop_ && batch.size() < max_batch_size) {
+              AppendCompatiblePendingDecodeLocked(&batch, sticky_step_backend,
+                                                  max_batch_size);
             }
           }
-          if (!stop_ && batch.size() < max_batch_size) {
-            AppendCompatiblePendingDecodeLocked(&batch, sticky_step_backend,
-                                                max_batch_size);
-          }
+          const std::size_t incompatible_before =
+              ready_before >= compatible_before
+                  ? ready_before - compatible_before
+                  : 0;
+          metrics_->RecordDecodeAssemblySnapshot(
+              "worker_sticky", ready_before, batch.size(), compatible_before,
+              incompatible_before);
         }
-        const std::size_t incompatible_before =
-            ready_before >= compatible_before ? ready_before - compatible_before
-                                              : 0;
-        metrics_->RecordDecodeAssemblySnapshot("worker_sticky", ready_before,
-                                               batch.size(), compatible_before,
-                                               incompatible_before);
+        UpdateQueueDepthLocked();
       }
-      UpdateQueueDepthLocked();
-    }
 
-    // If a KV transport is configured, drain cross-process packets that may
-    // have arrived from remote prefill workers.  For the in-process case the KV
-    // state is already resident in the llama context and no hydration is
-    // needed.
-    if (disagg_config_.kv_transport) {
-      while (auto pkt = disagg_config_.kv_transport->TryDequeue()) {
-        if (pkt->ticket_id > 0) {
-          disagg_config_.kv_transport->UpdateTicketStage(
-              pkt->ticket_id, disaggregated::KVTicketStage::kAcknowledged);
-          metrics_->RecordDisaggKVTicketStage(
-              disaggregated::KVTicketStageToString(
-                  disaggregated::KVTicketStage::kAcknowledged));
-        }
-        // Record KV transfer latency (§2.5 item 12): time from Enqueue to
-        // dequeue.
-        auto dequeue_time = std::chrono::steady_clock::now();
-        double transfer_ms = std::chrono::duration<double, std::milli>(
-                                 dequeue_time - pkt->enqueue_time)
-                                 .count();
-        metrics_->RecordKVTransfer(transfer_ms);
-
-        // Match the packet to a decode request by request_id and hydrate its
-        // KV state. Decode workers remove requests from pending_decode_ into
-        // the local `batch` before draining the transport, so we must inspect
-        // both collections or packets for the active batch will time out
-        // spuriously.
-        auto try_apply_packet = [&](std::shared_ptr<PendingRequest> &pending) {
-          if (!pending || pending->inference.id != pkt->request_id ||
-              pkt->n_past < 0) {
-            return false;
+      // If a KV transport is configured, drain cross-process packets that may
+      // have arrived from remote prefill workers.  For the in-process case the
+      // KV state is already resident in the llama context and no hydration is
+      // needed.
+      if (disagg_config_.kv_transport) {
+        while (auto pkt = disagg_config_.kv_transport->TryDequeue()) {
+          if (pkt->ticket_id > 0) {
+            disagg_config_.kv_transport->UpdateTicketStage(
+                pkt->ticket_id, disaggregated::KVTicketStage::kAcknowledged);
+            metrics_->RecordDisaggKVTicketStage(
+                disaggregated::KVTicketStageToString(
+                    disaggregated::KVTicketStage::kAcknowledged));
           }
+          // Record KV transfer latency (§2.5 item 12): time from Enqueue to
+          // dequeue.
+          auto dequeue_time = std::chrono::steady_clock::now();
+          double transfer_ms = std::chrono::duration<double, std::milli>(
+                                   dequeue_time - pkt->enqueue_time)
+                                   .count();
+          metrics_->RecordKVTransfer(transfer_ms);
 
-          // Packet carries a serialised KV blob; hydrate it now.
-          // (blob is currently empty for in-process path — no-op when empty.)
-          // kv_blob holds raw bytes from LlamaCppBackend::SerializeSequence.
-          // Pass it directly to HydrateSequence — no cast or size adjustment.
-          if (!pkt->kv_blob.empty() && pending->resolved_backend) {
-            uint64_t seq_generation = 0;
-            int seq_id = AllocSeqSlot(static_cast<int64_t>(pending->sequence),
-                                      &seq_generation);
-            if (seq_id >= 0) {
-              if (pending->resolved_backend->HydrateSequence(seq_id,
-                                                             pkt->kv_blob)) {
-                pending->inference.sequence_id = seq_id;
-                pending->inference.sequence_generation = seq_generation;
-                pending->inference.n_past = pkt->n_past;
+          // Match the packet to a decode request by request_id and hydrate its
+          // KV state. Decode workers remove requests from pending_decode_ into
+          // the local `batch` before draining the transport, so we must inspect
+          // both collections or packets for the active batch will time out
+          // spuriously.
+          auto try_apply_packet =
+              [&](std::shared_ptr<PendingRequest> &pending) {
+                if (!pending || pending->inference.id != pkt->request_id ||
+                    pkt->n_past < 0) {
+                  return false;
+                }
+
+                // Packet carries a serialised KV blob; hydrate it now.
+                // (blob is currently empty for in-process path — no-op when
+                // empty.) kv_blob holds raw bytes from
+                // LlamaCppBackend::SerializeSequence. Pass it directly to
+                // HydrateSequence — no cast or size adjustment.
+                if (!pkt->kv_blob.empty() && pending->resolved_backend) {
+                  uint64_t seq_generation = 0;
+                  int seq_id = AllocSeqSlot(
+                      static_cast<int64_t>(pending->sequence), &seq_generation);
+                  if (seq_id >= 0) {
+                    if (pending->resolved_backend->HydrateSequence(
+                            seq_id, pkt->kv_blob)) {
+                      pending->inference.sequence_id = seq_id;
+                      pending->inference.sequence_generation = seq_generation;
+                      pending->inference.n_past = pkt->n_past;
+                      return true;
+                    }
+                    FreeSeqSlot(seq_id, seq_generation);
+                  }
+                  return false;
+                }
                 return true;
-              }
-              FreeSeqSlot(seq_id, seq_generation);
-            }
-            return false;
-          }
-          return true;
-        };
+              };
 
-        // All AllocSeqSlot/FreeSeqSlot calls must be protected by
-        // queue_mutex_ to prevent concurrent sequence slot operations
-        // that corrupt llama.cpp internal state (double-free at c≥16).
-        bool ticket_committed = false;
-        {
-          std::lock_guard<std::mutex> lock(queue_mutex_);
-          for (auto &pending : batch) {
-            if (try_apply_packet(pending)) {
-              ticket_committed = true;
-              break;
-            }
-          }
-          if (!ticket_committed) {
-            for (auto &pending : pending_decode_) {
+          // All AllocSeqSlot/FreeSeqSlot calls must be protected by
+          // queue_mutex_ to prevent concurrent sequence slot operations
+          // that corrupt llama.cpp internal state (double-free at c≥16).
+          bool ticket_committed = false;
+          {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            for (auto &pending : batch) {
               if (try_apply_packet(pending)) {
                 ticket_committed = true;
                 break;
               }
             }
-          }
-          if (!ticket_committed) {
-            for (auto &pending : publishing_decode_) {
-              if (try_apply_packet(pending)) {
-                ticket_committed = true;
-                break;
+            if (!ticket_committed) {
+              for (auto &pending : pending_decode_) {
+                if (try_apply_packet(pending)) {
+                  ticket_committed = true;
+                  break;
+                }
+              }
+            }
+            if (!ticket_committed) {
+              for (auto &pending : publishing_decode_) {
+                if (try_apply_packet(pending)) {
+                  ticket_committed = true;
+                  break;
+                }
               }
             }
           }
-        }
-        if (pkt->ticket_id > 0) {
-          const auto ticket_stage =
-              ticket_committed ? disaggregated::KVTicketStage::kCommitted
-                               : disaggregated::KVTicketStage::kTimedOut;
-          disagg_config_.kv_transport->UpdateTicketStage(pkt->ticket_id,
-                                                         ticket_stage);
-          metrics_->RecordDisaggKVTicketStage(
-              disaggregated::KVTicketStageToString(ticket_stage));
-        }
-      }
-    }
-
-    if (batch.empty())
-      continue;
-
-    metrics_->RecordDecodeWorkerBatchSize(batch.size());
-
-    std::size_t decode_tokens = 0;
-    for (const auto &pending : batch) {
-      int slice_tokens = pending->inference.fairness.timeslice_tokens;
-      if (slice_tokens <= 0) {
-        if (pending->inference.fairness.remaining_decode_tokens > 0) {
-          slice_tokens = pending->inference.fairness.remaining_decode_tokens;
-        } else {
-          slice_tokens = pending->inference.max_tokens;
+          if (pkt->ticket_id > 0) {
+            const auto ticket_stage =
+                ticket_committed ? disaggregated::KVTicketStage::kCommitted
+                                 : disaggregated::KVTicketStage::kTimedOut;
+            disagg_config_.kv_transport->UpdateTicketStage(pkt->ticket_id,
+                                                           ticket_stage);
+            metrics_->RecordDisaggKVTicketStage(
+                disaggregated::KVTicketStageToString(ticket_stage));
+          }
         }
       }
-      decode_tokens += static_cast<std::size_t>(std::max(1, slice_tokens));
-    }
-    metrics_->RecordSchedulerIteration(
-        /*prefill_requests=*/0,
-        /*decode_requests=*/batch.size(), decode_tokens);
-    metrics_->RecordSchedulerPolicyIteration(
-        SchedulerBatchPolicyToString(config_.batch_policy),
-        /*prefill_requests=*/0, /*decode_requests=*/batch.size());
 
-    auto resolve_direct_step_backend =
-        [&]() -> std::shared_ptr<LlamaCppBackend> {
-      if (config_.decode_burst_tokens != 0) {
-        return nullptr;
-      }
-      std::shared_ptr<LlamaCppBackend> direct_backend;
+      if (batch.empty())
+        continue;
+
+      metrics_->RecordDecodeWorkerBatchSize(batch.size());
+
+      std::size_t decode_tokens = 0;
       for (const auto &pending : batch) {
-        if (!pending) {
-          return nullptr;
+        int slice_tokens = pending->inference.fairness.timeslice_tokens;
+        if (slice_tokens <= 0) {
+          if (pending->inference.fairness.remaining_decode_tokens > 0) {
+            slice_tokens = pending->inference.fairness.remaining_decode_tokens;
+          } else {
+            slice_tokens = pending->inference.max_tokens;
+          }
         }
-        const auto &inference = pending->inference;
-        const auto &backend = pending->resolved_backend;
-        if (!HasBoundDecodeBackend(inference, backend) || !backend ||
-            !backend->IsReady() || !inference.response_format.supported ||
-            inference.response_format.constraint.has_grammar ||
-            inference.collect_logprobs ||
-            inference.response_format.has_format) {
-          return nullptr;
-        }
-        if (sticky_step_backend && backend.get() != sticky_step_backend.get()) {
-          return nullptr;
-        }
-        if (!direct_backend) {
-          direct_backend = backend;
-        } else if (direct_backend.get() != backend.get()) {
-          return nullptr;
-        }
+        decode_tokens += static_cast<std::size_t>(std::max(1, slice_tokens));
       }
-      return direct_backend;
-    };
+      metrics_->RecordSchedulerIteration(
+          /*prefill_requests=*/0,
+          /*decode_requests=*/batch.size(), decode_tokens);
+      metrics_->RecordSchedulerPolicyIteration(
+          SchedulerBatchPolicyToString(config_.batch_policy),
+          /*prefill_requests=*/0, /*decode_requests=*/batch.size());
 
-    if (auto direct_step_backend = resolve_direct_step_backend()) {
-      metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise");
-      const bool native_direct_step_backend =
-          direct_step_backend->Name() == "inferflux_cuda";
-      if (native_direct_step_backend) {
-        metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise_native");
-      }
-
-      RequestBatch step_batch;
-      step_batch.batch_id =
-          next_batch_id_.fetch_add(1, std::memory_order_relaxed);
-      step_batch.requests.reserve(batch.size());
-
-      for (auto &pending : batch) {
-        auto *inference = &pending->inference;
-        if (slot_manager_ && inference->sequence_id >= 0) {
-          slot_manager_->MarkProcessing(inference->sequence_id);
+      auto resolve_direct_step_backend =
+          [&]() -> std::shared_ptr<LlamaCppBackend> {
+        if (config_.decode_burst_tokens != 0) {
+          return nullptr;
         }
-        PrimeUnifiedDecodeStepState(inference);
-        if (ShouldContinueUnifiedDecodeStep(*inference)) {
-          step_batch.requests.push_back(inference);
-        } else {
+        std::shared_ptr<LlamaCppBackend> direct_backend;
+        for (const auto &pending : batch) {
+          if (!pending) {
+            return nullptr;
+          }
+          const auto &inference = pending->inference;
+          const auto &backend = pending->resolved_backend;
+          if (!HasBoundDecodeBackend(inference, backend) || !backend ||
+              !backend->IsReady() || !inference.response_format.supported ||
+              inference.response_format.constraint.has_grammar ||
+              inference.collect_logprobs ||
+              inference.response_format.has_format) {
+            return nullptr;
+          }
+          if (sticky_step_backend &&
+              backend.get() != sticky_step_backend.get()) {
+            return nullptr;
+          }
+          if (!direct_backend) {
+            direct_backend = backend;
+          } else if (direct_backend.get() != backend.get()) {
+            return nullptr;
+          }
+        }
+        return direct_backend;
+      };
+
+      if (auto direct_step_backend = resolve_direct_step_backend()) {
+        metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise");
+        const bool native_direct_step_backend =
+            direct_step_backend->Name() == "inferflux_cuda";
+        if (native_direct_step_backend) {
+          metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise_native");
+        }
+
+        RequestBatch step_batch;
+        step_batch.batch_id =
+            next_batch_id_.fetch_add(1, std::memory_order_relaxed);
+        step_batch.requests.reserve(batch.size());
+
+        for (auto &pending : batch) {
+          auto *inference = &pending->inference;
+          if (slot_manager_ && inference->sequence_id >= 0) {
+            slot_manager_->MarkProcessing(inference->sequence_id);
+          }
+          PrimeUnifiedDecodeStepState(inference);
+          if (ShouldContinueUnifiedDecodeStep(*inference)) {
+            step_batch.requests.push_back(inference);
+          } else {
+            SyncUnifiedDecodeStepProgress(inference);
+            SyncSequenceSlotProgress(*inference);
+          }
+        }
+
+        if (!step_batch.empty()) {
+          executor_->ExecuteUnifiedBatchStep(step_batch, direct_step_backend);
+        }
+
+        std::vector<std::shared_ptr<PendingRequest>> active_requeue;
+        active_requeue.reserve(batch.size());
+        for (auto &pending : batch) {
+          auto *inference = &pending->inference;
+          InferenceResult result;
           SyncUnifiedDecodeStepProgress(inference);
           SyncSequenceSlotProgress(*inference);
-        }
-      }
+          if (ShouldContinueUnifiedDecodeStep(*inference)) {
+            LogSequenceSlotEvent("decode_step_requeue", *inference,
+                                 "decode_worker");
+            active_requeue.push_back(pending);
+            continue;
+          }
 
-      if (!step_batch.empty()) {
-        executor_->ExecuteUnifiedBatchStep(step_batch, direct_step_backend);
-      }
-
-      std::vector<std::shared_ptr<PendingRequest>> active_requeue;
-      active_requeue.reserve(batch.size());
-      for (auto &pending : batch) {
-        auto *inference = &pending->inference;
-        InferenceResult result;
-        SyncUnifiedDecodeStepProgress(inference);
-        SyncSequenceSlotProgress(*inference);
-        if (ShouldContinueUnifiedDecodeStep(*inference)) {
-          LogSequenceSlotEvent("decode_step_requeue", *inference,
-                               "decode_worker");
-          active_requeue.push_back(pending);
-          continue;
-        }
-
-        FinalizeUnifiedDecodeStepResult(inference, &result);
-        {
-          std::lock_guard<std::mutex> lock(queue_mutex_);
-          if (inference->session_lease_acquired &&
-              RequestUsesSessionHandle(*inference)) {
-            FinalizeSessionLease(pending.get(), !result.no_backend);
-          } else if (inference->sequence_id >= 0) {
-            if (cache_) {
-              cache_->ReleaseBlocksRef(inference->block_table);
+          FinalizeUnifiedDecodeStepResult(inference, &result);
+          FillResultUsageTelemetry(*inference, &result);
+          {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (inference->session_lease_acquired &&
+                RequestUsesSessionHandle(*inference)) {
+              FinalizeSessionLease(pending.get(), !result.no_backend);
+            } else if (inference->sequence_id >= 0) {
+              if (cache_) {
+                cache_->ReleaseBlocksRef(inference->block_table);
+              }
+              inference->block_table.clear();
+              FreeSeqSlot(inference->sequence_id,
+                          inference->sequence_generation,
+                          pending->resolved_backend);
+              ResetSequenceLease(inference);
             }
-            inference->block_table.clear();
-            FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                        pending->resolved_backend);
-            ResetSequenceLease(inference);
           }
+          pending->promise.set_value(std::move(result));
         }
-        pending->promise.set_value(std::move(result));
-      }
 
-      batch = std::move(active_requeue);
-      sticky_step_backend =
-          batch.empty() ? nullptr : std::move(direct_step_backend);
-      continue;
-    }
-
-    ResolveBackends(batch);
-
-    RequestBatch exec_batch;
-    exec_batch.batch_id =
-        next_batch_id_.fetch_add(1, std::memory_order_relaxed);
-    std::vector<std::shared_ptr<LlamaCppBackend>> overrides;
-    std::vector<std::shared_ptr<PendingRequest>> exec_pending;
-    overrides.reserve(batch.size());
-    exec_pending.reserve(batch.size());
-
-    for (auto &pending : batch) {
-      auto *inference = &pending->inference;
-      if (!inference->response_format.supported) {
-        InferenceResult error;
-        error.no_backend = true;
-        error.completion =
-            inference->response_format.error.empty()
-                ? "Selected model does not support requested features"
-                : inference->response_format.error;
-        pending->promise.set_value(std::move(error));
-        // Return the sequence slot and KV blocks so they are not leaked.
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (inference->session_lease_acquired &&
-            RequestUsesSessionHandle(*inference)) {
-          FinalizeSessionLease(pending.get(), false);
-        } else if (inference->sequence_id >= 0) {
-          if (cache_) {
-            cache_->ReleaseBlocksRef(inference->block_table);
-          }
-          inference->block_table.clear();
-          FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                      pending->resolved_backend);
-          ResetSequenceLease(inference);
-        }
+        batch = std::move(active_requeue);
+        sticky_step_backend =
+            batch.empty() ? nullptr : std::move(direct_step_backend);
         continue;
       }
-      if (inference->response_format.has_format &&
-          !inference->response_format.ready) {
-        StructuredConstraint constraint;
-        std::string adapter_error;
-        if (!StructuredOutputAdapter::BuildConstraint(
-                inference->response_format.type,
-                inference->response_format.schema,
-                inference->response_format.grammar,
-                inference->response_format.root, &constraint, &adapter_error)) {
+
+      ResolveBackends(batch);
+
+      RequestBatch exec_batch;
+      exec_batch.batch_id =
+          next_batch_id_.fetch_add(1, std::memory_order_relaxed);
+      std::vector<std::shared_ptr<LlamaCppBackend>> overrides;
+      std::vector<std::shared_ptr<PendingRequest>> exec_pending;
+      overrides.reserve(batch.size());
+      exec_pending.reserve(batch.size());
+
+      for (auto &pending : batch) {
+        auto *inference = &pending->inference;
+        if (!inference->response_format.supported) {
           InferenceResult error;
           error.no_backend = true;
-          error.completion = adapter_error.empty()
-                                 ? "response_format could not be converted"
-                                 : adapter_error;
+          error.completion =
+              inference->response_format.error.empty()
+                  ? "Selected model does not support requested features"
+                  : inference->response_format.error;
           pending->promise.set_value(std::move(error));
+          // Return the sequence slot and KV blocks so they are not leaked.
           std::lock_guard<std::mutex> lock(queue_mutex_);
           if (inference->session_lease_acquired &&
               RequestUsesSessionHandle(*inference)) {
@@ -1241,177 +1286,223 @@ void Scheduler::DecodeWorkerLoop() {
           }
           continue;
         }
-        inference->response_format.constraint = constraint;
-        inference->response_format.ready = true;
+        if (inference->response_format.has_format &&
+            !inference->response_format.ready) {
+          StructuredConstraint constraint;
+          std::string adapter_error;
+          if (!StructuredOutputAdapter::BuildConstraint(
+                  inference->response_format.type,
+                  inference->response_format.schema,
+                  inference->response_format.grammar,
+                  inference->response_format.root, &constraint,
+                  &adapter_error)) {
+            InferenceResult error;
+            error.no_backend = true;
+            error.completion = adapter_error.empty()
+                                   ? "response_format could not be converted"
+                                   : adapter_error;
+            pending->promise.set_value(std::move(error));
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (inference->session_lease_acquired &&
+                RequestUsesSessionHandle(*inference)) {
+              FinalizeSessionLease(pending.get(), false);
+            } else if (inference->sequence_id >= 0) {
+              if (cache_) {
+                cache_->ReleaseBlocksRef(inference->block_table);
+              }
+              inference->block_table.clear();
+              FreeSeqSlot(inference->sequence_id,
+                          inference->sequence_generation,
+                          pending->resolved_backend);
+              ResetSequenceLease(inference);
+            }
+            continue;
+          }
+          inference->response_format.constraint = constraint;
+          inference->response_format.ready = true;
+        }
+        if (slot_manager_ && inference->sequence_id >= 0) {
+          slot_manager_->MarkProcessing(inference->sequence_id);
+        }
+        exec_pending.push_back(pending);
+        overrides.push_back(pending->resolved_backend);
+        exec_batch.requests.push_back(inference);
       }
-      if (slot_manager_ && inference->sequence_id >= 0) {
-        slot_manager_->MarkProcessing(inference->sequence_id);
+
+      if (exec_pending.empty())
+        continue;
+
+      metrics_->RecordDecodeWorkerExecutionPath("general");
+
+      bool use_stepwise_decode = config_.decode_burst_tokens == 0;
+      std::shared_ptr<LlamaCppBackend> step_backend;
+      if (use_stepwise_decode) {
+        for (std::size_t i = 0; i < exec_pending.size(); ++i) {
+          auto *inference = &exec_pending[i]->inference;
+          const auto &backend = overrides[i];
+          if (!backend || !backend->IsReady() ||
+              !HasValidUnifiedStepState(*inference) ||
+              inference->response_format.constraint.has_grammar ||
+              inference->collect_logprobs ||
+              inference->response_format.has_format) {
+            use_stepwise_decode = false;
+            break;
+          }
+          if (!step_backend) {
+            step_backend = backend;
+          } else if (step_backend.get() != backend.get()) {
+            use_stepwise_decode = false;
+            break;
+          }
+        }
       }
-      exec_pending.push_back(pending);
-      overrides.push_back(pending->resolved_backend);
-      exec_batch.requests.push_back(inference);
-    }
 
-    if (exec_pending.empty())
-      continue;
+      std::vector<InferenceResult> responses;
+      if (use_stepwise_decode) {
+        const bool native_step_backend =
+            step_backend && step_backend->Name() == "inferflux_cuda";
+        if (native_step_backend) {
+          metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise_native");
+        }
+        RequestBatch step_batch;
+        step_batch.batch_id = exec_batch.batch_id;
+        step_batch.requests.reserve(exec_pending.size());
+        for (auto &pending : exec_pending) {
+          auto *inference = &pending->inference;
+          PrimeUnifiedDecodeStepState(inference);
+          if (ShouldContinueUnifiedDecodeStep(*inference)) {
+            step_batch.requests.push_back(inference);
+          } else {
+            SyncUnifiedDecodeStepProgress(inference);
+            SyncSequenceSlotProgress(*inference);
+          }
+        }
+        if (!step_batch.empty()) {
+          executor_->ExecuteUnifiedBatchStep(step_batch, step_backend);
+        }
+        for (auto &pending : exec_pending) {
+          SyncUnifiedDecodeStepProgress(&pending->inference);
+          SyncSequenceSlotProgress(pending->inference);
+        }
+      } else {
+        bool native_backend_decode = !overrides.empty();
+        for (const auto &backend : overrides) {
+          if (!backend || backend->Name() != "inferflux_cuda") {
+            native_backend_decode = false;
+            break;
+          }
+        }
+        if (native_backend_decode) {
+          metrics_->RecordDecodeWorkerExecutionPath(
+              "general_native_backend_decode");
+        }
+        responses = executor_->ExecuteBatch(exec_batch, overrides);
+      }
 
-    metrics_->RecordDecodeWorkerExecutionPath("general");
+      std::vector<std::shared_ptr<PendingRequest>> active_requeue;
+      active_requeue.reserve(exec_pending.size());
+      std::vector<std::shared_ptr<PendingRequest>> queue_requeue;
+      queue_requeue.reserve(exec_pending.size());
 
-    bool use_stepwise_decode = config_.decode_burst_tokens == 0;
-    std::shared_ptr<LlamaCppBackend> step_backend;
-    if (use_stepwise_decode) {
       for (std::size_t i = 0; i < exec_pending.size(); ++i) {
-        auto *inference = &exec_pending[i]->inference;
-        const auto &backend = overrides[i];
-        if (!backend || !backend->IsReady() ||
-            !HasValidUnifiedStepState(*inference) ||
-            inference->response_format.constraint.has_grammar ||
-            inference->collect_logprobs ||
-            inference->response_format.has_format) {
-          use_stepwise_decode = false;
-          break;
-        }
-        if (!step_backend) {
-          step_backend = backend;
-        } else if (step_backend.get() != backend.get()) {
-          use_stepwise_decode = false;
-          break;
-        }
-      }
-    }
-
-    std::vector<InferenceResult> responses;
-    if (use_stepwise_decode) {
-      const bool native_step_backend =
-          step_backend && step_backend->Name() == "inferflux_cuda";
-      if (native_step_backend) {
-        metrics_->RecordDecodeWorkerExecutionPath("direct_stepwise_native");
-      }
-      RequestBatch step_batch;
-      step_batch.batch_id = exec_batch.batch_id;
-      step_batch.requests.reserve(exec_pending.size());
-      for (auto &pending : exec_pending) {
+        auto &pending = exec_pending[i];
         auto *inference = &pending->inference;
-        PrimeUnifiedDecodeStepState(inference);
-        if (ShouldContinueUnifiedDecodeStep(*inference)) {
-          step_batch.requests.push_back(inference);
-        } else {
-          SyncUnifiedDecodeStepProgress(inference);
+        InferenceResult result;
+        if (!use_stepwise_decode && i < responses.size()) {
+          result = std::move(responses[i]);
           SyncSequenceSlotProgress(*inference);
         }
-      }
-      if (!step_batch.empty()) {
-        executor_->ExecuteUnifiedBatchStep(step_batch, step_backend);
-      }
-      for (auto &pending : exec_pending) {
-        SyncUnifiedDecodeStepProgress(&pending->inference);
-        SyncSequenceSlotProgress(pending->inference);
-      }
-    } else {
-      bool native_backend_decode = !overrides.empty();
-      for (const auto &backend : overrides) {
-        if (!backend || backend->Name() != "inferflux_cuda") {
-          native_backend_decode = false;
-          break;
-        }
-      }
-      if (native_backend_decode) {
-        metrics_->RecordDecodeWorkerExecutionPath(
-            "general_native_backend_decode");
-      }
-      responses = executor_->ExecuteBatch(exec_batch, overrides);
-    }
 
-    std::vector<std::shared_ptr<PendingRequest>> active_requeue;
-    active_requeue.reserve(exec_pending.size());
-    std::vector<std::shared_ptr<PendingRequest>> queue_requeue;
-    queue_requeue.reserve(exec_pending.size());
-
-    for (std::size_t i = 0; i < exec_pending.size(); ++i) {
-      auto &pending = exec_pending[i];
-      auto *inference = &pending->inference;
-      InferenceResult result;
-      if (!use_stepwise_decode && i < responses.size()) {
-        result = std::move(responses[i]);
-        SyncSequenceSlotProgress(*inference);
-      }
-
-      if (use_stepwise_decode) {
-        if (ShouldContinueUnifiedDecodeStep(*inference)) {
-          LogSequenceSlotEvent("decode_step_requeue", *inference,
-                               "decode_worker");
-          active_requeue.push_back(pending);
+        if (use_stepwise_decode) {
+          if (ShouldContinueUnifiedDecodeStep(*inference)) {
+            LogSequenceSlotEvent("decode_step_requeue", *inference,
+                                 "decode_worker");
+            active_requeue.push_back(pending);
+            continue;
+          }
+          FinalizeUnifiedDecodeStepResult(inference, &result);
+        } else if (inference->fairness.yielded) {
+          auto now = std::chrono::steady_clock::now();
+          pending->enqueue_time = now;
+          PrepareFairnessDecodeRequeue(inference, now);
+          LogSequenceSlotEvent("fairness_requeue", *inference, "decode_worker");
+          queue_requeue.push_back(pending);
           continue;
         }
-        FinalizeUnifiedDecodeStepResult(inference, &result);
-      } else if (inference->fairness.yielded) {
-        auto now = std::chrono::steady_clock::now();
-        pending->enqueue_time = now;
-        PrepareFairnessDecodeRequeue(inference, now);
-        LogSequenceSlotEvent("fairness_requeue", *inference, "decode_worker");
-        queue_requeue.push_back(pending);
-        continue;
-      }
 
-      if (!use_stepwise_decode && !inference->accumulated_output.empty()) {
-        result.completion = inference->accumulated_output;
-        if (inference->fairness.total_completion_tokens > 0) {
-          result.completion_tokens =
-              inference->fairness.total_completion_tokens;
-        }
-      }
-      if (!use_stepwise_decode &&
-          inference->fairness.reported_prompt_tokens >= 0) {
-        result.prompt_tokens = inference->fairness.reported_prompt_tokens;
-      }
-
-      // Return KV memory and sequence slot.  Both must happen together.
-      // ExecuteRequest intentionally does NOT call FreeSequence — it leaves
-      // sequence_id set so the scheduler (here or in ProcessBatch) handles
-      // both FreeSequence and FreeSeqSlot together in one place.
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (inference->session_lease_acquired &&
-            RequestUsesSessionHandle(*inference)) {
-          FinalizeSessionLease(pending.get(), !result.no_backend);
-        } else if (inference->sequence_id >= 0) {
-          if (cache_) {
-            cache_->ReleaseBlocksRef(inference->block_table);
+        if (!use_stepwise_decode && !inference->accumulated_output.empty()) {
+          result.completion = inference->accumulated_output;
+          if (inference->fairness.total_completion_tokens > 0) {
+            result.completion_tokens =
+                inference->fairness.total_completion_tokens;
           }
-          inference->block_table.clear();
-          FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                      pending->resolved_backend);
-          ResetSequenceLease(inference);
         }
+        if (!use_stepwise_decode &&
+            inference->fairness.reported_prompt_tokens >= 0) {
+          result.prompt_tokens = inference->fairness.reported_prompt_tokens;
+        }
+
+        // Return KV memory and sequence slot.  Both must happen together.
+        // ExecuteRequest intentionally does NOT call FreeSequence — it leaves
+        // sequence_id set so the scheduler (here or in ProcessBatch) handles
+        // both FreeSequence and FreeSeqSlot together in one place.
+        {
+          std::lock_guard<std::mutex> lock(queue_mutex_);
+          if (inference->session_lease_acquired &&
+              RequestUsesSessionHandle(*inference)) {
+            FinalizeSessionLease(pending.get(), !result.no_backend);
+          } else if (inference->sequence_id >= 0) {
+            if (cache_) {
+              cache_->ReleaseBlocksRef(inference->block_table);
+            }
+            inference->block_table.clear();
+            FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
+                        pending->resolved_backend);
+            ResetSequenceLease(inference);
+          }
+        }
+        if (!use_stepwise_decode) {
+          inference->phase = RequestPhase::kFinished;
+        }
+        FillResultUsageTelemetry(*inference, &result);
+        pending->promise.set_value(std::move(result));
       }
+
+      batch = std::move(active_requeue);
+      if (batch.empty()) {
+        sticky_step_backend.reset();
+      }
+
+      if (!queue_requeue.empty()) {
+        {
+          std::lock_guard<std::mutex> lock(queue_mutex_);
+          for (auto &pending : queue_requeue) {
+            pending_decode_.push_back(pending);
+          }
+          UpdateQueueDepthLocked();
+        }
+        decode_cv_.notify_one();
+      }
+
       if (!use_stepwise_decode) {
-        inference->phase = RequestPhase::kFinished;
+        batch.clear();
+        sticky_step_backend.reset();
+      } else {
+        sticky_step_backend = batch.empty() ? nullptr : step_backend;
       }
-      pending->promise.set_value(std::move(result));
     }
-
-    batch = std::move(active_requeue);
-    if (batch.empty()) {
-      sticky_step_backend.reset();
-    }
-
-    if (!queue_requeue.empty()) {
-      {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        for (auto &pending : queue_requeue) {
-          pending_decode_.push_back(pending);
-        }
-        UpdateQueueDepthLocked();
-      }
-      decode_cv_.notify_one();
-    }
-
-    if (!use_stepwise_decode) {
-      batch.clear();
-      sticky_step_backend.reset();
-    } else {
-      sticky_step_backend = batch.empty() ? nullptr : step_backend;
-    }
+  } catch (const std::exception &e) {
+    log::Error("scheduler",
+               std::string("DecodeWorkerLoop terminated by exception: ") +
+                   e.what());
+  } catch (...) {
+    log::Error("scheduler", "DecodeWorkerLoop terminated by unknown exception");
+  }
+  // The loop is dead — satisfy every queued future so HTTP callers get an
+  // error instead of hanging forever.
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    FailAllQueuedLocked();
   }
 }
 
@@ -1425,6 +1516,7 @@ std::future<InferenceResult> Scheduler::Generate(InferenceRequest request) {
   pending->inference.phase = RequestPhase::kPending;
   pending->inference.session_lease_acquired = false;
   pending->inference.enqueue_time = pending->enqueue_time;
+  pending->inference.accept_time = pending->enqueue_time;
   if (pending->inference.max_tokens <= 0) {
     pending->inference.max_tokens = 1;
   }
@@ -1461,95 +1553,103 @@ void Scheduler::UpdateFairnessConfig(const FairnessConfig &config) {
 }
 
 void Scheduler::WorkerLoop() {
-  auto &pc = ParallelContext::Get();
-  bool is_distributed = pc.IsInitialized() && pc.WorldSize() > 1;
+  // Exception envelope: see DecodeWorkerLoop.
+  try {
+    auto &pc = ParallelContext::Get();
+    bool is_distributed = pc.IsInitialized() && pc.WorldSize() > 1;
 
-  while (true) {
-    BatchSelection selection;
+    while (true) {
+      BatchSelection selection;
 
-    if (is_distributed && !pc.IsMaster()) {
-      // §P1g: Worker ranks wait for the master's batch decision.
-      std::vector<int> request_ids;
-      std::vector<int> phases;
-      if (!pc.ReceiveBatch(request_ids, phases)) {
-        if (stop_)
-          break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        continue;
-      }
+      if (is_distributed && !pc.IsMaster()) {
+        // §P1g: Worker ranks wait for the master's batch decision.
+        std::vector<int> request_ids;
+        std::vector<int> phases;
+        if (!pc.ReceiveBatch(request_ids, phases)) {
+          if (stop_)
+            break;
+          std::this_thread::sleep_for(std::chrono::milliseconds(10));
+          continue;
+        }
 
-      // In a real implementation we'd reconstruct 'selection' from active
-      // queues. For this foundation, we just Barrier to keep the worker rank
-      // aligned with the master's processing cadence.
-      pc.Comm()->Barrier();
-    } else {
-      {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        const std::size_t accumulation_target =
-            config_.min_batch_size <= 1
-                ? 1
-                : std::max<std::size_t>(
-                      2, static_cast<std::size_t>(config_.min_batch_size));
+        // In a real implementation we'd reconstruct 'selection' from active
+        // queues. For this foundation, we just Barrier to keep the worker rank
+        // aligned with the master's processing cadence.
+        pc.Comm()->Barrier();
+      } else {
+        {
+          std::unique_lock<std::mutex> lock(queue_mutex_);
+          const std::size_t accumulation_target =
+              config_.min_batch_size <= 1
+                  ? 1
+                  : std::max<std::size_t>(
+                        2, static_cast<std::size_t>(config_.min_batch_size));
 
-        // Batch accumulation: wait for minimum batch size or timeout
-        // to improve GPU utilization. Trade-off: slightly higher latency
-        // for significantly better throughput.
-        auto has_work = [&] {
-          return stop_ || !pending_prefill_.empty() ||
-                 (!use_decode_workers_ && !pending_decode_.empty());
-        };
+          // Batch accumulation: wait for minimum batch size or timeout
+          // to improve GPU utilization. Trade-off: slightly higher latency
+          // for significantly better throughput.
+          auto has_work = [&] {
+            return stop_ || !pending_prefill_.empty() ||
+                   (!use_decode_workers_ && !pending_decode_.empty());
+          };
 
-        auto has_min_batch = [&] {
-          if (stop_) {
-            return true;
-          }
-          std::size_t total_pending = pending_prefill_.size();
-          if (!use_decode_workers_) {
-            total_pending += pending_decode_.size();
-          }
-          return total_pending >= accumulation_target;
-        };
+          auto has_min_batch = [&] {
+            if (stop_) {
+              return true;
+            }
+            std::size_t total_pending = pending_prefill_.size();
+            if (!use_decode_workers_) {
+              total_pending += pending_decode_.size();
+            }
+            return total_pending >= accumulation_target;
+          };
 
-        if (config_.batch_accumulation_ms > 0) {
-          prefill_cv_.wait(lock, has_work);
-          if (!stop_) {
-            const auto deadline =
-                std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(config_.batch_accumulation_ms);
-            while (!stop_ && !has_min_batch()) {
-              if (prefill_cv_.wait_until(lock, deadline) ==
-                  std::cv_status::timeout) {
-                break;
+          if (config_.batch_accumulation_ms > 0) {
+            prefill_cv_.wait(lock, has_work);
+            if (!stop_) {
+              const auto deadline =
+                  std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(config_.batch_accumulation_ms);
+              while (!stop_ && !has_min_batch()) {
+                if (prefill_cv_.wait_until(lock, deadline) ==
+                    std::cv_status::timeout) {
+                  break;
+                }
               }
             }
+          } else {
+            // No batch accumulation: wait for any work immediately
+            prefill_cv_.wait(lock, has_work);
           }
-        } else {
-          // No batch accumulation: wait for any work immediately
-          prefill_cv_.wait(lock, has_work);
+
+          if (stop_ && pending_prefill_.empty() && pending_decode_.empty()) {
+            break;
+          }
+          selection = BuildBatchLocked();
         }
 
-        if (stop_ && pending_prefill_.empty() && pending_decode_.empty()) {
-          break;
+        if (is_distributed) {
+          // Broadcast the decision to all workers.
+          std::vector<int> ids;
+          std::vector<int> phases;
+          for (auto &p : selection.pending) {
+            ids.push_back(static_cast<int>(p->inference.id));
+            phases.push_back(static_cast<int>(p->inference.phase));
+          }
+          pc.BroadcastBatch(ids, phases);
+          pc.Comm()->Barrier(); // Wait for workers to catch up
         }
-        selection = BuildBatchLocked();
       }
 
-      if (is_distributed) {
-        // Broadcast the decision to all workers.
-        std::vector<int> ids;
-        std::vector<int> phases;
-        for (auto &p : selection.pending) {
-          ids.push_back(static_cast<int>(p->inference.id));
-          phases.push_back(static_cast<int>(p->inference.phase));
-        }
-        pc.BroadcastBatch(ids, phases);
-        pc.Comm()->Barrier(); // Wait for workers to catch up
+      if (!selection.pending.empty()) {
+        ProcessBatch(std::move(selection));
       }
     }
-
-    if (!selection.pending.empty()) {
-      ProcessBatch(std::move(selection));
-    }
+  } catch (const std::exception &e) {
+    log::Error("scheduler",
+               std::string("WorkerLoop terminated by exception: ") + e.what());
+  } catch (...) {
+    log::Error("scheduler", "WorkerLoop terminated by unknown exception");
   }
 }
 
@@ -1756,7 +1856,13 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   }
 
   metrics_->SetDecodeQueueDepth(static_cast<int>(selection.pending.size()));
-  ApplyFairness(&selection);
+  {
+    // ApplyFairness iterates/mutates the pending queues under its calling
+    // contract; ProcessBatch runs outside the BuildBatchLocked lock scope,
+    // so take queue_mutex_ here to pair with Generate()/DecodeWorkerLoop.
+    std::lock_guard<std::mutex> queue_lock(queue_mutex_);
+    ApplyFairness(&selection);
+  }
   ResolveBackends(selection.pending);
   auto batch_start = std::chrono::steady_clock::now();
   selection.batch.batch_id =
@@ -1863,6 +1969,10 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           cached_seq_id = lookup.sequence_id;
           matched_tokens = lookup.matched_tokens;
         }
+        // Per-request usage telemetry (usage.cached_tokens): only tokens
+        // whose KV blocks are actually reused count as cached — a partial
+        // trie match that cannot donate blocks reports zero.
+        inf.cache_matched_tokens = prefix_hit ? matched_tokens : 0;
 
         // PagedAttention Block Allocation: calculate additional blocks needed.
         std::size_t prompt_len = inf.bpe_prompt_tokens.size();
@@ -2057,8 +2167,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                   session_handle_manager_->DiscardLeasedState(inf.session_id);
                 }
                 FreeSeqSlot(seq_id, seq_generation, pending->resolved_backend);
-              } else if (cache_) {
-                cache_->ReleaseBlocks(new_blocks);
+              } else {
+                if (cache_) {
+                  cache_->ReleaseBlocks(new_blocks);
+                }
+                // Non-session path: also free the sequence slot — the
+                // backend sequence was allocated for this request and a
+                // double failure (phased step AND full-prefill fallback)
+                // previously leaked it.
+                FreeSeqSlot(seq_id, seq_generation, pending->resolved_backend);
               }
               inf.block_table.clear();
               ResetSequenceLease(&inf);
@@ -2227,7 +2344,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       metrics_decode_requests);
 
   if (use_decode_workers_) {
-    metrics_->SetDecodeQueueDepth(static_cast<int>(pending_decode_.size()));
+    // Split mode: decode workers mutate pending_decode_ under queue_mutex_;
+    // read the depth under the same lock (formal UB otherwise, and a torn
+    // count is a misleading metric).
+    int decode_depth = 0;
+    {
+      std::lock_guard<std::mutex> lock(queue_mutex_);
+      decode_depth = static_cast<int>(pending_decode_.size());
+    }
+    metrics_->SetDecodeQueueDepth(decode_depth);
   }
   if (use_decode_workers_ && decode_ready.empty()) {
     return;
@@ -2356,6 +2481,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
            remaining = inference->fairness.remaining_decode_tokens,
            slice = inference->fairness.last_timeslice_tokens, slice_tokens](
               const std::string &name, const SpanContext &ctx, double ms) {
+            if (!FairnessTraceEnabled()) {
+              return;
+            }
             std::cout << "[fairness] " << name << " request=" << req_id
                       << " trace=" << ctx.trace_id << " limit=" << slice
                       << " generated=" << slice_tokens
@@ -2426,6 +2554,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       ResetSequenceLease(inference);
     }
     inference->phase = RequestPhase::kFinished;
+    FillResultUsageTelemetry(*inference, &result);
     pending->promise.set_value(std::move(result));
     LogSequenceSlotEvent("promise_completed", *inference);
   }
@@ -2439,6 +2568,12 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       UpdateQueueDepthLocked();
     }
     prefill_cv_.notify_one();
+    // Split mode: decode workers wait on decode_cv_ (unbounded when
+    // batch_accumulation_ms > 0) — notifying only prefill_cv_ left a
+    // fairness-yielded request stranded until an unrelated prefill fired.
+    if (use_decode_workers_) {
+      decode_cv_.notify_one();
+    }
   }
   auto batch_exec_end = std::chrono::steady_clock::now();
   double exec_ms =
@@ -2456,6 +2591,12 @@ void Scheduler::UpdateQueueDepthLocked() const {
   metrics_->SetDecodeQueueDepth(decode_depth);
 }
 
+// CALLING CONTRACT: callers must hold queue_mutex_ (or otherwise exclude
+// Generate()/DecodeWorkerLoop queue mutations). The WorkerLoop's ProcessBatch
+// call site takes the lock; tests drive it under the same lock via
+// SchedulerTestAccess. This function iterates and mutates
+// pending_prefill_/pending_decode_ and pairs fairness_controller_ reads with
+// UpdateFairnessConfig's writes (same mutex).
 void Scheduler::ApplyFairness(BatchSelection *selection) {
   if (!selection || selection->pending.empty()) {
     return;
@@ -2477,6 +2618,9 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
           [req_id = pending->inference.id,
            remaining = pending->inference.fairness.remaining_decode_tokens](
               const std::string &name, const SpanContext &ctx, double ms) {
+            if (!FairnessTraceEnabled()) {
+              return;
+            }
             std::cout << "[fairness] " << name << " request=" << req_id
                       << " trace=" << ctx.trace_id << " remaining=" << remaining
                       << " duration_ms=" << ms << std::endl;
@@ -2491,6 +2635,12 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
     bool from_decode{false};
     std::size_t index{0};
   };
+  // Snapshot the queues under queue_mutex_: Scheduler::Generate() pushes
+  // into pending_prefill_ (HTTP workers) and DecodeWorkerLoop erases from
+  // pending_decode_ under the same mutex — touching the vectors unlocked
+  // here was a data race (vector realloc during iteration = UB). Only the
+  // snapshot and the swap mutation below hold the lock; the fairness
+  // evaluation runs on the local copies.
   std::vector<QueueItem> queue_refs;
   queue_refs.reserve(pending_prefill_.size() + pending_decode_.size());
   for (std::size_t i = 0; i < pending_prefill_.size(); ++i) {
@@ -2621,22 +2771,25 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
                          generation, RequestPhase::kFinished,
                          /*n_past=*/-1, /*remaining_decode_tokens=*/-1,
                          backend->Name());
+    // Validate the lease BEFORE freeing the backend sequence: a rejected
+    // retirement means this slot was already re-acquired by a new request,
+    // and the previous order (free first, validate after) destroyed the
+    // live occupant's KV/sequence on duplicate or stale frees.
+    const scheduler::SequenceLease lease{slot, generation, -1};
+    if (!slot_manager_->RetireLease(
+            lease, scheduler::SequenceRetireFence::Pending())) {
+      log::Warn("scheduler",
+                "Rejected stale sequence lease retirement for slot " +
+                    std::to_string(slot) +
+                    " gen=" + std::to_string(generation));
+      return;
+    }
     auto fence = backend->BeginFreeSequence(slot);
     LogSequenceSlotEvent("backend_release_end", /*request_id=*/-1, slot,
                          generation, RequestPhase::kFinished,
                          /*n_past=*/-1, /*remaining_decode_tokens=*/-1,
                          backend->Name());
     if (fence.pending) {
-      const scheduler::SequenceLease lease{slot, generation, -1};
-      const bool retired = slot_manager_->RetireLease(
-          lease, scheduler::SequenceRetireFence::Pending());
-      if (!retired) {
-        log::Warn("scheduler",
-                  "Rejected stale sequence lease retirement for slot " +
-                      std::to_string(slot) +
-                      " gen=" + std::to_string(generation));
-        return;
-      }
       LogSequenceSlotEvent("retire_pending", /*request_id=*/-1, slot,
                            generation, RequestPhase::kFinished, /*n_past=*/-1,
                            /*remaining_decode_tokens=*/-1);
@@ -2651,6 +2804,21 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
       RefreshNativeKvMemoryMetrics();
       return;
     }
+    // Fence already complete (synchronous free): finish the retirement now
+    // instead of falling through to ReleaseLease — the lease is already in
+    // kRetiring, and CompleteRetiredLease is its completion transition.
+    if (!slot_manager_->CompleteRetiredLease(lease)) {
+      log::Warn("scheduler",
+                "Failed to complete sequence lease retirement for slot " +
+                    std::to_string(slot) +
+                    " gen=" + std::to_string(generation));
+    } else {
+      LogSequenceSlotEvent("release", /*request_id=*/-1, slot, generation,
+                           RequestPhase::kFinished, /*n_past=*/-1,
+                           /*remaining_decode_tokens=*/-1);
+    }
+    RefreshNativeKvMemoryMetrics();
+    return;
   } else if (!backend && generation != 0) {
     const bool released = slot_manager_->ReleaseLease({slot, generation, -1});
     if (!released) {

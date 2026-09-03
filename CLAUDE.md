@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What This Is
 
-InferFlux is a C++17 inference server delivering OpenAI-compatible REST/gRPC/WebSocket APIs across CUDA, ROCm, Metal (MPS), Vulkan, and CPU backends via a unified device abstraction. Models in GGUF and safetensors formats are loaded through an integrated llama.cpp backend. The project also ships `inferctl`, a CLI client with interactive chat, streaming, and admin commands.
+InferFlux is a C++17 inference server serving an OpenAI-compatible HTTP/1.1 REST API (SSE streaming included; no gRPC/WebSocket surface today) across CUDA, ROCm, Metal (MPS), Vulkan, and CPU backends via a unified device abstraction. Models in GGUF and safetensors formats are loaded through an integrated llama.cpp backend. The project also ships `inferctl`, a CLI client with interactive chat, streaming, and admin commands.
 
 Sibling instruction files at the repo root (`AGENTS.md`, `GEMINI.md`) cover the same ground for other agents — keep them consistent when conventions change.
 
@@ -338,7 +338,7 @@ stale object files (WSL2 filesystem timestamp issue):
 - `INFERFLUX_CUDA_DISPATCH_PROBE` / `INFERFLUX_CUDA_DISPATCH_PROBE_FORCE_UNHEALTHY` — load-time reachability and controlled operator down-ranking; degraded state is visible in `/readyz`
 - `INFERFLUX_DISABLE_FUSED_GEMV=1`, `INFERFLUX_FORCE_CUBLAS=1`, `INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL=1` — dispatch overrides
 - `INFERFLUX_ENABLE_DOWNPROJ_MMQ` / `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH` — down-projection MMQ threshold
-- `INFERFLUX_CUDA_MMQ_MMA=1` / `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` — mma.sync int8 tensor-core Q6_K down-proj with deterministic K-split (default off; needs no MMQ layout transform)
+- `INFERFLUX_CUDA_MMQ_MMA` / `INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` / `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` — mma.sync int8 tensor-core MMQ family (Q4_K gate/up+QKV+o+down-proj, Q6_K down-proj; M ≥ min-batch, default 4; default ON — the S30 stale-`input_q81_precomputed` corruption that briefly forced the down-proj tier off is fixed, regression-gated by the batched-isolation probe)
 - `INFERFLUX_MMVQ_MIN_WARPS` / `INFERFLUX_MMVQ_MAX_WARPS` / `INFERFLUX_ENABLE_ADAPTIVE_MMVQ_THREADS` — MMVQ occupancy tuning
 - `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_*` — experimental grouped/rowpair/rowquad kernel variants (default off)
 - `INFERFLUX_CUDA_DEQUANT_CACHE_POLICY` — dequantized-weight cache policy (memory contract; see `GGUFMemoryContractTests`)
@@ -404,6 +404,8 @@ The multi-backend harness runs each backend in an isolated child process on purp
 - Health signals: timeout streak/debt metrics influence `/readyz` and optional fail-closed admission
 
 ## Commits & PRs
+
+**Branch flow:** feature/fix branches PR into `develop`; `develop` promotes to `main` via a promotion PR (CI runs on both targets — `pull_request: [main, develop]`). Never PR a feature branch straight to `main`, and never let the two lines diverge — after any direct-to-main hotfix, fast-forward `develop` to `main` immediately. This convention exists because mixed targeting (PRs #27–#29 to main while #30+ targeted develop) produced an 80-commit divergence that required a dedicated reconciliation PR (#35).
 
 Short imperative subjects under ~72 chars mentioning scope (e.g., `Wire speculative validation and async NVMe writes`). **No AI attribution, co-author trailers, or agent names — the `commit-msg` hook rejects them.** PR bodies should link the tracking issue, enumerate config/env changes, and paste ctest output. Update README.md, docs/, and Helm/Docker assets alongside code changes; re-run `python3 scripts/check_docs_contract.py` when doc or surface changes are involved.
 

@@ -61,6 +61,13 @@ std::vector<half> CopyDeviceHalfs(const half *device, size_t count) {
   return host;
 }
 
+std::vector<float> CopyDeviceFloats(const float *device, size_t count) {
+  std::vector<float> host(count);
+  REQUIRE(cudaMemcpy(host.data(), device, count * sizeof(float),
+                     cudaMemcpyDeviceToHost) == cudaSuccess);
+  return host;
+}
+
 void ApplyRopeHost(std::vector<half> *q, std::vector<half> *k, int seq_len,
                    int num_heads, int num_kv_heads, int head_dim, int n_past,
                    float freq_base, int rope_type) {
@@ -159,6 +166,131 @@ void FillQuantizedRows(runtime::cuda::native::GGUF::TensorType tensor_type,
       block.d = encode_half(0.01f * static_cast<float>(((row + blk) % 5) + 1));
     }
   }
+}
+
+void RequireQ6KVectorizedParity(int M, int N, int K, bool check_accumulate) {
+  using runtime::cuda::native::block_q6_k;
+  using runtime::cuda::native::block_q8_1;
+  using runtime::cuda::native::GGUF::TensorType;
+
+  CAPTURE(M, N, K);
+  const int quant_type = static_cast<int>(TensorType::Q6_K);
+  const int blocks_per_row = K / QK_K;
+  const size_t output_count = static_cast<size_t>(M) * N;
+  std::vector<block_q6_k> weights(static_cast<size_t>(N) * blocks_per_row);
+  FillQuantizedRows(TensorType::Q6_K, N, blocks_per_row, weights.data());
+  const std::vector<half> input =
+      MakeWaveTensor(static_cast<size_t>(M) * K, 0.009f, -0.001f);
+
+  block_q6_k *d_weights = nullptr;
+  half *d_input = nullptr;
+  void *d_act_q8_1 = nullptr;
+  half *d_scalar = nullptr;
+  half *d_vector = nullptr;
+  float *d_scalar_f32 = nullptr;
+  float *d_vector_f32 = nullptr;
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_weights),
+                     weights.size() * sizeof(block_q6_k)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_input),
+                     input.size() * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(&d_act_q8_1, static_cast<size_t>(M) * (K / QK8_1) *
+                                      sizeof(block_q8_1)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_scalar),
+                     output_count * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_vector),
+                     output_count * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_scalar_f32),
+                     output_count * sizeof(float)) == cudaSuccess);
+  REQUIRE(cudaMalloc(reinterpret_cast<void **>(&d_vector_f32),
+                     output_count * sizeof(float)) == cudaSuccess);
+
+  REQUIRE(cudaMemcpy(d_weights, weights.data(),
+                     weights.size() * sizeof(block_q6_k),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  REQUIRE(cudaMemcpy(d_input, input.data(), input.size() * sizeof(half),
+                     cudaMemcpyHostToDevice) == cudaSuccess);
+  FusedQuantGemm::QuantizeRowQ8_1(d_input, d_act_q8_1, M, K, nullptr);
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  NativeExecutionPolicy scalar_policy;
+  scalar_policy.disable_q6k_vectorized = true;
+  NativeExecutionPolicy vector_policy;
+  vector_policy.enable_q6k_vectorized = true;
+  const QuantizedWeightInfo info{d_weights, quant_type,
+                                 static_cast<int64_t>(N) * K};
+
+  REQUIRE(cudaMemset(d_scalar, 0, output_count * sizeof(half)) == cudaSuccess);
+  REQUIRE(cudaMemset(d_vector, 0, output_count * sizeof(half)) == cudaSuccess);
+  REQUIRE(FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_scalar, M, N, K, nullptr,
+                                   &scalar_policy));
+  REQUIRE(FusedQuantGemm::GemvQ8_1(info, d_act_q8_1, d_vector, M, N, K, nullptr,
+                                   &vector_policy));
+  REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+
+  const auto scalar = CopyDeviceHalfs(d_scalar, output_count);
+  const auto vector = CopyDeviceHalfs(d_vector, output_count);
+  for (size_t i = 0; i < output_count; ++i) {
+    REQUIRE(__half2float(vector[i]) ==
+            Catch::Approx(__half2float(scalar[i])).margin(8e-2f));
+  }
+
+  if (check_accumulate) {
+    const auto residual = MakeWaveTensor(output_count, 0.003f, 0.02f);
+    REQUIRE(cudaMemcpy(d_scalar, residual.data(), output_count * sizeof(half),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(cudaMemcpy(d_vector, residual.data(), output_count * sizeof(half),
+                       cudaMemcpyHostToDevice) == cudaSuccess);
+    REQUIRE(FusedQuantGemm::GemvQ8_1Accum(info, d_act_q8_1, d_scalar, M, N, K,
+                                          nullptr, &scalar_policy));
+    REQUIRE(FusedQuantGemm::GemvQ8_1Accum(info, d_act_q8_1, d_vector, M, N, K,
+                                          nullptr, &vector_policy));
+    REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+    const auto scalar_accum = CopyDeviceHalfs(d_scalar, output_count);
+    const auto vector_accum = CopyDeviceHalfs(d_vector, output_count);
+    for (size_t i = 0; i < output_count; ++i) {
+      REQUIRE(__half2float(vector_accum[i]) ==
+              Catch::Approx(__half2float(scalar_accum[i])).margin(8e-2f));
+    }
+
+    if (M <= 8) {
+      std::vector<float> residual_f32(output_count);
+      for (size_t i = 0; i < output_count; ++i) {
+        residual_f32[i] = 0.02f + 0.001f * static_cast<float>(i % 17);
+      }
+      REQUIRE(cudaMemcpy(d_scalar_f32, residual_f32.data(),
+                         output_count * sizeof(float),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+      REQUIRE(cudaMemcpy(d_vector_f32, residual_f32.data(),
+                         output_count * sizeof(float),
+                         cudaMemcpyHostToDevice) == cudaSuccess);
+      REQUIRE(FusedQuantGemm::GemvQ8_1AccumF32(
+          info, d_act_q8_1, d_scalar_f32, M, N, K, nullptr, &scalar_policy));
+      REQUIRE(FusedQuantGemm::GemvQ8_1AccumF32(
+          info, d_act_q8_1, d_vector_f32, M, N, K, nullptr, &vector_policy));
+      REQUIRE(cudaDeviceSynchronize() == cudaSuccess);
+      const auto scalar_accum_f32 =
+          CopyDeviceFloats(d_scalar_f32, output_count);
+      const auto vector_accum_f32 =
+          CopyDeviceFloats(d_vector_f32, output_count);
+      for (size_t i = 0; i < output_count; ++i) {
+        REQUIRE(vector_accum_f32[i] ==
+                Catch::Approx(scalar_accum_f32[i]).margin(8e-2f));
+      }
+    } else {
+      REQUIRE_FALSE(FusedQuantGemm::GemvQ8_1AccumF32(
+          info, d_act_q8_1, d_scalar_f32, M, N, K, nullptr, &scalar_policy));
+      REQUIRE_FALSE(FusedQuantGemm::GemvQ8_1AccumF32(
+          info, d_act_q8_1, d_vector_f32, M, N, K, nullptr, &vector_policy));
+    }
+  }
+
+  REQUIRE(cudaFree(d_vector_f32) == cudaSuccess);
+  REQUIRE(cudaFree(d_scalar_f32) == cudaSuccess);
+  REQUIRE(cudaFree(d_vector) == cudaSuccess);
+  REQUIRE(cudaFree(d_scalar) == cudaSuccess);
+  REQUIRE(cudaFree(d_act_q8_1) == cudaSuccess);
+  REQUIRE(cudaFree(d_input) == cudaSuccess);
+  REQUIRE(cudaFree(d_weights) == cudaSuccess);
 }
 
 void RunLmHeadLongPrefillContract(
@@ -373,6 +505,7 @@ TEST_CASE("NativeExecutionPolicy loads hot-path policy from env",
   ScopedEnvVar enable_mmq("INFERFLUX_ENABLE_DOWNPROJ_MMQ", "1");
   ScopedEnvVar mmq_min_batch("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", "7");
   ScopedEnvVar timing_sample_rate("INFERFLUX_CUDA_TIMING_SAMPLE_RATE", "9");
+  ScopedEnvVar disable_q6k_vectorized("INFERFLUX_DISABLE_Q6K_VECTORIZED", "1");
 
   const auto policy = NativeExecutionPolicy::FromEnv();
   REQUIRE(policy.enable_batched_decode);
@@ -392,6 +525,7 @@ TEST_CASE("NativeExecutionPolicy loads hot-path policy from env",
   REQUIRE(policy.enable_downproj_mmq);
   REQUIRE(policy.downproj_mmq_min_batch_override == 7);
   REQUIRE(policy.timing_sample_rate == 9);
+  REQUIRE(policy.disable_q6k_vectorized);
   REQUIRE(policy.require_fused_quantized_matmul_override);
   REQUIRE(policy.require_fused_quantized_matmul);
   REQUIRE(policy.dequantized_cache_policy_override == "batch");
@@ -405,6 +539,26 @@ TEST_CASE("NativeExecutionPolicy keeps grouped Q4_K single-row hot path on by "
 
   const auto policy = NativeExecutionPolicy::FromEnv();
   REQUIRE(policy.enable_experimental_q81_grouped_hot_q4k);
+}
+
+TEST_CASE("Q6_K vectorized decode selector honors architecture, cohort, and "
+          "rollback policy",
+          "[native_forward][q6k_vectorized]") {
+  NativeExecutionPolicy policy;
+  for (const int M : {3, 4, 5, 8}) {
+    REQUIRE(FusedQuantGemm::ShouldUseQ6KVectorizedDecode(8, 9, M, policy));
+  }
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseQ6KVectorizedDecode(8, 6, 4, policy));
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseQ6KVectorizedDecode(9, 0, 4, policy));
+
+  policy.enable_q6k_vectorized = true;
+  REQUIRE(FusedQuantGemm::ShouldUseQ6KVectorizedDecode(8, 6, 4, policy));
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseQ6KVectorizedDecode(8, 9, 9, policy));
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseQ6KVectorizedDecode(8, 9, 0, policy));
+
+  policy.disable_q6k_vectorized = true;
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseQ6KVectorizedDecode(8, 9, 4, policy));
+  REQUIRE_FALSE(FusedQuantGemm::ShouldUseQ6KVectorizedDecode(8, 6, 4, policy));
 }
 
 TEST_CASE("NativeExecutionPolicy enables batched decode by default",
@@ -5911,6 +6065,37 @@ TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q6_K outputs for "
   REQUIRE(cudaFree(d_w) == cudaSuccess);
 }
 
+TEST_CASE("Q6_K vectorized decode matches scalar dispatch across production "
+          "output modes",
+          "[native_forward][cuda_runtime_contract][q6k_vectorized]") {
+  int device_count = 0;
+  if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count <= 0) {
+    SUCCEED("No CUDA device available; skipping Q6_K vector parity.");
+    return;
+  }
+
+  const int quant_type =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+  if (!FusedQuantGemm::SupportsQ8_1Activations(quant_type)) {
+    SUCCEED("Q8_1 Q6_K kernels unavailable for this device/profile.");
+    return;
+  }
+
+  for (const int M : {3, 4, 5, 8}) {
+    RequireQ6KVectorizedParity(M, 8, 256, true);
+  }
+
+  SECTION("MMQ boundary ignores the MMVQ vector policy") {
+    for (const int M : {9, 16}) {
+      RequireQ6KVectorizedParity(M, 8, 256, true);
+    }
+  }
+
+  SECTION("exact down-projection geometry") {
+    RequireQ6KVectorizedParity(8, 2048, 11008, false);
+  }
+}
+
 TEST_CASE("FusedQuantGemm::GemvQ8_1 preserves per-row Q4_K outputs for exact "
           "down-proj hot geometry",
           "[native_forward][cuda_runtime_contract]") {
@@ -7256,11 +7441,17 @@ TEST_CASE(
               FusedDispatchGeometry{1, 2048, 11008, 1, true, false},
               /*allow_fused_quantized_matmul=*/true,
               policy) == FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed);
+  // M=4 Q4_K decode now takes the tensor-core operator too (S18 extended
+  // the MMA window beyond Q6_K); non-MMA hardware keeps the Q8_1 ladder.
+  const FusedQuantGemm::DownProjOperator q4k_m4_expect =
+      FusedQuantGemm::CurrentDeviceSupportsMmqMma()
+          ? FusedQuantGemm::DownProjOperator::kMmqMma
+          : FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad;
   REQUIRE(SelectInferfluxCudaDownProjOperator(
               raw, mmq, InferfluxCudaDispatchPhase::kDecode,
               FusedDispatchGeometry{4, 2048, 11008, 1, true, false},
               /*allow_fused_quantized_matmul=*/true,
-              policy) == FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad);
+              policy) == q4k_m4_expect);
 
   policy.enable_experimental_q81_downproj_rowpair_hot_fixed = true;
   REQUIRE(SelectInferfluxCudaDownProjOperator(
@@ -7268,6 +7459,79 @@ TEST_CASE(
               FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
               /*allow_fused_quantized_matmul=*/true, policy) ==
           FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
+}
+
+TEST_CASE(
+    "InferfluxCudaDispatchPolicy: down-proj registry promotes Q6_K MMA-window "
+    "decode to the tensor-core operator",
+    "[native_forward]") {
+  NativeExecutionPolicy policy;
+  const int q6k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K);
+  const int q4k =
+      static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K);
+  const QuantizedWeightInfo raw{reinterpret_cast<const void *>(0x1), q6k,
+                                2048LL * 11008LL};
+  const QuantizedWeightInfo raw_q4{reinterpret_cast<const void *>(0x1), q4k,
+                                   2048LL * 11008LL};
+  const MmqWeightInfo mmq{};
+
+  // Inside the MMA window (mmq_mma_min_batch..max_batch) the tensor-core
+  // operator outranks everything — but only on tensor-core hardware; the
+  // CPU-only fallback keeps the Q8_1 ladder.
+  const FusedQuantGemm::DownProjOperator window_expect =
+      FusedQuantGemm::CurrentDeviceSupportsMmqMma()
+          ? FusedQuantGemm::DownProjOperator::kMmqMma
+          : FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad;
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{8, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == window_expect);
+
+  // S18: Q4_K down-proj joins the same window — the ollama Q4_K_M recipe
+  // mixes per-layer Q4_K/Q6_K down-proj tensors, so both quants must
+  // promote identically.
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw_q4, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{8, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == window_expect);
+
+  // Policy off falls back down the ladder — never a tier-mismatched
+  // selection.
+  policy.enable_mmq_mma = false;
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{8, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad);
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw_q4, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{8, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad);
+
+  // Below the MMA window the Q8_1 ladder is untouched even with MMA armed
+  // (M=2 takes the geometry-gated row-pair hot-fixed rule).
+  policy.enable_mmq_mma = true;
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw, mmq, InferfluxCudaDispatchPhase::kDecode,
+              FusedDispatchGeometry{2, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) ==
+          FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed);
+
+  // Prefill chunks above the fused-path M ceiling select the dense
+  // fallback — the executor never attempts a fused tier there, so the
+  // MMA-with-prefill-ceiling executions live in the inline
+  // fused-gate+up+SiLU chain, outside this catalog (documented debt in
+  // dispatch_catalog.h).
+  REQUIRE(SelectInferfluxCudaDownProjOperator(
+              raw, mmq, InferfluxCudaDispatchPhase::kPrefill,
+              FusedDispatchGeometry{512, 2048, 11008, 1, true, false},
+              /*allow_fused_quantized_matmul=*/true,
+              policy) == FusedQuantGemm::DownProjOperator::kFallback);
 }
 
 TEST_CASE(
@@ -7397,6 +7661,10 @@ TEST_CASE(
       static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 1, 2048,
       11008,
       [&]() {
+        calls.emplace_back("mma");
+        return false;
+      },
+      [&]() {
         calls.emplace_back("mmq");
         return false;
       },
@@ -7416,8 +7684,9 @@ TEST_CASE(
       &summary);
 
   REQUIRE(ok);
-  REQUIRE(calls ==
-          std::vector<std::string>{"q81", "mmq", "packed", "fallback"});
+  REQUIRE(calls == std::vector<std::string>{"q81", "mma", "mmq", "packed",
+                                            "fallback"});
+  REQUIRE_FALSE(summary.used_mmq_mma);
   REQUIRE_FALSE(summary.used_mmq);
   REQUIRE_FALSE(summary.used_q81);
   REQUIRE_FALSE(summary.used_packed);
@@ -7502,13 +7771,15 @@ TEST_CASE("InferfluxCudaLinearExecutor: every down-proj operator reaches its "
           "tier when available",
           "[native_forward][dispatch_reachability]") {
   using Op = FusedQuantGemm::DownProjOperator;
-  const std::array<Op, 8> kAllDownOps = {
+  const std::array<Op, 9> kAllDownOps = {
       Op::kFallback,        Op::kQ81Gemv,
       Op::kQ81GemvHotFixed, Op::kQ81GemvRowPairHotFixed,
       Op::kQ81GemvRowPair,  Op::kQ81GemvRowQuad,
-      Op::kPackedGemv,      Op::kMmq};
+      Op::kPackedGemv,      Op::kMmq,
+      Op::kMmqMma};
 
   for (const Op op : kAllDownOps) {
+    bool mma_called = false;
     bool mmq_called = false;
     bool q81_called = false;
     bool packed_called = false;
@@ -7519,6 +7790,10 @@ TEST_CASE("InferfluxCudaLinearExecutor: every down-proj operator reaches its "
         op, "decode", "q4_k",
         static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K), 4,
         2048, 11008,
+        [&]() {
+          mma_called = true;
+          return true;
+        },
         [&]() {
           mmq_called = true;
           return true;
@@ -7548,13 +7823,25 @@ TEST_CASE("InferfluxCudaLinearExecutor: every down-proj operator reaches its "
     case Op::kQ81GemvRowQuad:
       REQUIRE(q81_called);
       REQUIRE_FALSE(mmq_called);
+      REQUIRE_FALSE(mma_called);
       REQUIRE(summary.used_q81);
       REQUIRE(summary.actual_op == op);
       break;
     case Op::kMmq:
       REQUIRE(mmq_called);
       REQUIRE_FALSE(q81_called);
+      REQUIRE_FALSE(mma_called);
       REQUIRE(summary.used_mmq);
+      REQUIRE(summary.actual_op == op);
+      break;
+    case Op::kMmqMma:
+      // The tensor-core selection must reach the MMA lambda — this is the
+      // assertion that fails if the executor lets kMmqMma degrade to the
+      // dp4a catch-all (the kQ81GroupMmq3 incident shape).
+      REQUIRE(mma_called);
+      REQUIRE_FALSE(mmq_called);
+      REQUIRE_FALSE(q81_called);
+      REQUIRE(summary.used_mmq_mma);
       REQUIRE(summary.actual_op == op);
       break;
     case Op::kPackedGemv:
@@ -7611,6 +7898,9 @@ TEST_CASE("FusedQuantGemm: metric names distinguish V2 hot-path variants",
   REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
               FusedQuantGemm::DownProjOperator::kMmq, q4k, 2, 11008) ==
           std::string("mmq"));
+  REQUIRE(FusedQuantGemm::DownProjOperatorMetricName(
+              FusedQuantGemm::DownProjOperator::kMmqMma, q6k, 8, 11008) ==
+          std::string("mmq_mma"));
 }
 
 TEST_CASE("cuda_kernel::QuantizeRowsSymmetric quantizes once per row with "

@@ -31,6 +31,7 @@ namespace runtime {
 namespace cuda {
 namespace native {
 struct BlockQ8_1Mmq;
+struct BlockQ8_1MmqDs;
 } // namespace native
 } // namespace cuda
 } // namespace runtime
@@ -249,6 +250,10 @@ public:
   /// primitive used by the Q6_K MMA path (Turing / SM 7.5 or newer).
   static bool SupportsMmqMmaArchitecture(int sm_major, int sm_minor);
 
+  /// Select the vectorized Q6_K MMVQ decode path for a GPU/policy tuple.
+  static bool ShouldUseQ6KVectorizedDecode(int sm_major, int sm_minor, int M,
+                                           const NativeExecutionPolicy &policy);
+
   /// Runtime form of SupportsMmqMmaArchitecture for the active CUDA device.
   static bool CurrentDeviceSupportsMmqMma();
 
@@ -275,6 +280,26 @@ public:
                          runtime::cuda::native::BlockQ8_1Mmq *output, int M,
                          int K, cudaStream_t stream);
 
+  /** Fused SwiGLU + DS quantization for the Q4_K MMA down-projection. */
+  static void
+  SiluMulQuantizeQ8_1MmqDs(const half *gate, const half *up,
+                           runtime::cuda::native::BlockQ8_1MmqDs *output, int M,
+                           int K, cudaStream_t stream);
+
+  /**
+   * Q4_K MMA down-projection (S18): out[M, N] = silu(gate)*up x W[N, K]^T
+   * for Q4_K W in raw row-major layout, consuming the DS activation buffer
+   * produced by SiluMulQuantizeQ8_1MmqDs. Mirrors DownProjMmqMma (Q6_K):
+   * raw weights, M in [mmq_mma_min_batch, max], K-split partials sized
+   * kMmqMmaMaxSplits * M * N floats. Returns false when unsupported so the
+   * caller falls back to the dp4a MMQ / Q8_1 tiers.
+   */
+  static bool DownProjMmqMmaQ4K(
+      const QuantizedWeightInfo &weight,
+      const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *output, int M,
+      int N, int K, float *partials, cudaStream_t stream,
+      const NativeExecutionPolicy *policy = nullptr, int max_m_override = -1);
+
   /**
    * MMA down-projection: out[M, N] = act[M, K] x W[N, K]^T for Q6_K W in
    * raw row-major super-block layout. K-split fills the SM array when the
@@ -284,11 +309,26 @@ public:
    * @return true if the kernel launched, false when unsupported (caller
    * falls back to the dp4a MMQ / Q8_1 tiers).
    */
+  /**
+   * Generic Q4_K single-projection MMA (S8): out[M, N] = act[M, K] x
+   * W[N, K]^T via the int8 tensor-core kernel with DS activations.
+   * Gated on NativeExecutionPolicy::enable_mmq_mma for Q4_K, M in
+   * [mmq_mma_min_batch_exclusive..max]; M=1 and non-Q4_K fall through.
+   */
+  static bool GemvMmqMma(const QuantizedWeightInfo &weight, const half *input,
+                         half *output,
+                         runtime::cuda::native::BlockQ8_1MmqDs *ds_act,
+                         float *partials, int M, int N, int K,
+                         cudaStream_t stream,
+                         const NativeExecutionPolicy *policy = nullptr,
+                         int max_m_override = -1);
+
   static bool DownProjMmqMma(const QuantizedWeightInfo &weight,
                              const runtime::cuda::native::BlockQ8_1Mmq *act_mmq,
                              half *output, int M, int N, int K, float *partials,
                              cudaStream_t stream,
-                             const NativeExecutionPolicy *policy = nullptr);
+                             const NativeExecutionPolicy *policy = nullptr,
+                             int max_m_override = -1);
 
   /**
    * Build a tile-major MMQ layout for a quantized tensor.

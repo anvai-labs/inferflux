@@ -28,6 +28,7 @@ inline int inferflux_close_socket(int fd) { return ::closesocket(fd); }
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 inline int inferflux_close_socket(int fd) { return ::close(fd); }
 #endif
@@ -728,6 +729,25 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
   j["usage"] = {{"prompt_tokens", prompt_toks},
                 {"completion_tokens", total_completion_tokens},
                 {"total_tokens", prompt_toks + total_completion_tokens}};
+  // Per-request cache split and timings. cached_tokens is always emitted —
+  // an explicit 0 on a miss — and prompt_tokens stays inclusive of the cached
+  // portion; consumers derive fresh input as prompt − cached. All choices
+  // share one prompt, so results[0] carries the request-level numbers.
+  int cached_toks = 0;
+  double duration_ms = -1.0;
+  double ttft_ms = -1.0;
+  if (!results.empty()) {
+    cached_toks = results[0].cached_prompt_tokens;
+    duration_ms = results[0].duration_ms;
+    ttft_ms = results[0].time_to_first_token_ms;
+  }
+  j["usage"]["prompt_tokens_details"] = {{"cached_tokens", cached_toks}};
+  if (duration_ms >= 0.0) {
+    j["usage"]["duration_ms"] = duration_ms;
+  }
+  if (ttft_ms >= 0.0) {
+    j["usage"]["time_to_first_token_ms"] = ttft_ms;
+  }
 
   json choices = json::array();
   for (int i = 0; i < static_cast<int>(results.size()); ++i) {
@@ -1338,6 +1358,42 @@ void HttpServer::Run() {
                    sizeof(nodelay));
 #endif
     }
+    // Socket deadlines: without them a stalled SSE client's kernel send
+    // buffer fills and ::send() blocks FOREVER inside the scheduler's decode
+    // worker (on_token -> SendAll), freezing token generation for every
+    // request on that worker — one remote client can halt the whole server.
+    // SO_SNDTIMEO turns that into a failed send -> SendAll returns false ->
+    // the stream is canceled. SO_RCVTIMEO bounds idle keep-alive reads so a
+    // slowloris client cannot pin a worker forever.
+    {
+      static const int send_timeout_sec = [] {
+        int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_SEND_TIMEOUT_SEC", 30);
+        return v > 0 ? v : 30;
+      }();
+      static const int recv_timeout_sec = [] {
+        int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_RECV_TIMEOUT_SEC", 120);
+        return v > 0 ? v : 120;
+      }();
+#ifdef _WIN32
+      DWORD send_tv = static_cast<DWORD>(send_timeout_sec * 1000);
+      DWORD recv_tv = static_cast<DWORD>(recv_timeout_sec * 1000);
+      ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char *>(&send_tv), sizeof(send_tv));
+      ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char *>(&recv_tv), sizeof(recv_tv));
+#else
+      struct timeval send_tv;
+      send_tv.tv_sec = send_timeout_sec;
+      send_tv.tv_usec = 0;
+      struct timeval recv_tv;
+      recv_tv.tv_sec = recv_timeout_sec;
+      recv_tv.tv_usec = 0;
+      ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &send_tv,
+                   sizeof(send_tv));
+      ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv,
+                   sizeof(recv_tv));
+#endif
+    }
     ClientSession session;
     session.fd = client_fd;
     if (tls_enabled_) {
@@ -1355,7 +1411,30 @@ void HttpServer::Run() {
       session.ssl = ssl;
     }
     {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
+      std::unique_lock<std::mutex> lock(queue_mutex_);
+      // Bounded accept backlog: idle/slow connections must not accumulate
+      // without limit (with N workers, N stalled clients already halt
+      // request processing; an unbounded queue additionally lets a
+      // connection flood grow memory without bound). Reject by closing —
+      // the client sees a dropped connection and can retry.
+      static const std::size_t max_pending = [] {
+        int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS",
+                                       256);
+        return v > 0 ? static_cast<std::size_t>(v) : 256;
+      }();
+      if (client_queue_.size() >= max_pending) {
+        lock.unlock();
+        // The handshake already completed for TLS sessions — free the SSL
+        // object too or every rejected connection leaks its buffers (an
+        // unauthenticated flood would grow listener memory without bound,
+        // relocating the exact hazard the bound exists to stop).
+        if (session.ssl) {
+          SSL_free(session.ssl);
+          session.ssl = nullptr;
+        }
+        inferflux_close_socket(client_fd);
+        continue;
+      }
       client_queue_.push(std::move(session));
     }
     queue_cv_.notify_one();
@@ -1382,19 +1461,13 @@ bool HttpServer::ResolveSubject(const std::string &headers,
     ctx->scopes.insert("generate");
     return true;
   }
-  auto pos = headers.find("Authorization:");
-  if (pos == std::string::npos) {
+  // RFC 9110 §5.1/§11.1: field names and the auth-scheme are case-insensitive
+  // (lowercase "authorization" is what hyper/reqwest and most HTTP/2-era
+  // clients send).
+  std::string token = ExtractBearerToken(headers);
+  if (token.empty()) {
     return false;
   }
-  auto end = headers.find("\r\n", pos);
-  std::string line = headers.substr(pos, end - pos);
-  auto token_pos = line.find("Bearer");
-  if (token_pos == std::string::npos) {
-    return false;
-  }
-  std::string token = line.substr(token_pos + 6);
-  token.erase(0, token.find_first_not_of(' '));
-  token.erase(token.find_last_not_of(' ') + 1);
   if (auth_ && auth_->HasKeys()) {
     auto hash = ApiKeyAuth::HashKey(token);
     if (auth_->IsAllowedByHash(hash)) {
@@ -1490,25 +1563,17 @@ void HttpServer::HandleClient(ClientSession &session) {
   // Phase 2: parse Content-Length and read remaining body bytes.
   std::size_t body_start = header_end_pos + 4;
   std::size_t content_length = 0;
-  {
-    auto cl_pos = request.find("Content-Length:");
-    if (cl_pos == std::string::npos) {
-      cl_pos = request.find("content-length:");
-    }
-    if (cl_pos != std::string::npos && cl_pos < header_end_pos) {
-      auto val_start = cl_pos + 15; // strlen("Content-Length:")
-      while (val_start < header_end_pos && request[val_start] == ' ') {
-        ++val_start;
-      }
-      auto val_end = request.find("\r\n", val_start);
-      if (val_end != std::string::npos) {
-        try {
-          content_length =
-              std::stoull(request.substr(val_start, val_end - val_start));
-        } catch (const std::exception &ex) {
-          log::Debug("http_server", "Invalid Content-Length header: " +
-                                        std::string(ex.what()));
-        }
+  if (header_end_pos != std::string::npos) {
+    // Case-insensitive lookup over the header block only (RFC 9110 §5.1), so
+    // mixed-case spellings and body bytes cannot affect the parse.
+    std::string cl_value =
+        GetHeaderValue(request.substr(0, header_end_pos), "content-length");
+    if (!cl_value.empty()) {
+      try {
+        content_length = std::stoull(cl_value);
+      } catch (const std::exception &ex) {
+        log::Debug("http_server",
+                   "Invalid Content-Length header: " + std::string(ex.what()));
       }
     }
   }
@@ -3285,6 +3350,17 @@ void HttpServer::HandleClient(ClientSession &session) {
                              {"completion_tokens", result.completion_tokens},
                              {"total_tokens",
                               result.prompt_tokens + result.completion_tokens}};
+              // Same per-request telemetry as the non-streaming usage body:
+              // explicit cached 0 on a miss, TTFT only when streamed.
+              uc["usage"]["prompt_tokens_details"] = {
+                  {"cached_tokens", result.cached_prompt_tokens}};
+              if (result.duration_ms >= 0.0) {
+                uc["usage"]["duration_ms"] = result.duration_ms;
+              }
+              if (result.time_to_first_token_ms >= 0.0) {
+                uc["usage"]["time_to_first_token_ms"] =
+                    result.time_to_first_token_ms;
+              }
               SendAll(session, "data: " + uc.dump() + "\n\n");
             }
             SendAll(session, "data: [DONE]\n\n");
@@ -3333,13 +3409,27 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
   }
   const char *data = wire_payload->c_str();
   std::size_t remaining = wire_payload->size();
+  // WALL-CLOCK deadline for TLS retries: on a blocking socket BIO an
+  // SO_SNDTIMEO expiry surfaces as WANT_WRITE from SSL_write, and each
+  // retry blocks another full send-timeout — a retry COUNT alone would
+  // multiply the intended deadline by the cap (64 x 30s ~ 32 minutes with
+  // SendAll running on a scheduler decode worker). Bound the total time
+  // instead; plain sockets get the deadline directly from the kernel.
+  static const int send_timeout_sec = [] {
+    int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_SEND_TIMEOUT_SEC", 30);
+    return v > 0 ? v : 30;
+  }();
+  const auto deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::seconds(static_cast<long long>(send_timeout_sec));
   while (remaining > 0) {
     int sent = 0;
     if (session.ssl) {
       sent = SSL_write(session.ssl, data, static_cast<int>(remaining));
       if (sent <= 0) {
         int err = SSL_get_error(session.ssl, sent);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) &&
+            std::chrono::steady_clock::now() < deadline) {
           continue;
         }
         return false;
@@ -3350,6 +3440,8 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
         if (errno == EINTR) {
           continue;
         }
+        // EAGAIN/EWOULDBLOCK here means the SO_SNDTIMEO deadline hit: the
+        // peer is not draining — fail so the caller can cancel the stream.
         return false;
       }
     }
@@ -3362,13 +3454,24 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
 ssize_t HttpServer::Receive(ClientSession &session, char *buffer,
                             std::size_t length) {
   if (session.ssl) {
+    // Same wall-clock bound as SendAll: a retry count would multiply the
+    // recv deadline by the cap (64 x 120s ~ 2.1 hours pinning an HTTP
+    // worker on an idle TLS keep-alive connection).
+    static const int recv_timeout_sec = [] {
+      int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_RECV_TIMEOUT_SEC", 120);
+      return v > 0 ? v : 120;
+    }();
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(static_cast<long long>(recv_timeout_sec));
     while (true) {
       int received = SSL_read(session.ssl, buffer, static_cast<int>(length));
       if (received > 0) {
         return received;
       }
       int err = SSL_get_error(session.ssl, received);
-      if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+      if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) &&
+          std::chrono::steady_clock::now() < deadline) {
         continue;
       }
       return -1;

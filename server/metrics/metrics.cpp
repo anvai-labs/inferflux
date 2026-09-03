@@ -936,6 +936,7 @@ void MetricsRegistry::RecordInferfluxCudaDownProjOperator(
   const std::string phase_label = NormalizeNativePhase(phase);
   const std::string op_label =
       op == "mmq"                            ? "mmq"
+      : op == "mmq_mma"                      ? "mmq_mma"
       : op == "q8_1_gemv_v2"                 ? "q8_1_gemv_v2"
       : op == "q8_1_gemv"                    ? "q8_1_gemv"
       : op == "q8_1_gemv_hot_fixed"          ? "q8_1_gemv_hot_fixed"

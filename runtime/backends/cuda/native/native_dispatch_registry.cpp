@@ -25,6 +25,7 @@ struct InferfluxCudaDownProjDispatchRule {
   bool requires_q81{false};
   bool requires_packed{false};
   bool requires_mmq{false};
+  bool requires_mma{false};
   bool (*match)(const InferfluxCudaDownProjDispatchProfile &,
                 const NativeExecutionPolicy &){nullptr};
   const char *reason{nullptr};
@@ -124,6 +125,11 @@ GetInferfluxCudaFfnDispatchRules() {
   return rules;
 }
 
+bool MatchDownProjMmqMma(const InferfluxCudaDownProjDispatchProfile &profile,
+                         const NativeExecutionPolicy &) {
+  return profile.mma_ready;
+}
+
 bool MatchDownProjMmq(const InferfluxCudaDownProjDispatchProfile &profile,
                       const NativeExecutionPolicy &) {
   return profile.mmq_ready;
@@ -170,31 +176,40 @@ bool MatchDownProjPacked(const InferfluxCudaDownProjDispatchProfile &,
   return true;
 }
 
-const std::array<InferfluxCudaDownProjDispatchRule, 7> &
+const std::array<InferfluxCudaDownProjDispatchRule, 8> &
 GetInferfluxCudaDownProjDispatchRules() {
-  static const std::array<InferfluxCudaDownProjDispatchRule, 7> rules = {{
+  static const std::array<InferfluxCudaDownProjDispatchRule, 8> rules = {{
+      {FusedQuantGemm::DownProjOperator::kMmqMma,
+       /*requires_q81=*/false, /*requires_packed=*/false,
+       /*requires_mmq=*/false, /*requires_mma=*/true, MatchDownProjMmqMma,
+       "mmq_mma"},
       {FusedQuantGemm::DownProjOperator::kMmq,
        /*requires_q81=*/false, /*requires_packed=*/false,
-       /*requires_mmq=*/true, MatchDownProjMmq, "mmq"},
+       /*requires_mmq=*/true, /*requires_mma=*/false, MatchDownProjMmq, "mmq"},
       {FusedQuantGemm::DownProjOperator::kQ81GemvHotFixed,
        /*requires_q81=*/true, /*requires_packed=*/false,
-       /*requires_mmq=*/false, MatchDownProjHotFixed, "q81_hot_fixed"},
+       /*requires_mmq=*/false, /*requires_mma=*/false, MatchDownProjHotFixed,
+       "q81_hot_fixed"},
       {FusedQuantGemm::DownProjOperator::kQ81GemvRowPairHotFixed,
        /*requires_q81=*/true, /*requires_packed=*/false,
-       /*requires_mmq=*/false, MatchDownProjRowPairHotFixed,
-       "q81_rowpair_hot_fixed"},
+       /*requires_mmq=*/false, /*requires_mma=*/false,
+       MatchDownProjRowPairHotFixed, "q81_rowpair_hot_fixed"},
       {FusedQuantGemm::DownProjOperator::kQ81GemvRowQuad,
        /*requires_q81=*/true, /*requires_packed=*/false,
-       /*requires_mmq=*/false, MatchDownProjRowQuad, "q81_rowquad"},
+       /*requires_mmq=*/false, /*requires_mma=*/false, MatchDownProjRowQuad,
+       "q81_rowquad"},
       {FusedQuantGemm::DownProjOperator::kQ81GemvRowPair,
        /*requires_q81=*/true, /*requires_packed=*/false,
-       /*requires_mmq=*/false, MatchDownProjRowPair, "q81_rowpair"},
+       /*requires_mmq=*/false, /*requires_mma=*/false, MatchDownProjRowPair,
+       "q81_rowpair"},
       {FusedQuantGemm::DownProjOperator::kQ81Gemv,
        /*requires_q81=*/true, /*requires_packed=*/false,
-       /*requires_mmq=*/false, MatchDownProjGenericQ81, "q81_generic"},
+       /*requires_mmq=*/false, /*requires_mma=*/false, MatchDownProjGenericQ81,
+       "q81_generic"},
       {FusedQuantGemm::DownProjOperator::kPackedGemv,
        /*requires_q81=*/false, /*requires_packed=*/true,
-       /*requires_mmq=*/false, MatchDownProjPacked, "packed_gemv"},
+       /*requires_mmq=*/false, /*requires_mma=*/false, MatchDownProjPacked,
+       "packed_gemv"},
   }};
   return rules;
 }
@@ -327,7 +342,7 @@ std::string DescribeInferfluxCudaFfnDispatchDecision(
 InferfluxCudaDownProjDispatchProfile BuildInferfluxCudaDownProjDispatchProfile(
     InferfluxCudaDispatchPhase phase, int quant_type,
     const FusedDispatchGeometry &geometry, bool q81_ready, bool packed_ready,
-    bool mmq_ready) {
+    bool mmq_ready, bool mma_ready) {
   InferfluxCudaDownProjDispatchProfile profile;
   profile.phase = phase;
   profile.quant_type = quant_type;
@@ -335,6 +350,7 @@ InferfluxCudaDownProjDispatchProfile BuildInferfluxCudaDownProjDispatchProfile(
   profile.q81_ready = q81_ready;
   profile.packed_ready = packed_ready;
   profile.mmq_ready = mmq_ready;
+  profile.mma_ready = mma_ready;
   profile.m_bucket = BucketBatchRows(geometry.M);
   profile.n_bucket = BucketExtent(geometry.N);
   profile.k_bucket = BucketExtent(geometry.K);
@@ -358,6 +374,9 @@ SelectInferfluxCudaDownProjDispatchDecision(
     if (rule.requires_mmq && !profile.mmq_ready) {
       continue;
     }
+    if (rule.requires_mma && !profile.mma_ready) {
+      continue;
+    }
     if (!rule.match || !rule.match(profile, policy)) {
       continue;
     }
@@ -378,6 +397,7 @@ std::string DescribeInferfluxCudaDownProjDispatchDecision(
          ", packed_ready=" +
          std::string(profile.packed_ready ? "true" : "false") +
          ", mmq_ready=" + std::string(profile.mmq_ready ? "true" : "false") +
+         ", mma_ready=" + std::string(profile.mma_ready ? "true" : "false") +
          ", m_bucket=" + InferfluxCudaDispatchBucketName(profile.m_bucket) +
          ", n_bucket=" + InferfluxCudaDispatchBucketName(profile.n_bucket) +
          ", k_bucket=" + InferfluxCudaDispatchBucketName(profile.k_bucket) +

@@ -211,7 +211,25 @@ Session handle contract:
 - `session_id` support is opt-in and only active when `session_handles.enabled=true`.
 - KV dtype stays server/model-load scoped (`runtime.cuda.kv_cache_dtype`), not per request/session.
 - `runtime.scheduler.policy` can be overridden with `INFERFLUX_SCHED_POLICY`.
-- Scheduler mixed-step env overrides: `INFERFLUX_SCHED_DECODE_BURST_TOKENS`, `INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS`, `INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO`.
+
+Gateway-fronted deployments (recommended posture when a proxy such as Sandhi fronts
+InferFlux and stamps `x-inferflux-session-id`):
+- Set `runtime.scheduler.session_handles.enabled: true` — without it the affinity header
+  is accepted but ignored, and every turn re-prefills from scratch (no session KV reuse,
+  no `prompt_tokens_details.cached_tokens` from session leases).
+- Size `max_sessions` (default 1024) for peak concurrent agent **conversations**, not
+  requests: a lease is held per session id across its turns, while many requests may
+  share one conversation. When the cap is hit, the least-recently-used **idle** lease is
+  evicted (its KV state is released); leases with an in-flight request are never evicted,
+  and if every lease is busy the new session is admitted stateless instead of blocking.
+- Idle leases expire after `ttl_ms` (default 300000 = 5 min) — a conversation idle longer
+  than the TTL loses its KV state and pays a full prefill on its next turn.
+- Expect one TCP connection per streaming call: SSE responses close the connection after
+  the stream terminates, so a gateway pays a handshake per streamed turn. Known behavior;
+  keep-alive across streams is not implemented.
+
+Scheduler mixed-step env overrides:
+- `INFERFLUX_SCHED_DECODE_BURST_TOKENS`, `INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS`, `INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO` retune the mixed-step knobs above without editing YAML.
 - Native stepwise burst env override: `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS`.
   Current sensible default for the March 27 WSL2/native CUDA burst solution is `4`.
   Use `2` for low-concurrency interactive traffic and keep `8` for explicit high-concurrency experiments only.
@@ -247,6 +265,9 @@ InferFlux CUDA KV sizing defaults:
 | Key | Default pattern | Tuning intent |
 |---|---|---|
 | `INFERFLUX_HTTP_WORKERS` | `16` | increase for high concurrency non-streaming workloads |
+| `INFERFLUX_HTTP_SEND_TIMEOUT_SEC` | `30` | socket send deadline (SO_SNDTIMEO); a stalled SSE client is cut off instead of blocking a decode worker forever — raise for very slow clients on large non-streaming responses |
+| `INFERFLUX_HTTP_RECV_TIMEOUT_SEC` | `120` | socket receive deadline (SO_RCVTIMEO); bounds idle keep-alive connections (slowloris protection) — raise for clients that upload very large request bodies slowly |
+| `INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS` | `256` | accept-queue bound; connections beyond it are closed at accept. Raise only with a matching worker count |
 
 **Performance notes**:
 - Non-streaming requests block worker threads via `future.get()` until completion
@@ -305,6 +326,12 @@ Scope contract:
 | `INFERFLUX_CUDA_STRICT` | fail model load if InferFlux CUDA runtime reports fallback |
 | `INFERFLUX_DISABLE_INFERFLUX_CUDA` | force InferFlux CUDA runtime readiness to false |
 | `INFERFLUX_CUDA_DEQUANT_CACHE_POLICY` | `runtime.cuda.dequantized_cache_policy` |
+| `INFERFLUX_CUDA_MMQ_MMA` | mma.sync int8 tensor-core MMQ family, M >= min-batch (Q4_K gate/up+QKV+o+down-proj, Q6_K down-proj); `0` reverts to the dp4a tier (`1` default) |
+| `INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` | minimum decode batch for the MMA down-proj/lm-head tier (`4` default) |
+| `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` | upper decode batch bound of the MMA tier (`16` default) |
+| `INFERFLUX_CUDA_MMQ_MMA_MAX_PREFILL_BATCH` | prefill-chunk M cap for the Q4_K MMA family (`512` default) |
+| `INFERFLUX_CUDA_WIDE_GATE_UP` | wide-load (uint4) fused gate/up MMVQ kernel for M<=8 (`1` default; `0` opts out) |
+| `INFERFLUX_CUDA_WIDE_ACCUM` | wide-load o_proj residual accumulate kernel (`1` default; `0` opts out) |
 | `INFERFLUX_CUDA_KV_MAX_BATCH` | InferFlux CUDA KV cache `max_batch` hard override |
 | `INFERFLUX_CUDA_KV_MAX_SEQ` | InferFlux CUDA KV cache `max_seq` hard override (disables seq auto-tune) |
 | `INFERFLUX_CUDA_KV_AUTO_TUNE` | enable/disable InferFlux CUDA KV seq auto-tuning (`true` default) |
@@ -320,6 +347,9 @@ Scope contract:
 | `INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST` | `runtime.backend_exposure.strict_inferflux_request` |
 | `INFERFLUX_DISABLE_STARTUP_ADVISOR` | suppress startup recommendations |
 | `INFERFLUX_HTTP_WORKERS` | HTTP server thread pool size (default: 16) |
+| `INFERFLUX_HTTP_SEND_TIMEOUT_SEC` | socket send deadline in seconds (default 30); stalled SSE clients are cut off instead of blocking a decode worker |
+| `INFERFLUX_HTTP_RECV_TIMEOUT_SEC` | socket receive deadline in seconds (default 120); bounds idle keep-alive connections |
+| `INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS` | accept-queue bound (default 256); excess connections are closed at accept |
 | `INFERCTL_API_KEY` | CLI auth token |
 
 ## 11) Startup Advisor Alignment

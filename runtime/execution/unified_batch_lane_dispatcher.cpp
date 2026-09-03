@@ -95,6 +95,7 @@ UnifiedBatchLaneDispatcher::Submit(const std::vector<UnifiedBatchInput> &inputs,
   const UnifiedBatchHandle handle = next_handle_.fetch_add(1);
   PendingState state;
   state.decode_lane = decode_lane;
+  state.enqueued_at = std::chrono::steady_clock::now();
   pending_.emplace(handle, std::move(state));
   lane_pending++;
 
@@ -158,9 +159,32 @@ std::size_t UnifiedBatchLaneDispatcher::PendingCount(bool decode_lane) const {
   return decode_lane ? pending_decode_count_ : pending_prefill_count_;
 }
 
+std::size_t UnifiedBatchLaneDispatcher::SweepAbandoned(
+    std::chrono::steady_clock::duration min_age) {
+  const auto cutoff = std::chrono::steady_clock::now() - min_age;
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::size_t reclaimed = 0;
+  for (auto it = pending_.begin(); it != pending_.end();) {
+    if (it->second.enqueued_at < cutoff) {
+      std::size_t &lane_pending = it->second.decode_lane
+                                      ? pending_decode_count_
+                                      : pending_prefill_count_;
+      if (lane_pending > 0) {
+        lane_pending--;
+      }
+      it = pending_.erase(it);
+      ++reclaimed;
+    } else {
+      ++it;
+    }
+  }
+  return reclaimed;
+}
+
 void UnifiedBatchLaneDispatcher::WorkerLoop(bool decode_lane) {
   while (true) {
     WorkItem item;
+    bool have_item = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       auto &queue = decode_lane ? decode_queue_ : prefill_queue_;
@@ -168,8 +192,21 @@ void UnifiedBatchLaneDispatcher::WorkerLoop(bool decode_lane) {
       if (stopping_ && queue.empty()) {
         return;
       }
-      item = std::move(queue.front());
-      queue.pop_front();
+      // Drop items whose pending entry was swept as abandoned: the caller
+      // already fell back and re-executed that work, and the permit was
+      // reclaimed — executing anyway double-books the lane and re-runs
+      // forwards for sequence ids that may have been re-acquired.
+      while (!queue.empty()) {
+        item = std::move(queue.front());
+        queue.pop_front();
+        if (pending_.find(item.handle) != pending_.end()) {
+          have_item = true;
+          break;
+        }
+      }
+    }
+    if (!have_item) {
+      continue;
     }
 
     ExecutionResult result;
@@ -178,6 +215,14 @@ void UnifiedBatchLaneDispatcher::WorkerLoop(bool decode_lane) {
     } catch (const std::exception &e) {
       result.success = false;
       result.error = e.what();
+      result.outputs.clear();
+    } catch (...) {
+      // A non-std exception escaping here would kill the lane worker thread
+      // permanently (and a later Start->Stop sequence would then terminate
+      // the process on reassignment of a joinable thread). Fail the batch
+      // instead.
+      result.success = false;
+      result.error = "unknown lane execution exception";
       result.outputs.clear();
     }
 

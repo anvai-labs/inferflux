@@ -3,6 +3,7 @@
 #include "runtime/backends/llama/llama_cpp_backend.h"
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -68,6 +69,15 @@ public:
 
   std::size_t PendingCount(bool decode_lane) const;
 
+  /// Reclaim abandoned pending slots: entries older than `min_age` are
+  /// erased and their lane permit released. Callers that give up on a handle
+  /// (timeout fallback in the executor) otherwise leak one lane slot per
+  /// occurrence; after `max_pending_per_lane` leaks the lane rejects all
+  /// submissions and overlap silently degrades for the process lifetime.
+  /// Safe for still-executing entries: the worker tolerates a missing
+  /// pending entry on completion.
+  std::size_t SweepAbandoned(std::chrono::steady_clock::duration min_age);
+
 private:
   struct WorkItem {
     UnifiedBatchHandle handle{0};
@@ -82,6 +92,7 @@ private:
     std::vector<UnifiedBatchOutput> outputs;
     std::string error;
     double elapsed_ms{0.0};
+    std::chrono::steady_clock::time_point enqueued_at{};
   };
 
   void WorkerLoop(bool decode_lane);
