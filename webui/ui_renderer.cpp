@@ -7,9 +7,9 @@
 namespace inferflux {
 
 std::string WebUiRenderer::RenderIndex(const std::string &backend_label) const {
-  std::string html = UiHtml();
-  litehtml::replace_placeholder(html, "{{css}}", UiCss());
-  litehtml::replace_placeholder(html, "{{js}}", UiJs());
+  std::string html = webui::UiHtml();
+  litehtml::replace_placeholder(html, "{{css}}", webui::UiCss());
+  litehtml::replace_placeholder(html, "{{js}}", webui::UiJs());
   litehtml::replace_placeholder(html, "{{backend}}", backend_label);
   return html;
 }
