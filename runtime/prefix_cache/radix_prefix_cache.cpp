@@ -126,7 +126,12 @@ bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,
     if (node->sequence_id >= 0) {
       last_seq_id = node->sequence_id;
     }
-    node->last_used = ++clock_;
+    // Relaxed atomics: Lookup runs under the SHARED lock, so the touch must
+    // not tear (previously ++clock_ and last_used were plain uint64_t — a
+    // data race with any second Lookup caller). Approximate ordering is all
+    // LRU eviction needs.
+    node->last_used.store(clock_.fetch_add(1, std::memory_order_relaxed) + 1,
+                          std::memory_order_relaxed);
   }
 
   if (result) {
@@ -203,7 +208,8 @@ void RadixPrefixCache::Insert(
       if (sequence_id >= 0)
         live_sequences_++;
 
-      leaf->last_used = ++clock_;
+      leaf->last_used.store(clock_.fetch_add(1, std::memory_order_relaxed) + 1,
+                            std::memory_order_relaxed);
       node->children[first] = std::move(leaf);
       size_++;
 
@@ -249,14 +255,15 @@ void RadixPrefixCache::Insert(
 
   node->sequence_id = sequence_id;
   node->backend = backend;
-  node->last_used = ++clock_;
+  node->last_used.store(clock_.fetch_add(1, std::memory_order_relaxed) + 1,
+                        std::memory_order_relaxed);
 }
 
 void RadixPrefixCache::CollectNodes(
     RadixNode *node, const std::function<bool(const RadixNode *)> &criteria,
     std::vector<std::pair<uint64_t, RadixNode *>> &out) const {
   if (criteria(node)) {
-    out.emplace_back(node->last_used, node);
+    out.emplace_back(node->last_used.load(std::memory_order_relaxed), node);
   }
   for (const auto &[key, child] : node->children) {
     CollectNodes(child.get(), criteria, out);

@@ -28,6 +28,7 @@ inline int inferflux_close_socket(int fd) { return ::closesocket(fd); }
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 inline int inferflux_close_socket(int fd) { return ::close(fd); }
 #endif
@@ -1357,6 +1358,42 @@ void HttpServer::Run() {
                    sizeof(nodelay));
 #endif
     }
+    // Socket deadlines: without them a stalled SSE client's kernel send
+    // buffer fills and ::send() blocks FOREVER inside the scheduler's decode
+    // worker (on_token -> SendAll), freezing token generation for every
+    // request on that worker — one remote client can halt the whole server.
+    // SO_SNDTIMEO turns that into a failed send -> SendAll returns false ->
+    // the stream is canceled. SO_RCVTIMEO bounds idle keep-alive reads so a
+    // slowloris client cannot pin a worker forever.
+    {
+      static const int send_timeout_sec = [] {
+        int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_SEND_TIMEOUT_SEC", 30);
+        return v > 0 ? v : 30;
+      }();
+      static const int recv_timeout_sec = [] {
+        int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_RECV_TIMEOUT_SEC", 120);
+        return v > 0 ? v : 120;
+      }();
+#ifdef _WIN32
+      DWORD send_tv = static_cast<DWORD>(send_timeout_sec * 1000);
+      DWORD recv_tv = static_cast<DWORD>(recv_timeout_sec * 1000);
+      ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
+                   reinterpret_cast<const char *>(&send_tv), sizeof(send_tv));
+      ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char *>(&recv_tv), sizeof(recv_tv));
+#else
+      struct timeval send_tv;
+      send_tv.tv_sec = send_timeout_sec;
+      send_tv.tv_usec = 0;
+      struct timeval recv_tv;
+      recv_tv.tv_sec = recv_timeout_sec;
+      recv_tv.tv_usec = 0;
+      ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &send_tv,
+                   sizeof(send_tv));
+      ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv,
+                   sizeof(recv_tv));
+#endif
+    }
     ClientSession session;
     session.fd = client_fd;
     if (tls_enabled_) {
@@ -1374,7 +1411,22 @@ void HttpServer::Run() {
       session.ssl = ssl;
     }
     {
-      std::lock_guard<std::mutex> lock(queue_mutex_);
+      std::unique_lock<std::mutex> lock(queue_mutex_);
+      // Bounded accept backlog: idle/slow connections must not accumulate
+      // without limit (with N workers, N stalled clients already halt
+      // request processing; an unbounded queue additionally lets a
+      // connection flood grow memory without bound). Reject by closing —
+      // the client sees a dropped connection and can retry.
+      static const std::size_t max_pending = [] {
+        int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS",
+                                       256);
+        return v > 0 ? static_cast<std::size_t>(v) : 256;
+      }();
+      if (client_queue_.size() >= max_pending) {
+        lock.unlock();
+        inferflux_close_socket(client_fd);
+        continue;
+      }
       client_queue_.push(std::move(session));
     }
     queue_cv_.notify_one();
@@ -3349,13 +3401,20 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
   }
   const char *data = wire_payload->c_str();
   std::size_t remaining = wire_payload->size();
+  // Retry cap: WANT_READ/WANT_WRITE on a socket with SO_SNDTIMEO set can
+  // otherwise spin indefinitely against a stalled peer; the deadline turns
+  // it into a bounded number of retries and then a hard failure (which the
+  // SSE on_token path converts into stream cancellation).
+  constexpr int kMaxTlsRetries = 64;
+  int tls_retries = 0;
   while (remaining > 0) {
     int sent = 0;
     if (session.ssl) {
       sent = SSL_write(session.ssl, data, static_cast<int>(remaining));
       if (sent <= 0) {
         int err = SSL_get_error(session.ssl, sent);
-        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+        if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) &&
+            tls_retries++ < kMaxTlsRetries) {
           continue;
         }
         return false;
@@ -3366,6 +3425,8 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
         if (errno == EINTR) {
           continue;
         }
+        // EAGAIN/EWOULDBLOCK here means the SO_SNDTIMEO deadline hit: the
+        // peer is not draining — fail so the caller can cancel the stream.
         return false;
       }
     }
@@ -3378,13 +3439,16 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
 ssize_t HttpServer::Receive(ClientSession &session, char *buffer,
                             std::size_t length) {
   if (session.ssl) {
+    constexpr int kMaxTlsRetries = 64;
+    int tls_retries = 0;
     while (true) {
       int received = SSL_read(session.ssl, buffer, static_cast<int>(length));
       if (received > 0) {
         return received;
       }
       int err = SSL_get_error(session.ssl, received);
-      if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+      if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) &&
+          tls_retries++ < kMaxTlsRetries) {
         continue;
       }
       return -1;

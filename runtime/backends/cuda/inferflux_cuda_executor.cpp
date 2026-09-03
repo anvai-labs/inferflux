@@ -2629,6 +2629,11 @@ InferfluxCudaExecutor::ExecuteUnifiedBatchWithOverlap(
     total_prefill_tokens += static_cast<int>(inputs[idx].tokens.size());
   }
 
+  // Reclaim lane slots abandoned by timeout fallbacks (well past the 5 s
+  // collect deadline) so leaked entries cannot permanently exhaust a lane's
+  // pending budget and silently disable overlap.
+  (void)lane_dispatcher_.SweepAbandoned(std::chrono::seconds(30));
+
   if (total_prefill_tokens < min_prefill_tokens_ || prefill_indices.empty() ||
       decode_indices.empty()) {
     // Fall back to standard execution
