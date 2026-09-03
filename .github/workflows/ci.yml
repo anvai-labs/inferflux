@@ -446,6 +446,45 @@ jobs:
         run: cmake --build build --target inferfluxd -j$(nproc)
 
   # ---------------------------------------------------------------------------
+  build-check-webui:
+    name: Build check (WebUI)
+    runs-on: ubuntu-latest
+    continue-on-error: true   # Advisory — ENABLE_WEBUI ships in releases only
+    needs: [changes]
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.shared == 'true'
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake libssl-dev libyaml-cpp-dev
+
+      # ENABLE_WEBUI=ON compiles webui/ sources that every other CI leg skips
+      # (release packaging is the only other consumer); without this leg a
+      # compile break there is invisible until a tagged release.
+      - name: Configure (ENABLE_WEBUI=ON)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF \
+            -DENABLE_SBOM=OFF \
+            -DENABLE_WEBUI=ON
+
+      - name: Build (compile-only)
+        run: cmake --build build --target inferfluxd -j$(nproc)
+
+  # ---------------------------------------------------------------------------
   # CUDA throughput gate (self-hosted GPU)
   # Runs only when explicitly enabled via repo variable:
   #   INFERFLUX_ENABLE_CUDA_THROUGHPUT_GATE=true
