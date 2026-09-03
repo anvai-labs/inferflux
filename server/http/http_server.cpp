@@ -1424,6 +1424,14 @@ void HttpServer::Run() {
       }();
       if (client_queue_.size() >= max_pending) {
         lock.unlock();
+        // The handshake already completed for TLS sessions — free the SSL
+        // object too or every rejected connection leaks its buffers (an
+        // unauthenticated flood would grow listener memory without bound,
+        // relocating the exact hazard the bound exists to stop).
+        if (session.ssl) {
+          SSL_free(session.ssl);
+          session.ssl = nullptr;
+        }
         inferflux_close_socket(client_fd);
         continue;
       }
@@ -3401,12 +3409,19 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
   }
   const char *data = wire_payload->c_str();
   std::size_t remaining = wire_payload->size();
-  // Retry cap: WANT_READ/WANT_WRITE on a socket with SO_SNDTIMEO set can
-  // otherwise spin indefinitely against a stalled peer; the deadline turns
-  // it into a bounded number of retries and then a hard failure (which the
-  // SSE on_token path converts into stream cancellation).
-  constexpr int kMaxTlsRetries = 64;
-  int tls_retries = 0;
+  // WALL-CLOCK deadline for TLS retries: on a blocking socket BIO an
+  // SO_SNDTIMEO expiry surfaces as WANT_WRITE from SSL_write, and each
+  // retry blocks another full send-timeout — a retry COUNT alone would
+  // multiply the intended deadline by the cap (64 x 30s ~ 32 minutes with
+  // SendAll running on a scheduler decode worker). Bound the total time
+  // instead; plain sockets get the deadline directly from the kernel.
+  static const int send_timeout_sec = [] {
+    int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_SEND_TIMEOUT_SEC", 30);
+    return v > 0 ? v : 30;
+  }();
+  const auto deadline =
+      std::chrono::steady_clock::now() +
+      std::chrono::seconds(static_cast<long long>(send_timeout_sec));
   while (remaining > 0) {
     int sent = 0;
     if (session.ssl) {
@@ -3414,7 +3429,7 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
       if (sent <= 0) {
         int err = SSL_get_error(session.ssl, sent);
         if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) &&
-            tls_retries++ < kMaxTlsRetries) {
+            std::chrono::steady_clock::now() < deadline) {
           continue;
         }
         return false;
@@ -3439,8 +3454,16 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
 ssize_t HttpServer::Receive(ClientSession &session, char *buffer,
                             std::size_t length) {
   if (session.ssl) {
-    constexpr int kMaxTlsRetries = 64;
-    int tls_retries = 0;
+    // Same wall-clock bound as SendAll: a retry count would multiply the
+    // recv deadline by the cap (64 x 120s ~ 2.1 hours pinning an HTTP
+    // worker on an idle TLS keep-alive connection).
+    static const int recv_timeout_sec = [] {
+      int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_RECV_TIMEOUT_SEC", 120);
+      return v > 0 ? v : 120;
+    }();
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::seconds(static_cast<long long>(recv_timeout_sec));
     while (true) {
       int received = SSL_read(session.ssl, buffer, static_cast<int>(length));
       if (received > 0) {
@@ -3448,7 +3471,7 @@ ssize_t HttpServer::Receive(ClientSession &session, char *buffer,
       }
       int err = SSL_get_error(session.ssl, received);
       if ((err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) &&
-          tls_retries++ < kMaxTlsRetries) {
+          std::chrono::steady_clock::now() < deadline) {
         continue;
       }
       return -1;

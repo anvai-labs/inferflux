@@ -839,6 +839,32 @@ std::size_t Scheduler::CountCompatiblePendingDecodeLocked(
   return compatible;
 }
 
+// Fail every queued request with an error result. Called when a worker loop
+// dies by exception: without this, requests still in the pending queues hang
+// forever (their futures are only satisfied inside the worker loops) and the
+// HTTP workers block in future.get() — wedging the whole HTTP surface.
+void Scheduler::FailAllQueuedLocked() {
+  auto fail = [](const std::shared_ptr<PendingRequest> &pending) {
+    if (!pending || !pending->promise_valid) {
+      return;
+    }
+    InferenceResult result;
+    result.completion.clear();
+    result.no_backend = true; // surfaces as the standard 503-style failure
+    pending->promise.set_value(std::move(result));
+    pending->promise_valid = false;
+  };
+  for (auto &pending : pending_prefill_) {
+    fail(pending);
+  }
+  pending_prefill_.clear();
+  for (auto &pending : pending_decode_) {
+    fail(pending);
+  }
+  pending_decode_.clear();
+  UpdateQueueDepthLocked();
+}
+
 void Scheduler::DecodeWorkerLoop() {
   // Exception envelope: an escapee (e.g. bad_alloc on a huge request) would
   // call std::terminate and take the whole server down; every other worker
@@ -1471,6 +1497,12 @@ void Scheduler::DecodeWorkerLoop() {
                    e.what());
   } catch (...) {
     log::Error("scheduler", "DecodeWorkerLoop terminated by unknown exception");
+  }
+  // The loop is dead — satisfy every queued future so HTTP callers get an
+  // error instead of hanging forever.
+  {
+    std::lock_guard<std::mutex> lock(queue_mutex_);
+    FailAllQueuedLocked();
   }
 }
 
@@ -2135,8 +2167,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                   session_handle_manager_->DiscardLeasedState(inf.session_id);
                 }
                 FreeSeqSlot(seq_id, seq_generation, pending->resolved_backend);
-              } else if (cache_) {
-                cache_->ReleaseBlocks(new_blocks);
+              } else {
+                if (cache_) {
+                  cache_->ReleaseBlocks(new_blocks);
+                }
+                // Non-session path: also free the sequence slot — the
+                // backend sequence was allocated for this request and a
+                // double failure (phased step AND full-prefill fallback)
+                // previously leaked it.
+                FreeSeqSlot(seq_id, seq_generation, pending->resolved_backend);
               }
               inf.block_table.clear();
               ResetSequenceLease(&inf);

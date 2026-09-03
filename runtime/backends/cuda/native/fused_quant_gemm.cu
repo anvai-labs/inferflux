@@ -2681,7 +2681,9 @@ bool FusedQuantGemm::FusedGateUpSiluGemvQ8_1(
 
   // Wide-load variant at M=1: uint4 weight slices lift the incumbent from
   // 68% to 95% DRAM (ncu cold: 109.1us -> 78.2us at the memory wall).
-  // Opt-in until the c1 A/B confirms end to end.
+  // DEFAULT ON (the c1 A/B confirmed end to end: kernel-exact on random
+  // data, c1 ratio 0.77 -> 0.85); set INFERFLUX_CUDA_WIDE_GATE_UP=0 to
+  // opt out.
   static const bool wide_enabled = [] {
     const char *raw = std::getenv("INFERFLUX_CUDA_WIDE_GATE_UP");
     return !raw || !(std::string(raw) == "0" || std::string(raw) == "false");

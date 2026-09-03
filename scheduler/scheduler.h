@@ -153,6 +153,9 @@ private:
   struct PendingRequest {
     InferenceRequest inference;
     std::promise<InferenceResult> promise;
+    // True until the promise is satisfied; guards double set_value when a
+    // dying worker loop drains the queues (FailAllQueuedLocked).
+    bool promise_valid{true};
     std::chrono::steady_clock::time_point enqueue_time;
     int priority{0};
     int priority_level{0};
@@ -173,6 +176,7 @@ private:
   void StartDecodeWorkers();
   void StopDecodeWorkers();
   void ApplyFairness(BatchSelection *selection);
+  void FailAllQueuedLocked();
   void UpdateQueueDepthLocked() const;
   void
   ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>> &batch);
