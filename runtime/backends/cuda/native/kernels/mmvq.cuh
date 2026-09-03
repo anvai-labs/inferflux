@@ -286,10 +286,11 @@ __global__ void inferflux_mmvq_q4k_bias(const block_q4_k *__restrict__ weight,
 // uint4 weight loads, per-lane scale decode, no shuffles. The incumbent
 // runs 23.1us at M=1 (3.5x floor) on the same 4B-load L1TEX stalls.
 template <int ncols, typename OutputT, bool UseAtomic>
-__global__ void inferflux_mmvq_q4k_accum_wide(
-    const block_q4_k *__restrict__ weight,
-    const block_q8_1 *__restrict__ act_q8_1, OutputT *__restrict__ output,
-    int N, int K, int M) {
+__global__ void
+inferflux_mmvq_q4k_accum_wide(const block_q4_k *__restrict__ weight,
+                              const block_q8_1 *__restrict__ act_q8_1,
+                              OutputT *__restrict__ output, int N, int K,
+                              int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -299,8 +300,8 @@ __global__ void inferflux_mmvq_q4k_accum_wide(
     return;
 
   const int num_super_blocks = K / QK_K;
-  const block_q4_k *wrow = weight + static_cast<size_t>(out_idx) *
-                                       num_super_blocks;
+  const block_q4_k *wrow =
+      weight + static_cast<size_t>(out_idx) * num_super_blocks;
   const int num_q8_per_row = K / QK8_1;
   const int s = lane & 7;
   const int blk_in_warp = lane >> 3;
@@ -337,8 +338,8 @@ __global__ void inferflux_mmvq_q4k_accum_wide(
       const int row = col_base + c;
       if (row >= M)
         break;
-      const block_q8_1 *a_row = act_q8_1 +
-                                static_cast<size_t>(row) * num_q8_per_row;
+      const block_q8_1 *a_row =
+          act_q8_1 + static_cast<size_t>(row) * num_q8_per_row;
       const block_q8_1 &a_lo = a_row[blk * 8 + pair * 2];
       const block_q8_1 &a_hi = a_row[blk * 8 + pair * 2 + 1];
       const int *x_lo = reinterpret_cast<const int *>(&a_lo.qs[x_off]);
@@ -1356,60 +1357,74 @@ inferflux_mmvq_q4k_group(PackedProjectionGroupParams<block_q4_k, nprojs> params,
 
   float acc[nprojs][ncols] = {};
 
+  // Loop structure (review finding): the weight block depends only on
+  // (blk, p) and the activation block only on (blk, c) — stage each once.
+  // The previous nest (for c { for p }) re-read the weight block once per
+  // column: ncols=8, nprojs=3 fetched 24 blocks per blk where 3 suffice,
+  // all L1 hits but paying the L1TEX scoreboard stalls ncu attributed to
+  // this path. Per-(blk,c,p) arithmetic is UNCHANGED — same dp4a inputs,
+  // same accumulation order.
   for (int blk = warp_id; blk < num_super_blocks; blk += kMmvqWarps) {
-    // Inner loop over batch columns — load activation once per column
+    // Stage activations for all live columns
+    int x_lo4s[ncols], x_hi4s[ncols];
+    float d8_los[ncols], d8_his[ncols];
+    float s_los[ncols], s_his[ncols];
 #pragma unroll
     for (int c = 0; c < ncols; ++c) {
       const int row = col_base + c;
       if (row >= M)
         break;
-
       const block_q8_1 *a_row = act_q8_1 + row * num_q8_per_row;
       const block_q8_1 &a_lo = a_row[blk * 8 + pair * 2];
       const block_q8_1 &a_hi = a_row[blk * 8 + pair * 2 + 1];
-      const int x_lo4 = *reinterpret_cast<const int *>(&a_lo.qs[offs]);
-      const int x_hi4 = *reinterpret_cast<const int *>(&a_hi.qs[offs]);
-      float d8_lo = __half2float(__low2half(a_lo.ds));
-      float d8_hi = __half2float(__low2half(a_hi.ds));
-      float s_lo = __half2float(__high2half(a_lo.ds));
-      float s_hi = __half2float(__high2half(a_hi.ds));
+      x_lo4s[c] = *reinterpret_cast<const int *>(&a_lo.qs[offs]);
+      x_hi4s[c] = *reinterpret_cast<const int *>(&a_hi.qs[offs]);
+      d8_los[c] = __half2float(__low2half(a_lo.ds));
+      d8_his[c] = __half2float(__low2half(a_hi.ds));
+      s_los[c] = __half2float(__high2half(a_lo.ds));
+      s_his[c] = __half2float(__high2half(a_hi.ds));
+    }
 
-      // Loop over projections — each reads its own weight row
 #pragma unroll
-      for (int p = 0; p < nprojs; ++p) {
-        if (out_idx >= params.output_cols[p])
-          continue;
+    for (int p = 0; p < nprojs; ++p) {
+      if (out_idx >= params.output_cols[p])
+        continue;
 
-        const block_q4_k *wrow = params.weights[p] + out_idx * num_super_blocks;
-        const block_q4_k &b = wrow[blk];
-        const float d =
-            __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
-        const float dmin =
-            __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
+      const block_q4_k *wrow = params.weights[p] + out_idx * num_super_blocks;
+      const block_q4_k &b = wrow[blk];
+      const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+      const float dmin =
+          __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
 
-        unsigned char sc_lo, m_lo, sc_hi, m_hi;
+      unsigned char sc_lo, m_lo, sc_hi, m_hi;
+      if ((lane & 7) == 0) {
+        get_scale_min_k4(pair * 2, b.scales, &sc_lo, &m_lo);
+        get_scale_min_k4(pair * 2 + 1, b.scales, &sc_hi, &m_hi);
+      }
+      sc_lo = __shfl_sync(0xFFFFFFFF, sc_lo, group_leader);
+      m_lo = __shfl_sync(0xFFFFFFFF, m_lo, group_leader);
+      sc_hi = __shfl_sync(0xFFFFFFFF, sc_hi, group_leader);
+      m_hi = __shfl_sync(0xFFFFFFFF, m_hi, group_leader);
+
+      int qs4 = __ldg(reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
+      int q_lo4 = qs4 & 0x0F0F0F0F;
+      int q_hi4 = (qs4 >> 4) & 0x0F0F0F0F;
+
+#pragma unroll
+      for (int c = 0; c < ncols; ++c) {
+        const int row = col_base + c;
+        if (row >= M)
+          break;
+        int dot_lo = Dp4aS8(q_lo4, x_lo4s[c], 0);
+        int dot_hi = Dp4aS8(q_hi4, x_hi4s[c], 0);
+
+        acc[p][c] += d * static_cast<float>(sc_lo) * d8_los[c] *
+                         static_cast<float>(dot_lo) +
+                     d * static_cast<float>(sc_hi) * d8_his[c] *
+                         static_cast<float>(dot_hi);
         if ((lane & 7) == 0) {
-          get_scale_min_k4(pair * 2, b.scales, &sc_lo, &m_lo);
-          get_scale_min_k4(pair * 2 + 1, b.scales, &sc_hi, &m_hi);
-        }
-        sc_lo = __shfl_sync(0xFFFFFFFF, sc_lo, group_leader);
-        m_lo = __shfl_sync(0xFFFFFFFF, m_lo, group_leader);
-        sc_hi = __shfl_sync(0xFFFFFFFF, sc_hi, group_leader);
-        m_hi = __shfl_sync(0xFFFFFFFF, m_hi, group_leader);
-
-        int qs4 = __ldg(reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
-        int q_lo4 = qs4 & 0x0F0F0F0F;
-        int q_hi4 = (qs4 >> 4) & 0x0F0F0F0F;
-
-        int dot_lo = Dp4aS8(q_lo4, x_lo4, 0);
-        int dot_hi = Dp4aS8(q_hi4, x_hi4, 0);
-
-        acc[p][c] +=
-            d * static_cast<float>(sc_lo) * d8_lo * static_cast<float>(dot_lo) +
-            d * static_cast<float>(sc_hi) * d8_hi * static_cast<float>(dot_hi);
-        if ((lane & 7) == 0) {
-          acc[p][c] -= dmin * static_cast<float>(m_lo) * s_lo +
-                       dmin * static_cast<float>(m_hi) * s_hi;
+          acc[p][c] -= dmin * static_cast<float>(m_lo) * s_los[c] +
+                       dmin * static_cast<float>(m_hi) * s_his[c];
         }
       }
     }
@@ -1491,48 +1506,58 @@ inferflux_mmvq_q6k_group(PackedProjectionGroupParams<block_q6_k, nprojs> params,
 
   float acc[nprojs][ncols] = {};
 
+  // Same hoist as the q4k group kernel: the weight block depends only on
+  // (blk, p); stage the activations for all columns once per blk instead of
+  // re-reading weights per column. Per-(blk,c,p) arithmetic unchanged.
   for (int blk = warp_id; blk < num_super_blocks; blk += kMmvqWarps) {
+    int x_los[ncols], x_his[ncols];
+    float d8_los[ncols], d8_his[ncols];
 #pragma unroll
     for (int c = 0; c < ncols; ++c) {
       const int row = col_base + c;
       if (row >= M)
         break;
-
       const block_q8_1 *a_row = act_q8_1 + row * num_q8_per_row;
       const block_q8_1 &a_lo = a_row[blk * 8 + g * 4 + sub_base];
       const block_q8_1 &a_hi = a_row[blk * 8 + g * 4 + sub_base + 2];
-      const int x_lo = LoadPackedInt32Unaligned(&a_lo.qs[e_base]);
-      const int x_hi = LoadPackedInt32Unaligned(&a_hi.qs[e_base]);
-      float d8_lo = __half2float(__low2half(a_lo.ds));
-      float d8_hi = __half2float(__low2half(a_hi.ds));
+      x_los[c] = LoadPackedInt32Unaligned(&a_lo.qs[e_base]);
+      x_his[c] = LoadPackedInt32Unaligned(&a_hi.qs[e_base]);
+      d8_los[c] = __half2float(__low2half(a_lo.ds));
+      d8_his[c] = __half2float(__low2half(a_hi.ds));
+    }
 
 #pragma unroll
-      for (int p = 0; p < nprojs; ++p) {
-        if (out_idx >= params.output_cols[p])
-          continue;
+    for (int p = 0; p < nprojs; ++p) {
+      if (out_idx >= params.output_cols[p])
+        continue;
 
-        const block_q6_k *wrow = params.weights[p] + out_idx * num_super_blocks;
-        const block_q6_k &b = wrow[blk];
-        const float d =
-            __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+      const block_q6_k *wrow = params.weights[p] + out_idx * num_super_blocks;
+      const block_q6_k &b = wrow[blk];
+      const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
 
-        const int ql4 =
-            LoadPackedInt32Unaligned(&b.ql[g * 64 + sub_base * 32 + e_base]);
-        const int qh4 = LoadPackedInt32Unaligned(&b.qh[g * 32 + e_base]);
+      const int ql4 =
+          LoadPackedInt32Unaligned(&b.ql[g * 64 + sub_base * 32 + e_base]);
+      const int qh4 = LoadPackedInt32Unaligned(&b.qh[g * 32 + e_base]);
 
-        int vl_lo = ql4 & 0x0F0F0F0F;
-        int vh_lo = ((qh4 >> qh_shift_lo) << 4) & 0x30303030;
-        int vi_lo = Vsubss4(vl_lo | vh_lo, 0x20202020);
-        int dot_lo = Dp4aS8(vi_lo, x_lo, 0);
+      int vl_lo = ql4 & 0x0F0F0F0F;
+      int vh_lo = ((qh4 >> qh_shift_lo) << 4) & 0x30303030;
+      int vi_lo = Vsubss4(vl_lo | vh_lo, 0x20202020);
 
-        int vl_hi = (ql4 >> 4) & 0x0F0F0F0F;
-        int vh_hi = ((qh4 >> qh_shift_hi) << 4) & 0x30303030;
-        int vi_hi = Vsubss4(vl_hi | vh_hi, 0x20202020);
-        int dot_hi = Dp4aS8(vi_hi, x_hi, 0);
+      int vl_hi = (ql4 >> 4) & 0x0F0F0F0F;
+      int vh_hi = ((qh4 >> qh_shift_hi) << 4) & 0x30303030;
+      int vi_hi = Vsubss4(vl_hi | vh_hi, 0x20202020);
 
-        acc[p][c] += d * (static_cast<float>(b.scales[sc_lo]) * d8_lo *
+#pragma unroll
+      for (int c = 0; c < ncols; ++c) {
+        const int row = col_base + c;
+        if (row >= M)
+          break;
+        int dot_lo = Dp4aS8(vi_lo, x_los[c], 0);
+        int dot_hi = Dp4aS8(vi_hi, x_his[c], 0);
+
+        acc[p][c] += d * (static_cast<float>(b.scales[sc_lo]) * d8_los[c] *
                               static_cast<float>(dot_lo) +
-                          static_cast<float>(b.scales[sc_hi]) * d8_hi *
+                          static_cast<float>(b.scales[sc_hi]) * d8_his[c] *
                               static_cast<float>(dot_hi));
       }
     }
@@ -1831,17 +1856,17 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu_wide(
 
   const int num_super_blocks = K / QK_K;
   const int num_q8_per_row = K / QK8_1;
-  const int s = lane & 7;        // 16B slice within a super-block
+  const int s = lane & 7;            // 16B slice within a super-block
   const int blk_in_warp = lane >> 3; // super-block within this warp's quartet
-  const int pair = s >> 1;       // k4 scale pair (32 values per 16B slice x2)
+  const int pair = s >> 1; // k4 scale pair (32 values per 16B slice x2)
 
   float gate_acc[ncols] = {};
   float up_acc[ncols] = {};
 
-  const block_q4_k *grow = gate_weight + static_cast<size_t>(out_idx) *
-                                            num_super_blocks;
-  const block_q4_k *urow = up_weight + static_cast<size_t>(out_idx) *
-                                           num_super_blocks;
+  const block_q4_k *grow =
+      gate_weight + static_cast<size_t>(out_idx) * num_super_blocks;
+  const block_q4_k *urow =
+      up_weight + static_cast<size_t>(out_idx) * num_super_blocks;
 
   for (int qbase = warp_id * 4; qbase < num_super_blocks;
        qbase += 4 * kMmvqWarps) {
@@ -1853,8 +1878,8 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu_wide(
         const int row = col_base + c;
         if (row >= M)
           break;
-        const block_q8_1 *a_row = act_q8_1 +
-                                  static_cast<size_t>(row) * num_q8_per_row;
+        const block_q8_1 *a_row =
+            act_q8_1 + static_cast<size_t>(row) * num_q8_per_row;
         const block_q8_1 &a_lo = a_row[blk * 8 + pair * 2];
         const block_q8_1 &a_hi = a_row[blk * 8 + pair * 2 + 1];
         const int *x_lo = reinterpret_cast<const int *>(&a_lo.qs[x_off]);
@@ -1888,11 +1913,10 @@ __global__ void inferflux_mmvq_q4k_fused_gate_up_silu_wide(
           acc_lo += Dp4aS8((qs4.w) & 0x0F0F0F0F, x_lo[3], 0);
           acc_hi += Dp4aS8((qs4.w >> 4) & 0x0F0F0F0F, x_hi[3], 0);
 
-          float acc_f =
-              d * static_cast<float>(sc_lo) * d8_lo *
-                  static_cast<float>(acc_lo) +
-              d * static_cast<float>(sc_hi) * d8_hi *
-                  static_cast<float>(acc_hi);
+          float acc_f = d * static_cast<float>(sc_lo) * d8_lo *
+                            static_cast<float>(acc_lo) +
+                        d * static_cast<float>(sc_hi) * d8_hi *
+                            static_cast<float>(acc_hi);
           if ((s & 1) == 0) {
             // dmin correction once per (block, pair): the two q8 blocks'
             // sum fields cover this slice's 32 values.
