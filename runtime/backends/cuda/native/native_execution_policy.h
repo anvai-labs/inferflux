@@ -68,15 +68,26 @@ struct NativeExecutionPolicy {
   bool enable_experimental_q81_grouped_mmq3{true};
   bool enable_downproj_mmq{false};
   int downproj_mmq_min_batch_override{-1};
-  // mma.sync Q6_K down-projection (S7): int8 tensor-core MMQ with
-  // deterministic K-split. Default off; A/B gate pending. When on, the
-  // down-proj MMQ tier prefers the MMA kernel for Q6_K weights.
-  bool enable_mmq_mma{false};
+  // mma.sync int8 tensor-core MMQ family (S7/S8): Q4_K gate/up+QKV+o
+  // and Q6_K down-proj at M >= 2. Default ON — interleaved 3-round c16
+  // A/B: +22/+31/+22% tok/s, ratio vs llama 0.62->0.84 / 0.71->0.87 /
+  // 0.68->0.76, zero classified failures.
+  bool enable_mmq_mma{true};
   // MMA only wins where the dp4a MMVQ tier stops being at the bandwidth
   // floor: measured -13% at c4 (M=4) vs the incumbent MMVQ, so the floor
   // M is 9 (the same batch range the dp4a MMQ threshold targets).
-  int mmq_mma_min_batch{9};
+  // Q6_K MMA floor. Rig (benchmark_q6k_kernels, N=2048 K=11008): at M=4 the
+  // MMA kernel is ~1.6x and at M=8 ~4x faster than the best MMVQ variant
+  // (62us vs 102us, 48us vs 190us warm; MMA sits at the ~51us bandwidth
+  // floor at s=6). A/B at c8 decode: +15% tok/s. Below M=4 the row-quad
+  // family stays competitive with MMA's fixed launch/quantize overhead.
+  int mmq_mma_min_batch{4};
   int mmq_mma_max_batch{16};
+  // Prefill M ceiling for the MMA family (S12): prefill chunks (default
+  // chunked_prefill=512) run the grouped dp4a path at 422us/call without
+  // this. Decode keeps the 16 cap; larger M uses splits=1 (the heuristic
+  // counts y-tiles), so the partials buffer stays decode-sized.
+  int mmq_mma_max_prefill_batch{512};
   bool use_vectorized_loads{false};
   bool enable_fused_gate_up_silu{true};
   bool enable_adaptive_mmvq_threads{true};
@@ -93,6 +104,7 @@ struct NativeExecutionPolicy {
   bool enable_fused_gemv_norm_quant_epilogue{true}; // P2: validated
   bool enable_mmvq_bias_epilogue{false};            // P3
   bool enable_q6k_vectorized{false};                // P4
+  bool disable_q6k_vectorized{false};               // P4 rollback
   bool enable_gate_up_silu_q81_epilogue{false};     // P5
 
   // Precision: keep residual stream in FP32 to match llama.cpp numerical
@@ -184,11 +196,13 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_DOWNPROJ_MMQ", false);
     policy.downproj_mmq_min_batch_override =
         ParseIntEnv("INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH", -1, 1, 64);
-    policy.enable_mmq_mma = ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", false);
+    policy.enable_mmq_mma = ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA", true);
     policy.mmq_mma_min_batch =
-        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 9, 1, 64);
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH", 4, 1, 512);
     policy.mmq_mma_max_batch =
         ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH", 16, 1, 64);
+    policy.mmq_mma_max_prefill_batch =
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_MAX_PREFILL_BATCH", 512, 1, 512);
     policy.use_vectorized_loads =
         ParseBoolEnv("INFERFLUX_USE_VECTORIZED_LOADS", false);
     policy.enable_fused_gate_up_silu =
@@ -215,6 +229,8 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_MMVQ_BIAS_EPILOGUE", false);
     policy.enable_q6k_vectorized =
         ParseBoolEnv("INFERFLUX_ENABLE_Q6K_VECTORIZED", false);
+    policy.disable_q6k_vectorized =
+        ParseBoolEnv("INFERFLUX_DISABLE_Q6K_VECTORIZED", false);
     policy.enable_gate_up_silu_q81_epilogue =
         ParseBoolEnv("INFERFLUX_ENABLE_GATE_UP_SILU_Q81_EPILOGUE", false);
     policy.enable_fp32_residual =

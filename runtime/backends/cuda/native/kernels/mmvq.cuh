@@ -280,6 +280,133 @@ __global__ void inferflux_mmvq_q4k_bias(const block_q4_k *__restrict__ weight,
 // UseAtomic = true (default): use atomicAdd for FP32 output (safe for residual
 // accumulation) UseAtomic = false: direct write (faster, only safe when no race
 // conditions)
+// Wide-load variant of the Q4_K accumulator (o_proj residual path):
+// same 16B-per-lane mapping as the wide fused gate+up kernel — lanes 0-7
+// cover a super-block's 128 qs bytes, lanes 8-31 the next three blocks,
+// uint4 weight loads, per-lane scale decode, no shuffles. The incumbent
+// runs 23.1us at M=1 (3.5x floor) on the same 4B-load L1TEX stalls.
+template <int ncols, typename OutputT, bool UseAtomic>
+__global__ void inferflux_mmvq_q4k_accum_wide(
+    const block_q4_k *__restrict__ weight,
+    const block_q8_1 *__restrict__ act_q8_1, OutputT *__restrict__ output,
+    int N, int K, int M) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x;
+  const int col_base = blockIdx.y * ncols;
+  if (out_idx >= N)
+    return;
+
+  const int num_super_blocks = K / QK_K;
+  const block_q4_k *wrow = weight + static_cast<size_t>(out_idx) *
+                                       num_super_blocks;
+  const int num_q8_per_row = K / QK8_1;
+  const int s = lane & 7;
+  const int blk_in_warp = lane >> 3;
+  const int pair = s >> 1;
+
+  float acc[ncols] = {};
+
+  for (int qbase = warp_id * 4; qbase < num_super_blocks;
+       qbase += 4 * kMmvqWarps) {
+    const int blk = qbase + blk_in_warp;
+    if (blk >= num_super_blocks)
+      continue;
+    const block_q4_k &b = wrow[blk];
+    const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+    const float dmin =
+        __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
+    unsigned char sc_lo, m_lo, sc_hi, m_hi;
+    get_scale_min_k4(pair * 2, b.scales, &sc_lo, &m_lo);
+    get_scale_min_k4(pair * 2 + 1, b.scales, &sc_hi, &m_hi);
+
+    const uint4 qs4 = *reinterpret_cast<const uint4 *>(&b.qs[s * 16]);
+    const int q_lo0 = qs4.x & 0x0F0F0F0F;
+    const int q_hi0 = (qs4.x >> 4) & 0x0F0F0F0F;
+    const int q_lo1 = qs4.y & 0x0F0F0F0F;
+    const int q_hi1 = (qs4.y >> 4) & 0x0F0F0F0F;
+    const int q_lo2 = qs4.z & 0x0F0F0F0F;
+    const int q_hi2 = (qs4.z >> 4) & 0x0F0F0F0F;
+    const int q_lo3 = qs4.w & 0x0F0F0F0F;
+    const int q_hi3 = (qs4.w >> 4) & 0x0F0F0F0F;
+
+    const int x_off = (s & 1) * 16;
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row >= M)
+        break;
+      const block_q8_1 *a_row = act_q8_1 +
+                                static_cast<size_t>(row) * num_q8_per_row;
+      const block_q8_1 &a_lo = a_row[blk * 8 + pair * 2];
+      const block_q8_1 &a_hi = a_row[blk * 8 + pair * 2 + 1];
+      const int *x_lo = reinterpret_cast<const int *>(&a_lo.qs[x_off]);
+      const int *x_hi = reinterpret_cast<const int *>(&a_hi.qs[x_off]);
+      const float d8_lo = __half2float(__low2half(a_lo.ds));
+      const float d8_hi = __half2float(__low2half(a_hi.ds));
+
+      int dot_lo = Dp4aS8(q_lo0, x_lo[0], 0);
+      int dot_hi = Dp4aS8(q_hi0, x_hi[0], 0);
+      dot_lo = Dp4aS8(q_lo1, x_lo[1], dot_lo);
+      dot_hi = Dp4aS8(q_hi1, x_hi[1], dot_hi);
+      dot_lo = Dp4aS8(q_lo2, x_lo[2], dot_lo);
+      dot_hi = Dp4aS8(q_hi2, x_hi[2], dot_hi);
+      dot_lo = Dp4aS8(q_lo3, x_lo[3], dot_lo);
+      dot_hi = Dp4aS8(q_hi3, x_hi[3], dot_hi);
+
+      acc[c] += d * static_cast<float>(sc_lo) * d8_lo * dot_lo +
+                d * static_cast<float>(sc_hi) * d8_hi * dot_hi;
+      if ((s & 1) == 0) {
+        const float s_lo = __half2float(__high2half(a_lo.ds));
+        const float s_hi = __half2float(__high2half(a_hi.ds));
+        acc[c] -= dmin * static_cast<float>(m_lo) * s_lo +
+                  dmin * static_cast<float>(m_hi) * s_hi;
+      }
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < ncols; ++c) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
+    }
+  }
+
+  __shared__ float warp_sums[kMmvqWarps * ncols];
+  if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+    // blockDim may be smaller than kMmvqWarps (work-aware launch): only
+    // the resident warps wrote their slots — combining the rest reads
+    // uninitialized shared memory.
+    const int num_warps = blockDim.x >> 5;
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row >= M)
+        break;
+      float sum = 0.0f;
+      for (int w = 0; w < num_warps; ++w)
+        sum += warp_sums[c * kMmvqWarps + w];
+      if constexpr (std::is_same_v<OutputT, float>) {
+        if constexpr (UseAtomic) {
+          atomicAdd(&output[row * N + out_idx], sum);
+        } else {
+          output[row * N + out_idx] = sum;
+        }
+      } else {
+        output[row * N + out_idx] = static_cast<half>(sum);
+      }
+    }
+  }
+}
+
 template <int ncols, typename OutputT = half, bool UseAtomic = true>
 __global__ void
 inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
@@ -1677,6 +1804,151 @@ bool DispatchMmvqTriple(const void *data0, const void *data1, const void *data2,
 //
 // Output is FP16 (requires separate Q8_1 quantize before down_proj GEMV).
 // ============================================================================
+
+// Wide-load variant of the fused gate+up+SiLU MMVQ: each lane covers a
+// full 16-byte weight slice (uint4) of one super-block — 4x fewer weight
+// load instructions than the 4B-per-lane incumbent, which ncu shows
+// stalling 61% on L1TEX scoreboard with only 0.95 eligible warps per
+// scheduler cycle. Lanes 0-7 cover one super-block's 128 qs bytes;
+// lanes 8-31 cover the next three super-blocks, so a warp processes
+// four blocks per iteration with independent loads in flight. Scales
+// decode per lane (no shuffles). Activation loads stay 4B — they are
+// L2-resident and misalignment-blocked by the q8 block layout.
+// Nibble math is identical to the incumbent (lo nibble = even sub-block,
+// hi = odd, per byte b: sub 2*(b/32) lo / 2*(b/32)+1 hi, value b%32).
+template <int ncols>
+__global__ void inferflux_mmvq_q4k_fused_gate_up_silu_wide(
+    const block_q4_k *__restrict__ gate_weight,
+    const block_q4_k *__restrict__ up_weight,
+    const block_q8_1 *__restrict__ act_q8_1, half *__restrict__ output, int N,
+    int K, int M) {
+  const int lane = threadIdx.x & 31;
+  const int warp_id = threadIdx.x >> 5;
+  const int out_idx = blockIdx.x;
+  const int col_base = blockIdx.y * ncols;
+  if (out_idx >= N)
+    return;
+
+  const int num_super_blocks = K / QK_K;
+  const int num_q8_per_row = K / QK8_1;
+  const int s = lane & 7;        // 16B slice within a super-block
+  const int blk_in_warp = lane >> 3; // super-block within this warp's quartet
+  const int pair = s >> 1;       // k4 scale pair (32 values per 16B slice x2)
+
+  float gate_acc[ncols] = {};
+  float up_acc[ncols] = {};
+
+  const block_q4_k *grow = gate_weight + static_cast<size_t>(out_idx) *
+                                            num_super_blocks;
+  const block_q4_k *urow = up_weight + static_cast<size_t>(out_idx) *
+                                           num_super_blocks;
+
+  for (int qbase = warp_id * 4; qbase < num_super_blocks;
+       qbase += 4 * kMmvqWarps) {
+    const int blk = qbase + blk_in_warp;
+    if (blk < num_super_blocks) {
+      const int x_off = (s & 1) * 16; // byte within each 32-value q8 block
+#pragma unroll
+      for (int c = 0; c < ncols; ++c) {
+        const int row = col_base + c;
+        if (row >= M)
+          break;
+        const block_q8_1 *a_row = act_q8_1 +
+                                  static_cast<size_t>(row) * num_q8_per_row;
+        const block_q8_1 &a_lo = a_row[blk * 8 + pair * 2];
+        const block_q8_1 &a_hi = a_row[blk * 8 + pair * 2 + 1];
+        const int *x_lo = reinterpret_cast<const int *>(&a_lo.qs[x_off]);
+        const int *x_hi = reinterpret_cast<const int *>(&a_hi.qs[x_off]);
+        const float d8_lo = __half2float(__low2half(a_lo.ds));
+        const float d8_hi = __half2float(__low2half(a_hi.ds));
+
+#pragma unroll
+        for (int mat = 0; mat < 2; ++mat) {
+          const block_q4_k &b = mat ? urow[blk] : grow[blk];
+          const float d =
+              __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+          const float dmin =
+              __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
+          unsigned char sc_lo, m_lo, sc_hi, m_hi;
+          get_scale_min_k4(pair * 2, b.scales, &sc_lo, &m_lo);
+          get_scale_min_k4(pair * 2 + 1, b.scales, &sc_hi, &m_hi);
+
+          const uint4 qs4 = *reinterpret_cast<const uint4 *>(&b.qs[s * 16]);
+          // Lo/hi nibbles belong to DIFFERENT sub-blocks with different
+          // scales — accumulate their dots separately and scale each by
+          // its own factor (the incumbent's per-pair structure).
+          int acc_lo = 0;
+          int acc_hi = 0;
+          acc_lo += Dp4aS8((qs4.x) & 0x0F0F0F0F, x_lo[0], 0);
+          acc_hi += Dp4aS8((qs4.x >> 4) & 0x0F0F0F0F, x_hi[0], 0);
+          acc_lo += Dp4aS8((qs4.y) & 0x0F0F0F0F, x_lo[1], 0);
+          acc_hi += Dp4aS8((qs4.y >> 4) & 0x0F0F0F0F, x_hi[1], 0);
+          acc_lo += Dp4aS8((qs4.z) & 0x0F0F0F0F, x_lo[2], 0);
+          acc_hi += Dp4aS8((qs4.z >> 4) & 0x0F0F0F0F, x_hi[2], 0);
+          acc_lo += Dp4aS8((qs4.w) & 0x0F0F0F0F, x_lo[3], 0);
+          acc_hi += Dp4aS8((qs4.w >> 4) & 0x0F0F0F0F, x_hi[3], 0);
+
+          float acc_f =
+              d * static_cast<float>(sc_lo) * d8_lo *
+                  static_cast<float>(acc_lo) +
+              d * static_cast<float>(sc_hi) * d8_hi *
+                  static_cast<float>(acc_hi);
+          if ((s & 1) == 0) {
+            // dmin correction once per (block, pair): the two q8 blocks'
+            // sum fields cover this slice's 32 values.
+            const float s_lo = __half2float(__high2half(a_lo.ds));
+            const float s_hi = __half2float(__high2half(a_hi.ds));
+            acc_f -= dmin * static_cast<float>(m_lo) * s_lo +
+                     dmin * static_cast<float>(m_hi) * s_hi;
+          }
+          if (mat == 0) {
+            gate_acc[c] += acc_f;
+          } else {
+            up_acc[c] += acc_f;
+          }
+        }
+      }
+    }
+  }
+
+#pragma unroll
+  for (int c = 0; c < ncols; ++c) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      gate_acc[c] += __shfl_down_sync(0xFFFFFFFF, gate_acc[c], offset);
+      up_acc[c] += __shfl_down_sync(0xFFFFFFFF, up_acc[c], offset);
+    }
+  }
+  // Cross-warp combine (the incumbent's pattern): each warp reduced only
+  // its own K-blocks — without this, every warp's lane 0 writes a partial
+  // and the last warp's zero clobbers the answer.
+  __shared__ float warp_gate[kMmvqWarps * ncols];
+  __shared__ float warp_up[kMmvqWarps * ncols];
+  if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      warp_gate[c * kMmvqWarps + warp_id] = gate_acc[c];
+      warp_up[c * kMmvqWarps + warp_id] = up_acc[c];
+    }
+  }
+  __syncthreads();
+
+  if ((threadIdx.x >> 5) == 0 && lane == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row < M) {
+        float g = 0.0f, u = 0.0f;
+        for (int w2 = 0; w2 < kMmvqWarps; ++w2) {
+          g += warp_gate[c * kMmvqWarps + w2];
+          u += warp_up[c * kMmvqWarps + w2];
+        }
+        const float silu = g / (1.0f + __expf(-g));
+        output[static_cast<size_t>(row) * N + out_idx] =
+            static_cast<half>(silu * u);
+      }
+    }
+  }
+}
 
 template <int ncols>
 __global__ void inferflux_mmvq_q4k_fused_gate_up_silu(

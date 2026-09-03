@@ -598,6 +598,7 @@ target_link_libraries(inferctl PRIVATE inferflux_core)
 
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   add_executable(benchmark_downproj_q81 tests/unit/benchmark_downproj_q81.cu)
+  add_executable(benchmark_gate_up_kernels tests/unit/benchmark_gate_up_kernels.cu)
   add_executable(benchmark_q6k_kernels tests/unit/benchmark_q6k_kernels.cu)
   target_include_directories(benchmark_q6k_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
@@ -605,6 +606,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_downproj_q81 PRIVATE inferflux_core)
   target_link_libraries(benchmark_q6k_kernels PRIVATE inferflux_core inferflux_cuda_kernels)
+  target_link_libraries(benchmark_gate_up_kernels PRIVATE inferflux_core inferflux_cuda_kernels)
   add_executable(benchmark_fused_gate_up_q81
                  tests/unit/benchmark_fused_gate_up_q81.cu)
   target_include_directories(benchmark_fused_gate_up_q81 PRIVATE
@@ -631,12 +633,32 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     CUDA_STANDARD 17
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   )
+  add_executable(test_fa2_prefill tests/unit/test_fa2_prefill.cu
+                           runtime/backends/cuda/kernels/flash_attention.cu)
+  target_include_directories(test_fa2_prefill PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(test_fa2_prefill PRIVATE CUDA::cudart)
+  add_test(NAME Fa2PrefillTests COMMAND test_fa2_prefill)
+  set_tests_properties(Fa2PrefillTests PROPERTIES LABELS "fa2_prefill")
+  add_executable(test_mma_q4k tests/unit/test_mma_q4k.cu)
+  target_include_directories(test_mma_q4k PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(test_mma_q4k PRIVATE CUDA::cudart)
+  add_test(NAME MmaQ4KTests COMMAND test_mma_q4k)
+  set_tests_properties(MmaQ4KTests PROPERTIES LABELS "mma_q4k")
   add_executable(test_mma_q6k tests/unit/test_mma_q6k.cu)
   target_include_directories(test_mma_q6k PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(test_mma_q6k PRIVATE CUDA::cudart)
   add_test(NAME MmaQ6KTests COMMAND test_mma_q6k)
   set_tests_properties(MmaQ6KTests PROPERTIES LABELS "mma_q6k")
+  add_executable(test_mmvq_group_prefill tests/unit/test_mmvq_group_prefill.cu)
+  target_include_directories(test_mmvq_group_prefill PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(test_mmvq_group_prefill PRIVATE CUDA::cudart)
+  add_test(NAME MmvqGroupPrefillTests COMMAND test_mmvq_group_prefill)
+  set_tests_properties(MmvqGroupPrefillTests PROPERTIES LABELS
+                                                           "mmvq_group_prefill")
 endif()
 
 install(TARGETS inferfluxd inferctl
@@ -698,6 +720,7 @@ add_executable(inferflux_tests
   tests/unit/test_batch_analyzer.cpp
   tests/unit/test_backend_interface.cpp
   tests/unit/test_native_bootstrap_config.cpp
+  tests/unit/test_decode_relay_fingerprint.cpp
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_startup_advisor.cpp
@@ -744,6 +767,14 @@ if(ENABLE_CUDA)
     ${CMAKE_CURRENT_SOURCE_DIR}/external
   )
   target_link_libraries(inferflux_first_token_probe PRIVATE inferflux_core)
+
+  add_executable(inferflux_batched_isolation_probe
+    tests/tools/batched_isolation_probe.cpp
+  )
+  target_include_directories(inferflux_batched_isolation_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external
+  )
+  target_link_libraries(inferflux_batched_isolation_probe PRIVATE inferflux_core)
 
   add_executable(inferflux_attention_profile_probe
     tests/tools/attention_profile_probe.cpp

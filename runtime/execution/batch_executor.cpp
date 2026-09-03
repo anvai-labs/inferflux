@@ -21,6 +21,15 @@ namespace inferflux {
 
 namespace {
 
+// Stamps the first-token timestamp only if unset, so later blanket stamps
+// (slice/step finalizers, Generate() return) never overwrite the genuine
+// first emission recorded by the per-chunk callback or first decode step.
+void MarkFirstTokenIfUnset(InferenceRequest &req) {
+  if (req.first_token_time == std::chrono::steady_clock::time_point{}) {
+    req.first_token_time = std::chrono::steady_clock::now();
+  }
+}
+
 bool IsNonAccumulatingCompletion(std::string_view text) {
   return text == "[batch state error]" || IsBackendEmptyResponse(text);
 }
@@ -39,6 +48,9 @@ bool AppendGeneratedPiece(InferenceRequest *req, std::string_view raw_piece,
   }
 
   completion->append(assembled.text);
+  // First visible piece = the perceived first token; stamp before the
+  // on_token emission so TTFT reflects when the client could first see it.
+  MarkFirstTokenIfUnset(*req);
   std::string emit_piece;
   const bool stop_hit =
       ApplyStop(assembled.text, *completion, req->stop, &emit_piece);
@@ -60,6 +72,7 @@ void FinishGeneratedText(InferenceRequest *req, std::string *completion,
     return;
   }
   completion->append(assembled.text);
+  MarkFirstTokenIfUnset(*req);
   if (req->on_token) {
     metrics->RecordStreamTokens(1);
     req->on_token(assembled.text, nullptr);
@@ -393,7 +406,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
 
   if (inference.cancellation_flag && inference.cancellation_flag->load()) {
     inference.phase = RequestPhase::kAborted;
-    inference.first_token_time = std::chrono::steady_clock::now();
+    MarkFirstTokenIfUnset(inference);
     response.no_backend = true;
     response.completion = "[cancelled]";
     return outcome;
@@ -495,8 +508,13 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
         auto on_token = inference.on_token;
         auto cancel_flag = inference.cancellation_flag;
         auto *metrics_ptr = &metrics_;
-        chunk_cb = [on_token, cancel_flag, metrics_ptr](
+        auto *req_ptr = &inference;
+        chunk_cb = [on_token, cancel_flag, metrics_ptr, req_ptr](
                        const std::string &token_chunk, const TokenLogprob *lp) {
+          // Stamp the true first-token time on the first emitted chunk. The
+          // legacy Generate() path emits every chunk before returning, so a
+          // return-time stamp would report TTFT ≈ total duration.
+          MarkFirstTokenIfUnset(*req_ptr);
           metrics_ptr->RecordStreamTokens(1);
           on_token(token_chunk, lp);
           if (cancel_flag && cancel_flag->load()) {
@@ -648,7 +666,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
           kv_page = -1;
           inference.block_table.clear();
         }
-        inference.first_token_time = std::chrono::steady_clock::now();
+        MarkFirstTokenIfUnset(inference);
         return outcome;
       }
       response.completion = json({{"output", response.completion}}).dump();
@@ -677,7 +695,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
     inference.block_table.clear();
   }
 
-  inference.first_token_time = std::chrono::steady_clock::now();
+  MarkFirstTokenIfUnset(inference);
   inference.fairness.service_tokens += response.completion_tokens;
 
   // KV memory release and slot bookkeeping (FreeSequence + FreeSeqSlot) are
@@ -878,7 +896,7 @@ BatchExecutor::ExecuteBatchDecodePhased(
       req->fairness.remaining_decode_tokens = remaining_after_slice;
     }
 
-    req->first_token_time = std::chrono::steady_clock::now();
+    MarkFirstTokenIfUnset(*req);
     // sequence_id left intact — scheduler handles FreeSequence + FreeSeqSlot.
   }
 
@@ -1118,7 +1136,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
           step_ok = false;
         } else {
           for (std::size_t i = 0; i < decode_positions.size(); ++i) {
-            step[decode_positions[i]] = decode_outputs[i];
+            step[decode_positions[i]] = std::move(decode_outputs[i]);
           }
         }
       }
@@ -1131,7 +1149,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
           step_ok = false;
         } else {
           for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
-            step[prefill_positions[i]] = prefill_outputs[i];
+            step[prefill_positions[i]] = std::move(prefill_outputs[i]);
           }
         }
       }
@@ -1282,7 +1300,7 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     LogUnifiedAssemblyState("finalize", *req, std::string_view{},
                             out.completion, -1, gen, req->n_past, false,
                             states[i].active);
-    req->first_token_time = std::chrono::steady_clock::now();
+    MarkFirstTokenIfUnset(*req);
   }
 
   metrics_.RecordDecodeStepLoops("unified_phased", decode_step_loops);
@@ -1513,7 +1531,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
         step_ok = false;
       } else {
         for (std::size_t i = 0; i < decode_positions.size(); ++i) {
-          step_outputs[decode_positions[i]] = decode_outputs[i];
+          step_outputs[decode_positions[i]] = std::move(decode_outputs[i]);
         }
       }
     }
@@ -1526,7 +1544,7 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
         step_ok = false;
       } else {
         for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
-          step_outputs[prefill_positions[i]] = prefill_outputs[i];
+          step_outputs[prefill_positions[i]] = std::move(prefill_outputs[i]);
         }
       }
     }

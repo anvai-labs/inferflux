@@ -198,7 +198,10 @@ void TestShape(int M, int N, int K, int ksplits, uint32_t seed) {
         }
       }
       const float got = __half2float(out[static_cast<size_t>(j) * N + col]);
-      const double rel = std::fabs((got - ref) / (ref == 0.0 ? 1.0 : ref));
+      // Denominator floor: outputs near zero (cancellation) would otherwise
+      // blow up a pure relative error on fp16-noise deltas.
+      const double denom = std::fabs(ref) > 0.01 ? std::fabs(ref) : 0.01;
+      const double rel = std::fabs((got - ref) / denom);
       max_rel = std::max(max_rel, rel);
       ++n_checked;
     }
@@ -257,6 +260,86 @@ void TestUniform() {
 
 } // namespace
 
+// Fused SwiGLU D4 quantizer (SiluMulQuantizeQ8_1MmqKernel) vs host emulation:
+// the production Q6_K MMA down-proj path quantizes gate/up with this kernel,
+// and it has no other coverage. Byte-exact against the host below.
+void TestSiluMulQuantizer(int M, int K, uint32_t seed) {
+  const int groups = K / 128;
+  std::vector<half> gate(static_cast<size_t>(M) * K), up(static_cast<size_t>(M) * K);
+  for (size_t i = 0; i < gate.size(); ++i) {
+    gate[i] = __float2half((static_cast<int>(Lcg(seed) % 4001) - 2000) / 1000.0f);
+    up[i] = __float2half((static_cast<int>(Lcg(seed) % 4001) - 2000) / 1000.0f);
+  }
+  // Host emulation: silu(g)*u, then the QuantizeHost D4 path.
+  std::vector<half> acts(static_cast<size_t>(M) * K);
+  for (size_t i = 0; i < acts.size(); ++i) {
+    const float g = __half2float(gate[i]);
+    acts[i] = __float2half(g * __half2float(up[i]) / (1.0f + std::exp(-g)));
+  }
+  std::vector<BlockQ8_1Mmq> row_major(static_cast<size_t>(M) * groups);
+  for (int r = 0; r < M; ++r)
+    QuantizeHost(acts, K, row_major, r);
+  std::vector<BlockQ8_1Mmq> gm(row_major.size());
+  for (int r = 0; r < M; ++r)
+    for (int g = 0; g < groups; ++g)
+      gm[static_cast<size_t>(g) * M + r] = row_major[static_cast<size_t>(r) * groups + g];
+
+  half *d_gate = nullptr, *d_up = nullptr;
+  BlockQ8_1Mmq *d_y = nullptr;
+  cudaStream_t s;
+  cudaStreamCreate(&s);
+  cudaMalloc(&d_gate, gate.size() * sizeof(half));
+  cudaMalloc(&d_up, up.size() * sizeof(half));
+  cudaMalloc(&d_y, gm.size() * sizeof(BlockQ8_1Mmq));
+  cudaMemcpyAsync(d_gate, gate.data(), gate.size() * sizeof(half),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_up, up.data(), up.size() * sizeof(half),
+                  cudaMemcpyHostToDevice, s);
+  dim3 qgrid((groups + 3) / 4, M);
+  SiluMulQuantizeQ8_1MmqKernel<<<qgrid, 128, 0, s>>>(d_gate, d_up, d_y, K, M);
+  std::vector<BlockQ8_1Mmq> dev(gm.size());
+  cudaMemcpyAsync(dev.data(), d_y, dev.size() * sizeof(BlockQ8_1Mmq),
+                  cudaMemcpyDeviceToHost, s);
+  cudaStreamSynchronize(s);
+  // The device kernel uses __expf (fast intrinsic); the host uses expf —
+  // silu values can differ slightly, flipping a quantized byte on rounding
+  // boundaries and shifting the d4 scale in the amax element (measured
+  // ~5e-4 relative). Require mismatches to be sparse single-step boundary
+  // flips and the scales within tolerance; layout/mapping bugs instead
+  // produce wholesale mismatches.
+  int q_mismatch = 0, q_big = 0, d_checked = 0;
+  long q_total = 0;
+  double d_max_rel = 0.0;
+  for (size_t i = 0; i < gm.size(); ++i) {
+    for (size_t b = 0; b < sizeof(dev[i].qs); ++b) {
+      const int d = std::abs(static_cast<int>(dev[i].qs[b]) -
+                             static_cast<int>(gm[i].qs[b]));
+      ++q_total;
+      if (d != 0) {
+        ++q_mismatch;
+        if (d > 1)
+          ++q_big;
+      }
+    }
+    for (int s = 0; s < 4; ++s) {
+      const double a = dev[i].d4[s], b = gm[i].d4[s];
+      if (b != 0.0) {
+        d_max_rel = std::max(d_max_rel, std::fabs((a - b) / b));
+      }
+      ++d_checked;
+    }
+  }
+  char name[64];
+  snprintf(name, sizeof(name), "silu-mul D4 quantizer == host (M=%d, K=%d)", M, K);
+  const double mismatch_rate = static_cast<double>(q_mismatch) / q_total;
+  Report(name, q_big == 0 && mismatch_rate < 0.02 && d_max_rel < 2e-3,
+         std::max(mismatch_rate, d_max_rel));
+  cudaStreamDestroy(s);
+  cudaFree(d_gate);
+  cudaFree(d_up);
+  cudaFree(d_y);
+}
+
 int main() {
   cudaFree(0);
   std::fesetround(FE_TONEAREST);
@@ -269,12 +352,35 @@ int main() {
   }
 
   TestUniform();
+  TestSiluMulQuantizer(1, 11008, 424242);
+  TestSiluMulQuantizer(2, 11008, 424243);
+  TestSiluMulQuantizer(4, 11008, 424244);
+  TestSiluMulQuantizer(8, 11008, 424245);
   TestShape(1, 256, 256, 1, 12345);
   TestShape(2, 300, 256, 1, 777); // tail N tile (300 % 128 != 0)
+  // Decode batch sizes at production down-proj geometry — the MMA window
+  // extends down to M=4 (mmq_mma_min_batch), so these rows must be covered.
+  TestShape(4, 2048, 11008, 1, 20260847);
+  TestShape(6, 2048, 11008, 1, 20260848);
+  TestShape(8, 2048, 11008, 1, 20260849);
+  // Production decode shapes with K-split active (the SM-count heuristic
+  // yields splits>1 for M<16 at N=2048): this tier regressed output quality
+  // until probed by the batched-isolation probe.
+  TestShape(4, 2048, 11008, 3, 20260850);
+  TestShape(4, 2048, 11008, 4, 20260851);
+  TestShape(6, 2048, 11008, 3, 20260852);
+  TestShape(8, 2048, 11008, 3, 20260853);
+  TestShape(8, 2048, 11008, 2, 20260854);
   TestShape(16, 2048, 2048, 1, 4242);
   TestShape(16, 2048, 11008, 1, 999);
   TestShape(16, 2048, 11008, 3, 555); // K-split with reduce
   TestShape(16, 2048, 11008, 6, 31337);
+  // Multi-y-tile M (second tile only exists when M > 16) — the writeback
+  // row-offset regression lived here; also prefill decode shapes.
+  TestShape(17, 2048, 11008, 1, 20260843);
+  TestShape(18, 2048, 11008, 1, 20260844);
+  TestShape(18, 2048, 2048, 1, 20260845);
+  TestShape(33, 2048, 11008, 1, 20260846);
 
   printf("%s (%d failures)\n", g_failures ? "RESULT: FAIL" : "RESULT: PASS",
          g_failures);

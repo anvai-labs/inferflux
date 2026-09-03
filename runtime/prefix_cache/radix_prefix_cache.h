@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <shared_mutex>
@@ -28,7 +29,7 @@ struct RadixNode {
   // here).
   int n_tokens{0};
 
-  uint64_t last_used{0};
+  std::atomic<uint64_t> last_used{0}; // relaxed LRU clock (shared-lock touch)
 
   int NumTokens() const { return static_cast<int>(edge.size()); }
 };
@@ -104,7 +105,7 @@ private:
   std::size_t max_sequences_;
   std::size_t size_{0};
   std::size_t live_sequences_{0};
-  uint64_t clock_{0};
+  std::atomic<uint64_t> clock_{0}; // relaxed LRU clock
   std::unique_ptr<RadixNode> root_;
   mutable std::shared_mutex mutex_;
 };

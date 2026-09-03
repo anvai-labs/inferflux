@@ -196,8 +196,9 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
         return nullptr;
       }
       tensor_->dequantized_gpu = d_dequantized;
-      if (dequant_dirty_flag_)
-        *dequant_dirty_flag_ = true;
+      // F32->F16 conversions are permanent (retained by ClearDequantizedCache)
+      // — do not dirty the batch-scoped flag; it exists to gate the per-batch
+      // cleanup's 3-stream sync before freeing QUANTIZED projection caches.
       return d_dequantized;
     }
     log::Error("gguf_weight_accessor",
@@ -253,6 +254,19 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
                               stream);
   if (!CheckCudaStatus(cudaGetLastError(), "gguf_weight_accessor",
                        "DequantizeGpuToGpu launch")) {
+    cudaFree(d_dequantized);
+    return nullptr;
+  }
+
+  // The dequantized cache is SHARED through the loader tensor: every weight
+  // map (primary + lane-overlap replicas) receives this pointer, and readers
+  // may launch on a different (non-blocking) stream than the one this dequant
+  // runs on. Without this sync the pointer is cached and handed to other
+  // streams while the dequant kernel is still writing — the lane-overlap
+  // first-mixed-call corruption read partially-dequantized weights (bit
+  // identical across processes; see the batched-isolation probe).
+  if (!CheckCudaStatus(cudaStreamSynchronize(stream), "gguf_weight_accessor",
+                       "cudaStreamSynchronize(dequantized cache)")) {
     cudaFree(d_dequantized);
     return nullptr;
   }
@@ -1100,10 +1114,11 @@ void GGUFModelLoader::ClearDequantizedCache() {
         CheckCudaStatus(cudaFree(tensor.dequantized_gpu), "gguf_loader",
                         "cudaFree(tensor.dequantized_gpu:" + name + ")");
         tensor.dequantized_gpu = nullptr;
-      } else {
-        // Retained entries mean we still have dequantized data
-        has_dequantized_entries_ = true;
       }
+      // Retained entries are never freed, so they must NOT re-set the flag:
+      // has_dequantized_entries_ exists to tell the per-batch cleanup when a
+      // freeable (batch-scoped) dequant happened, and permanently-true made
+      // the cleanup issue 3 stream syncs after EVERY batch.
     }
   }
 }

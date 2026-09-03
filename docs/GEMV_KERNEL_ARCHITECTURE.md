@@ -172,6 +172,29 @@ For M=1 decode, each warp computes **two output columns** instead of one, halvin
 
 Tiled matrix-multiply kernels for the down projection, using 2D thread blocks. Gated behind `INFERFLUX_DOWNPROJ_MMQ_MIN_BATCH` for controlled rollout.
 
+The MMA tensor-core family (`INFERFLUX_CUDA_MMQ_MMA`, default on) covers
+`M >= INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` (default 4) for BOTH down-proj
+quants: Q6_K (D4 activations via `SiluMulQuantizeQ8_1Mmq`) and, since S18,
+Q4_K (DS activations via `SiluMulQuantizeQ8_1MmqDs` + `DownProjMmqMmaQ4K`).
+Mixed-quant models (the ollama Q4_K_M recipe: per-layer Q4_K/Q6_K down-proj
+mix) take the same operator either way. At the down-proj geometry
+(N=2048, K=11008) the Q6_K variant is ~1.6x faster than the best MMVQ variant
+at M=4 and ~4x at M=8; the Q4_K variant measures 65-69us flat across M=4..16
+(1.9x its weight-traffic floor). Above the max-batch cap the dp4a MMQ family
+takes over.
+
+**S30 incident note (tier briefly default-off).** The tier shipped producing
+deterministic wrong logits at M>=4 in batched decode and was temporarily
+default-off (`min_batch=65`). Root cause was NOT in the kernels — every
+component passes standalone rigs — but in the transformer loop:
+`input_q81_precomputed` was a sticky loop-carry flag, so once the first layer
+set it, any later layer whose down-proj boundary precomputed the next input
+norm (skipping the per-layer norm+quant refresh of `d_act_q8_1_`) let the QKV
+grouped path consume a stale `d_act_q8_1_` as its input — garbage Q/K/V from
+that layer on. The flag is now consume-once (reset after the QKV stage), the
+tier is back on at M>=4, and `tests/tools/batched_isolation_probe.cpp`
+(T/W/X ops at N>=4) is the regression oracle.
+
 ## 4) Dispatch Priority
 
 The transformer forward pass attempts dispatch paths in this order:

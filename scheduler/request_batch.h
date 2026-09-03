@@ -48,6 +48,16 @@ struct InferenceResult {
   bool finish_reason_length{false};
   std::vector<TokenLogprob> logprobs;
 
+  // Per-request usage telemetry surfaced on the OpenAI-compatible usage
+  // object. cached_prompt_tokens counts the prompt tokens served from the
+  // radix prefix cache / session KV reuse (0 on a miss); duration_ms measures
+  // accept → last token; time_to_first_token_ms is accept → first token and
+  // is only populated for streaming requests. Negative duration fields mean
+  // "not measured" and are omitted from the wire usage.
+  int cached_prompt_tokens{0};
+  double duration_ms{-1.0};
+  double time_to_first_token_ms{-1.0};
+
   struct {
     int total_chunks{0};
     int accepted_chunks{0};
@@ -176,6 +186,14 @@ struct InferenceRequest {
   // Timing for SLO tracking.
   std::chrono::steady_clock::time_point enqueue_time;
   std::chrono::steady_clock::time_point first_token_time;
+  // Set once at Generate() admission and never reset (enqueue_time is
+  // refreshed on fairness requeue, so it cannot serve as the request-accept
+  // origin for duration/TTFT reporting).
+  std::chrono::steady_clock::time_point accept_time;
+  // Per-request prefix-cache hit (BPE tokens matched from the radix trie or a
+  // session lease), recorded at prefill staging and reported via the result's
+  // cached_prompt_tokens.
+  int cache_matched_tokens{0};
 
   // W3C trace-id propagated from the incoming HTTP traceparent header.
   // Empty string if no traceparent was present in the request.

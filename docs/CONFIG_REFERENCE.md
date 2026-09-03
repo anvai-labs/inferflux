@@ -211,7 +211,25 @@ Session handle contract:
 - `session_id` support is opt-in and only active when `session_handles.enabled=true`.
 - KV dtype stays server/model-load scoped (`runtime.cuda.kv_cache_dtype`), not per request/session.
 - `runtime.scheduler.policy` can be overridden with `INFERFLUX_SCHED_POLICY`.
-- Scheduler mixed-step env overrides: `INFERFLUX_SCHED_DECODE_BURST_TOKENS`, `INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS`, `INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO`.
+
+Gateway-fronted deployments (recommended posture when a proxy such as Sandhi fronts
+InferFlux and stamps `x-inferflux-session-id`):
+- Set `runtime.scheduler.session_handles.enabled: true` — without it the affinity header
+  is accepted but ignored, and every turn re-prefills from scratch (no session KV reuse,
+  no `prompt_tokens_details.cached_tokens` from session leases).
+- Size `max_sessions` (default 1024) for peak concurrent agent **conversations**, not
+  requests: a lease is held per session id across its turns, while many requests may
+  share one conversation. When the cap is hit, the least-recently-used **idle** lease is
+  evicted (its KV state is released); leases with an in-flight request are never evicted,
+  and if every lease is busy the new session is admitted stateless instead of blocking.
+- Idle leases expire after `ttl_ms` (default 300000 = 5 min) — a conversation idle longer
+  than the TTL loses its KV state and pays a full prefill on its next turn.
+- Expect one TCP connection per streaming call: SSE responses close the connection after
+  the stream terminates, so a gateway pays a handshake per streamed turn. Known behavior;
+  keep-alive across streams is not implemented.
+
+Scheduler mixed-step env overrides:
+- `INFERFLUX_SCHED_DECODE_BURST_TOKENS`, `INFERFLUX_SCHED_CHUNKED_PREFILL_TOKENS`, `INFERFLUX_SCHED_MIXED_PREFILL_BUDGET_RATIO` retune the mixed-step knobs above without editing YAML.
 - Native stepwise burst env override: `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS`.
   Current sensible default for the March 27 WSL2/native CUDA burst solution is `4`.
   Use `2` for low-concurrency interactive traffic and keep `8` for explicit high-concurrency experiments only.

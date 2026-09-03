@@ -56,7 +56,8 @@ cudaError_t FlashDecodeMultiSeqStrided(const T *Q, const T *kv_buffer, T *O,
                                        size_t kv_stride, float scale,
                                        cudaStream_t stream = 0,
                                        void *split_workspace = nullptr,
-                                       size_t split_workspace_bytes = 0);
+                                       size_t split_workspace_bytes = 0,
+                                       int max_kv_hint = 0);
 
 /**
  * FlashDecodeMultiSeqIndirect: Batched decode attention using slot base
@@ -73,6 +74,21 @@ cudaError_t FlashDecodeMultiSeqIndirect(
     int num_kv_heads, int head_dim, size_t layer_stride, size_t kv_stride,
     float scale, cudaStream_t stream, void *ptr_workspace,
     size_t ptr_workspace_bytes);
+
+/**
+ * FlashDecodeWarpPerHead: warp-per-Q-head decode attention — no shared
+ * memory, no block barriers, no split workspace or combine kernel.
+ * Single launch; preferred at decode contexts where the full-KV scan by
+ * num_heads warps already saturates bandwidth.
+ */
+template <typename T>
+cudaError_t FlashDecodeWarpPerHead(const T *Q, const T *kv_buffer, T *O,
+                                   const int *d_seq_ids, const int *d_kv_lens,
+                                   int layer, int batch_size, int num_heads,
+                                   int num_kv_heads, int head_dim,
+                                   size_t slot_stride, size_t layer_stride,
+                                   size_t kv_stride, float scale,
+                                   cudaStream_t stream);
 
 /**
  * FlashDecodeMultiSeqStridedSplit: split-parallel decode attention.
