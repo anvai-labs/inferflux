@@ -943,7 +943,17 @@ set(CPACK_PACKAGE_VENDOR "Inferencial Labs")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "InferFlux inference server and CLI")
 set(CPACK_PACKAGE_VERSION ${PROJECT_VERSION})
 set(CPACK_PACKAGE_CONTACT "support@inferencial.ai")
-set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/README.md")
+# The macOS productbuild/DragNDrop generators reject License/ReadMe/Welcome
+# resources unless they end in .rtfd/.rtf/.html/.txt — stage the plain-text
+# LICENSE as LICENSE.txt in the build tree so every generator accepts it.
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
+               "${CMAKE_CURRENT_BINARY_DIR}/LICENSE.txt" COPYONLY)
+set(CPACK_RESOURCE_FILE_LICENSE
+    "${CMAKE_CURRENT_BINARY_DIR}/LICENSE.txt")
+# DragNDrop's software-license dialog additionally requires RTF; skip it (the
+# productbuild .pkg still presents the license) so the DMG generator cannot
+# trip on the .txt resource across CMake versions.
+set(CPACK_DMG_SLA_USE_RESOURCE_FILE_LICENSE OFF)
 set(CPACK_PACKAGE_FILE_NAME
     "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_STRIP_FILES TRUE)
