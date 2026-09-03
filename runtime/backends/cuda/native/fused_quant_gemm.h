@@ -323,6 +323,26 @@ public:
                          const NativeExecutionPolicy *policy = nullptr,
                          int max_m_override = -1);
 
+  /// Quantize `input` [M,K] half -> DS layout for GemvMmqMmaPrequantized.
+  /// Split from GemvMmqMma so paired projections (gate+up share the same
+  /// input) quantize once and consume twice instead of paying the quantize
+  /// launch + 2x quantize FLOPs per projection (36 redundant launches per
+  /// forward at 36 layers). Same eligibility checks as GemvMmqMma.
+  static bool QuantizeForMmqMma(const half *input,
+                                runtime::cuda::native::BlockQ8_1MmqDs *ds_act,
+                                int M, int K, cudaStream_t stream,
+                                const NativeExecutionPolicy *policy = nullptr,
+                                int max_m_override = -1);
+
+  /// GemvMmqMma without the input quantization step; requires ds_act to
+  /// have been filled by QuantizeForMmqMma with the same M/K on the same
+  /// stream.
+  static bool GemvMmqMmaPrequantized(
+      const QuantizedWeightInfo &weight,
+      const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *output,
+      float *partials, int M, int N, int K, cudaStream_t stream,
+      const NativeExecutionPolicy *policy = nullptr, int max_m_override = -1);
+
   static bool DownProjMmqMma(const QuantizedWeightInfo &weight,
                              const runtime::cuda::native::BlockQ8_1Mmq *act_mmq,
                              half *output, int M, int N, int K, float *partials,
