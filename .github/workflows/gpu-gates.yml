@@ -63,11 +63,13 @@ jobs:
       - name: Build CUDA contracts
         # DRIFT TRAP: ctest below runs every registered test. Any new
         # add_executable test target in CMakeLists.txt must be added here
-        # or the gate fails with "(Not Run)" — this bit MmaQ6KTests (PR #34).
+        # or the gate fails with "(Not Run)" — this bit MmaQ6KTests (PR #34)
+        # and again the Fa2Prefill/MmaQ4K/MmvqGroupPrefill trio (found in a
+        # promotion review before it could fail the gate on main).
         run: >-
           cmake --build build-ci-cuda -j$(nproc) --target
           inferfluxd inferctl inferflux_tests inferflux_fused_kernel_tests
-          test_mma_q6k
+          test_fa2_prefill test_mma_q4k test_mma_q6k test_mmvq_group_prefill
 
       - name: Run CUDA unit and behavioral contracts
         run: ctest --test-dir build-ci-cuda --output-on-failure --timeout 180

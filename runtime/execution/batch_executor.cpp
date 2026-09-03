@@ -1172,6 +1172,15 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
 
       if (states[i].in_prefill) {
         int chunk_processed = static_cast<int>(batch_inputs[j].tokens.size());
+        // A failed INTERMEDIATE no-logits chunk leaves a KV hole — advancing
+        // would decode over missing context with no error signal. Deactivate
+        // instead (the final-chunk branch below handles the last chunk).
+        if (!res.ok && req->prefill_offset + chunk_processed <
+                           static_cast<int>(req->bpe_prompt_tokens.size())) {
+          states[i].active = false;
+          states[i].in_prefill = false;
+          continue;
+        }
         req->prefill_offset += chunk_processed;
         req->n_past = req->prefill_offset;
 
@@ -1627,7 +1636,16 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     const auto &res = step_outputs[j];
 
     if (req->execution.in_prefill) {
-      req->prefill_offset += static_cast<int>(batch_inputs[j].tokens.size());
+      int chunk_processed = static_cast<int>(batch_inputs[j].tokens.size());
+      if (!res.ok && req->prefill_offset + chunk_processed <
+                         static_cast<int>(req->bpe_prompt_tokens.size())) {
+        // Failed intermediate chunk: deactivate rather than decode over the
+        // KV hole (see the phased-executor note above).
+        req->execution.active = false;
+        req->execution.in_prefill = false;
+        continue;
+      }
+      req->prefill_offset += chunk_processed;
       if (req->prefill_offset >=
           static_cast<int>(req->bpe_prompt_tokens.size())) {
         req->execution.in_prefill = false;

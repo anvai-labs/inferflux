@@ -2192,8 +2192,14 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
     UnifiedBatchInput warm_prefill;
     warm_prefill.sequence_id = 0;
     warm_prefill.n_past = 0;
-    warm_prefill.tokens.assign(
-        static_cast<size_t>(std::max(256, min_prefill_tokens_)), 1);
+    // Clamp to the KV cache's max sequence length: with a small auto-tuned
+    // max_seq (< 256) the warm Forward would fail its length check and the
+    // warm-up would silently no-op, re-exposing the first-mixed-call
+    // corruption it exists to absorb.
+    const int warm_len = std::min(std::max(256, min_prefill_tokens_),
+                                  kv_cache_ ? kv_cache_->MaxSeqLen()
+                                            : std::numeric_limits<int>::max());
+    warm_prefill.tokens.assign(static_cast<size_t>(warm_len), 1);
     warm_prefill.request_logits = false;
     warm_prefill.request_id = -1;
     UnifiedBatchInput warm_decode;
@@ -2202,11 +2208,21 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
     warm_decode.tokens = {1};
     warm_decode.request_logits = true;
     warm_decode.request_id = -1;
-    (void)ExecuteUnifiedBatch({warm_prefill, warm_decode});
+    const auto warm_outputs = ExecuteUnifiedBatch({warm_prefill, warm_decode});
+    bool warm_ok = !warm_outputs.empty();
+    for (const auto &wo : warm_outputs) {
+      warm_ok = warm_ok && wo.ok;
+    }
     NativeFreeSequence(0);
     NativeFreeSequence(1);
-    log::Info("inferflux_cuda_executor",
-              "Lane-overlap path warmed with a throwaway mixed batch");
+    if (warm_ok) {
+      log::Info("inferflux_cuda_executor",
+                "Lane-overlap path warmed with a throwaway mixed batch");
+    } else {
+      log::Warn("inferflux_cuda_executor",
+                "Lane-overlap warm batch FAILED - the first real mixed batch "
+                "may hit the first-call corruption path");
+    }
   }
 
   return true;
@@ -3175,7 +3191,7 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
       if (decode_relay_active_ &&
           DecodeRelayIdentityMatches(decode_relay_armed_, batch_seq_ids,
                                      chunk_generations, batch_n_past,
-                                     static_cast<size_t>(B))) {
+                                     batch_tokens, static_cast<size_t>(B))) {
         fwd_ok = model_forward_->BatchForwardReplay(d_logits_, B);
         if (!fwd_ok) {
           // Graph replay failed — fall back to full BatchForward
@@ -3279,6 +3295,8 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
                                            batch_seq_ids.begin() + B);
         decode_relay_armed_.generations = chunk_generations;
         decode_relay_armed_.next_n_past.resize(static_cast<size_t>(B));
+        decode_relay_armed_.tokens.assign(batch_tokens.begin(),
+                                          batch_tokens.begin() + B);
         for (int b = 0; b < B; ++b) {
           decode_relay_armed_.next_n_past[static_cast<size_t>(b)] =
               batch_n_past[b] + 1;
@@ -4195,9 +4213,6 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id, int n_past_start,
   // Allocate device-side token accumulation buffer
   int *d_token_buf = nullptr;
   if (cudaMalloc(&d_token_buf, n_tokens * sizeof(int)) != cudaSuccess) {
-    return 0;
-  }
-  if (!d_token_buf) {
     return 0;
   }
 
