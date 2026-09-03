@@ -4,7 +4,10 @@ namespace inferflux {
 namespace webui {
 
 const std::string &UiHtml() {
-  static const std::string kHtml = R"(<!DOCTYPE html>
+  // Delimiter HTML: the document body contains ')' followed by '"' in inline
+  // onclick handlers (e.g. saveApiKey()), which would terminate a default
+  // raw-string literal early. Same reason kCss/kJs below carry delimiters.
+  static const std::string kHtml = R"HTML(<!DOCTYPE html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -90,7 +93,7 @@ const std::string &UiHtml() {
     <script>{{js}}</script>
   </body>
 </html>
-)";
+)HTML";
   return kHtml;
 }
 
