@@ -410,3 +410,9 @@ The multi-backend harness runs each backend in an isolated child process on purp
 Short imperative subjects under ~72 chars mentioning scope (e.g., `Wire speculative validation and async NVMe writes`). **No AI attribution, co-author trailers, or agent names — the `commit-msg` hook rejects them.** PR bodies should link the tracking issue, enumerate config/env changes, and paste ctest output. Update README.md, docs/, and Helm/Docker assets alongside code changes; re-run `python3 scripts/check_docs_contract.py` when doc or surface changes are involved.
 
 <!-- imported-from: codex:project:instructions -->
+
+# Branching & Releases
+
+- **`develop`** is the integration branch: feature branches open PRs into `develop` (CI-gated).
+- **Promotion is explicit**: `develop` → `main` via a release PR (CI-gated); releases are tagged on `main`.
+- `main` always reflects the last promoted, releasable state.
