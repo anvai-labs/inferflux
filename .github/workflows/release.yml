@@ -162,7 +162,6 @@ jobs:
         shell: pwsh
         run: >
           cmake -S . -B build
-          -G "Visual Studio 17 2022"
           -A x64
           -DCMAKE_BUILD_TYPE=$Env:BUILD_TYPE
           -DENABLE_WEBUI=ON
@@ -370,6 +369,19 @@ jobs:
 
       - name: List assets
         run: ls -R release-assets
+
+      - name: Generate sha256sums.txt
+        # One checksums manifest for every published asset, named by basename
+        # so it matches the flattened release asset list. Homebrew taps (and
+        # other consumers) verify against this instead of re-downloading.
+        run: |
+          : > release-assets/sha256sums.txt
+          find release-assets -type f ! -name sha256sums.txt -print0 |
+            sort -z |
+            while IFS= read -r -d '' f; do
+              printf '%s  %s\n' "$(sha256sum "$f" | awk '{print $1}')" "$(basename "$f")" >> release-assets/sha256sums.txt
+            done
+          cat release-assets/sha256sums.txt
 
       - name: Derive tag name
         id: release_tag
