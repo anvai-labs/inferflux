@@ -1361,8 +1361,7 @@ bool DispatchQ8_1MmvqAccumF32Q4K(const void *data, const void *act_q8_1,
     // blocks -> 2 of 4 warps idle). Rig: 10.7us -> 6.6us at K=2048.
     // Never below 2 warps: 1 warp cannot cover 8 blocks (the 32-thread
     // rig "win" was computing half the sum).
-    const int warps =
-        std::max(2, std::min(kMmvqWarps, (K / QK_K + 3) / 4));
+    const int warps = std::max(2, std::min(kMmvqWarps, (K / QK_K + 3) / 4));
     const dim3 block(warps * 32);
     switch (ncols) {
     case 1:
@@ -2048,6 +2047,88 @@ bool FusedQuantGemm::DownProjMmq(const MmqWeightInfo &weight,
                   stream);
 }
 
+bool FusedQuantGemm::QuantizeForMmqMma(
+    const half *input, runtime::cuda::native::BlockQ8_1MmqDs *ds_act, int M,
+    int K, cudaStream_t stream, const NativeExecutionPolicy *policy,
+    int max_m_override) {
+  using namespace runtime::cuda::native;
+  const auto &p = ResolveExecutionPolicy(policy);
+  const int m_cap = max_m_override > 0 ? max_m_override : p.mmq_mma_max_batch;
+  if (!p.enable_mmq_mma || !input || !ds_act || M < 2 || M > m_cap || K <= 0 ||
+      K % QK_K != 0) {
+    return false;
+  }
+  dim3 qgrid((K / 128 + 3) / 4, M);
+  QuantizeRowQ8_1MmqDsKernel<<<qgrid, 128, 0, stream>>>(input, ds_act, K, M);
+  return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool FusedQuantGemm::GemvMmqMmaPrequantized(
+    const QuantizedWeightInfo &weight,
+    const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *output,
+    float *partials, int M, int N, int K, cudaStream_t stream,
+    const NativeExecutionPolicy *policy, int max_m_override) {
+  // Same gating and launch as GemvMmqMma minus the quantize launch; the
+  // caller guarantees ds_act was filled with the same M/K on this stream.
+  using namespace runtime::cuda::native;
+  const auto &p = ResolveExecutionPolicy(policy);
+  const int m_cap = max_m_override > 0 ? max_m_override : p.mmq_mma_max_batch;
+  if (!p.enable_mmq_mma || !weight.data || !ds_act || !output || !partials ||
+      M < 2 || M > m_cap || N <= 0 || K <= 0 ||
+      static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
+      static_cast<GGUF::TensorType>(weight.quant_type) !=
+          GGUF::TensorType::Q4_K ||
+      K % QK_K != 0) {
+    return false;
+  }
+  static bool smem_configured = false;
+  static size_t configured_smem = 0;
+  const size_t smem = MmqSmemInts(16) * sizeof(int);
+  if (!smem_configured || configured_smem != smem) {
+    if (cudaFuncSetAttribute(InferfluxMmqQ4KMma<16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(smem)) != cudaSuccess) {
+      return false;
+    }
+    smem_configured = true;
+    configured_smem = smem;
+  }
+  static int sm_count = [] {
+    cudaDeviceProp prop{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+      return 0;
+    }
+    return prop.multiProcessorCount;
+  }();
+  if (sm_count <= 0) {
+    return false;
+  }
+  const int n_tiles = (N + kMmqY - 1) / kMmqY;
+  const int total_ctas = n_tiles * ((M + 15) / 16);
+  int splits = 1;
+  if (total_ctas < sm_count) {
+    splits = std::min((sm_count + total_ctas - 1) / total_ctas,
+                      static_cast<int>(kMmqMmaMaxSplits));
+  }
+  if (M > 8 && M <= p.mmq_mma_max_batch) {
+    splits = std::max(splits, 2);
+  }
+  dim3 grid(n_tiles, (M + 15) / 16, splits);
+  InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
+      static_cast<const char *>(weight.data), ds_act, output, N, K, M,
+      splits > 1 ? partials : nullptr, splits);
+  if (splits > 1) {
+    const size_t mn = static_cast<size_t>(M) * N;
+    const int rthreads = 256;
+    const size_t rblocks = (mn + rthreads - 1) / rthreads;
+    ReduceMmqKSplit<<<rblocks, rthreads, 0, stream>>>(partials, output, splits,
+                                                      mn);
+  }
+  return cudaPeekAtLastError() == cudaSuccess;
+}
+
 bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
                                 const half *input, half *output,
                                 runtime::cuda::native::BlockQ8_1MmqDs *ds_act,
@@ -2057,8 +2138,7 @@ bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
                                 int max_m_override) {
   using namespace runtime::cuda::native;
   const auto &p = ResolveExecutionPolicy(policy);
-  const int m_cap =
-      max_m_override > 0 ? max_m_override : p.mmq_mma_max_batch;
+  const int m_cap = max_m_override > 0 ? max_m_override : p.mmq_mma_max_batch;
   if (!p.enable_mmq_mma || !weight.data || !input || !output || !ds_act ||
       !partials || M < 2 || M > m_cap || N <= 0 || K <= 0 ||
       static_cast<size_t>(N) * K != static_cast<size_t>(weight.num_elements) ||
