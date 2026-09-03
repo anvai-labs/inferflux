@@ -496,9 +496,21 @@ QuantizedWeightMap::GetWeightAccessor(const std::string &name) {
 void QuantizedWeightMap::ClearCache() {
   log::Debug("quantized_weight_map", "Clearing dequantized weight cache");
 
-  // Projection weights use scratch buffer — nothing to clear for them.
-  // Only clear permanently-cached non-projection weights.
+  // Nullify the PROJECTION cache slots too: with the batch dequant cache
+  // enabled (INFERFLUX_BATCH_DEQUANT_CACHE=1) these route through
+  // GetDequantizedWeights and hold loader-level dequantized buffers — the
+  // per-batch cleanup frees exactly those in the loader, and a stale map
+  // pointer here meant the next batch's fast path handed freed device
+  // memory to the cuBLAS/dequant fallback GEMM (use-after-free). The
+  // scratch-buffer comment below predates that path.
   for (auto &lw : layers_) {
+    lw.q_proj = nullptr;
+    lw.k_proj = nullptr;
+    lw.v_proj = nullptr;
+    lw.o_proj = nullptr;
+    lw.gate_proj = nullptr;
+    lw.up_proj = nullptr;
+    lw.down_proj = nullptr;
     lw.input_norm = nullptr;
     lw.post_attn_norm = nullptr;
     lw.q_proj_bias = nullptr;

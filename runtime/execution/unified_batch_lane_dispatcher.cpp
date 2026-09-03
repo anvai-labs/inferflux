@@ -184,6 +184,7 @@ std::size_t UnifiedBatchLaneDispatcher::SweepAbandoned(
 void UnifiedBatchLaneDispatcher::WorkerLoop(bool decode_lane) {
   while (true) {
     WorkItem item;
+    bool have_item = false;
     {
       std::unique_lock<std::mutex> lock(mutex_);
       auto &queue = decode_lane ? decode_queue_ : prefill_queue_;
@@ -191,8 +192,21 @@ void UnifiedBatchLaneDispatcher::WorkerLoop(bool decode_lane) {
       if (stopping_ && queue.empty()) {
         return;
       }
-      item = std::move(queue.front());
-      queue.pop_front();
+      // Drop items whose pending entry was swept as abandoned: the caller
+      // already fell back and re-executed that work, and the permit was
+      // reclaimed — executing anyway double-books the lane and re-runs
+      // forwards for sequence ids that may have been re-acquired.
+      while (!queue.empty()) {
+        item = std::move(queue.front());
+        queue.pop_front();
+        if (pending_.find(item.handle) != pending_.end()) {
+          have_item = true;
+          break;
+        }
+      }
+    }
+    if (!have_item) {
+      continue;
     }
 
     ExecutionResult result;

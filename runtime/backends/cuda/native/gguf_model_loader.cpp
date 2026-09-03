@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 namespace inferflux {
@@ -142,6 +143,13 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
       if (tensor_->dequantized_gpu) {
         return tensor_->dequantized_gpu;
       }
+      // Same cross-thread serialization as the quantized lazy path below
+      // (double-check after locking).
+      static std::mutex f32_lazy_mu;
+      std::lock_guard<std::mutex> lazy_guard(f32_lazy_mu);
+      if (tensor_->dequantized_gpu) {
+        return tensor_->dequantized_gpu;
+      }
       size_t num_elements = 1;
       for (uint64_t dim : tensor_->info.shape) {
         if (dim == 0 ||
@@ -210,6 +218,19 @@ half *GGUFWeightAccessor::GetDequantizedGpuWeights(cudaStream_t stream) {
   // Return cached dequantized data if available
   if (tensor_->dequantized_gpu) {
     return tensor_->dequantized_gpu;
+  }
+
+  // Serialize check-dequant-publish across threads: the lane-overlap
+  // workers (and their two weight maps) can first-touch the same shared
+  // tensor concurrently; without this, both see nullptr, both dequantize,
+  // and the loser's buffer (potentially hundreds of MB for a projection)
+  // is orphaned forever — plus the tensor pointer write itself is a data
+  // race. Cold path only (first touch after a cache free), so a
+  // process-wide mutex is fine.
+  static std::mutex lazy_dequant_mu;
+  std::lock_guard<std::mutex> lazy_guard(lazy_dequant_mu);
+  if (tensor_->dequantized_gpu) {
+    return tensor_->dequantized_gpu; // double-check after locking
   }
 
   // Perform lazy dequantization

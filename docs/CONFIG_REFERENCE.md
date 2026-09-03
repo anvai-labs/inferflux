@@ -265,6 +265,9 @@ InferFlux CUDA KV sizing defaults:
 | Key | Default pattern | Tuning intent |
 |---|---|---|
 | `INFERFLUX_HTTP_WORKERS` | `16` | increase for high concurrency non-streaming workloads |
+| `INFERFLUX_HTTP_SEND_TIMEOUT_SEC` | `30` | socket send deadline (SO_SNDTIMEO); a stalled SSE client is cut off instead of blocking a decode worker forever — raise for very slow clients on large non-streaming responses |
+| `INFERFLUX_HTTP_RECV_TIMEOUT_SEC` | `120` | socket receive deadline (SO_RCVTIMEO); bounds idle keep-alive connections (slowloris protection) — raise for clients that upload very large request bodies slowly |
+| `INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS` | `256` | accept-queue bound; connections beyond it are closed at accept. Raise only with a matching worker count |
 
 **Performance notes**:
 - Non-streaming requests block worker threads via `future.get()` until completion
@@ -323,6 +326,12 @@ Scope contract:
 | `INFERFLUX_CUDA_STRICT` | fail model load if InferFlux CUDA runtime reports fallback |
 | `INFERFLUX_DISABLE_INFERFLUX_CUDA` | force InferFlux CUDA runtime readiness to false |
 | `INFERFLUX_CUDA_DEQUANT_CACHE_POLICY` | `runtime.cuda.dequantized_cache_policy` |
+| `INFERFLUX_CUDA_MMQ_MMA` | mma.sync int8 tensor-core MMQ family, M >= min-batch (Q4_K gate/up+QKV+o+down-proj, Q6_K down-proj); `0` reverts to the dp4a tier (`1` default) |
+| `INFERFLUX_CUDA_MMQ_MMA_MIN_BATCH` | minimum decode batch for the MMA down-proj/lm-head tier (`4` default) |
+| `INFERFLUX_CUDA_MMQ_MMA_MAX_BATCH` | upper decode batch bound of the MMA tier (`16` default) |
+| `INFERFLUX_CUDA_MMQ_MMA_MAX_PREFILL_BATCH` | prefill-chunk M cap for the Q4_K MMA family (`512` default) |
+| `INFERFLUX_CUDA_WIDE_GATE_UP` | wide-load (uint4) fused gate/up MMVQ kernel for M<=8 (`1` default; `0` opts out) |
+| `INFERFLUX_CUDA_WIDE_ACCUM` | wide-load o_proj residual accumulate kernel (`1` default; `0` opts out) |
 | `INFERFLUX_CUDA_KV_MAX_BATCH` | InferFlux CUDA KV cache `max_batch` hard override |
 | `INFERFLUX_CUDA_KV_MAX_SEQ` | InferFlux CUDA KV cache `max_seq` hard override (disables seq auto-tune) |
 | `INFERFLUX_CUDA_KV_AUTO_TUNE` | enable/disable InferFlux CUDA KV seq auto-tuning (`true` default) |
@@ -338,6 +347,9 @@ Scope contract:
 | `INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST` | `runtime.backend_exposure.strict_inferflux_request` |
 | `INFERFLUX_DISABLE_STARTUP_ADVISOR` | suppress startup recommendations |
 | `INFERFLUX_HTTP_WORKERS` | HTTP server thread pool size (default: 16) |
+| `INFERFLUX_HTTP_SEND_TIMEOUT_SEC` | socket send deadline in seconds (default 30); stalled SSE clients are cut off instead of blocking a decode worker |
+| `INFERFLUX_HTTP_RECV_TIMEOUT_SEC` | socket receive deadline in seconds (default 120); bounds idle keep-alive connections |
+| `INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS` | accept-queue bound (default 256); excess connections are closed at accept |
 | `INFERCTL_API_KEY` | CLI auth token |
 
 ## 11) Startup Advisor Alignment
