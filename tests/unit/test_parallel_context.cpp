@@ -38,6 +38,12 @@ TEST_CASE("ParallelContext: batch synchronization stubs", "[parallel]") {
 
 TEST_CASE("ParallelContext: collective stubs", "[parallel]") {
   auto &pc = ParallelContext::Get();
+  // comm_ only exists after Initialize(); under randomized test order this
+  // case can run before any initializing case, so guarantee it here.
+  // Initialize is idempotent (first call wins), so use the same topology
+  // (rank 0, world 2) as "initialization and rank tracking" — whichever
+  // case runs first initializes the singleton for both.
+  pc.Initialize(0, 2);
   auto *comm = pc.Comm();
   REQUIRE(comm != nullptr);
 
