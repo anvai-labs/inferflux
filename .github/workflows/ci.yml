@@ -313,7 +313,18 @@ jobs:
         run: cmake --build build -j$(sysctl -n hw.logicalcpu)
 
       - name: Run unit tests
-        run: ctest --test-dir build --output-on-failure --timeout 90
+        # `script` wraps ctest in a pty so the test binary line-buffers its
+        # output. Piped (non-pty) stdout is block-buffered and only flushed
+        # at kill time, which erased the position of the intermittent
+        # UnitTests timeout stall — with a pty every log line lands in the
+        # Actions log live and the hung test is identifiable from the tail.
+        # BSD script's own exit status is not reliably the child's, so the
+        # real ctest status travels via a file.
+        run: |
+          script -q /dev/null sh -c 'ctest --test-dir build --output-on-failure --timeout 90; echo $? > /tmp/ctest_rc'
+          rc=$(cat /tmp/ctest_rc)
+          echo "ctest exit: $rc"
+          exit "$rc"
 
   build-check-mlx:
     name: Build (macos-latest, MLX flag)
