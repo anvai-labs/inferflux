@@ -47,9 +47,13 @@ TEST_CASE("BackendRegistry returns nullptr for unregistered backend",
 TEST_CASE("BackendRegistry AvailableTargets includes registered targets",
           "[backend_registry]") {
   auto &reg = BackendRegistry::Instance();
+  // Register here rather than relying on the registration side effect of an
+  // earlier case ("can register and create backends"): under randomized test
+  // order that case may not have run yet. Re-registering the same factory is
+  // idempotent, so declaration order stays green too.
+  reg.Register(LlamaBackendTarget::kOpenCL, BackendProvider::kLlamaCpp,
+               [] { return std::make_shared<OpenClBackend>(); });
   auto targets = reg.AvailableTargets();
-  // CPU target should always be available (registered below or by other tests)
-  // At minimum, OpenCL was registered in the test above
   bool has_opencl = false;
   for (auto t : targets) {
     if (t == LlamaBackendTarget::kOpenCL) {

@@ -2226,6 +2226,16 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           publishing_decode_.push_back(pending);
         }
         enqueued = disagg_config_.kv_transport->Enqueue(std::move(packet));
+        if (enqueued) {
+          // Record the stage the moment the packet becomes visible. Decode
+          // workers can drive the ticket to committed and satisfy the
+          // request future before this thread reaches any later recording
+          // site, which made the enqueued counter observable as 0 under
+          // scheduling contention (slow runners).
+          metrics_->RecordDisaggKVTicketStage(
+              disaggregated::KVTicketStageToString(
+                  disaggregated::KVTicketStage::kEnqueued));
+        }
         {
           std::lock_guard<std::mutex> lock(queue_mutex_);
           auto publication = std::find(publishing_decode_.begin(),
@@ -2245,13 +2255,17 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         }
       } else {
         enqueued = true;
+        if (use_split_decode_workers) {
+          // Non-transport split handoff: counted here for parity with the
+          // transport path above.
+          metrics_->RecordDisaggKVTicketStage(
+              disaggregated::KVTicketStageToString(
+                  disaggregated::KVTicketStage::kEnqueued));
+        }
       }
       if (enqueued) {
         inf.disagg_enqueue_retries = 0;
         if (use_split_decode_workers) {
-          metrics_->RecordDisaggKVTicketStage(
-              disaggregated::KVTicketStageToString(
-                  disaggregated::KVTicketStage::kEnqueued));
           if (!published_to_decode_worker) {
             staged_decode_worker.push_back(pending);
           }
