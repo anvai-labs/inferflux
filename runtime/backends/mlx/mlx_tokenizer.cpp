@@ -384,14 +384,34 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
 
   // Pre-tokenizer type.
   if (j.contains("pre_tokenizer") && j["pre_tokenizer"].is_object()) {
+    auto apply_pre_tokenizer_type = [this](const json &pt) {
+      const std::string type = pt.value("type", "");
+      if (type == "Metaspace") {
+        pre_tok_ = PreTokenizerType::Metaspace;
+        add_prefix_space_ = pt.value("add_prefix_space", true);
+        return true;
+      }
+      if (type == "ByteLevel") {
+        pre_tok_ = PreTokenizerType::ByteLevel;
+        add_prefix_space_ = pt.value("add_prefix_space", false);
+        return true;
+      }
+      return false;
+    };
+
     const auto &pt = j["pre_tokenizer"];
     const std::string type = pt.value("type", "");
-    if (type == "Metaspace") {
-      pre_tok_ = PreTokenizerType::Metaspace;
-      add_prefix_space_ = pt.value("add_prefix_space", true);
-    } else if (type == "ByteLevel") {
-      pre_tok_ = PreTokenizerType::ByteLevel;
-      add_prefix_space_ = pt.value("add_prefix_space", false);
+    if (type == "Sequence" && pt.contains("pretokenizers") &&
+        pt["pretokenizers"].is_array()) {
+      // HuggingFace wraps most GPT-2-family tokenizers (Qwen, Llama-3,
+      // Phi-3, StarCoder, ...) as Sequence[Split, ByteLevel]; the nested
+      // entry, not the wrapper, determines byte encoding/decoding.
+      for (const auto &nested : pt["pretokenizers"]) {
+        if (apply_pre_tokenizer_type(nested))
+          break;
+      }
+    } else {
+      apply_pre_tokenizer_type(pt);
     }
   }
 
@@ -414,6 +434,8 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
   }
 
   // Resolve BOS/EOS from tokenizer_config.json.
+  bool bos_resolved = false;
+  bool eos_resolved = false;
   const auto cfg_path = model_dir / "tokenizer_config.json";
   std::ifstream cfg_f(cfg_path);
   if (cfg_f.is_open()) {
@@ -436,14 +458,69 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
 
     const std::string bos_str = resolve_tok("bos_token");
     const std::string eos_str = resolve_tok("eos_token");
-    if (!bos_str.empty() && vocab_.count(bos_str))
+    if (!bos_str.empty() && vocab_.count(bos_str)) {
       bos_id_ = vocab_.at(bos_str);
-    if (!eos_str.empty() && vocab_.count(eos_str))
+      bos_resolved = true;
+    }
+    if (!eos_str.empty() && vocab_.count(eos_str)) {
       eos_id_ = vocab_.at(eos_str);
+      eos_resolved = true;
+    }
 
     // Chat template (Jinja2 string used by FormatChatMessages override).
     if (cfg.contains("chat_template") && cfg["chat_template"].is_string())
       chat_template_ = cfg["chat_template"].get<std::string>();
+  }
+
+  // Fall back to a standalone chat_template.jinja file — the convention
+  // transformers v4.44+ / vLLM / SGLang use when tokenizer_config.json has
+  // no embedded chat_template (or doesn't exist at all).
+  if (chat_template_.empty()) {
+    std::ifstream jinja_f(model_dir / "chat_template.jinja");
+    if (jinja_f.is_open()) {
+      std::ostringstream jinja_ss;
+      jinja_ss << jinja_f.rdbuf();
+      chat_template_ = jinja_ss.str();
+    }
+  }
+
+  // Fall back to config.json's bos_token_id/eos_token_id (plain vocab IDs,
+  // no string lookup needed) when tokenizer_config.json is absent or didn't
+  // specify them. Without this, bos_id_/eos_id_ silently keep their
+  // Reset() defaults (1/2) for model directories that ship only
+  // tokenizer.json + config.json — wrong for most vocabularies, and fatal
+  // to generation quality since the model never emits a stop token the
+  // executor recognizes (see runtime/backends/cuda/inferflux_cuda_executor.cpp,
+  // which builds its stop-token set directly from EosTokenId()).
+  if (!bos_resolved || !eos_resolved) {
+    std::ifstream model_cfg_f(model_dir / "config.json");
+    if (model_cfg_f.is_open()) {
+      json model_cfg;
+      try {
+        model_cfg_f >> model_cfg;
+      } catch (const std::exception &) {
+      }
+      auto resolve_id = [&](const char *key) -> int32_t {
+        if (!model_cfg.contains(key))
+          return -1;
+        const auto &v = model_cfg[key];
+        if (v.is_number_integer())
+          return v.get<int32_t>();
+        if (v.is_array() && !v.empty() && v[0].is_number_integer())
+          return v[0].get<int32_t>(); // some configs list multiple eos ids
+        return -1;
+      };
+      if (!bos_resolved) {
+        const int32_t id = resolve_id("bos_token_id");
+        if (id >= 0)
+          bos_id_ = id;
+      }
+      if (!eos_resolved) {
+        const int32_t id = resolve_id("eos_token_id");
+        if (id >= 0)
+          eos_id_ = id;
+      }
+    }
   }
 
   // Build special token string list for greedy matching.

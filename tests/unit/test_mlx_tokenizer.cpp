@@ -154,6 +154,70 @@ static fs::path WriteByteLevelTokenizer(const fs::path &dir) {
   return dir;
 }
 
+// Same vocab/merges as WriteByteLevelTokenizer, but with pre_tokenizer
+// wrapped as Sequence[Split, ByteLevel] — the form HuggingFace actually
+// emits for Qwen2.5, GPT-2, Llama-3, Phi-3, and most other ByteLevel-BPE
+// tokenizers. Regression fixture for the bug where the wrapped form was
+// never unwrapped, leaving pre_tok_ at Unknown and Decode() returning raw,
+// undecoded token text (literal Ġ/Ċ instead of spaces/newlines).
+static fs::path WriteByteLevelSequenceTokenizer(const fs::path &dir) {
+  fs::create_directories(dir);
+
+  nlohmann::json vocab;
+  vocab["<unk>"] = 0;
+  vocab["<s>"] = 1;
+  vocab["</s>"] = 2;
+  vocab["h"] = 3;
+  vocab["e"] = 4;
+  vocab["l"] = 5;
+  vocab["o"] = 6;
+  vocab["w"] = 7;
+  vocab["r"] = 8;
+  vocab["d"] = 9;
+  vocab["\xc4\xa0"] = 10; // Ġ
+  vocab["he"] = 11;
+  vocab["hel"] = 12;
+  vocab["hell"] = 13;
+  vocab["hello"] = 14;
+  vocab["\xc4\xa0w"] = 15;     // Ġw
+  vocab["\xc4\xa0wo"] = 16;    // Ġwo
+  vocab["\xc4\xa0wor"] = 17;   // Ġwor
+  vocab["\xc4\xa0worl"] = 18;  // Ġworl
+  vocab["\xc4\xa0world"] = 19; // Ġworld
+
+  nlohmann::json merges = nlohmann::json::array({
+      "h e",
+      "he l",
+      "hel l",
+      "hell o",
+      "\xc4\xa0 w",
+      "\xc4\xa0w o",
+      "\xc4\xa0wo r",
+      "\xc4\xa0wor l",
+      "\xc4\xa0worl d",
+  });
+
+  nlohmann::json tok;
+  tok["model"]["type"] = "BPE";
+  tok["model"]["vocab"] = vocab;
+  tok["model"]["merges"] = merges;
+  tok["pre_tokenizer"]["type"] = "Sequence";
+  tok["pre_tokenizer"]["pretokenizers"] = nlohmann::json::array({
+      {{"type", "Split"}, {"behavior", "Isolated"}, {"invert", false}},
+      {{"type", "ByteLevel"}, {"add_prefix_space", false}},
+  });
+  tok["added_tokens"] = nlohmann::json::array({
+      {{"id", 0}, {"content", "<unk>"}, {"special", true}},
+      {{"id", 1}, {"content", "<s>"}, {"special", true}},
+      {{"id", 2}, {"content", "</s>"}, {"special", true}},
+  });
+
+  const auto path = dir / "tokenizer.json";
+  std::ofstream f(path);
+  f << tok.dump(2);
+  return dir;
+}
+
 // ---------------------------------------------------------------------------
 // MlxTokenizerResult defaults
 // ---------------------------------------------------------------------------
@@ -354,6 +418,31 @@ TEST_CASE("MlxTokenizer ByteLevel decode round-trip", "[mlx_tokenizer]") {
   fs::remove_all(dir);
 }
 
+TEST_CASE("MlxTokenizer unwraps Sequence-wrapped ByteLevel pre_tokenizer",
+          "[mlx_tokenizer]") {
+  // Regression test: HuggingFace's actual tokenizer.json for Qwen2.5,
+  // GPT-2, Llama-3, Phi-3, etc. wraps pre_tokenizer as
+  // Sequence[Split, ByteLevel], not a flat {"type": "ByteLevel"}. Before
+  // the fix, Load() only matched the flat form, so pre_tok_ stayed Unknown
+  // and Decode() fell through to raw, undecoded token text — every decoded
+  // response contained literal Ġ/Ċ instead of spaces/newlines.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_bl_seq";
+  WriteByteLevelSequenceTokenizer(dir);
+
+  MlxTokenizer tok;
+  REQUIRE(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+
+  auto r = tok.Encode("hello world", /*add_bos=*/false);
+  REQUIRE(r.ok);
+  const std::string decoded = tok.Decode(r.ids, /*skip_special=*/false);
+  // Must be real decoded text with a space, not "helloĠworld" or
+  // "hello\xc4\xa0world" (the undecoded ByteLevel marker for space).
+  REQUIRE(decoded == "hello world");
+
+  fs::remove_all(dir);
+}
+
 // ---------------------------------------------------------------------------
 // tokenizer_config.json — bos/eos resolved from object notation
 // ---------------------------------------------------------------------------
@@ -422,6 +511,83 @@ TEST_CASE("MlxTokenizer HasChatTemplate false when key absent",
   REQUIRE(tok.Load(dir));
   REQUIRE_FALSE(tok.HasChatTemplate());
   REQUIRE(tok.ChatTemplate().empty());
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer falls back to standalone chat_template.jinja file "
+          "when tokenizer_config.json is absent",
+          "[mlx_tokenizer]") {
+  // Regression test: transformers v4.44+ / vLLM / SGLang ship the chat
+  // template as a standalone chat_template.jinja file when there is no
+  // tokenizer_config.json (or it has no embedded chat_template). Before
+  // this fallback existed, such a model directory silently loaded with no
+  // chat template at all, forcing every caller through their non-instruct
+  // fallback formatting.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_jinja_file";
+  WriteByteLevelTokenizer(dir); // no tokenizer_config.json written
+  {
+    std::ofstream f(dir / "chat_template.jinja");
+    f << "{{ '<|im_start|>' + role }}";
+  }
+
+  MlxTokenizer tok;
+  REQUIRE(tok.Load(dir));
+  REQUIRE(tok.HasChatTemplate());
+  REQUIRE(tok.ChatTemplate().find("im_start") != std::string::npos);
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer falls back to config.json bos/eos_token_id when "
+          "tokenizer_config.json is absent",
+          "[mlx_tokenizer]") {
+  // Regression test: some safetensors conversions ship only tokenizer.json
+  // + config.json (no tokenizer_config.json). Without this fallback,
+  // bos_id_/eos_id_ silently kept Reset()'s defaults (1, 2) instead of the
+  // model's real special-token IDs, breaking generation stopping.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_cfg_json_eos";
+  WriteByteLevelTokenizer(dir); // no tokenizer_config.json written
+  {
+    nlohmann::json cfg;
+    cfg["bos_token_id"] = 1;
+    cfg["eos_token_id"] = 42; // distinct from Reset()'s default (2)
+    std::ofstream f(dir / "config.json");
+    f << cfg.dump();
+  }
+
+  MlxTokenizer tok;
+  REQUIRE(tok.Load(dir));
+  REQUIRE(tok.BosId() == 1);
+  REQUIRE(tok.EosId() == 42);
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer prefers tokenizer_config.json bos/eos over "
+          "config.json when both are present",
+          "[mlx_tokenizer]") {
+  const auto dir = fs::temp_directory_path() / "ifx_tok_cfg_precedence";
+  WriteByteLevelTokenizer(dir);
+  {
+    nlohmann::json tok_cfg;
+    tok_cfg["bos_token"] = "<s>";
+    tok_cfg["eos_token"] = "</s>";
+    std::ofstream f(dir / "tokenizer_config.json");
+    f << tok_cfg.dump();
+  }
+  {
+    nlohmann::json model_cfg;
+    model_cfg["bos_token_id"] = 99; // should be ignored
+    model_cfg["eos_token_id"] = 99; // should be ignored
+    std::ofstream f(dir / "config.json");
+    f << model_cfg.dump();
+  }
+
+  MlxTokenizer tok;
+  REQUIRE(tok.Load(dir));
+  REQUIRE(tok.BosId() == 1); // from tokenizer_config.json's "<s>"
+  REQUIRE(tok.EosId() == 2); // from tokenizer_config.json's "</s>"
 
   fs::remove_all(dir);
 }
