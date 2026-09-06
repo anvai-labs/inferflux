@@ -62,12 +62,25 @@ moment decode begins rather than at cohort rebuild; expect small gains
 
 ## 4) Ranked plan (status: Sep 6 2026)
 
-1. **CUDA-graph the safetensors decode step** (port the GGUF decode relay
-   design). Kills the ~12% sync overhead, removes per-step launch latency,
-   and stabilizes cuBLAS kernel selection. Moderate effort, proven pattern
-   in this codebase (`decode_relay_fingerprint`, graph capture on the GGUF
-   path). Gate: capture must cover cuBLAS calls (they are capturable) with
-   the same fingerprint guards as GGUF. **Next up.**
+1. **CUDA-graph the safetensors decode step — DONE.** The batched decode
+   path already had full capture scaffolding; the safetensors path was
+   excluded by `DecodeGraphCaptureSafe` (quantized weights required)
+   plus per-projection capture aborts at every cuBLAS fallback. Changes:
+   cuBLAS projection fallbacks are now capture-safe when the cuBLAS
+   workspace is pinned (`HasPinnedWorkspace()`, already 4 MB via the
+   executor), so the aborts only fire when unsafe; `GemmTypedLt`'s
+   heuristic is cached per shape so no host-side query runs under
+   capture; and the single-slot graph (which would thrash destroy+
+   recapture on EOS-staggered width changes) became a per-width LRU set
+   (cap 4). Verified: graphs capture for safetensors (B=1..7, ~509-581
+   nodes), greedy outputs bit-identical with graphs on vs
+   `INFERFLUX_DISABLE_CUDA_GRAPH=1` (both safetensors and GGUF paths),
+   8-way concurrent identical prompts -> 1 distinct output, 32/32
+   success. End-to-end (c=16 profiled, 2 runs): 266.8/286.2 ->
+   331.3/316.6 tok/s (**+17.2% avg**), whole decode workload executed as
+   ~200 `cudaGraphLaunch` calls; kernel time itself also dropped
+   (cutlass 3490 -> 2860 ms) — capture-time algo selection beats
+   live-heuristic picks under launch pressure.
 2. **cublasLt algo search — DONE (scoped to lm_head).** Experiment result:
    Lt's first heuristic is neutral (~±1%) vs `cublasGemmEx` on the
    FFN/QKV/O shapes, but **1.6-2.1x faster on the lm_head shape
@@ -96,8 +109,8 @@ moment decode begins rather than at cohort rebuild; expect small gains
 3. **Fuse gate+up into one [2N, K] GEMM** — **FALSIFIED**: cold-L2 spike
    shows fused [22016, 2048] is 1.01-1.02x two [11008, 2048] calls
    (noise). Two back-to-back GEMMs are already fine; skip.
-4. **Specialist bf16 decode kernel** (the 2x-vs-physics prize): only after
-   1 lands, as a real project — large row-tiles per block (64-128 rows),
+4. **Specialist bf16 decode kernel** (the 2x-vs-physics prize): next
+   after 1, as a real project — large row-tiles per block (64-128 rows),
    cp.async double-buffered K-stream, tensor-core-free FMUL pipeline sized
    to 48 SMs, dispatch rule M<=8. Spike tool already provides the honest
    cold-L2 benchmark harness to iterate against.
