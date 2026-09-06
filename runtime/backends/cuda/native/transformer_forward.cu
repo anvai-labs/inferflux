@@ -2537,8 +2537,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           vocab_size_, hidden_size_, stream_, "lm_head",
                           &execution_policy_)) {
         const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
-        if (!gemm_->GemmTyped<T>(1, vocab_size_, hidden_size_, d_norm_out_,
-                                 lm_head, d_logits_typed_)) {
+        // cublasLt heuristic: 1.6-2.1x over cublasGemmEx at this shape
+        // (N=vocab) cold-L2; falls back to GemmTyped internally on failure.
+        if (!gemm_->GemmTypedLt<T>(1, vocab_size_, hidden_size_, d_norm_out_,
+                                   lm_head, d_logits_typed_)) {
           log::Error("llama_forward", "LM head projection failed");
           return false;
         }
@@ -4044,8 +4046,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             return false;
           }
           const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
-          gemm_->GemmTyped<T>(B, vocab_size_, hidden_size_, d_norm_out_,
-                              lm_head, d_logits_typed_);
+          gemm_->GemmTypedLt<T>(B, vocab_size_, hidden_size_, d_norm_out_,
+                                lm_head, d_logits_typed_);
         }
       }
 

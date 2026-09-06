@@ -60,24 +60,44 @@ admitting *prefilled-and-waiting* requests into the running cohort the
 moment decode begins rather than at cohort rebuild; expect small gains
 (<10%) on this workload, larger on open-loop arrivals.
 
-## 4) Ranked plan
+## 4) Ranked plan (status: Sep 6 2026)
 
 1. **CUDA-graph the safetensors decode step** (port the GGUF decode relay
    design). Kills the ~12% sync overhead, removes per-step launch latency,
    and stabilizes cuBLAS kernel selection. Moderate effort, proven pattern
    in this codebase (`decode_relay_fingerprint`, graph capture on the GGUF
    path). Gate: capture must cover cuBLAS calls (they are capturable) with
-   the same fingerprint guards as GGUF.
-2. **cublasLt algo search for the 5 shapes x M in [1..16]** — offline
-   enumeration cached at load time (`cublasLtMatmulAlgoGetHeuristic` with
-   workspace tuning). Cheap (a day), typically 10-30% on skinny shapes,
-   no kernel maintenance burden. Extends
-   `native_linear_executor`/strategy dispatch.
-3. **Fuse gate+up into one [2N, K] GEMM** on the bf16 path (the quantized
-   path already has `INFERFLUX_ENABLE_FUSED_GATE_UP_SILU`): halves call
-   count for 90 MB of weights, better launch shape. Small effort.
+   the same fingerprint guards as GGUF. **Next up.**
+2. **cublasLt algo search — DONE (scoped to lm_head).** Experiment result:
+   Lt's first heuristic is neutral (~±1%) vs `cublasGemmEx` on the
+   FFN/QKV/O shapes, but **1.6-2.1x faster on the lm_head shape
+   (N=vocab)**, where `cublasGemmEx`'s pick is both slow and unstable
+   cold-L2 (3.0-4.2 ms vs a consistent ~2.0 ms). Landed as
+   `CublasGemm::GemmTypedLt` (cached per-shape heuristic, GemmTyped
+   fallback), routed for the vocab projection (single + batched).
+   End-to-end after review fix: 252.6 -> 266.8/286.2 tok/s profiled
+   (+5.6%/+13.3%, avg ~+9.5%), GPU busy 7.18 -> 6.78 s, 32/32 success,
+   output coherent. **Falsified for other shapes** — do not bother
+   routing them.
+   **Review lesson (adversarial round 1):** the first version of
+   `GemmTypedLt` created its matmul descriptor with the matrix dtype
+   (bf16) as `scaleType` while passing `float*` alpha/beta — cublasLt
+   requires `CUDA_R_32F` scale type for `CUBLAS_COMPUTE_32F`, so the
+   heuristic query returned zero results and every call silently
+   permanently fell back to `GemmTyped` (a no-op shipped as an
+   optimization; the spike had it right, the production wiring dropped
+   it). The reviewer caught it by reproducing the descriptor setup
+   standalone at the real lm_head shape. Fix: scaleType = `CUDA_R_32F`,
+   plus a one-time warn when a shape's heuristic fails so this class of
+   silent fallback can't recur unnoticed. Measurement honesty note: the
+   pre-fix "+7.2%" was run-to-run variance, not the code — the no-op
+   build measured 270.9/269.9 vs pre-change 252.6, which is why the
+   post-fix claim is re-measured from scratch.
+3. **Fuse gate+up into one [2N, K] GEMM** — **FALSIFIED**: cold-L2 spike
+   shows fused [22016, 2048] is 1.01-1.02x two [11008, 2048] calls
+   (noise). Two back-to-back GEMMs are already fine; skip.
 4. **Specialist bf16 decode kernel** (the 2x-vs-physics prize): only after
-   1-3 land, as a real project — large row-tiles per block (64-128 rows),
+   1 lands, as a real project — large row-tiles per block (64-128 rows),
    cp.async double-buffered K-stream, tensor-core-free FMUL pipeline sized
    to 48 SMs, dispatch rule M<=8. Spike tool already provides the honest
    cold-L2 benchmark harness to iterate against.
