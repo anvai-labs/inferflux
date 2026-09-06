@@ -4047,7 +4047,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
           }
           const T *lm_head = reinterpret_cast<const T *>(weights_->LmHead());
           gemm_->GemmTypedLt<T>(B, vocab_size_, hidden_size_, d_norm_out_,
-                              lm_head, d_logits_typed_);
+                                lm_head, d_logits_typed_);
         }
       }
 

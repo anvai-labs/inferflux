@@ -16,8 +16,8 @@
 //
 // Not wired into CMake: spike tool, no server integration yet.
 
-#include <cublas_v2.h>
 #include <cublasLt.h>
+#include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
@@ -27,23 +27,23 @@
 #include <random>
 #include <vector>
 
-#define CHECK(x)                                                           \
-  do {                                                                     \
-    cudaError_t e = (x);                                                   \
-    if (e != cudaSuccess) {                                                \
-      printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__,  \
-             __LINE__);                                                    \
-      exit(1);                                                             \
-    }                                                                      \
+#define CHECK(x)                                                               \
+  do {                                                                         \
+    cudaError_t e = (x);                                                       \
+    if (e != cudaSuccess) {                                                    \
+      printf("CUDA error %s at %s:%d\n", cudaGetErrorString(e), __FILE__,      \
+             __LINE__);                                                        \
+      exit(1);                                                                 \
+    }                                                                          \
   } while (0)
 
-#define CUBLAS_CHECK(x)                                                    \
-  do {                                                                     \
-    cublasStatus_t s = (x);                                                \
-    if (s != CUBLAS_STATUS_SUCCESS) {                                      \
-      printf("cuBLAS error %d at %s:%d\n", (int)s, __FILE__, __LINE__);    \
-      exit(1);                                                             \
-    }                                                                      \
+#define CUBLAS_CHECK(x)                                                        \
+  do {                                                                         \
+    cublasStatus_t s = (x);                                                    \
+    if (s != CUBLAS_STATUS_SUCCESS) {                                          \
+      printf("cuBLAS error %d at %s:%d\n", (int)s, __FILE__, __LINE__);        \
+      exit(1);                                                                 \
+    }                                                                          \
   } while (0)
 
 // ---------------------------------------------------------------------------
@@ -62,23 +62,24 @@ constexpr int kMaxM = 16;
 
 // One warp per output row. Lane l handles elements l*8 .. l*8+7 of each
 // 128-byte segment (8 bf16), striding warp_width*8 elements per iteration.
-__global__ void __launch_bounds__(256) GemvBf16WideK(
-    const __nv_bfloat16 *__restrict__ w,  // [N, K] row-major
-    const __nv_bfloat16 *__restrict__ x,  // [M, K] row-major
-    float *__restrict__ y,                // [M, N] row-major
-    int N, int K, int M) {
+__global__ void __launch_bounds__(256)
+    GemvBf16WideK(const __nv_bfloat16 *__restrict__ w, // [N, K] row-major
+                  const __nv_bfloat16 *__restrict__ x, // [M, K] row-major
+                  float *__restrict__ y,               // [M, N] row-major
+                  int N, int K, int M) {
   const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
   const int lane = threadIdx.x & 31;
   const int n_rows = (gridDim.x * blockDim.x) >> 5;
   const int warp_inc = (gridDim.x * blockDim.x) >> 5;
 
-  const int vec_per_row = K >> 3;  // 8 bf16 per 16B load
+  const int vec_per_row = K >> 3; // 8 bf16 per 16B load
 
   for (int row = warp; row < N; row += warp_inc) {
     const __nv_bfloat16 *w_row = w + static_cast<long>(row) * K;
     float acc[kMaxM];
 #pragma unroll
-    for (int m = 0; m < kMaxM; ++m) acc[m] = 0.f;
+    for (int m = 0; m < kMaxM; ++m)
+      acc[m] = 0.f;
 
     const int4 *w_vec = reinterpret_cast<const int4 *>(w_row);
     for (int v = lane; v < vec_per_row; v += 32) {
@@ -110,7 +111,6 @@ __global__ void __launch_bounds__(256) GemvBf16WideK(
   }
 }
 
-
 // ---------------------------------------------------------------------------
 // Reference + harness
 // ---------------------------------------------------------------------------
@@ -125,10 +125,10 @@ static void CublasGemmTN(cublasHandle_t h, int M, int N, int K,
   // viewed as [N,K] col-major? no) -- use op(B)=T form:
   // y_cm[N,M] = W_rowmajor_as_cm[K,N]^T * x_rowmajor_as_cm[K,M]
   float alpha = 1.f, beta = 0.f;
-  CUBLAS_CHECK(cublasGemmEx(
-      h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, w, CUDA_R_16BF, K, x,
-      CUDA_R_16BF, K, &beta, y, CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
-      CUBLAS_GEMM_DEFAULT));
+  CUBLAS_CHECK(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha, w,
+                            CUDA_R_16BF, K, x, CUDA_R_16BF, K, &beta, y,
+                            CUDA_R_32F, N, CUBLAS_COMPUTE_32F,
+                            CUBLAS_GEMM_DEFAULT));
 }
 
 struct Shape {
@@ -136,7 +136,6 @@ struct Shape {
   int N, K;
   long weight_bytes() const { return (long)N * K * 2; }
 };
-
 
 // ---------------------------------------------------------------------------
 // cublasLt: enumerate heuristic algos beyond the cublasGemmEx default pick,
@@ -149,8 +148,10 @@ struct LtContext {
   static constexpr size_t kWorkspace = 32u * 1024 * 1024;
 
   bool Init() {
-    if (cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS) return false;
-    if (cudaMalloc(&workspace, kWorkspace) != cudaSuccess) return false;
+    if (cublasLtCreate(&handle) != CUBLAS_STATUS_SUCCESS)
+      return false;
+    if (cudaMalloc(&workspace, kWorkspace) != cudaSuccess)
+      return false;
     return true;
   }
 };
@@ -158,19 +159,21 @@ struct LtContext {
 // One cold-L2 timed cublasLtMatmul call. Returns ms, or -1 on unsupported.
 static float TimeLtOnce(LtContext &lt, cublasLtMatmulDesc_t op,
                         cublasLtMatrixLayout_t ad, cublasLtMatrixLayout_t bd,
-                        cublasLtMatrixLayout_t dd, const cublasLtMatmulAlgo_t *algo,
+                        cublasLtMatrixLayout_t dd,
+                        const cublasLtMatmulAlgo_t *algo,
                         const __nv_bfloat16 *x, const __nv_bfloat16 *w,
-                        float *y, float *evict, size_t evict_n,
-                        cudaEvent_t t0, cudaEvent_t t1) {
+                        float *y, float *evict, size_t evict_n, cudaEvent_t t0,
+                        cudaEvent_t t1) {
   float alpha = 1.f, beta = 0.f;
   CHECK(cudaMemsetAsync(evict, 0x5A, evict_n * sizeof(float)));
   CHECK(cudaEventRecord(t0));
-  cublasStatus_t st = cublasLtMatmul(lt.handle, op, &alpha, x, ad, w, bd, &beta,
-                                     y, dd, y, dd,
-                                     algo, lt.workspace, LtContext::kWorkspace, 0);
+  cublasStatus_t st =
+      cublasLtMatmul(lt.handle, op, &alpha, x, ad, w, bd, &beta, y, dd, y, dd,
+                     algo, lt.workspace, LtContext::kWorkspace, 0);
   CHECK(cudaEventRecord(t1));
   CHECK(cudaEventSynchronize(t1));
-  if (st != CUBLAS_STATUS_SUCCESS) return -1.f;
+  if (st != CUBLAS_STATUS_SUCCESS)
+    return -1.f;
   float ms = 0;
   CHECK(cudaEventElapsedTime(&ms, t0, t1));
   return ms;
@@ -178,8 +181,8 @@ static float TimeLtOnce(LtContext &lt, cublasLtMatmulDesc_t op,
 
 // Returns best-of-heuristics time in ms; fills best_was_default.
 static float LtBestCold(LtContext &lt, int M, int N, int K,
-                        const __nv_bfloat16 *x, const __nv_bfloat16 *w, float *y,
-                        float *evict, size_t evict_n, cudaEvent_t t0,
+                        const __nv_bfloat16 *x, const __nv_bfloat16 *w,
+                        float *y, float *evict, size_t evict_n, cudaEvent_t t0,
                         cudaEvent_t t1, int *returned_count,
                         float *default_time) {
   cublasLtMatmulDesc_t op;
@@ -195,24 +198,21 @@ static float LtBestCold(LtContext &lt, int M, int N, int K,
   // A = x [M, K] row-major, op N.
   CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&ad, CUDA_R_16BF, M, K, K));
   CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
-      ad, CUBLASLT_MATRIX_LAYOUT_ORDER, &kRowOrder,
-      sizeof(kRowOrder)));
+      ad, CUBLASLT_MATRIX_LAYOUT_ORDER, &kRowOrder, sizeof(kRowOrder)));
   // B = w [N, K] row-major, op T.
   CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&bd, CUDA_R_16BF, N, K, K));
   CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
-      bd, CUBLASLT_MATRIX_LAYOUT_ORDER, &kRowOrder,
-      sizeof(kRowOrder)));
+      bd, CUBLASLT_MATRIX_LAYOUT_ORDER, &kRowOrder, sizeof(kRowOrder)));
   // D = y [M, N] row-major, fp32 out (matches spike's cublasGemmEx ref).
   CUBLAS_CHECK(cublasLtMatrixLayoutCreate(&dd, CUDA_R_32F, M, N, N));
   CUBLAS_CHECK(cublasLtMatrixLayoutSetAttribute(
-      dd, CUBLASLT_MATRIX_LAYOUT_ORDER, &kRowOrder,
-      sizeof(kRowOrder)));
+      dd, CUBLASLT_MATRIX_LAYOUT_ORDER, &kRowOrder, sizeof(kRowOrder)));
 
   cublasLtMatmulPreference_t pref;
   CUBLAS_CHECK(cublasLtMatmulPreferenceCreate(&pref));
   CUBLAS_CHECK(cublasLtMatmulPreferenceSetAttribute(
-      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-      &LtContext::kWorkspace, sizeof(size_t)));
+      pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &LtContext::kWorkspace,
+      sizeof(size_t)));
 
   cublasLtMatmulHeuristicResult_t results[12];
   int n_results = 0;
@@ -236,13 +236,20 @@ static float LtBestCold(LtContext &lt, int M, int N, int K,
     for (int k = 0; k < 3; ++k) {
       t[k] = TimeLtOnce(lt, op, ad, bd, dd, &results[i].algo, x, w, y, evict,
                         evict_n, t0, t1);
-      if (t[k] < 0) { ok = false; break; }
+      if (t[k] < 0) {
+        ok = false;
+        break;
+      }
     }
-    if (!ok) continue;
-    float med = t[0] < t[1] ? (t[1] < t[2] ? t[1] : (t[0] < t[2] ? t[2] : t[0]))
-                            : (t[0] < t[2] ? t[0] : (t[1] < t[2] ? t[2] : t[1]));
-    if (i == 0) *default_time = med;  // heuristic[0] ~= GemmEx default pick
-    if (med < best) best = med;
+    if (!ok)
+      continue;
+    float med = t[0] < t[1]
+                    ? (t[1] < t[2] ? t[1] : (t[0] < t[2] ? t[2] : t[0]))
+                    : (t[0] < t[2] ? t[0] : (t[1] < t[2] ? t[2] : t[1]));
+    if (i == 0)
+      *default_time = med; // heuristic[0] ~= GemmEx default pick
+    if (med < best)
+      best = med;
   }
 
   cublasLtMatmulPreferenceDestroy(pref);
@@ -255,9 +262,8 @@ static float LtBestCold(LtContext &lt, int M, int N, int K,
 
 int main() {
   Shape shapes[] = {
-      {"gate/up", 11008, 2048}, {"down", 2048, 11008},
-      {"qkv", 2560, 2048},      {"o_proj", 2048, 2048},
-      {"lm_head", 151936, 2048},
+      {"gate/up", 11008, 2048}, {"down", 2048, 11008},     {"qkv", 2560, 2048},
+      {"o_proj", 2048, 2048},   {"lm_head", 151936, 2048},
   };
   int Ms[] = {1, 2, 3, 4, 8, 16};
 
@@ -286,16 +292,16 @@ int main() {
       std::mt19937 rng(42);
       std::uniform_real_distribution<float> dist(-1.f, 1.f);
       std::vector<__nv_bfloat16> h_w(wn), h_x(xn);
-      for (auto &v : h_w) v = __float2bfloat16(dist(rng));
-      for (auto &v : h_x) v = __float2bfloat16(dist(rng));
-      CHECK(
-          cudaMemcpy(d_w, h_w.data(), wn * 2, cudaMemcpyHostToDevice));
-      CHECK(
-          cudaMemcpy(d_x, h_x.data(), xn * 2, cudaMemcpyHostToDevice));
+      for (auto &v : h_w)
+        v = __float2bfloat16(dist(rng));
+      for (auto &v : h_x)
+        v = __float2bfloat16(dist(rng));
+      CHECK(cudaMemcpy(d_w, h_w.data(), wn * 2, cudaMemcpyHostToDevice));
+      CHECK(cudaMemcpy(d_x, h_x.data(), xn * 2, cudaMemcpyHostToDevice));
 
       // Custom kernel launch geometry: warp handles one row; total warps
       // ~4x what's needed so every SM is saturated; rows strided.
-      int warps_wanted = shape.N;  // one warp per row upper bound
+      int warps_wanted = shape.N; // one warp per row upper bound
       int block = 256;
       int grid = std::min((warps_wanted * 32 + block - 1) / block,
                           prop.multiProcessorCount * 8);
@@ -316,22 +322,20 @@ int main() {
       // cuBLAS timing
       float alpha = 1.f, beta = 0.f;
       CUBLAS_CHECK(cublasSetStream(handle, 0));
-      CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, shape.N, M, shape.K,
-                                &alpha, d_w, CUDA_R_16BF, shape.K, d_x,
-                                CUDA_R_16BF, shape.K, &beta, d_y_cublas,
-                                CUDA_R_32F, shape.N, CUBLAS_COMPUTE_32F,
-                                CUBLAS_GEMM_DEFAULT));
+      CUBLAS_CHECK(cublasGemmEx(
+          handle, CUBLAS_OP_T, CUBLAS_OP_N, shape.N, M, shape.K, &alpha, d_w,
+          CUDA_R_16BF, shape.K, d_x, CUDA_R_16BF, shape.K, &beta, d_y_cublas,
+          CUDA_R_32F, shape.N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
       // Evict L2 between iterations (attention kernels run between
       // projections in the real decode loop) but time only the GEMM window.
       ms_cublas = 0;
       for (int i = 0; i < iters; ++i) {
         CHECK(cudaMemsetAsync(d_evict, i & 0xFF, evict_n * sizeof(float)));
         CHECK(cudaEventRecord(t0));
-        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, shape.N, M,
-                                  shape.K, &alpha, d_w, CUDA_R_16BF, shape.K, d_x,
-                                  CUDA_R_16BF, shape.K, &beta, d_y_cublas,
-                                  CUDA_R_32F, shape.N, CUBLAS_COMPUTE_32F,
-                                  CUBLAS_GEMM_DEFAULT));
+        CUBLAS_CHECK(cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, shape.N, M, shape.K, &alpha, d_w,
+            CUDA_R_16BF, shape.K, d_x, CUDA_R_16BF, shape.K, &beta, d_y_cublas,
+            CUDA_R_32F, shape.N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         CHECK(cudaEventRecord(t1));
         CHECK(cudaEventSynchronize(t1));
         float ms_i = 0;
@@ -344,8 +348,8 @@ int main() {
       CHECK(cudaGetLastError());
       ms_custom = 0;
       for (int i = 0; i < iters; ++i) {
-        CHECK(cudaMemsetAsync(d_evict, (i + 1) & 0xFF,
-                              evict_n * sizeof(float)));
+        CHECK(
+            cudaMemsetAsync(d_evict, (i + 1) & 0xFF, evict_n * sizeof(float)));
         CHECK(cudaEventRecord(t0));
         GemvBf16WideK<<<grid, block>>>(d_w, d_x, d_y_custom, shape.N, shape.K,
                                        M);
@@ -367,7 +371,8 @@ int main() {
       size_t stride = std::max<size_t>(1, yn / 4096);
       for (size_t i = 0; i < yn; i += stride) {
         double d = std::abs((double)ya[i] - (double)yb[i]);
-        if (d > max_diff) max_diff = d;
+        if (d > max_diff)
+          max_diff = d;
       }
 
       double gbs = shape.weight_bytes() / 1e9;
@@ -383,18 +388,16 @@ int main() {
             "%-8s M=%2d | cublas %7.3f ms (%3.0f%%) | warp/row %7.3f ms "
             "(%3.0f%%) | ltdef %7.3f ms | ltbest %7.3f ms (%4.2fx vs cublas, "
             "%d algos) | maxdiff %.3f\n",
-            shape.name, M, ms_cublas,
-            100.0 * (gbs / (ms_cublas / 1e3)) / 576.0, ms_custom,
-            100.0 * (gbs / (ms_custom / 1e3)) / 576.0, lt_default, lt_best,
-            ms_cublas / lt_best, n_lt, max_diff);
+            shape.name, M, ms_cublas, 100.0 * (gbs / (ms_cublas / 1e3)) / 576.0,
+            ms_custom, 100.0 * (gbs / (ms_custom / 1e3)) / 576.0, lt_default,
+            lt_best, ms_cublas / lt_best, n_lt, max_diff);
       } else {
-        printf(
-            "%-8s M=%2d | cublas %7.3f ms (%3.0f%% roofline) | warp/row "
-            "%7.3f ms (%3.0f%%) | speedup %4.2fx | maxdiff %.3f\n",
-            shape.name, M, ms_cublas,
-            100.0 * (gbs / (ms_cublas / 1e3)) / 576.0, ms_custom,
-            100.0 * (gbs / (ms_custom / 1e3)) / 576.0, ms_cublas / ms_custom,
-            max_diff);
+        printf("%-8s M=%2d | cublas %7.3f ms (%3.0f%% roofline) | warp/row "
+               "%7.3f ms (%3.0f%%) | speedup %4.2fx | maxdiff %.3f\n",
+               shape.name, M, ms_cublas,
+               100.0 * (gbs / (ms_cublas / 1e3)) / 576.0, ms_custom,
+               100.0 * (gbs / (ms_custom / 1e3)) / 576.0, ms_cublas / ms_custom,
+               max_diff);
       }
 
       CHECK(cudaEventDestroy(t0));
@@ -426,12 +429,15 @@ int main() {
       std::uniform_real_distribution<float> dist(-1.f, 1.f);
       {
         std::vector<__nv_bfloat16> tmp(wf);
-        for (auto &v : tmp) v = __float2bfloat16(dist(rng));
+        for (auto &v : tmp)
+          v = __float2bfloat16(dist(rng));
         CHECK(cudaMemcpy(d_wf, tmp.data(), wf * 2, cudaMemcpyHostToDevice));
         CHECK(cudaMemcpy(d_w1, d_wf, w1 * 2, cudaMemcpyDeviceToDevice));
         std::vector<__nv_bfloat16> tx((size_t)M * Kq);
-        for (auto &v : tx) v = __float2bfloat16(dist(rng));
-        CHECK(cudaMemcpy(d_x, tx.data(), tx.size() * 2, cudaMemcpyHostToDevice));
+        for (auto &v : tx)
+          v = __float2bfloat16(dist(rng));
+        CHECK(
+            cudaMemcpy(d_x, tx.data(), tx.size() * 2, cudaMemcpyHostToDevice));
       }
       float *d_evict;
       const size_t evict_n = 96u * 1024 * 1024 / sizeof(float);
@@ -446,12 +452,11 @@ int main() {
         CHECK(cudaMemsetAsync(d_evict, i & 0xFF, evict_n * sizeof(float)));
         CHECK(cudaEventRecord(t0));
         for (int half = 0; half < 2; ++half)
-          CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, Ngate, M,
-                                    Kq, &alpha, d_w1 + (size_t)half * w1,
-                                    CUDA_R_16BF, Kq, d_x, CUDA_R_16BF, Kq,
-                                    &beta, d_y + (size_t)half * Ngate,
-                                    CUDA_R_32F, Ngate, CUBLAS_COMPUTE_32F,
-                                    CUBLAS_GEMM_DEFAULT));
+          CUBLAS_CHECK(cublasGemmEx(
+              handle, CUBLAS_OP_T, CUBLAS_OP_N, Ngate, M, Kq, &alpha,
+              d_w1 + (size_t)half * w1, CUDA_R_16BF, Kq, d_x, CUDA_R_16BF, Kq,
+              &beta, d_y + (size_t)half * Ngate, CUDA_R_32F, Ngate,
+              CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         CHECK(cudaEventRecord(t1));
         CHECK(cudaEventSynchronize(t1));
         float ms_i = 0;
@@ -459,24 +464,22 @@ int main() {
         ms_two += ms_i;
       }
       for (int i = 0; i < iters; ++i) {
-        CHECK(cudaMemsetAsync(d_evict, (i + 3) & 0xFF,
-                              evict_n * sizeof(float)));
+        CHECK(
+            cudaMemsetAsync(d_evict, (i + 3) & 0xFF, evict_n * sizeof(float)));
         CHECK(cudaEventRecord(t0));
-        CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, 2 * Ngate,
-                                  M, Kq, &alpha, d_wf, CUDA_R_16BF, Kq, d_x,
-                                  CUDA_R_16BF, Kq, &beta, d_y, CUDA_R_32F,
-                                  2 * Ngate, CUBLAS_COMPUTE_32F,
-                                  CUBLAS_GEMM_DEFAULT));
+        CUBLAS_CHECK(cublasGemmEx(
+            handle, CUBLAS_OP_T, CUBLAS_OP_N, 2 * Ngate, M, Kq, &alpha, d_wf,
+            CUDA_R_16BF, Kq, d_x, CUDA_R_16BF, Kq, &beta, d_y, CUDA_R_32F,
+            2 * Ngate, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
         CHECK(cudaEventRecord(t1));
         CHECK(cudaEventSynchronize(t1));
         float ms_i = 0;
         CHECK(cudaEventElapsedTime(&ms_i, t0, t1));
         ms_fused += ms_i;
       }
-      printf(
-          "  M=%2d | two x[11008] %7.3f ms | fused [22016] %7.3f ms | "
-          "fused/two %4.2fx\n",
-          M, ms_two / iters, ms_fused / iters, ms_two / ms_fused);
+      printf("  M=%2d | two x[11008] %7.3f ms | fused [22016] %7.3f ms | "
+             "fused/two %4.2fx\n",
+             M, ms_two / iters, ms_fused / iters, ms_two / ms_fused);
       CHECK(cudaEventDestroy(t0));
       CHECK(cudaEventDestroy(t1));
       cudaFree(d_w1);

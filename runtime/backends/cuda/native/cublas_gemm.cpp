@@ -116,9 +116,11 @@ bool CublasGemm::GemmTyped(int M, int N, int K, const T *A, const T *B, T *C) {
 }
 
 bool CublasGemm::EnsureLt() {
-  if (lt_handle_) return true;
+  if (lt_handle_)
+    return true;
   cublasLtHandle_t lt = nullptr;
-  if (cublasLtCreate(&lt) != CUBLAS_STATUS_SUCCESS) return false;
+  if (cublasLtCreate(&lt) != CUBLAS_STATUS_SUCCESS)
+    return false;
   void *ws = nullptr;
   if (cudaMalloc(&ws, kLtWorkspaceBytes) != cudaSuccess) {
     cublasLtDestroy(lt);
@@ -151,7 +153,7 @@ inline void LtAlgoToBytes(const cublasLtMatmulAlgo_t &algo,
                           unsigned char *bytes) {
   std::memcpy(bytes, &algo, sizeof(algo));
 }
-}  // namespace
+} // namespace
 
 template <typename T>
 bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
@@ -169,7 +171,8 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
     std::lock_guard<std::mutex> lock(lt_mutex_);
     auto it = lt_algo_cache_.find(key);
     if (it != lt_algo_cache_.end()) {
-      if (it->second.valid) algo = LtAlgoFromBytes(it->second.algo_bytes);
+      if (it->second.valid)
+        algo = LtAlgoFromBytes(it->second.algo_bytes);
       have_algo = it->second.valid;
       cached = true;
     }
@@ -183,8 +186,8 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
     // A = x [M, K] row-major with op N; B = W [N, K] row-major with op T;
     // D = C [M, N] row-major. Descriptors are cheap host objects, rebuilt
     // per call; only the chosen algo is cached per shape.
-    cublasStatus_t st = cublasLtMatmulDescCreate(
-        &op, CUBLAS_COMPUTE_32F, dtype);
+    cublasStatus_t st =
+        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, dtype);
     if (st == CUBLAS_STATUS_SUCCESS) {
       cublasOperation_t ta = CUBLAS_OP_N, tb = CUBLAS_OP_T;
       cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
@@ -215,9 +218,9 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
             pref, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &ws, sizeof(ws));
         cublasLtMatmulHeuristicResult_t heur[4];
         int returned = 0;
-        if (cublasLtMatmulAlgoGetHeuristic(reinterpret_cast<cublasLtHandle_t>(lt_handle_), op, ad, bd, dd, dd,
-                                           pref, 4, heur,
-                                           &returned) == CUBLAS_STATUS_SUCCESS &&
+        if (cublasLtMatmulAlgoGetHeuristic(
+                reinterpret_cast<cublasLtHandle_t>(lt_handle_), op, ad, bd, dd,
+                dd, pref, 4, heur, &returned) == CUBLAS_STATUS_SUCCESS &&
             returned > 0) {
           algo = heur[0].algo;
           have_algo = true;
@@ -228,12 +231,13 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
     std::lock_guard<std::mutex> lock(lt_mutex_);
     LtAlgoCacheEntry entry;
     entry.valid = have_algo;
-    if (have_algo) LtAlgoToBytes(algo, entry.algo_bytes);
+    if (have_algo)
+      LtAlgoToBytes(algo, entry.algo_bytes);
     lt_algo_cache_[key] = entry;
   } else {
     // Cache hit: still need descriptors for the call.
-    cublasStatus_t st = cublasLtMatmulDescCreate(
-        &op, CUBLAS_COMPUTE_32F, dtype);
+    cublasStatus_t st =
+        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, dtype);
     if (st == CUBLAS_STATUS_SUCCESS) {
       cublasOperation_t ta = CUBLAS_OP_N, tb = CUBLAS_OP_T;
       cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
@@ -267,10 +271,14 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
                         have_algo ? &algo : nullptr, lt_workspace_,
                         kLtWorkspaceBytes, stream_) == CUBLAS_STATUS_SUCCESS;
   }
-  if (op) cublasLtMatmulDescDestroy(op);
-  if (ad) cublasLtMatrixLayoutDestroy(ad);
-  if (bd) cublasLtMatrixLayoutDestroy(bd);
-  if (dd) cublasLtMatrixLayoutDestroy(dd);
+  if (op)
+    cublasLtMatmulDescDestroy(op);
+  if (ad)
+    cublasLtMatrixLayoutDestroy(ad);
+  if (bd)
+    cublasLtMatrixLayoutDestroy(bd);
+  if (dd)
+    cublasLtMatrixLayoutDestroy(dd);
 
   if (!ok) {
     return GemmTyped<T>(M, N, K, A, B, C);
