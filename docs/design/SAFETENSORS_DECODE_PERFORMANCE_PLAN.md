@@ -117,6 +117,32 @@ moment decode begins rather than at cohort rebuild; expect small gains
 5. **Re-run the two-stage benchmark after each landing** (2x runs, per the
    variance protocol) and update `docs/benchmarks.md`.
 
+## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
+
+The executor arms a per-step device relay after each decode step (sampled
+tokens + n_past+1 written into device metadata by `DeviceTokenRelay`, plus
+an identity fingerprint) so the next step can replay the just-captured
+graph without the H2D metadata upload. Review instrumentation showed **0
+relay matches across ~2k decode steps**: the arm stores the *fed* tokens
+and a `+1`-offset n_past, but the check compares against the *sampled*
+tokens the next step feeds and the already-advanced host n_past — both can
+never hold, so the primary-path relay has been dead code since it landed
+(only the burst path's closed device loop relays).
+
+A naive fix (arm stores `sampled_tokens`; compare `armed.next_n_past ==
+presented_n_past`) was attempted and **reverted**: with the relay forced
+live, `inferflux_batched_isolation_probe` reported 16 divergent sequences
+-- but the identical count occurs with graphs disabled, i.e. the probe
+cannot distinguish relay corruption from the pre-existing bf16
+batch-vs-single numerics divergence (batch-width-dependent kernel
+selection changes reduction order). Without a correctness signal that
+separates the two, a live relay cannot be validated. Proper fix path:
+device-side tracing of the relayed metadata
+(`INFERFLUX_DEBUG_SEQUENCE_SLOTS` + decode_mapping) against host
+expectations, on a branch where the numerics divergence is first
+quantified (or fp32-forced) so corruption is detectable. Prize: the
+per-step H2D metadata upload + host batch assembly (~0.5-1 ms/step).
+
 ## 5) Measurement protocol (keep using it)
 
 - nsys captures without env instrumentation; treat
