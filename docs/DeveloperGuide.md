@@ -148,7 +148,7 @@ Minimum for doc-related PRs:
 | Backend parity roadmap | [design/Backend_Parity_LlamaCpp_CUDA_MLX](design/Backend_Parity_LlamaCpp_CUDA_MLX.md) |
 | KV and slot-manager deep dives | [design/KV_CACHE_ARCHITECTURE_DEEP_DIVE_2026_03_04](design/KV_CACHE_ARCHITECTURE_DEEP_DIVE_2026_03_04.md), [design/SEQUENCE_SLOT_MANAGER_PLAN](design/SEQUENCE_SLOT_MANAGER_PLAN.md) |
 | Common backend refactor plan | [design/REFACTORING_COMMON_BACKEND_LOGIC](design/REFACTORING_COMMON_BACKEND_LOGIC.md) |
-| EP/TP scaling plan | [design_ep_tp](design_ep_tp.md) |
+| EP/TP scaling plan | [design_ep_tp](design/design_ep_tp.md) |
 
 ## 10) Related Docs
 

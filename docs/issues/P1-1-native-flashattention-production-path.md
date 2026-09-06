@@ -16,7 +16,7 @@ Native flash-attention implementation still contains placeholder and TODO paths,
 - `runtime/backends/cuda/kernels/flash_attention.h`
 - `tests/unit/test_flash_attn.cpp`
 - `tests/integration/native_metrics_test.py`
-- `docs/PERFORMANCE_TUNING.md`
+- `docs/MONITORING.md`
 
 ## Test Plan
 1. Add kernel correctness tests against reference attention outputs.

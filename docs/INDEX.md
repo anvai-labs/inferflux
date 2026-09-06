@@ -46,6 +46,7 @@ graph TD
 | API surface | [API_SURFACE](API_SURFACE.md) |
 | Configuration | [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
 | Benchmark results and current CUDA reading | [benchmarks](benchmarks.md) |
+| Multi-backend benchmark harness checklist | [benchmark_multi_backend_steps](benchmark_multi_backend_steps.md) |
 | Monitoring and tuning | [MONITORING](MONITORING.md) |
 | Archived throughput investigations | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) |
 | Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |
@@ -69,6 +70,10 @@ graph TD
 | Incident triage | [Troubleshooting](Troubleshooting.md) |
 | Release process | [ReleaseProcess](ReleaseProcess.md) |
 | Installer/package flow | [Installer](Installer.md) |
+| Startup sizing recommendations | [STARTUP_ADVISOR](STARTUP_ADVISOR.md) |
+| GGUF smoke validation | [GGUF_SMOKE_TEST_GUIDE](GGUF_SMOKE_TEST_GUIDE.md) |
+| ROCm on WSL install | [ROCM_INSTALLATION_GUIDE_WSL](ROCM_INSTALLATION_GUIDE_WSL.md) |
+| Dev hardware reference | [HARDWARE_SETUP](HARDWARE_SETUP.md) |
 
 ## 4) Contributor Deep Dives
 
@@ -80,7 +85,7 @@ graph TD
 | Native GGUF quantized runtime design | [design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE](design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md) |
 | InferFlux CUDA + distributed uplift plan | [design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN](design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md) |
 | Session handle layer (Phase 1) | [design/SESSION_HANDLE_LAYER_PHASE1](design/SESSION_HANDLE_LAYER_PHASE1.md) |
-| EP/TP scaling design | [design_ep_tp](design_ep_tp.md) |
+| EP/TP scaling design | [design_ep_tp](design/design_ep_tp.md) |
 
 ## 5) Backlog and Evidence
 

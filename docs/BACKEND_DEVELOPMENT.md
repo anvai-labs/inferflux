@@ -716,4 +716,4 @@ graph LR
 
 ---
 
-**Next:** [Configuration Reference](CONFIG_REFERENCE.md) | [Performance Tuning](PERFORMANCE_TUNING.md) | [Developer Guide](DeveloperGuide.md)
+**Next:** [Configuration Reference](CONFIG_REFERENCE.md) | [Monitoring & Tuning](MONITORING.md) | [Developer Guide](DeveloperGuide.md)

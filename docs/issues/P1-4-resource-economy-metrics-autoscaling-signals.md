@@ -18,8 +18,7 @@ Current performance view is still too token-per-second centric; economy decision
 - `tests/unit/test_metrics.cpp`
 - `tests/integration/throughput_gate_contract_test.py`
 - `docs/MONITORING.md`
-- `docs/PERFORMANCE_TUNING.md`
-- `docs/NFR.md`
+- `docs/PRD.md`
 
 ## Test Plan
 1. Add unit tests for new metrics registration and update semantics.
