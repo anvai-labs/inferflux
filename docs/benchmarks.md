@@ -128,6 +128,28 @@ Cross-check: 2.3 (width) × ~1.15 (vLLM's slightly better kernels) × 1.12
 (syncs) ≈ 3.0 — matching the observed 2.4-2.7x gap within run-to-run
 variance.
 
+**Follow-up experiments (Sep 6, later same day) refined two of these:**
+
+- A `batch_accumulation_ms` A/B sweep (2/8/16 ms, 2 runs per point) showed
+  **no material width gain** (320.7 / 329.3 / 292.4 tok/s averages; 16 ms
+  strictly worse) — low-width steps come from EOS-staggered completions
+  (sequences stop at natural EOS at different lengths, a direct consequence
+  of the stop-token fix above) plus closed-loop client arrivals, not from a
+  merge-window bug. The scheduler does refill correctly when pending work
+  exists (85/206 steps at width 15-16 in a live-metrics run).
+- A standalone kernel spike (`tests/tools/bf16_gemv_bench.cu`) measured
+  cuBLAS on the exact projection shapes under **cold L2** — the realistic
+  condition, since attention kernels evict L2 between projections: 30-44%
+  of roofline (small shapes worst). A naive warp-per-row custom GEMV
+  matches but does not beat cold-L2 cuBLAS, falsifying the quick-rewrite
+  path; closing the 2x-vs-physics kernel gap needs the heavyweight design
+  (multi-row tiles, cp.async double buffering) or cheaper wins first.
+
+The staged plan (CUDA-graph the safetensors decode step, cublasLt algo
+search, gate/up fusion, then a specialist kernel) with all measurements and
+falsified hypotheses lives in
+[design/SAFETENSORS_DECODE_PERFORMANCE_PLAN](design/SAFETENSORS_DECODE_PERFORMANCE_PLAN.md).
+
 **Methodology caveat worth keeping:** `INFERFLUX_CUDA_PHASE_TIMING=1`
 synchronizes the stream between every phase of every layer (~324 syncs per
 decode step) and **halved measured throughput** (171 vs 252.6 tok/s
