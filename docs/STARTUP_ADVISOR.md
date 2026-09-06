@@ -447,4 +447,4 @@ ctest --test-dir build -R StartupAdvisor --output-on-failure
 
 ---
 
-**Next:** [Configuration Reference](CONFIG_REFERENCE.md) | [Performance Tuning](PERFORMANCE_TUNING.md) | [Architecture](Architecture.md)
+**Next:** [Configuration Reference](CONFIG_REFERENCE.md) | [Monitoring & Tuning](MONITORING.md) | [Architecture](Architecture.md)

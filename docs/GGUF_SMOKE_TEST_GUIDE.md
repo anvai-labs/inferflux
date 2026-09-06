@@ -55,6 +55,5 @@ curl -s http://127.0.0.1:8080/metrics | grep -E "native_forward|cuda_attention_k
 
 ## 6) Consolidation Notes
 
-The previous long-form smoke guide is archived at:
-
-- [GGUF_SMOKE_TEST_GUIDE_2026_03_05](archive/evidence/GGUF_SMOKE_TEST_GUIDE_2026_03_05.md)
+The previous long-form smoke guide is cataloged (name only, no working tree
+copy) in [ARCHIVE_INDEX](ARCHIVE_INDEX.md).
