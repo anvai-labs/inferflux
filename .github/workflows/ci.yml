@@ -3,6 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+    # Tag pushes must run CI: Release Packaging is a workflow_run of this
+    # workflow, so a tag whose CI never completes never gets packaged or
+    # published (v0.1.0 shipped as an asset-less release this way).
+    tags: ['v*']
   pull_request:
     branches: [main, develop]
   schedule:
