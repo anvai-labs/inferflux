@@ -70,6 +70,21 @@ const ByteUnicodeTable &GetBUT() {
 // U+2581 ▁  (LOWER ONE EIGHTH BLOCK — used as space marker in Metaspace).
 constexpr const char *kMetaMark = "\xe2\x96\x81";
 
+// Upper bound on a vocab/added_tokens id read from tokenizer.json. Real
+// vocabularies top out in the low hundreds of thousands (the largest known
+// multilingual tokenizers are under 1M); this is a generous ceiling that
+// still rejects a corrupted or adversarial id before it is used to size or
+// index id_to_token_. Without this, a negative id becomes a huge size_t
+// via implicit conversion in id_to_token_[id] (out-of-bounds write), and a
+// merely large positive id causes id_to_token_.assign()/resize() to
+// attempt allocating and zero-constructing hundreds of millions of
+// std::string objects (memory-exhaustion denial of service).
+constexpr int32_t kMaxReasonableTokenId = 10'000'000;
+
+bool IsValidTokenId(int32_t id) {
+  return id >= 0 && id <= kMaxReasonableTokenId;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -369,6 +384,12 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
         continue;
       }
       int32_t id = id_val.get<int32_t>();
+      if (!IsValidTokenId(id)) {
+        log::Warn("mlx_tokenizer", "Skipping vocab entry '" + tok +
+                                       "' with out-of-range id " +
+                                       std::to_string(id));
+        continue;
+      }
       vocab_[tok] = id;
       max_id = std::max(max_id, id);
     }
@@ -474,6 +495,12 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
         continue;
       }
       const int32_t id = at["id"].get<int32_t>();
+      if (!IsValidTokenId(id)) {
+        log::Warn("mlx_tokenizer", "Skipping added_tokens entry with "
+                                   "out-of-range id " +
+                                       std::to_string(id));
+        continue;
+      }
       const std::string content = at["content"].get<std::string>();
       // Insert into vocab if not already present.
       vocab_.emplace(content, id);

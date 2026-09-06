@@ -507,6 +507,104 @@ TEST_CASE("MlxTokenizer skips a vocab entry with a non-numeric id instead "
   // The well-formed entries must still load; the bad one must not
   // contribute to vocab_size_.
   REQUIRE(tok.VocabSize() == 2);
+  // Stronger than a VocabSize() count alone: confirm the bad entry did not
+  // get silently inserted under a fallback id (e.g. 0), which would still
+  // satisfy VocabSize()==2 without actually being rejected.
+  REQUIRE(tok.Decode({0}, /*skip_special=*/false) == "<unk>");
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer rejects a negative vocab id instead of corrupting "
+          "memory",
+          "[mlx_tokenizer]") {
+  // Regression test for a SEGV found by adversarial review: a negative id
+  // passes the is_number() type check added for the previous fix, but
+  // id_to_token_[id] = tok then indexes a std::vector<std::string> with a
+  // negative int32_t implicitly converted to a huge size_t -- an
+  // out-of-bounds write, reproduced as a crash under ASan.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_vocab_negative_id";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    vocab["hello"] = 1;
+    vocab["evil"] = -12345;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+  REQUIRE(tok.VocabSize() == 2); // negative-id entry rejected, not sized in
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer rejects an unreasonably large vocab id instead of "
+          "attempting a huge allocation",
+          "[mlx_tokenizer]") {
+  // Regression test for a memory-exhaustion DoS found by adversarial
+  // review: an id like 2,000,000,000 passes the is_number() check, and
+  // id_to_token_.assign(max_id + 1, "") then attempts to allocate and
+  // default-construct ~2 billion std::string objects from a few hundred
+  // bytes of input JSON.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_vocab_huge_id";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    vocab["hello"] = 1;
+    vocab["huge"] = 2000000000;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  // Must return promptly, not attempt a multi-gigabyte allocation.
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+  REQUIRE(tok.VocabSize() == 2); // huge-id entry rejected, not sized in
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer rejects an out-of-range added_tokens id instead of "
+          "corrupting memory",
+          "[mlx_tokenizer]") {
+  // Same class of bug as the vocab-loop negative/huge id issue above, for
+  // the added_tokens loop's id_to_token_.resize(id + 1) / id_to_token_[id].
+  const auto dir = fs::temp_directory_path() / "ifx_tok_added_bad_range";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    tok["added_tokens"] = nlohmann::json::array({
+        {{"id", -1}, {"content", "<neg>"}},
+        {{"id", 2000000000}, {"content", "<huge>"}},
+        {{"id", 5}, {"content", "<good>"}, {"special", true}},
+    });
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+  REQUIRE(tok.VocabSize() == 6); // only the well-formed id=5 entry counted
 
   fs::remove_all(dir);
 }
