@@ -407,7 +407,7 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
       // Phi-3, StarCoder, ...) as Sequence[Split, ByteLevel]; the nested
       // entry, not the wrapper, determines byte encoding/decoding.
       for (const auto &nested : pt["pretokenizers"]) {
-        if (apply_pre_tokenizer_type(nested))
+        if (nested.is_object() && apply_pre_tokenizer_type(nested))
           break;
       }
     } else {

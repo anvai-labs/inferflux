@@ -443,6 +443,41 @@ TEST_CASE("MlxTokenizer unwraps Sequence-wrapped ByteLevel pre_tokenizer",
   fs::remove_all(dir);
 }
 
+TEST_CASE("MlxTokenizer does not crash on a malformed non-object entry in "
+          "a Sequence pretokenizers array",
+          "[mlx_tokenizer]") {
+  // Regression test: the Sequence-unwrapping loop must not assume every
+  // array entry is a JSON object. A hand-edited or corrupted tokenizer.json
+  // with a non-object entry (a bare string, here) previously threw an
+  // uncaught nlohmann::json::type_error out of Load() -- a contract
+  // violation (Load() must return false on bad input, never throw) that
+  // would abort the whole process via std::terminate.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_seq_malformed";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    tok["pre_tokenizer"]["type"] = "Sequence";
+    tok["pre_tokenizer"]["pretokenizers"] = nlohmann::json::array(
+        {"not_an_object",
+         {{"type", "ByteLevel"}, {"add_prefix_space", false}}});
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  // Must not throw/crash; the well-formed ByteLevel entry after the
+  // malformed one should still be picked up.
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+
+  fs::remove_all(dir);
+}
+
 // ---------------------------------------------------------------------------
 // tokenizer_config.json — bos/eos resolved from object notation
 // ---------------------------------------------------------------------------
