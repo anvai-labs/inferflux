@@ -91,11 +91,8 @@ quadrantChart
 
 ## 8) Consolidation Notes
 
-The previous long-form narratives are preserved as evidence snapshots:
-
-- [VISION_2026_03_05](archive/evidence/VISION_2026_03_05.md)
-- [COMPETITIVE_POSITIONING_2026_03_05](archive/evidence/COMPETITIVE_POSITIONING_2026_03_05.md)
-- [NFR_2026_03_05](archive/evidence/NFR_2026_03_05.md)
+The previous long-form narratives are cataloged (name only, no working tree
+copy) in [ARCHIVE_INDEX](ARCHIVE_INDEX.md).
 
 Canonical sources for active planning:
 

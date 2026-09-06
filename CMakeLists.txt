@@ -116,6 +116,8 @@ add_library(inferflux_core STATIC
   model/llama_tokenizer.h
   model/hf_tokenizer.cpp
   model/hf_tokenizer.h
+  model/chat_template_renderer.cpp
+  model/chat_template_renderer.h
   runtime/backends/mlx/mlx_tokenizer.cpp
   runtime/backends/mlx/mlx_tokenizer.h
   model/model_format.cpp
@@ -698,6 +700,9 @@ add_executable(inferflux_tests
   tests/unit/test_flash_attn.cpp
   tests/unit/test_shm_transport.cpp
   tests/unit/test_chat_template.cpp
+  tests/unit/test_mlx_tokenizer.cpp
+  tests/unit/test_chat_template_renderer.cpp
+  tests/unit/test_hf_tokenizer.cpp
   tests/unit/test_sampling.cpp
   tests/unit/test_logger.cpp
   tests/unit/test_structured_output.cpp
@@ -812,7 +817,6 @@ endif()
 if(ENABLE_MLX)
   target_sources(inferflux_tests PRIVATE
     tests/unit/test_mlx_loader.cpp
-    tests/unit/test_mlx_tokenizer.cpp
     tests/unit/test_mlx_execution.cpp
     tests/unit/test_mlx_backend.cpp
   )
@@ -894,6 +898,8 @@ add_test(NAME SequenceSlotManagerTests COMMAND inferflux_tests "[slot_manager]")
 set_tests_properties(SequenceSlotManagerTests PROPERTIES LABELS slot_manager)
 add_test(NAME BatchSelectionPolicyTests COMMAND inferflux_tests "[batch_selection_policy]")
 set_tests_properties(BatchSelectionPolicyTests PROPERTIES LABELS batch_selection_policy)
+add_test(NAME MlxTokenizerTests COMMAND inferflux_tests "[mlx_tokenizer]")
+set_tests_properties(MlxTokenizerTests PROPERTIES LABELS mlx_tokenizer)
 if(ENABLE_MLX)
   add_test(NAME MlxLoaderTests COMMAND inferflux_tests "[mlx_loader]")
   set_tests_properties(MlxLoaderTests PROPERTIES LABELS mlx_loader)
@@ -902,8 +908,6 @@ if(ENABLE_MLX)
     set_tests_properties(MlxLoaderTests PROPERTIES
       ENVIRONMENT "DYLD_LIBRARY_PATH=${MLX_C_LIB_DIR}:$ENV{DYLD_LIBRARY_PATH}")
   endif()
-  add_test(NAME MlxTokenizerTests COMMAND inferflux_tests "[mlx_tokenizer]")
-  set_tests_properties(MlxTokenizerTests PROPERTIES LABELS mlx_tokenizer)
   add_test(NAME MlxExecutionTests COMMAND inferflux_tests "[mlx_execution]")
   set_tests_properties(MlxExecutionTests PROPERTIES LABELS mlx_execution)
   if(MLX_C_LIB_DIR)

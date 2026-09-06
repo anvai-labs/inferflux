@@ -1,4 +1,5 @@
 #include "model/hf_tokenizer.h"
+#include "model/chat_template_renderer.h"
 #include "server/logging/logger.h"
 
 #include <filesystem>
@@ -51,13 +52,24 @@ int HFTokenizer::TokenCount(const std::string &text) const {
 }
 
 ITokenizer::ChatResult HFTokenizer::ApplyChatTemplate(
-    const std::vector<std::pair<std::string, std::string>> & /*messages*/,
-    bool /*add_assistant_prefix*/) const {
-  // MlxTokenizer stores the Jinja2 template string but doesn't render it.
-  // Chat template rendering requires a Jinja2 engine.
-  // For now, return invalid so callers use their fallback path.
-  // TODO: Add minimal Jinja2 renderer or use llama_chat_apply_template.
-  return {};
+    const std::vector<std::pair<std::string, std::string>> &messages,
+    bool add_assistant_prefix) const {
+  if (messages.empty()) {
+    return {};
+  }
+
+  // inner_.ChatTemplate() is empty for models with no discoverable chat
+  // template (no tokenizer_config.json / chat_template.jinja); the shared
+  // renderer's family detection defaults to ChatML in that case, matching
+  // GGUFTokenizer's behavior for the common case of an instruct model with
+  // undeclared template metadata.
+  std::string prompt =
+      RenderChatTemplate(inner_.ChatTemplate(), messages, add_assistant_prefix);
+
+  ChatResult result;
+  result.prompt = prompt;
+  result.valid = !prompt.empty();
+  return result;
 }
 
 int HFTokenizer::BosTokenId() const { return inner_.BosId(); }
