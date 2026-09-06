@@ -6,6 +6,8 @@
 #include <array>
 
 #include <cstdint>
+#include <list>
+#include <unordered_map>
 
 namespace inferflux {
 
@@ -114,8 +116,7 @@ public:
   }
 
   bool DecodeGraphReady(int batch_size) const override {
-    return decode_graph_exec_ != nullptr && graph_batch_size_ == batch_size &&
-           graph_enabled_;
+    return graph_enabled_ && decode_graphs_.count(batch_size) > 0;
   }
 
   bool BatchForwardDevice(int batch_size, float *d_logits) override;
@@ -217,9 +218,21 @@ private:
   // allocations and weight dequantizations settle before attempting capture.
   // graph_retry_remaining_ allows transient capture failures to be retried
   // instead of permanently disabling graphs on the first failure.
-  cudaGraph_t decode_graph_{nullptr};
-  cudaGraphExec_t decode_graph_exec_{nullptr};
-  int graph_batch_size_{0};
+  //
+  // Graphs are kept per batch width (LRU-capped): decode width varies with
+  // sequence EOS stagger, so a single-slot graph would thrash
+  // (destroy + recapture nearly every step). Each entry's device buffers are
+  // the same fixed addresses, so replay after host-side Phase 1-2 H2D
+  // uploads is safe for any cached width.
+  struct DecodeGraphEntry {
+    cudaGraph_t graph{nullptr};
+    cudaGraphExec_t exec{nullptr};
+  };
+  static constexpr std::size_t kMaxDecodeGraphs = 4;
+  std::unordered_map<int, DecodeGraphEntry> decode_graphs_;
+  // Front = most recently used batch width.
+  std::list<int> decode_graph_lru_;
+
   bool graph_enabled_{true};
   int graph_warmup_remaining_{4};
   int graph_retry_remaining_{3};

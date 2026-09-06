@@ -105,6 +105,13 @@ public:
    */
   bool PreallocateWorkspace(size_t workspace_bytes = 4 * 1024 * 1024);
 
+  /**
+   * True once PreallocateWorkspace() has succeeded: cuBLAS calls are then
+   * capture-safe (no internal allocations during graph capture) and may run
+   * inside a captured decode graph.
+   */
+  bool HasPinnedWorkspace() const { return workspace_ != nullptr; }
+
 private:
   cublasHandle_t handle_{nullptr};
   void *workspace_{nullptr};

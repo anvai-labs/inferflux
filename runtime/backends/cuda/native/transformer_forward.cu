@@ -1476,14 +1476,17 @@ template <typename T> void LlamaForwardTyped<T>::FreeScratchBuffers() {
   h_batch_seq_ids_ = nullptr;
   h_batch_kv_lens_ = nullptr;
 
-  if (decode_graph_exec_) {
-    cudaGraphExecDestroy(decode_graph_exec_);
-    decode_graph_exec_ = nullptr;
+  for (auto &[batch_size, entry] : decode_graphs_) {
+    (void)batch_size;
+    if (entry.exec) {
+      cudaGraphExecDestroy(entry.exec);
+    }
+    if (entry.graph) {
+      cudaGraphDestroy(entry.graph);
+    }
   }
-  if (decode_graph_) {
-    cudaGraphDestroy(decode_graph_);
-    decode_graph_ = nullptr;
-  }
+  decode_graphs_.clear();
+  decode_graph_lru_.clear();
   device_workspace_bytes_ = 0;
   host_workspace_bytes_ = 0;
 }
@@ -2602,12 +2605,13 @@ template <typename T> void LlamaForwardTyped<T>::WarmWeightCaches() {
 
 template <typename T>
 bool LlamaForwardTyped<T>::BatchForwardReplay(float *d_logits, int batch_size) {
-  if (!decode_graph_exec_ || graph_batch_size_ != batch_size) {
-    return false; // Graph not captured or batch size mismatch
+  auto it = decode_graphs_.find(batch_size);
+  if (it == decode_graphs_.end() || !it->second.exec) {
+    return false; // Graph not captured for this batch width
   }
   // Skip H2D metadata upload — DeviceTokenRelay already updated d_batch_meta_
   // on device. Just replay the graph.
-  cudaError_t err = cudaGraphLaunch(decode_graph_exec_, stream_);
+  cudaError_t err = cudaGraphLaunch(it->second.exec, stream_);
   return err == cudaSuccess;
 }
 
@@ -2859,10 +2863,14 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
   // disable with INFERFLUX_DISABLE_CUDA_GRAPH=1.
   const bool phase_timing_enabled = policy.phase_timing_enabled;
   const bool graph_disabled = policy.disable_cuda_graph;
-  const bool capture_safe = DecodeGraphCaptureSafe(
-      weights_, num_layers_, B, hidden_size_, num_heads_, num_kv_heads_,
-      head_dim_, intermediate_size_, vocab_size_,
-      g_allow_fused_quantized_matmul, policy);
+  const bool cublas_capture_ok = gemm_ && gemm_->HasPinnedWorkspace();
+  const bool capture_safe =
+      weights_->HasQuantizedWeights()
+          ? DecodeGraphCaptureSafe(
+                weights_, num_layers_, B, hidden_size_, num_heads_,
+                num_kv_heads_, head_dim_, intermediate_size_, vocab_size_,
+                g_allow_fused_quantized_matmul, policy)
+          : cublas_capture_ok;
   {
     static bool logged_once = false;
     if (!logged_once) {
@@ -2891,37 +2899,41 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
   // Graph warmup: skip capture for the first N calls to let any remaining
   // lazy first-use allocations settle.  With WarmWeightCaches() called at
   // init time, this should normally be 0.
-  if (use_graph && graph_warmup_remaining_ > 0 && !decode_graph_exec_) {
+  if (use_graph && graph_warmup_remaining_ > 0 && decode_graphs_.empty()) {
     --graph_warmup_remaining_;
     use_graph = false;
   }
   PhaseTiming pt;
   pt.Begin(stream_, phase_timing_enabled);
 
-  // Fast path: replay existing graph if batch size matches
-  if (use_graph && decode_graph_exec_ && graph_batch_size_ == B) {
-    err = cudaGraphLaunch(decode_graph_exec_, stream_);
-    if (err == cudaSuccess)
-      return true;
-    log::Warn("llama_forward", "CUDA graph replay failed, disabling");
-    cudaGraphExecDestroy(decode_graph_exec_);
-    decode_graph_exec_ = nullptr;
-    cudaGraphDestroy(decode_graph_);
-    decode_graph_ = nullptr;
-    graph_enabled_ = false;
-    // Fall through to non-graph path
-  }
-
-  // Destroy stale graph if batch size changed (graph topology depends on B)
-  if (decode_graph_exec_ && graph_batch_size_ != B) {
-    cudaGraphExecDestroy(decode_graph_exec_);
-    decode_graph_exec_ = nullptr;
-    cudaGraphDestroy(decode_graph_);
-    decode_graph_ = nullptr;
+  // Fast path: replay existing graph for this batch width. Graphs are
+  // cached per width (LRU-capped) because decode width varies with EOS
+  // stagger; per-width replay avoids recapturing on every width change.
+  if (use_graph) {
+    auto it = decode_graphs_.find(B);
+    if (it != decode_graphs_.end() && it->second.exec) {
+      err = cudaGraphLaunch(it->second.exec, stream_);
+      if (err == cudaSuccess) {
+        // Refresh LRU order.
+        decode_graph_lru_.remove(B);
+        decode_graph_lru_.push_front(B);
+        return true;
+      }
+      log::Warn("llama_forward", "CUDA graph replay failed, disabling");
+      cudaGraphExecDestroy(it->second.exec);
+      cudaGraphDestroy(it->second.graph);
+      decode_graphs_.erase(it);
+      graph_enabled_ = false;
+      // Fall through to non-graph path
+    }
   }
 
   // Begin graph capture if enabled
   bool capturing = false;
+  // Transient holders for the graph being captured; on success they move
+  // into the per-width decode_graphs_ map.
+  cudaGraph_t decode_graph_ = nullptr;
+  cudaGraphExec_t decode_graph_exec_ = nullptr;
   if (use_graph) {
     // Drain any sticky CUDA error from prior operations (e.g., prefill
     // Forward(), weight dequantization, or pre-warm failures).
@@ -3084,7 +3096,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                        stream_, "q_proj", active_policy);
                           },
                           [&]() {
-                            if (capturing) {
+                            if (capturing && !cublas_capture_ok) {
                               capture_abort = true;
                               return false;
                             }
@@ -3119,7 +3131,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                                   "k_proj", active_policy);
                           },
                           [&]() {
-                            if (capturing) {
+                            if (capturing && !cublas_capture_ok) {
                               capture_abort = true;
                               return false;
                             }
@@ -3154,7 +3166,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                                   "v_proj", active_policy);
                           },
                           [&]() {
-                            if (capturing) {
+                            if (capturing && !cublas_capture_ok) {
                               capture_abort = true;
                               return false;
                             }
@@ -3413,7 +3425,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                               d_packed_activation_, d_packed_activation_scales_,
                               B, hidden_size_, num_heads_ * head_dim_, stream_,
                               "o_proj", active_policy)) {
-          if (capturing) {
+          if (capturing && !cublas_capture_ok) {
             capture_abort = true;
             return false;
           }
@@ -3658,7 +3670,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                                     "gate_proj", active_policy);
                             },
                             [&]() {
-                              if (capturing) {
+                              if (capturing && !cublas_capture_ok) {
                                 capture_abort = true;
                                 return false;
                               }
@@ -3693,7 +3705,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                                     "up_proj", active_policy);
                             },
                             [&]() {
-                              if (capturing) {
+                              if (capturing && !cublas_capture_ok) {
                                 capture_abort = true;
                                 return false;
                               }
@@ -3785,7 +3797,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             }
           }
           if (!down_ok) {
-            if (capturing) {
+            if (capturing && !cublas_capture_ok) {
               capture_abort = true;
               return false;
             }
@@ -3891,7 +3903,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             d_packed_activation_, d_packed_activation_scales_,
                             B, hidden_size_, intermediate_size_, stream_,
                             "down_proj", active_policy)) {
-                      if (capturing) {
+                      if (capturing && !cublas_capture_ok) {
                         capture_abort = true;
                         return false;
                       }
@@ -4041,7 +4053,7 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         if (!TryQ8_1Gemv<T>(lm_raw, d_norm_out_, d_logits_typed_, d_act_q8_1_,
                             B, vocab_size_, hidden_size_, stream_, "lm_head",
                             active_policy)) {
-          if (capturing) {
+          if (capturing && !cublas_capture_ok) {
             capture_abort = true;
             return false;
           }
@@ -4097,7 +4109,23 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       err = cudaGraphInstantiate(&decode_graph_exec_, decode_graph_, nullptr,
                                  nullptr, 0);
       if (err == cudaSuccess) {
-        graph_batch_size_ = B;
+        // Evict the least-recently-used width if the per-width graph set is
+        // full. Evicted device buffers are shared (fixed addresses), so only
+        // the graph objects are destroyed.
+        while (decode_graphs_.size() >= kMaxDecodeGraphs &&
+               !decode_graph_lru_.empty()) {
+          const int evict_b = decode_graph_lru_.back();
+          decode_graph_lru_.pop_back();
+          auto eit = decode_graphs_.find(evict_b);
+          if (eit != decode_graphs_.end()) {
+            if (eit->second.exec) cudaGraphExecDestroy(eit->second.exec);
+            if (eit->second.graph) cudaGraphDestroy(eit->second.graph);
+            decode_graphs_.erase(eit);
+          }
+        }
+        decode_graphs_[B] = {decode_graph_, decode_graph_exec_};
+        decode_graph_lru_.remove(B);
+        decode_graph_lru_.push_front(B);
         size_t num_nodes = 0;
         cudaGraphGetNodes(decode_graph_, nullptr, &num_nodes);
         log::Info("llama_forward",
