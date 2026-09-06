@@ -50,6 +50,7 @@ jobs:
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+            -DBUILD_SHARED_LIBS=OFF \
             -DENABLE_WEBUI=ON \
             -DENABLE_CUDA=OFF \
             -DENABLE_ROCM=OFF \
@@ -106,6 +107,7 @@ jobs:
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+            -DBUILD_SHARED_LIBS=OFF \
             -DENABLE_WEBUI=ON \
             -DENABLE_CUDA=OFF \
             -DENABLE_ROCM=OFF \
@@ -164,6 +166,7 @@ jobs:
           cmake -S . -B build
           -A x64
           -DCMAKE_BUILD_TYPE=$Env:BUILD_TYPE
+          -DBUILD_SHARED_LIBS=OFF
           -DENABLE_WEBUI=ON
           -DENABLE_CUDA=OFF
           -DENABLE_ROCM=OFF

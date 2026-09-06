@@ -18,7 +18,7 @@ Quantized forward path still uses sequential and non-fused fallbacks that limit 
 - `runtime/backends/cuda/native/model_forward_factory.cpp`
 - `tests/unit/test_native_forward.cpp`
 - `tests/unit/test_native_batching.cpp`
-- `docs/PERFORMANCE_TUNING.md`
+- `docs/MONITORING.md`
 
 ## Test Plan
 1. Add unit tests validating true batched quantized forward path selection.

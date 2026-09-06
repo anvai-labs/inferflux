@@ -172,6 +172,8 @@ VLLM_MODEL_PATH=models/qwen2.5-3b-instruct-safetensors \
 SGLANG_MODEL_PATH=models/qwen2.5-3b-instruct-safetensors \
 VLLM_LAUNCH_ARGS="--dtype half --max-model-len 2048" \
 SGLANG_LAUNCH_ARGS="--dtype half --context-length 2048" \
+TVM_FFI_GPU_BACKEND=cuda \
+CUDA_HOME=/usr/local/cuda-13.2 \
 BUILD_DIR=./build-cuda \
 ./scripts/benchmark.sh multi-backend \
   models/qwen2.5-3b-instruct-safetensors
@@ -183,3 +185,64 @@ Notes:
 * GGUF inputs skip `vllm` / `sglang`; safetensors inputs skip `llama_cpp_cuda` / `ollama`.
 * `vllm` and `sglang` should be benchmarked with safetensors/Hugging Face model directories via `VLLM_MODEL_PATH` / `SGLANG_MODEL_PATH`.
 * If you already run those servers elsewhere, leave `AUTOSTART_VLLM` / `AUTOSTART_SGLANG` unset and point `VLLM_HOST` / `SGLANG_HOST` at the existing endpoints.
+
+**Two environment gotchas on this dual-GPU (NVIDIA + AMD) box, both fixed by
+the env vars above / a one-time model directory fix — don't rediscover
+these:**
+
+1. **vLLM returns HTTP 200 with 0 real tokens** if the target safetensors
+   directory has no chat template (`ChatTemplateResolutionError` in
+   `server_vllm.log` — transformers v4.44+ dropped the default-template
+   fallback). The harness's success check is HTTP-status-only, so this
+   silently reports "N/N OK" at 0 tok/s instead of failing loudly. Fix once
+   per model directory: drop a `chat_template.jinja` (the standard Qwen2.5
+   ChatML template, matching InferFlux's own `RenderChatML` format) next to
+   `tokenizer.json`. Always spot-check a raw response body for a new model
+   directory, not just the summary table.
+2. **SGLang fails to start** for two independent reasons on a box with both
+   CUDA and ROCm installed: its JIT tool (`tvm_ffi`) auto-detects ROCm over
+   CUDA whenever a ROCm install exists at all, regardless of which GPU is
+   targeted (`TVM_FFI_GPU_BACKEND=cuda` forces the correct choice); and a
+   stale `~/.cache/flashinfer` / `~/.cache/tvm-ffi` JIT cache can hold a
+   hardcoded `nvcc` path from a different machine/environment (clear both
+   dirs and set `CUDA_HOME` explicitly if `nvcc` isn't at the path the cache
+   expects).
+
+## 9. Full backend coverage in two stages
+
+No single model file exercises all five backends, so getting a complete
+`inferflux_cuda` / `llama_cpp_cuda` / `ollama` / `vllm` / `sglang` picture
+takes two sequential harness invocations, not one:
+
+**Stage 1 — GGUF (inferflux_cuda, llama_cpp_cuda, ollama):**
+
+```bash
+BUILD_DIR=./build-cuda \
+./scripts/benchmark.sh multi-backend \
+  models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf
+```
+
+`ollama` benchmarks against `OLLAMA_HOST` (default
+`http://192.168.1.20:11434`, a remote host on this dual-GPU dev box) using
+`OLLAMA_MODEL` (default `qwen2.5:3b`) — confirm the tag exists on that host
+first (`curl $OLLAMA_HOST/api/tags`) rather than assuming it does.
+`lmstudio` is skipped here (`SKIP_LMSTUDIO=true`) when no LM Studio instance
+is reachable.
+
+**Stage 2 — safetensors (inferflux_cuda, vllm, sglang):** the recipe in
+Section 8 above, run separately, after Stage 1's local backends have torn
+down and reset the CUDA device.
+
+Run the two stages one after another, never concurrently — both stages
+launch local CUDA backends against the same physical GPU, and the harness's
+own cross-backend reset hook (Section 3) only serializes backends *within*
+one invocation, not across two.
+
+**Build gotcha specific to this dual-GPU box:** `cmake -S . -B build-cuda
+-DENABLE_CUDA=ON` alone is not CUDA-only — `ENABLE_ROCM` defaults to `ON` in
+the top-level `CMakeLists.txt`, and with both SDKs installed the combined
+configure pulls in `<hip/hip_runtime.h>` (via
+`server/startup_advisor.cpp`'s `INFERFLUX_HAS_ROCM` path) alongside CUDA's
+`vector_types.h`, which fails with conflicting `dim3` declarations. Pass
+`-DENABLE_ROCM=OFF` explicitly when the goal is a CUDA-only `build-cuda` for
+this benchmark.

@@ -150,11 +150,11 @@ Short end-to-end benchmark after Phase B on the source branch:
 - native: `113.9 tok/s`
 - `llama_cpp_cuda`: `115.0 tok/s`
 - exact match: `6/8`
-- artifact:
-  [comparison_20260311_122203.json](/home/vsingh/code/inferflux/gguf_benchmark_results/comparison_20260311_122203.json)
+- artifact: `comparison_20260311_122203.json` (local benchmark run output, not
+  retained in the repo)
 
 Serialized steady-state `nsys` profiling on this branch is now trustworthy
-because [profile_backend.sh](/home/vsingh/code/inferflux/scripts/profile_backend.sh)
+because [profile_backend.sh](../../scripts/profile_backend.sh)
 uses backend-specific default ports plus a lock file to prevent overlapping
 profiling sessions.
 
@@ -173,17 +173,17 @@ slab upload. The dominant unresolved issue is the cost of the remaining
 After adding:
 
 - pinned host buffers for sampler result/logits staging in
-  [gpu_sampler.cu](/home/vsingh/code/inferflux/runtime/backends/cuda/native/gpu_sampler.cu)
+  [gpu_sampler.cu](../../runtime/backends/cuda/native/gpu_sampler.cu)
 - per-site native copy tracing in
-  [cuda_copy_trace.h](/home/vsingh/code/inferflux/runtime/backends/cuda/native/cuda_copy_trace.h)
+  [cuda_copy_trace.h](../../runtime/backends/cuda/native/cuda_copy_trace.h)
 
 the short `c=4` benchmark reported:
 
 - native: `123.6 tok/s`
 - `llama_cpp_cuda`: `127.9 tok/s`
 - ratio: `0.97x`
-- artifact:
-  [comparison_20260311_123017.json](/home/vsingh/code/inferflux/gguf_benchmark_results/comparison_20260311_123017.json)
+- artifact: `comparison_20260311_123017.json` (local benchmark run output, not
+  retained in the repo)
 
 The native server log now shows the exact live copy sites:
 
