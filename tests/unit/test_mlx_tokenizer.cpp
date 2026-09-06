@@ -615,6 +615,69 @@ TEST_CASE("MlxTokenizer does not let an id truncate into a valid range and "
   fs::remove_all(dir);
 }
 
+TEST_CASE("MlxTokenizer does not let a float id truncate into a valid "
+          "range and silently overwrite an existing token",
+          "[mlx_tokenizer]") {
+  // Regression test for a second bypass of the same collision bug: the
+  // id-type guard checked is_number() rather than is_number_integer(), and
+  // is_number() is also true for JSON floats. get<int64_t>() on a float
+  // truncates toward zero without throwing (1.5 -> 1), so a vocab id of
+  // 1.5 would pass IsValidTokenId(1) and collide with whatever legitimate
+  // token already holds integer id 1 -- the same outcome as the 2^32+1
+  // integer-overflow case above, via a different input shape.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_vocab_id_float";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    vocab["legit_one"] = 1;
+    vocab["attacker_float"] = 1.5;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+  REQUIRE(tok.Decode({1}, /*skip_special=*/false) == "legit_one");
+  REQUIRE(tok.VocabSize() == 2); // the float-id entry was rejected
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer rejects an out-of-range config.json "
+          "bos_token_id/eos_token_id instead of silently truncating",
+          "[mlx_tokenizer]") {
+  // Same narrowing-without-range-check pattern as the vocab/added_tokens
+  // loops, in the config.json bos/eos fallback path: resolve_id() range-
+  // checks the id (via IsValidTokenId) before narrowing to int32_t, so an
+  // out-of-range bos/eos id from config.json is ignored (falling back to
+  // whatever default was already in place) rather than silently
+  // truncated into something that looks valid.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_cfg_bad_eos_range";
+  WriteByteLevelTokenizer(dir); // no tokenizer_config.json written
+  {
+    nlohmann::json cfg;
+    cfg["bos_token_id"] = -5;         // out of range: negative
+    cfg["eos_token_id"] = 4294967297; // out of range: overflows int32_t
+    std::ofstream f(dir / "config.json");
+    f << cfg.dump();
+  }
+
+  MlxTokenizer tok;
+  REQUIRE(tok.Load(dir));
+  // Neither out-of-range value should have been applied; both fields keep
+  // MlxTokenizer::Reset()'s defaults (1, 2).
+  REQUIRE(tok.BosId() == 1);
+  REQUIRE(tok.EosId() == 2);
+
+  fs::remove_all(dir);
+}
+
 TEST_CASE("MlxTokenizer rejects an out-of-range added_tokens id instead of "
           "corrupting memory",
           "[mlx_tokenizer]") {

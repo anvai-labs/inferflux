@@ -384,7 +384,11 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
   if (model.contains("vocab") && model["vocab"].is_object()) {
     int32_t max_id = -1;
     for (const auto &[tok, id_val] : model["vocab"].items()) {
-      if (!id_val.is_number()) {
+      // is_number_integer(), not is_number(): the latter is also true for
+      // JSON floats, and get<int64_t>() truncates a float toward zero
+      // without throwing (e.g. 1.5 -> 1), which would silently collide
+      // with whatever token already legitimately holds that integer id.
+      if (!id_val.is_number_integer()) {
         log::Warn("mlx_tokenizer",
                   "Skipping vocab entry '" + tok + "' with non-numeric id");
         continue;
@@ -498,9 +502,11 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
     for (const auto &at : j["added_tokens"]) {
       if (!at.contains("id") || !at.contains("content"))
         continue;
-      if (!at["id"].is_number() || !at["content"].is_string()) {
+      // is_number_integer(), not is_number(): see the matching comment in
+      // the vocab loop above.
+      if (!at["id"].is_number_integer() || !at["content"].is_string()) {
         log::Warn("mlx_tokenizer",
-                  "Skipping added_tokens entry with non-numeric id or "
+                  "Skipping added_tokens entry with non-integer id or "
                   "non-string content");
         continue;
       }
@@ -593,25 +599,28 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
         model_cfg_f >> model_cfg;
       } catch (const std::exception &) {
       }
-      auto resolve_id = [&](const char *key) -> int32_t {
+      // Returns int64_t (-1 sentinel for "absent") and defers narrowing
+      // until after the IsValidTokenId range check at each call site --
+      // same rationale as the vocab/added_tokens loops above.
+      auto resolve_id = [&](const char *key) -> int64_t {
         if (!model_cfg.contains(key))
           return -1;
         const auto &v = model_cfg[key];
         if (v.is_number_integer())
-          return v.get<int32_t>();
+          return v.get<int64_t>();
         if (v.is_array() && !v.empty() && v[0].is_number_integer())
-          return v[0].get<int32_t>(); // some configs list multiple eos ids
+          return v[0].get<int64_t>(); // some configs list multiple eos ids
         return -1;
       };
       if (!bos_resolved) {
-        const int32_t id = resolve_id("bos_token_id");
-        if (id >= 0)
-          bos_id_ = id;
+        const int64_t id = resolve_id("bos_token_id");
+        if (IsValidTokenId(id))
+          bos_id_ = static_cast<int32_t>(id);
       }
       if (!eos_resolved) {
-        const int32_t id = resolve_id("eos_token_id");
-        if (id >= 0)
-          eos_id_ = id;
+        const int64_t id = resolve_id("eos_token_id");
+        if (IsValidTokenId(id))
+          eos_id_ = static_cast<int32_t>(id);
       }
     }
   }
