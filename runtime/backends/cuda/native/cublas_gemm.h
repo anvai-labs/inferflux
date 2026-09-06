@@ -1,6 +1,9 @@
 #pragma once
 
 #include <cublas_v2.h>
+
+#include <mutex>
+#include <unordered_map>
 // CUDA headers when available; opaque typedefs otherwise (mirrors
 // model_loader.h) so CPU-only CI builds compile this header.
 #if defined(INFERFLUX_HAS_CUDA) ||                                             \
@@ -57,6 +60,21 @@ public:
   bool GemmTyped(int M, int N, int K, const T *A, const T *B, T *C);
 
   /**
+   * Typed GEMM via cublasLt with a cached heuristic algo: C = A * B^T.
+   *
+   * cublasGemmEx's default heuristic picks a poor kernel for very wide
+   * shapes (the lm_head projection, N=vocab_size: measured 1.6-2.1x slower
+   * than cublasLt's first heuristic on RTX 4000 Ada, cold L2, per
+   * tests/tools/bf16_gemv_bench.cu). cublasLt's own first heuristic matches
+   * cublasGemmEx everywhere else (within ~1%), so routing a call through
+   * here is safe and at worst neutral. The heuristic is queried once per
+   * (M, N, K, dtype) and cached; any failure falls back to GemmTyped
+   * internally, so callers can use this as a drop-in.
+   */
+  template <typename T>
+  bool GemmTypedLt(int M, int N, int K, const T *A, const T *B, T *C);
+
+  /**
    * Typed GEMM with accumulation: C = A * B^T + C (beta = 1.0)
    * Eliminates the need for a separate ResidualAdd kernel when the output
    * buffer already contains the residual to accumulate into.
@@ -91,6 +109,25 @@ private:
   cublasHandle_t handle_{nullptr};
   void *workspace_{nullptr};
   size_t workspace_size_{0};
+
+  // cublasLt state for GemmTypedLt: lazily created handle (typed in the
+  // .cpp; kept as void* here so this header stays free of cublasLt
+  // includes) + a dedicated workspace (separate from the graph-capture
+  // workspace above so Lt calls never disturb pinned cuBLAS workspaces
+  // during capture), plus a cache of the chosen heuristic algo per problem
+  // shape. cublasLtMatmulAlgo_t is a 64-byte opaque struct, cached as raw
+  // bytes.
+  struct LtAlgoCacheEntry {
+    unsigned char algo_bytes[64]{};
+    bool valid{false};
+  };
+  bool EnsureLt();
+  cudaStream_t stream_{nullptr};
+  void *lt_handle_{nullptr};
+  void *lt_workspace_{nullptr};
+  static constexpr size_t kLtWorkspaceBytes = 32u * 1024 * 1024;
+  std::mutex lt_mutex_;
+  std::unordered_map<uint64_t, LtAlgoCacheEntry> lt_algo_cache_;
 };
 
 } // namespace inferflux
