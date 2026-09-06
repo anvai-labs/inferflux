@@ -70,6 +70,27 @@ const ByteUnicodeTable &GetBUT() {
 // U+2581 ▁  (LOWER ONE EIGHTH BLOCK — used as space marker in Metaspace).
 constexpr const char *kMetaMark = "\xe2\x96\x81";
 
+// Upper bound on a vocab/added_tokens id read from tokenizer.json. Real
+// vocabularies top out in the low hundreds of thousands (the largest known
+// multilingual tokenizers are under 1M); this is a generous ceiling that
+// still rejects a corrupted or adversarial id before it is used to size or
+// index id_to_token_. Without this, a negative id becomes a huge size_t
+// via implicit conversion in id_to_token_[id] (out-of-bounds write), and a
+// merely large positive id causes id_to_token_.assign()/resize() to
+// attempt allocating and zero-constructing hundreds of millions of
+// std::string objects (memory-exhaustion denial of service).
+constexpr int32_t kMaxReasonableTokenId = 10'000'000;
+
+// Takes int64_t, not int32_t: nlohmann::json::get<int32_t>() performs an
+// unchecked static_cast from its internal 64-bit storage with no range
+// check, so an id like 2^32 + 1 silently truncates to 1 and would pass a
+// same-width bounds check while colliding with (and overwriting) the
+// legitimate token at id 1. Validating the untruncated 64-bit value before
+// narrowing closes that gap.
+bool IsValidTokenId(int64_t id) {
+  return id >= 0 && id <= kMaxReasonableTokenId;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -363,7 +384,26 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
   if (model.contains("vocab") && model["vocab"].is_object()) {
     int32_t max_id = -1;
     for (const auto &[tok, id_val] : model["vocab"].items()) {
-      int32_t id = id_val.get<int32_t>();
+      // is_number_integer(), not is_number(): the latter is also true for
+      // JSON floats, and get<int64_t>() truncates a float toward zero
+      // without throwing (e.g. 1.5 -> 1), which would silently collide
+      // with whatever token already legitimately holds that integer id.
+      if (!id_val.is_number_integer()) {
+        log::Warn("mlx_tokenizer",
+                  "Skipping vocab entry '" + tok + "' with non-numeric id");
+        continue;
+      }
+      // Read as int64_t and range-check before narrowing -- get<int32_t>()
+      // would silently truncate an out-of-range value instead of rejecting
+      // it (see IsValidTokenId's comment).
+      const int64_t id64 = id_val.get<int64_t>();
+      if (!IsValidTokenId(id64)) {
+        log::Warn("mlx_tokenizer", "Skipping vocab entry '" + tok +
+                                       "' with out-of-range id " +
+                                       std::to_string(id64));
+        continue;
+      }
+      const int32_t id = static_cast<int32_t>(id64);
       vocab_[tok] = id;
       max_id = std::max(max_id, id);
     }
@@ -373,34 +413,76 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
     vocab_size_ = max_id + 1;
   }
 
-  // Merges.
+  // Merges. Two shapes are valid HuggingFace tokenizer.json output: a
+  // space-joined string ("a b", the older/common form) or a 2-element array
+  // of the two pieces (["a", "b"], used by some newer exporters). Both map
+  // to the same internal merge_rank_ key so BpeEncode() doesn't need to
+  // know which shape the file used.
   if (model.contains("merges") && model["merges"].is_array()) {
     int32_t rank = 0;
     for (const auto &m : model["merges"]) {
-      const std::string s = m.get<std::string>();
-      merge_rank_[s] = rank++;
+      if (m.is_string()) {
+        merge_rank_[m.get<std::string>()] = rank++;
+      } else if (m.is_array() && m.size() == 2 && m[0].is_string() &&
+                 m[1].is_string()) {
+        merge_rank_[m[0].get<std::string>() + " " + m[1].get<std::string>()] =
+            rank++;
+      } else {
+        log::Warn("mlx_tokenizer",
+                  "Skipping merges entry with unexpected shape (expected a "
+                  "string or a 2-element array of strings)");
+      }
     }
   }
 
+  // Small type-safe field accessors. tokenizer.json comes from many
+  // different exporters and hand-edited/malformed files can carry a field
+  // under the expected key but with the wrong JSON type (e.g. a number
+  // where a string is expected). nlohmann::json::value<T>() throws a
+  // type_error in that case; Load() must return false on bad input, never
+  // throw, so every field read below goes through one of these instead.
+  auto get_string_field = [](const json &obj, const char *key,
+                             const std::string &def) -> std::string {
+    if (!obj.contains(key))
+      return def;
+    if (!obj[key].is_string()) {
+      log::Warn("mlx_tokenizer",
+                std::string("Ignoring non-string '") + key + "' field");
+      return def;
+    }
+    return obj[key].get<std::string>();
+  };
+  auto get_bool_field = [](const json &obj, const char *key, bool def) -> bool {
+    if (!obj.contains(key))
+      return def;
+    if (!obj[key].is_boolean()) {
+      log::Warn("mlx_tokenizer",
+                std::string("Ignoring non-boolean '") + key + "' field");
+      return def;
+    }
+    return obj[key].get<bool>();
+  };
+
   // Pre-tokenizer type.
   if (j.contains("pre_tokenizer") && j["pre_tokenizer"].is_object()) {
-    auto apply_pre_tokenizer_type = [this](const json &pt) {
-      const std::string type = pt.value("type", "");
+    auto apply_pre_tokenizer_type = [this, &get_string_field,
+                                     &get_bool_field](const json &pt) {
+      const std::string type = get_string_field(pt, "type", "");
       if (type == "Metaspace") {
         pre_tok_ = PreTokenizerType::Metaspace;
-        add_prefix_space_ = pt.value("add_prefix_space", true);
+        add_prefix_space_ = get_bool_field(pt, "add_prefix_space", true);
         return true;
       }
       if (type == "ByteLevel") {
         pre_tok_ = PreTokenizerType::ByteLevel;
-        add_prefix_space_ = pt.value("add_prefix_space", false);
+        add_prefix_space_ = get_bool_field(pt, "add_prefix_space", false);
         return true;
       }
       return false;
     };
 
     const auto &pt = j["pre_tokenizer"];
-    const std::string type = pt.value("type", "");
+    const std::string type = get_string_field(pt, "type", "");
     if (type == "Sequence" && pt.contains("pretokenizers") &&
         pt["pretokenizers"].is_array()) {
       // HuggingFace wraps most GPT-2-family tokenizers (Qwen, Llama-3,
@@ -420,7 +502,24 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
     for (const auto &at : j["added_tokens"]) {
       if (!at.contains("id") || !at.contains("content"))
         continue;
-      const int32_t id = at["id"].get<int32_t>();
+      // is_number_integer(), not is_number(): see the matching comment in
+      // the vocab loop above.
+      if (!at["id"].is_number_integer() || !at["content"].is_string()) {
+        log::Warn("mlx_tokenizer",
+                  "Skipping added_tokens entry with non-integer id or "
+                  "non-string content");
+        continue;
+      }
+      // Read as int64_t and range-check before narrowing -- see the
+      // matching comment in the vocab loop above.
+      const int64_t id64 = at["id"].get<int64_t>();
+      if (!IsValidTokenId(id64)) {
+        log::Warn("mlx_tokenizer", "Skipping added_tokens entry with "
+                                   "out-of-range id " +
+                                       std::to_string(id64));
+        continue;
+      }
+      const int32_t id = static_cast<int32_t>(id64);
       const std::string content = at["content"].get<std::string>();
       // Insert into vocab if not already present.
       vocab_.emplace(content, id);
@@ -428,7 +527,7 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
         id_to_token_.resize(id + 1);
       id_to_token_[id] = content;
       vocab_size_ = std::max(vocab_size_, id + 1);
-      if (at.value("special", false))
+      if (get_bool_field(at, "special", false))
         special_ids_.insert(id);
     }
   }
@@ -500,25 +599,28 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
         model_cfg_f >> model_cfg;
       } catch (const std::exception &) {
       }
-      auto resolve_id = [&](const char *key) -> int32_t {
+      // Returns int64_t (-1 sentinel for "absent") and defers narrowing
+      // until after the IsValidTokenId range check at each call site --
+      // same rationale as the vocab/added_tokens loops above.
+      auto resolve_id = [&](const char *key) -> int64_t {
         if (!model_cfg.contains(key))
           return -1;
         const auto &v = model_cfg[key];
         if (v.is_number_integer())
-          return v.get<int32_t>();
+          return v.get<int64_t>();
         if (v.is_array() && !v.empty() && v[0].is_number_integer())
-          return v[0].get<int32_t>(); // some configs list multiple eos ids
+          return v[0].get<int64_t>(); // some configs list multiple eos ids
         return -1;
       };
       if (!bos_resolved) {
-        const int32_t id = resolve_id("bos_token_id");
-        if (id >= 0)
-          bos_id_ = id;
+        const int64_t id = resolve_id("bos_token_id");
+        if (IsValidTokenId(id))
+          bos_id_ = static_cast<int32_t>(id);
       }
       if (!eos_resolved) {
-        const int32_t id = resolve_id("eos_token_id");
-        if (id >= 0)
-          eos_id_ = id;
+        const int64_t id = resolve_id("eos_token_id");
+        if (IsValidTokenId(id))
+          eos_id_ = static_cast<int32_t>(id);
       }
     }
   }
