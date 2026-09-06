@@ -578,6 +578,43 @@ TEST_CASE("MlxTokenizer rejects an unreasonably large vocab id instead of "
   fs::remove_all(dir);
 }
 
+TEST_CASE("MlxTokenizer does not let an id truncate into a valid range and "
+          "silently overwrite an existing token",
+          "[mlx_tokenizer]") {
+  // Regression test for a truncation exploit found by adversarial review:
+  // reading the id via get<int32_t>() performs an unchecked static_cast
+  // from JSON's internal 64-bit storage, so an id like 2^32 + 1 silently
+  // truncates to 1 -- passing an int32-width range check while colliding
+  // with (and overwriting) whatever legitimate token already has id 1.
+  // The fix reads the id as int64_t and range-checks the untruncated
+  // value before narrowing.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_vocab_id_truncation";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    vocab["legit_one"] = 1;
+    // 2^32 + 1 == 4294967297; truncates to 1 under an unchecked
+    // int64_t -> int32_t cast.
+    vocab["attacker_wrap"] = 4294967297LL;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+  // id 1 must still resolve to the legitimate token, not the attacker's.
+  REQUIRE(tok.Decode({1}, /*skip_special=*/false) == "legit_one");
+  REQUIRE(tok.VocabSize() == 2); // the wrapping entry was rejected
+
+  fs::remove_all(dir);
+}
+
 TEST_CASE("MlxTokenizer rejects an out-of-range added_tokens id instead of "
           "corrupting memory",
           "[mlx_tokenizer]") {

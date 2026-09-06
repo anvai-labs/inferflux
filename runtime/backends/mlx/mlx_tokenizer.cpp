@@ -81,7 +81,13 @@ constexpr const char *kMetaMark = "\xe2\x96\x81";
 // std::string objects (memory-exhaustion denial of service).
 constexpr int32_t kMaxReasonableTokenId = 10'000'000;
 
-bool IsValidTokenId(int32_t id) {
+// Takes int64_t, not int32_t: nlohmann::json::get<int32_t>() performs an
+// unchecked static_cast from its internal 64-bit storage with no range
+// check, so an id like 2^32 + 1 silently truncates to 1 and would pass a
+// same-width bounds check while colliding with (and overwriting) the
+// legitimate token at id 1. Validating the untruncated 64-bit value before
+// narrowing closes that gap.
+bool IsValidTokenId(int64_t id) {
   return id >= 0 && id <= kMaxReasonableTokenId;
 }
 
@@ -383,13 +389,17 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
                   "Skipping vocab entry '" + tok + "' with non-numeric id");
         continue;
       }
-      int32_t id = id_val.get<int32_t>();
-      if (!IsValidTokenId(id)) {
+      // Read as int64_t and range-check before narrowing -- get<int32_t>()
+      // would silently truncate an out-of-range value instead of rejecting
+      // it (see IsValidTokenId's comment).
+      const int64_t id64 = id_val.get<int64_t>();
+      if (!IsValidTokenId(id64)) {
         log::Warn("mlx_tokenizer", "Skipping vocab entry '" + tok +
                                        "' with out-of-range id " +
-                                       std::to_string(id));
+                                       std::to_string(id64));
         continue;
       }
+      const int32_t id = static_cast<int32_t>(id64);
       vocab_[tok] = id;
       max_id = std::max(max_id, id);
     }
@@ -494,13 +504,16 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
                   "non-string content");
         continue;
       }
-      const int32_t id = at["id"].get<int32_t>();
-      if (!IsValidTokenId(id)) {
+      // Read as int64_t and range-check before narrowing -- see the
+      // matching comment in the vocab loop above.
+      const int64_t id64 = at["id"].get<int64_t>();
+      if (!IsValidTokenId(id64)) {
         log::Warn("mlx_tokenizer", "Skipping added_tokens entry with "
                                    "out-of-range id " +
-                                       std::to_string(id));
+                                       std::to_string(id64));
         continue;
       }
+      const int32_t id = static_cast<int32_t>(id64);
       const std::string content = at["content"].get<std::string>();
       // Insert into vocab if not already present.
       vocab_.emplace(content, id);
