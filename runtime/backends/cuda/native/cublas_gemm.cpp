@@ -135,10 +135,12 @@ namespace {
 // Layout-safe cache key: M/N/K each under 2^20 for any realistic model, and
 // the dtype enum folded into the top bits where it cannot overlap.
 inline uint64_t LtCacheKey(int M, int N, int K, cudaDataType_t dtype) {
-  return (static_cast<uint64_t>(M & 0xFFFFF) << 40) |
+  // dtype enum values fit in 4 bits (CUDA_R_16BF = 14); bits 60-63 cannot
+  // overlap the M field, which starts at bit 40 and spans 20 bits.
+  return (static_cast<uint64_t>(dtype & 0xF) << 60) |
+         (static_cast<uint64_t>(M & 0xFFFFF) << 40) |
          (static_cast<uint64_t>(N & 0xFFFFF) << 20) |
-         static_cast<uint64_t>(K & 0xFFFFF) |
-         (static_cast<uint64_t>(dtype) << 61);
+         static_cast<uint64_t>(K & 0xFFFFF);
 }
 
 // cublasLtMatmulAlgo_t is a 64-byte opaque struct; the header caches it as
@@ -187,7 +189,7 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
     // D = C [M, N] row-major. Descriptors are cheap host objects, rebuilt
     // per call; only the chosen algo is cached per shape.
     cublasStatus_t st =
-        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, dtype);
+        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
     if (st == CUBLAS_STATUS_SUCCESS) {
       cublasOperation_t ta = CUBLAS_OP_N, tb = CUBLAS_OP_T;
       cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
@@ -234,10 +236,16 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
     if (have_algo)
       LtAlgoToBytes(algo, entry.algo_bytes);
     lt_algo_cache_[key] = entry;
+    if (!have_algo) {
+      log::Warn("cublas_gemm", "cublasLt heuristic unavailable for " +
+                                   std::to_string(M) + "x" + std::to_string(N) +
+                                   "x" + std::to_string(K) +
+                                   "; using cublasGemmEx fallback");
+    }
   } else {
     // Cache hit: still need descriptors for the call.
     cublasStatus_t st =
-        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, dtype);
+        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
     if (st == CUBLAS_STATUS_SUCCESS) {
       cublasOperation_t ta = CUBLAS_OP_N, tb = CUBLAS_OP_T;
       cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,

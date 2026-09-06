@@ -75,9 +75,24 @@ moment decode begins rather than at cohort rebuild; expect small gains
    cold-L2 (3.0-4.2 ms vs a consistent ~2.0 ms). Landed as
    `CublasGemm::GemmTypedLt` (cached per-shape heuristic, GemmTyped
    fallback), routed for the vocab projection (single + batched).
-   End-to-end: 252.6 -> 270.9/269.9 tok/s profiled (+7.2%, reproduced,
-   0.4% spread), GPU busy -11%, 32/32 success, output coherent.
-   **Falsified for other shapes** — do not bother routing them.
+   End-to-end after review fix: 252.6 -> 266.8/286.2 tok/s profiled
+   (+5.6%/+13.3%, avg ~+9.5%), GPU busy 7.18 -> 6.78 s, 32/32 success,
+   output coherent. **Falsified for other shapes** — do not bother
+   routing them.
+   **Review lesson (adversarial round 1):** the first version of
+   `GemmTypedLt` created its matmul descriptor with the matrix dtype
+   (bf16) as `scaleType` while passing `float*` alpha/beta — cublasLt
+   requires `CUDA_R_32F` scale type for `CUBLAS_COMPUTE_32F`, so the
+   heuristic query returned zero results and every call silently
+   permanently fell back to `GemmTyped` (a no-op shipped as an
+   optimization; the spike had it right, the production wiring dropped
+   it). The reviewer caught it by reproducing the descriptor setup
+   standalone at the real lm_head shape. Fix: scaleType = `CUDA_R_32F`,
+   plus a one-time warn when a shape's heuristic fails so this class of
+   silent fallback can't recur unnoticed. Measurement honesty note: the
+   pre-fix "+7.2%" was run-to-run variance, not the code — the no-op
+   build measured 270.9/269.9 vs pre-change 252.6, which is why the
+   post-fix claim is re-measured from scratch.
 3. **Fuse gate+up into one [2N, K] GEMM** — **FALSIFIED**: cold-L2 spike
    shows fused [22016, 2048] is 1.01-1.02x two [11008, 2048] calls
    (noise). Two back-to-back GEMMs are already fine; skip.
