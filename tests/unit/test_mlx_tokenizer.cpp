@@ -478,6 +478,234 @@ TEST_CASE("MlxTokenizer does not crash on a malformed non-object entry in "
   fs::remove_all(dir);
 }
 
+TEST_CASE("MlxTokenizer skips a vocab entry with a non-numeric id instead "
+          "of crashing",
+          "[mlx_tokenizer]") {
+  // Regression test: the vocab-parsing loop called id_val.get<int32_t>()
+  // on every model["vocab"] entry unconditionally. A hand-edited or
+  // corrupted tokenizer.json with a non-numeric id (a string, here)
+  // previously threw an uncaught nlohmann::json::type_error out of
+  // Load() -- Load() must return false on bad input, never throw.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_vocab_bad_id";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    vocab["hello"] = 1;
+    vocab["bad_token"] = "not_a_number"; // wrong type
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+  // The well-formed entries must still load; the bad one must not
+  // contribute to vocab_size_.
+  REQUIRE(tok.VocabSize() == 2);
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer skips a merges entry with an unexpected shape "
+          "instead of crashing",
+          "[mlx_tokenizer]") {
+  // Regression test: the merges-parsing loop called m.get<std::string>()
+  // on every model["merges"] entry unconditionally. A hand-edited or
+  // corrupted tokenizer.json with a non-string, non-array entry (a bare
+  // number, here) previously threw an uncaught nlohmann::json::type_error
+  // out of Load().
+  const auto dir = fs::temp_directory_path() / "ifx_tok_merges_bad_shape";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    vocab["h"] = 1;
+    vocab["e"] = 2;
+    vocab["he"] = 3;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array({42, "h e"});
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+
+  // The well-formed "h e" merge after the malformed entry must still take
+  // effect.
+  auto r = tok.Encode("he", /*add_bos=*/false);
+  REQUIRE(r.ok);
+  REQUIRE(r.ids.size() == 1);
+  REQUIRE(r.ids[0] == 3); // merged "he" token id
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer supports merges in array-of-arrays format",
+          "[mlx_tokenizer]") {
+  // Compatibility test (not just crash-avoidance): some newer HuggingFace
+  // tokenizer.json exports encode merges as an array of 2-element
+  // [piece_a, piece_b] arrays rather than the older space-joined
+  // "piece_a piece_b" string. Both are legitimate tokenizer.json shapes in
+  // the wild; before this fix only the string form worked.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_merges_arr";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    vocab["h"] = 1;
+    vocab["e"] = 2;
+    vocab["l"] = 3;
+    vocab["he"] = 4;
+    vocab["hel"] = 5;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array({
+        nlohmann::json::array({"h", "e"}),
+        nlohmann::json::array({"he", "l"}),
+    });
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+
+  auto r = tok.Encode("hel", /*add_bos=*/false);
+  REQUIRE(r.ok);
+  REQUIRE(r.ids.size() == 1);
+  REQUIRE(r.ids[0] == 5); // "hel" merged via array-of-arrays merges
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer skips an added_tokens entry with wrong-typed id or "
+          "content instead of crashing",
+          "[mlx_tokenizer]") {
+  // Regression test: the added_tokens loop checked at.contains("id") /
+  // at.contains("content") but not that those values were actually the
+  // expected JSON type. A hand-edited tokenizer.json with e.g.
+  // {"id": "not_a_number", ...} or {"content": 123, ...} previously threw
+  // an uncaught nlohmann::json::type_error out of Load().
+  const auto dir = fs::temp_directory_path() / "ifx_tok_added_bad_type";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    tok["added_tokens"] = nlohmann::json::array({
+        {{"id", "not_a_number"}, {"content", "<bad_id>"}},
+        {{"id", 5}, {"content", 123}}, // content wrong type
+        {{"id", 7}, {"content", "<good>"}, {"special", true}},
+    });
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+  // The well-formed entry after the two malformed ones must still load.
+  REQUIRE(tok.VocabSize() == 8); // ids up to 7
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer ignores a non-string pre_tokenizer type field "
+          "instead of crashing",
+          "[mlx_tokenizer]") {
+  // Regression test found during the same audit: apply_pre_tokenizer_type()
+  // read pt.value("type", "") directly, which throws
+  // nlohmann::json::type_error if "type" is present but not a string (e.g.
+  // hand-edited to a number).
+  const auto dir = fs::temp_directory_path() / "ifx_tok_pt_bad_type";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    tok["pre_tokenizer"]["type"] = 42; // wrong type
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer ignores a non-boolean add_prefix_space field "
+          "instead of crashing",
+          "[mlx_tokenizer]") {
+  // Same class of bug as the pre_tokenizer type field above, for the
+  // boolean field read alongside it.
+  const auto dir = fs::temp_directory_path() / "ifx_tok_pt_bad_prefix_space";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    tok["pre_tokenizer"]["type"] = "ByteLevel";
+    tok["pre_tokenizer"]["add_prefix_space"] = "yes"; // wrong type
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+
+  fs::remove_all(dir);
+}
+
+TEST_CASE("MlxTokenizer ignores a non-boolean added_tokens special field "
+          "instead of crashing",
+          "[mlx_tokenizer]") {
+  const auto dir = fs::temp_directory_path() / "ifx_tok_added_bad_special";
+  fs::create_directories(dir);
+  {
+    nlohmann::json vocab;
+    vocab["<unk>"] = 0;
+    nlohmann::json tok;
+    tok["model"]["type"] = "BPE";
+    tok["model"]["vocab"] = vocab;
+    tok["model"]["merges"] = nlohmann::json::array();
+    tok["added_tokens"] = nlohmann::json::array({
+        {{"id", 5}, {"content", "<x>"}, {"special", "yes"}}, // wrong type
+    });
+    std::ofstream f(dir / "tokenizer.json");
+    f << tok.dump(2);
+  }
+
+  MlxTokenizer tok;
+  REQUIRE_NOTHROW(tok.Load(dir));
+  REQUIRE(tok.Loaded());
+  REQUIRE(tok.VocabSize() == 6);
+
+  fs::remove_all(dir);
+}
+
 // ---------------------------------------------------------------------------
 // tokenizer_config.json — bos/eos resolved from object notation
 // ---------------------------------------------------------------------------

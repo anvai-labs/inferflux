@@ -363,6 +363,11 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
   if (model.contains("vocab") && model["vocab"].is_object()) {
     int32_t max_id = -1;
     for (const auto &[tok, id_val] : model["vocab"].items()) {
+      if (!id_val.is_number()) {
+        log::Warn("mlx_tokenizer",
+                  "Skipping vocab entry '" + tok + "' with non-numeric id");
+        continue;
+      }
       int32_t id = id_val.get<int32_t>();
       vocab_[tok] = id;
       max_id = std::max(max_id, id);
@@ -373,34 +378,76 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
     vocab_size_ = max_id + 1;
   }
 
-  // Merges.
+  // Merges. Two shapes are valid HuggingFace tokenizer.json output: a
+  // space-joined string ("a b", the older/common form) or a 2-element array
+  // of the two pieces (["a", "b"], used by some newer exporters). Both map
+  // to the same internal merge_rank_ key so BpeEncode() doesn't need to
+  // know which shape the file used.
   if (model.contains("merges") && model["merges"].is_array()) {
     int32_t rank = 0;
     for (const auto &m : model["merges"]) {
-      const std::string s = m.get<std::string>();
-      merge_rank_[s] = rank++;
+      if (m.is_string()) {
+        merge_rank_[m.get<std::string>()] = rank++;
+      } else if (m.is_array() && m.size() == 2 && m[0].is_string() &&
+                 m[1].is_string()) {
+        merge_rank_[m[0].get<std::string>() + " " + m[1].get<std::string>()] =
+            rank++;
+      } else {
+        log::Warn("mlx_tokenizer",
+                  "Skipping merges entry with unexpected shape (expected a "
+                  "string or a 2-element array of strings)");
+      }
     }
   }
 
+  // Small type-safe field accessors. tokenizer.json comes from many
+  // different exporters and hand-edited/malformed files can carry a field
+  // under the expected key but with the wrong JSON type (e.g. a number
+  // where a string is expected). nlohmann::json::value<T>() throws a
+  // type_error in that case; Load() must return false on bad input, never
+  // throw, so every field read below goes through one of these instead.
+  auto get_string_field = [](const json &obj, const char *key,
+                             const std::string &def) -> std::string {
+    if (!obj.contains(key))
+      return def;
+    if (!obj[key].is_string()) {
+      log::Warn("mlx_tokenizer",
+                std::string("Ignoring non-string '") + key + "' field");
+      return def;
+    }
+    return obj[key].get<std::string>();
+  };
+  auto get_bool_field = [](const json &obj, const char *key, bool def) -> bool {
+    if (!obj.contains(key))
+      return def;
+    if (!obj[key].is_boolean()) {
+      log::Warn("mlx_tokenizer",
+                std::string("Ignoring non-boolean '") + key + "' field");
+      return def;
+    }
+    return obj[key].get<bool>();
+  };
+
   // Pre-tokenizer type.
   if (j.contains("pre_tokenizer") && j["pre_tokenizer"].is_object()) {
-    auto apply_pre_tokenizer_type = [this](const json &pt) {
-      const std::string type = pt.value("type", "");
+    auto apply_pre_tokenizer_type = [this, &get_string_field,
+                                     &get_bool_field](const json &pt) {
+      const std::string type = get_string_field(pt, "type", "");
       if (type == "Metaspace") {
         pre_tok_ = PreTokenizerType::Metaspace;
-        add_prefix_space_ = pt.value("add_prefix_space", true);
+        add_prefix_space_ = get_bool_field(pt, "add_prefix_space", true);
         return true;
       }
       if (type == "ByteLevel") {
         pre_tok_ = PreTokenizerType::ByteLevel;
-        add_prefix_space_ = pt.value("add_prefix_space", false);
+        add_prefix_space_ = get_bool_field(pt, "add_prefix_space", false);
         return true;
       }
       return false;
     };
 
     const auto &pt = j["pre_tokenizer"];
-    const std::string type = pt.value("type", "");
+    const std::string type = get_string_field(pt, "type", "");
     if (type == "Sequence" && pt.contains("pretokenizers") &&
         pt["pretokenizers"].is_array()) {
       // HuggingFace wraps most GPT-2-family tokenizers (Qwen, Llama-3,
@@ -420,6 +467,12 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
     for (const auto &at : j["added_tokens"]) {
       if (!at.contains("id") || !at.contains("content"))
         continue;
+      if (!at["id"].is_number() || !at["content"].is_string()) {
+        log::Warn("mlx_tokenizer",
+                  "Skipping added_tokens entry with non-numeric id or "
+                  "non-string content");
+        continue;
+      }
       const int32_t id = at["id"].get<int32_t>();
       const std::string content = at["content"].get<std::string>();
       // Insert into vocab if not already present.
@@ -428,7 +481,7 @@ bool MlxTokenizer::Load(const std::filesystem::path &model_dir) {
         id_to_token_.resize(id + 1);
       id_to_token_[id] = content;
       vocab_size_ = std::max(vocab_size_, id + 1);
-      if (at.value("special", false))
+      if (get_bool_field(at, "special", false))
         special_ids_.insert(id);
     }
   }
