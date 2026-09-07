@@ -86,6 +86,76 @@ jobs:
           path: artifacts/linux
           retention-days: 14
 
+  # Arm64 Linux builds natively on the ubuntu-24.04-arm runner (same runner
+  # agentbrowser uses for its server-linux-arm64 leg). CMAKE_SYSTEM_PROCESSOR
+  # is aarch64 there, so cpack names the artifacts ...-Linux-aarch64.*.
+  linux-arm64-packages:
+    name: Linux arm64 (tgz/deb/rpm)
+    runs-on: ubuntu-24.04-arm
+    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          fetch-depth: 0
+          ref: ${{ env.RELEASE_REF }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            libssl-dev \
+            libyaml-cpp-dev \
+            python3 \
+            rpm \
+            dpkg-dev \
+            fakeroot
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=${BUILD_TYPE} \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DENABLE_WEBUI=ON \
+            -DENABLE_CUDA=OFF \
+            -DENABLE_ROCM=OFF \
+            -DENABLE_MPS=OFF \
+            -DENABLE_BLAS=OFF \
+            -DENABLE_VULKAN=OFF \
+            -DENABLE_MTMD=OFF
+
+      - name: Build binaries
+        run: cmake --build build -j$(nproc) --target inferfluxd inferctl
+
+      - name: Install staging tree
+        run: cmake --install build --prefix build/install
+
+      - name: Package (tgz/deb/rpm)
+        run: |
+          cpack --config build/CPackConfig.cmake -G TGZ
+          cpack --config build/CPackConfig.cmake -G DEB
+          cpack --config build/CPackConfig.cmake -G RPM
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts/linux-arm64
+          mv inferflux-*Linux-aarch64*.tar.gz artifacts/linux-arm64/ 2>/dev/null || true
+          mv inferflux-*Linux-aarch64*.deb artifacts/linux-arm64/ 2>/dev/null || true
+          mv inferflux-*Linux-aarch64*.rpm artifacts/linux-arm64/ 2>/dev/null || true
+          ls -R artifacts/linux-arm64
+
+      - name: Upload Linux arm64 artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: linux-arm64-packages
+          path: artifacts/linux-arm64
+          retention-days: 14
+
   mac-packages:
     name: macOS (tgz/pkg/dmg)
     runs-on: macos-latest
@@ -358,7 +428,7 @@ jobs:
 
   create-release:
     name: Publish tagged release
-    needs: [linux-packages, mac-packages, windows-packages, manifests]
+    needs: [linux-packages, linux-arm64-packages, mac-packages, windows-packages, manifests]
     if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/') }}
     runs-on: ubuntu-latest
     permissions:
