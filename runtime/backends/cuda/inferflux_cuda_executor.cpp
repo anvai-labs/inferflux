@@ -2197,13 +2197,15 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
     UnifiedBatchInput warm_prefill;
     warm_prefill.sequence_id = 0;
     warm_prefill.n_past = 0;
-    // Clamp to the KV cache's max sequence length: with a small auto-tuned
-    // max_seq (< 256) the warm Forward would fail its length check and the
-    // warm-up would silently no-op, re-exposing the first-mixed-call
-    // corruption it exists to absorb.
-    const int warm_len = std::min(std::max(256, min_prefill_tokens_),
-                                  kv_cache_ ? kv_cache_->MaxSeqLen()
-                                            : std::numeric_limits<int>::max());
+    // Clamp to the KV cache's max sequence length AND the prefill chunk cap:
+    // the warm Forward must satisfy the same bounds a real call does (scratch
+    // rows = chunk cap; seq window = KV max_seq), or it fails its length
+    // checks and the warm-up silently no-ops, re-exposing the
+    // first-mixed-call corruption it exists to absorb.
+    int warm_len = std::min(std::max(256, min_prefill_tokens_),
+                            kv_cache_ ? kv_cache_->MaxSeqLen()
+                                      : std::numeric_limits<int>::max());
+    warm_len = std::min(warm_len, prefill_chunk_tokens_);
     warm_prefill.tokens.assign(static_cast<size_t>(warm_len), 1);
     warm_prefill.request_logits = false;
     warm_prefill.request_id = -1;
