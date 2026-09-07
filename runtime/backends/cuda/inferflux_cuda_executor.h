@@ -424,6 +424,18 @@ private:
   std::atomic<int> timing_batch_counter_{0};
   NativeExecutionPolicy execution_policy_{};
 
+  // KV bounds backstop: the native KV cache indexes device memory by raw
+  // sequence id (slot table + per-slot strides) with no device-side bounds
+  // check. Admission bounds ids in normal operation — the scheduler sizes its
+  // sequence slot manager to the published KV capacity — so a violation here
+  // means a scheduler/backend capacity mismatch; the guard converts it into a
+  // clean per-request failure instead of an out-of-bounds device write.
+  bool SeqIdInKvRange(int seq_id) const {
+    return seq_id >= 0 && kv_cache_ && seq_id < kv_cache_->MaxBatchSize();
+  }
+  void RecordKvRangeViolation(int seq_id);
+  std::atomic<int> kv_range_violations_{0};
+
   struct NativePerfAccumulator {
     std::atomic<double> prefill_ms{0.0};
     std::atomic<double> decode_ms{0.0};
