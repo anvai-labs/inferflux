@@ -111,6 +111,96 @@ __global__ void __launch_bounds__(256)
   }
 }
 
+
+// Deep-MLP warp-per-row kernel: the K loop is unrolled UNROLL-way and each
+// unrolled iteration keeps its OWN partial accumulator, so the UNROLL 16-byte
+// weight loads are independent (all in flight simultaneously) instead of
+// serializing through one accumulator dependency chain. This was the missing
+// ingredient in the first warp-per-row attempt.
+template <int UNROLL, int M_MAX>
+__global__ void __launch_bounds__(256) GemvBf16DeepMlpK(
+    const __nv_bfloat16 *__restrict__ w, const __nv_bfloat16 *__restrict__ x,
+    float *__restrict__ y, int N, int K, int M) {
+  const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  const int lane = threadIdx.x & 31;
+  const int warps_per_grid = (gridDim.x * blockDim.x) >> 5;
+  const int vec_per_row = K >> 3;  // 8 bf16 per 16 B load
+  // Full unrolled passes cover vec_per_row rounded down to a multiple of
+  // (32 * UNROLL); the tail (<= 31 vectors per lane) runs scalar-bound.
+  const int full_passes = vec_per_row / (32 * UNROLL);
+
+  for (int row = warp; row < N; row += warps_per_grid) {
+    const int4 *w_vec =
+        reinterpret_cast<const int4 *>(w + static_cast<long>(row) * K);
+
+    float part[UNROLL][M_MAX];
+#pragma unroll
+    for (int u = 0; u < UNROLL; ++u)
+#pragma unroll
+      for (int m = 0; m < M_MAX; ++m) part[u][m] = 0.f;
+
+    int v = lane;
+    for (int p = 0; p < full_passes; ++p, v += 32 * UNROLL) {
+      int4 wv[UNROLL];
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) wv[u] = __ldg(w_vec + v + u * 32);
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) {
+        const __nv_bfloat16 *wh =
+            reinterpret_cast<const __nv_bfloat16 *>(&wv[u]);
+        // x must track the SAME vector the weight came from (v + u*32) --
+        // pairing W's u-offset with x's base offset silently corrupts every
+        // u != 0 partial.
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+          const __nv_bfloat16 *x_row =
+              x + static_cast<long>(m) * K + (v + u * 32) * 8;
+          float t = __bfloat162float(wh[0]) * __bfloat162float(x_row[0]) +
+                    __bfloat162float(wh[1]) * __bfloat162float(x_row[1]) +
+                    __bfloat162float(wh[2]) * __bfloat162float(x_row[2]) +
+                    __bfloat162float(wh[3]) * __bfloat162float(x_row[3]) +
+                    __bfloat162float(wh[4]) * __bfloat162float(x_row[4]) +
+                    __bfloat162float(wh[5]) * __bfloat162float(x_row[5]) +
+                    __bfloat162float(wh[6]) * __bfloat162float(x_row[6]) +
+                    __bfloat162float(wh[7]) * __bfloat162float(x_row[7]);
+          part[u][m] += t;
+        }
+      }
+    }
+    // Tail vectors (K not a multiple of 32*UNROLL*8): still strided by the
+    // warp width so lanes never overlap each other's vectors.
+    float tail[M_MAX];
+#pragma unroll
+    for (int m = 0; m < M_MAX; ++m) tail[m] = 0.f;
+    for (v = lane + full_passes * 32 * UNROLL; v < vec_per_row; v += 32) {
+      int4 wv = __ldg(w_vec + v);
+      const __nv_bfloat16 *wh = reinterpret_cast<const __nv_bfloat16 *>(&wv);
+#pragma unroll
+      for (int m = 0; m < M; ++m) {
+        const __nv_bfloat16 *x_row = x + static_cast<long>(m) * K + v * 8;
+        tail[m] += __bfloat162float(wh[0]) * __bfloat162float(x_row[0]) +
+                   __bfloat162float(wh[1]) * __bfloat162float(x_row[1]) +
+                   __bfloat162float(wh[2]) * __bfloat162float(x_row[2]) +
+                   __bfloat162float(wh[3]) * __bfloat162float(x_row[3]) +
+                   __bfloat162float(wh[4]) * __bfloat162float(x_row[4]) +
+                   __bfloat162float(wh[5]) * __bfloat162float(x_row[5]) +
+                   __bfloat162float(wh[6]) * __bfloat162float(x_row[6]) +
+                   __bfloat162float(wh[7]) * __bfloat162float(x_row[7]);
+      }
+    }
+#pragma unroll
+    for (int m = 0; m < M; ++m) {
+      float s = tail[m];
+#pragma unroll
+      for (int u = 0; u < UNROLL; ++u) s += part[u][m];
+#pragma unroll
+      for (int off = 16; off > 0; off >>= 1)
+        s += __shfl_down_sync(0xffffffffu, s, off);
+      if (lane == 0) y[static_cast<long>(m) * N + row] = s;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Reference + harness
 // ---------------------------------------------------------------------------
@@ -278,34 +368,27 @@ int main() {
   printf("GPU: %s, SMs=%d, peak BW ~%.0f GB/s\n\n", prop.name,
          prop.multiProcessorCount, 576.0);
 
+  float lt_default_tmp = -1.f;  // overwritten by LtBestCold per shape
   for (const auto &shape : shapes) {
     for (int M : Ms) {
       size_t wn = (size_t)shape.N * shape.K, xn = (size_t)M * shape.K,
              yn = (size_t)M * shape.N;
       __nv_bfloat16 *d_w, *d_x;
-      float *d_y_cublas, *d_y_custom;
+      float *d_y_ref, *d_y_wr, *d_y_deep, *d_y_lt;
       CHECK(cudaMalloc(&d_w, wn * 2));
       CHECK(cudaMalloc(&d_x, xn * 2));
-      CHECK(cudaMalloc(&d_y_cublas, yn * 4));
-      CHECK(cudaMalloc(&d_y_custom, yn * 4));
+      CHECK(cudaMalloc(&d_y_ref, yn * 4));
+      CHECK(cudaMalloc(&d_y_wr, yn * 4));
+      CHECK(cudaMalloc(&d_y_deep, yn * 4));
+      CHECK(cudaMalloc(&d_y_lt, yn * 4));
 
       std::mt19937 rng(42);
       std::uniform_real_distribution<float> dist(-1.f, 1.f);
       std::vector<__nv_bfloat16> h_w(wn), h_x(xn);
-      for (auto &v : h_w)
-        v = __float2bfloat16(dist(rng));
-      for (auto &v : h_x)
-        v = __float2bfloat16(dist(rng));
+      for (auto &v : h_w) v = __float2bfloat16(dist(rng));
+      for (auto &v : h_x) v = __float2bfloat16(dist(rng));
       CHECK(cudaMemcpy(d_w, h_w.data(), wn * 2, cudaMemcpyHostToDevice));
       CHECK(cudaMemcpy(d_x, h_x.data(), xn * 2, cudaMemcpyHostToDevice));
-
-      // Custom kernel launch geometry: warp handles one row; total warps
-      // ~4x what's needed so every SM is saturated; rows strided.
-      int warps_wanted = shape.N; // one warp per row upper bound
-      int block = 256;
-      int grid = std::min((warps_wanted * 32 + block - 1) / block,
-                          prop.multiProcessorCount * 8);
-      grid = std::max(grid, 1);
 
       // 96 MB scratch, swept between iterations to evict L2 (Ada L2=48MB).
       float *d_evict;
@@ -317,99 +400,106 @@ int main() {
       CHECK(cudaEventCreate(&t0));
       CHECK(cudaEventCreate(&t1));
       const int iters = 20;
-      float ms_cublas = 0, ms_custom = 0;
-
-      // cuBLAS timing
       float alpha = 1.f, beta = 0.f;
-      CUBLAS_CHECK(cublasSetStream(handle, 0));
-      CUBLAS_CHECK(cublasGemmEx(
-          handle, CUBLAS_OP_T, CUBLAS_OP_N, shape.N, M, shape.K, &alpha, d_w,
-          CUDA_R_16BF, shape.K, d_x, CUDA_R_16BF, shape.K, &beta, d_y_cublas,
-          CUDA_R_32F, shape.N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
-      // Evict L2 between iterations (attention kernels run between
-      // projections in the real decode loop) but time only the GEMM window.
-      ms_cublas = 0;
-      for (int i = 0; i < iters; ++i) {
-        CHECK(cudaMemsetAsync(d_evict, i & 0xFF, evict_n * sizeof(float)));
+      int block = 256;
+      int grid_wr = std::min((shape.N * 32 + block - 1) / block,
+                             prop.multiProcessorCount * 12);
+      grid_wr = std::max(grid_wr, 1);
+      int grid_deep = std::min((shape.N * 32 + block - 1) / block,
+                               prop.multiProcessorCount * 12);
+      grid_deep = std::max(grid_deep, 1);
+
+      // Cold-timed run helper: evict L2, time one call, return ms.
+      auto timed = [&](const char *kind) -> float {
+        CHECK(cudaMemsetAsync(d_evict, 0x5A, evict_n * sizeof(float)));
         CHECK(cudaEventRecord(t0));
-        CUBLAS_CHECK(cublasGemmEx(
-            handle, CUBLAS_OP_T, CUBLAS_OP_N, shape.N, M, shape.K, &alpha, d_w,
-            CUDA_R_16BF, shape.K, d_x, CUDA_R_16BF, shape.K, &beta, d_y_cublas,
-            CUDA_R_32F, shape.N, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        if (std::strcmp(kind, "cublas") == 0)
+          CUBLAS_CHECK(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N, shape.N,
+                                    M, shape.K, &alpha, d_w, CUDA_R_16BF,
+                                    shape.K, d_x, CUDA_R_16BF, shape.K, &beta,
+                                    d_y_ref, CUDA_R_32F, shape.N,
+                                    CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+        else if (std::strcmp(kind, "wr") == 0)
+          GemvBf16WideK<<<grid_wr, block>>>(d_w, d_x, d_y_wr, shape.N, shape.K,
+                                            M);
+        else if (std::strcmp(kind, "deep") == 0 && M <= 4) {
+          if (M <= 2)
+            GemvBf16DeepMlpK<8, 2>
+                <<<grid_deep, block>>>(d_w, d_x, d_y_deep, shape.N, shape.K, M);
+          else
+            GemvBf16DeepMlpK<8, 4>
+                <<<grid_deep, block>>>(d_w, d_x, d_y_deep, shape.N, shape.K, M);
+        } else
+          return -1.f;
         CHECK(cudaEventRecord(t1));
         CHECK(cudaEventSynchronize(t1));
-        float ms_i = 0;
-        CHECK(cudaEventElapsedTime(&ms_i, t0, t1));
-        ms_cublas += ms_i;
-      }
+        float ms = 0;
+        CHECK(cudaEventElapsedTime(&ms, t0, t1));
+        return ms;
+      };
 
-      // Custom timing
-      GemvBf16WideK<<<grid, block>>>(d_w, d_x, d_y_custom, shape.N, shape.K, M);
-      CHECK(cudaGetLastError());
-      ms_custom = 0;
-      for (int i = 0; i < iters; ++i) {
-        CHECK(
-            cudaMemsetAsync(d_evict, (i + 1) & 0xFF, evict_n * sizeof(float)));
-        CHECK(cudaEventRecord(t0));
-        GemvBf16WideK<<<grid, block>>>(d_w, d_x, d_y_custom, shape.N, shape.K,
-                                       M);
-        CHECK(cudaEventRecord(t1));
-        CHECK(cudaEventSynchronize(t1));
-        float ms_i = 0;
-        CHECK(cudaEventElapsedTime(&ms_i, t0, t1));
-        ms_custom += ms_i;
-      }
-
+      float ms_cublas = 0, ms_wr = 0, ms_deep = 0;
+      for (int i = 0; i < iters; ++i) ms_cublas += timed("cublas");
+      for (int i = 0; i < iters; ++i) ms_wr += timed("wr");
+      const bool deep_ok = M <= 4;
+      if (deep_ok)
+        for (int i = 0; i < iters; ++i) ms_deep += timed("deep");
       ms_cublas /= iters;
-      ms_custom /= iters;
+      ms_wr /= iters;
+      if (ms_deep > 0) ms_deep /= iters;
 
-      // Correctness (coarse): max abs diff on a sample of outputs.
-      std::vector<float> ya(yn), yb(yn);
-      CHECK(cudaMemcpy(ya.data(), d_y_cublas, yn * 4, cudaMemcpyDeviceToHost));
-      CHECK(cudaMemcpy(yb.data(), d_y_custom, yn * 4, cudaMemcpyDeviceToHost));
-      double max_diff = 0;
-      size_t stride = std::max<size_t>(1, yn / 4096);
-      for (size_t i = 0; i < yn; i += stride) {
-        double d = std::abs((double)ya[i] - (double)yb[i]);
-        if (d > max_diff)
-          max_diff = d;
-      }
+      // Reference: download the cuBLAS result BEFORE anything else can
+      // clobber d_y_ref; then each variant diffed against it.
+      std::vector<float> ref(yn);
+      CHECK(cudaMemcpy(ref.data(), d_y_ref, yn * 4, cudaMemcpyDeviceToHost));
+      auto diff_vs_ref = [&](float *d_buf) {
+        std::vector<float> got(yn);
+        CHECK(cudaMemcpy(got.data(), d_buf, yn * 4, cudaMemcpyDeviceToHost));
+        double md = 0;
+        size_t stride = std::max<size_t>(1, yn / 2048);
+        for (size_t i = 0; i < yn; i += stride)
+          md = std::max(md, std::abs((double)ref[i] - (double)got[i]));
+        return md;
+      };
+      double md_wr = diff_vs_ref(d_y_wr);
+      double md_deep = deep_ok ? diff_vs_ref(d_y_deep) : -1.0;
 
-      double gbs = shape.weight_bytes() / 1e9;
-      // cublasLt best-of-heuristics (cold), same shape.
-      float lt_default = -1.f, lt_best = -1.f;
+      // cublasLt: median-of-3 cold best-of-heuristics, own output buffer.
+      float lt_best = -1.f;
       int n_lt = 0;
       if (lt.handle) {
-        lt_best = LtBestCold(lt, M, shape.N, shape.K, d_x, d_w, d_y_cublas,
-                             d_evict, evict_n, t0, t1, &n_lt, &lt_default);
+        lt_best = LtBestCold(lt, M, shape.N, shape.K, d_x, d_w, d_y_lt,
+                             d_evict, evict_n, t0, t1, &n_lt, &lt_default_tmp);
       }
-      if (lt_best > 0) {
-        printf(
-            "%-8s M=%2d | cublas %7.3f ms (%3.0f%%) | warp/row %7.3f ms "
-            "(%3.0f%%) | ltdef %7.3f ms | ltbest %7.3f ms (%4.2fx vs cublas, "
-            "%d algos) | maxdiff %.3f\n",
-            shape.name, M, ms_cublas, 100.0 * (gbs / (ms_cublas / 1e3)) / 576.0,
-            ms_custom, 100.0 * (gbs / (ms_custom / 1e3)) / 576.0, lt_default,
-            lt_best, ms_cublas / lt_best, n_lt, max_diff);
-      } else {
-        printf("%-8s M=%2d | cublas %7.3f ms (%3.0f%% roofline) | warp/row "
-               "%7.3f ms (%3.0f%%) | speedup %4.2fx | maxdiff %.3f\n",
-               shape.name, M, ms_cublas,
-               100.0 * (gbs / (ms_cublas / 1e3)) / 576.0, ms_custom,
-               100.0 * (gbs / (ms_custom / 1e3)) / 576.0, ms_cublas / ms_custom,
-               max_diff);
-      }
+      double md_lt = -1.0;
+      if (lt_best > 0) md_lt = diff_vs_ref(d_y_lt);
+
+      double gbs = shape.weight_bytes() / 1e9;
+      printf(
+          "%-8s M=%2d | cublas %7.3f ms (%3.0f%%) | warp/row %7.3f ms "
+          "(%3.0f%%, d=%.3f) | deep %7s ms (%3.0f%%, %5.2fx, d=%.3f) | "
+          "ltbest %7.3f ms (%5.2fx, d=%.3f)\n",
+          shape.name, M, ms_cublas,
+          100.0 * (gbs / (ms_cublas / 1e3)) / 576.0, ms_wr,
+          100.0 * (gbs / (ms_wr / 1e3)) / 576.0, md_wr,
+          deep_ok ? std::to_string(ms_deep).c_str() : std::string("-").c_str(),
+          deep_ok ? 100.0 * (gbs / (ms_deep / 1e3)) / 576.0 : 0.0,
+          deep_ok ? ms_cublas / ms_deep : 0.0, md_deep, lt_best,
+          lt_best > 0 ? ms_cublas / lt_best : 0.0, md_lt);
 
       CHECK(cudaEventDestroy(t0));
-      cudaFree(d_evict);
       CHECK(cudaEventDestroy(t1));
       cudaFree(d_w);
       cudaFree(d_x);
-      cudaFree(d_y_cublas);
-      cudaFree(d_y_custom);
+      cudaFree(d_y_ref);
+      cudaFree(d_y_wr);
+      cudaFree(d_y_deep);
+      cudaFree(d_y_lt);
+      cudaFree(d_evict);
     }
     printf("\n");
   }
+
   // ------------------------------------------------------------------
   // Gate/up fusion experiment (plan item 3): one [22016, 2048] GEMM vs
   // two [11008, 2048] GEMMs back-to-back, cold-L2, bf16 weights.
