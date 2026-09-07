@@ -272,18 +272,6 @@ transactions, register tiling), not more aggressive DRAM prefetch. This
 also explains why the deep-MLP DRAM-focused redesign plateaued at the
 same ceiling as cuBLAS.
 
-**Occupancy lever falsified (Sep 7):** ncu showed the MMA-tier kernels
-(`InferfluxMmqQ4KMma/Q6KMma`, 117-121 regs/thread,
-`__launch_bounds__(256, 1)`, 33% occupancy, L1TEX 45-54%) as
-under-saturated vs the 90-95% grouped-FFN kernels. The classic fix —
-`__launch_bounds__(256, 2)` to target 2 blocks/SM — measured **20-25%
-WORSE** (263-369 vs 413-429 tok/s on the same driver/config): the
-register budget IS the accumulator working set; forcing 2-block
-occupancy spills it. The 54% L1TEX reading reflects genuine pipe
-saturation for this kernel's mix, not fixable idleness. Kernel-level
-follow-up would need SASS analysis (smem bank pattern / ldmatrix
-scheduling), not occupancy tuning.
-
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled
