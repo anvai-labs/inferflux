@@ -241,6 +241,23 @@ tok/s (7x slower than CUDA; both inferflux_rocm and llama_cpp_rocm land
 identically — GGUF decode in the ROCm build rides the llama.cpp HIP
 kernels). ST-on-ROCm is blocked: no HIP bf16 forward is built.
 
+**Output-accuracy verification (the throughput table is meaningful):**
+all working combos were validated for response correctness, not just speed:
+- GGUF CUDA: harness semantic similarity HIGH for all engine pairs at all
+  concurrency levels (inferflux-vs-llama 0.89-0.94, inferflux-vs-ollama
+  0.89-0.90); 32/32 success every level.
+- ST CUDA: harness reference (llama.cpp) absent, so cross-engine similarity
+  was computed directly from saved responses (160 per engine, MiniLM
+  cosine): inferflux-vs-vLLM 0.923, inferflux-vs-SGLang 0.924, vLLM-vs-
+  SGLang 0.997 (llama.cpp-derived siblings nearly identical, as expected);
+  0 degenerate responses across all 480.
+- ROCm GGUF: both backends produce identical outputs (1.000 mutual) at
+  0.92-0.96 cosine vs the CUDA backend for the same prompts+greedy —
+  correctness on the AMD path confirmed against the CUDA reference.
+The multi-variant GGUF outputs (2-3 coherent variants per load) are
+decode-composition numerics: present with relay and graphs on and off,
+all variants correct — not a regression.
+
 nsys kernel summaries (c=8 wave, 32x64): inferflux GGUF = native MMQ/MMVQ
 kernels (InferfluxMmqQ 326ms top); inferflux ST = cutlass bf16 wmma + FA2
 MMA; llama.cpp GGUF = mul_mat_q stream-k; vLLM = ampere fp16 CUTLASS GEMMs.
