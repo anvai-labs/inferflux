@@ -149,12 +149,22 @@ prefill/refill boundary instead of joining the running cohort. Decode
 is memory-bound: a width-1 step costs nearly as much GPU time as a
 width-16 step, so every solo step is ~15 tokens of foregone throughput.
 
-**Next scheduler lever (moderate effort, +25-40% potential at c=16):**
-admit/overlap waiting prefills during tail stretches -- e.g., proactively
-prefill newly arrived requests into the running cohort (mixed batches)
-instead of at cohort-rebuild boundaries, and cap solo-cohort drain by
-refilling from pending_decode_ mid-tick. Measurable target: width=1
-fraction from 38% to <10% on the same load.
+**FALSIFIED (Sep 7): the width-1 tail is workload-shaped, not
+monopolization.** Hypothesis tested: the solo bursts (a single sequence
+running up to its full 63-token remainder via TryGreedyBurstDecodeTokens)
+monopolize the pipeline while other requests wait; capping the solo burst
+to 8 tokens when prefill work is pending should recover width. Result:
+capped runs 181-189 tok/s vs 195-202 uncapped (instrumented, same
+driver) -- slightly WORSE; there is genuinely no other decode-ready work
+during solo rounds (closed-loop EOS stagger: the "waiting" requests
+belong to clients still blocked on their own in-flight responses). The
+width-1 fraction is workload physics for this arrival pattern, not a
+scheduler defect. Remaining honest levers for the vLLM gap (2.33x): the
+TMA/wgmma kernel class (uncertain, vendor-grade) and open-loop arrival
+patterns. Strategic recommendation: compete on memory footprint
+(2.3x less than vLLM's pre-allocation), quantized serving (leads
+llama.cpp), and single-binary deployment rather than matching vLLM's
+fp16 high-concurrency ceiling.
 
 **Refined with the fixed logging (chronological run-length analysis):**
 the width sequence is NOT a smooth drain-ramp. It alternates between two
