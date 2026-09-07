@@ -305,6 +305,76 @@ saturation for this kernel's mix, not fixable idleness. Kernel-level
 follow-up would need SASS analysis (smem bank pattern / ldmatrix
 scheduling), not occupancy tuning.
 
+## 4e) Memory-overhead investigation (Sep 7): root cause found
+
+Question: GGUF q4_k_m peaks at 7,148 MB vs llama.cpp 4,142 MB (+3.0 GB).
+Weights are identical. Where does the +3 GB go?
+
+Method: fresh nsys capture with `--cuda-memory-usage=true` (GGUF config,
+c=16 load), sqlite export, `CUDA_GPU_MEMORY_USAGE_EVENTS` bucketed by exact
+allocation size and netted allocation-vs-free by address (an earlier cut
+double-counted freed generations — the numbers below are the netted, live-set
+corrected ones and sum exactly to the measured live total). Every family
+factors exactly against Qwen2.5-3B shapes (hidden=2048, ffn=11008,
+vocab=151,936, 36 layers, kv_heads=2, head_dim=128). One load generation:
+weights/KV allocate once and free at shutdown; live bytes go 5,848 MB after
+startup, +543 MB at first decode, 6,391 MB steady at c=16.
+
+The whale: **three live full-model copies of the transformed down-proj MMQ
+weight layouts — 1,683 MB live, 1,122 MB redundant.**
+`FusedQuantGemm::BuildDownProjMmqLayout` (fused_quant_gemm.cu:1913)
+re-lays-out every layer's down_proj weight for the mma.sync MMQ path
+(Q4_K 12,681,216 B / Q6_K 18,493,440 B per tensor; q4_k_m uses Q6_K
+down-proj on 18 of 36 layers -> 18+18 per pass, 561 MB per pass). The
+layout is cached per-layer inside each `QuantizedWeightMap`
+(quantized_weight_map.cpp:437), and there are three maps per model
+(primary executor:1847 + decode lane :1386 + prefill lane :1387 — GGUF
+lanes own private maps because the map holds mutable scratch state;
+safetensors lanes share one map and have no MMQ path at all). Two passes
+build at load, one lazily at first decode (+543 MB measured; one ~18 MB
+Q6_K tensor of that pass builds during load, which is why the measured
+delta is 543 rather than the full 561 MB pass). All stay live until
+shutdown. llama.cpp needs zero such copies — its MMQ kernels read the
+native layout.
+
+Full steady-state decomposition (GGUF q4_k_m, live at c=16, sums to the
+measured 6,391 MB):
+
+| Block | Size | Verdict |
+|---|---|---|
+| Native quantized weight buffer (single cudaMalloc, file-sized) | 2,099 MB | optimal |
+| Transformed down-proj MMQ layouts, 3 passes x 561 MB | 1,683 MB | 1 pass needed; loader-level shared cache saves 1,122 MB |
+| KV cache (16 batch x 2048 seq worst case, 36 layers) | 1,208 MB | worst-case reservation vs llama.cpp demand-grown pool; batch-aware planner + admission guards are correctness prerequisites |
+| token_embd fp16 dequant (retained by policy) | 622 MB | needed by the embed path; row-gather kernel would remove it (out of scope) |
+| 3 forward replicas: rows-scaled scratch ~616 MB + logits/samplers | ~700 MB | prefill/decode overlap cost; rows right-sizing saves ~460 MB |
+| Slot tables, cublas workspaces, events, misc | ~79 MB | legit |
+
+Corrections vs the first cut of this section (caught in adversarial review):
+there are exactly 3 `QuantizedWeightMap` instances per model, not 6 (the 6
+layout passes in the raw trace were cumulative allocation events, not a live
+set — netting frees by address shows a single load generation); the second
+622 MB vocab-sized buffer is a load-time TRANSIENT (dequanted output.weight
+freed by the post-warm-batch dequant-cache cleanup at t=1.77s), not a
+permanent tie-unaware double — steady state holds one 622 MB token_embd
+dequant; replica scratch is ~616 MB rows-scaled (not ~400 MB); the
+"gate+up transform" and "dequant spill" families resolve to per-replica
+activation staging and the batch-scoped dequant churn.
+
+Efficiency summary vs llama.cpp: ~1.1 GB is multiplied weight-layout copies
+(shared per-tensor cache), ~0.6 GB is worst-case KV reservation (bounded by
+admission; planner can shrink batch under budget), ~0.46 GB is scratch
+sized to max-seq instead of chunk+batch. Fixing the first and third plus
+the load transient puts GGUF peak around 5.5 GB vs llama.cpp 4.14 GB; the
+residual is the KV worst-case reserve — the honest cost of pre-allocated
+per-slot KV. The 2.0 GB weight buffer itself is already optimal.
+
+En-route correctness findings (fixed in the follow-up series): KV
+`GetK/GetV`/`Append` and the device slot table are unchecked while the
+scheduler circulates up to 128 slot ids against 16 KV slots (OOB device
+writes whenever >16 sequences are resident), and native-CUDA embeddings
+(NativeEmbed, ephemeral seq ids >=900000) appends KV far out of bounds on
+every call.
+
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled
