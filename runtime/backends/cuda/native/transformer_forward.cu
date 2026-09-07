@@ -1141,6 +1141,39 @@ bool TryQ8_1SiluMulGemv<half>(const QuantizedWeightInfo &raw, const half *gate,
   return ok;
 }
 
+// Shared projection dispatch context + entry points: single-source the
+// quantized-cascade and dense-fallback chain used at every plain projection
+// site across Forward/BatchForward/BatchForwardDevice (GGUF-quantized and
+// safetensors alike). Sites with genuine per-site branching (fp32-residual
+// routing, accumulate-vs-direct) stay explicit.
+struct ProjectionCtx {
+  void *act_q8_1{nullptr};
+  void *act_q8_1_mmq{nullptr};
+  float *mma_partials{nullptr};
+  cudaStream_t stream{nullptr};
+  const NativeExecutionPolicy *policy{nullptr};
+  CublasGemm *gemm{nullptr};
+  int mma_max_batch{-1}; // -1: MMA tier self-gates (decode); prefill passes the policy cap
+};
+
+template <typename T>
+bool TryQuantizedProjection(const ProjectionCtx &ctx,
+                            const QuantizedWeightInfo &raw, const T *input,
+                            T *output, int M, int N, int K, const char *name) {
+  return TryQ8_1MmaGemv<T>(raw, input, output, ctx.act_q8_1_mmq,
+                           ctx.mma_partials, M, N, K, ctx.stream, name,
+                           ctx.policy, ctx.mma_max_batch) ||
+         TryQ8_1Gemv<T>(raw, input, output, ctx.act_q8_1, M, N, K, ctx.stream,
+                        name, ctx.policy);
+}
+
+template <typename T>
+bool RunDenseProjection(const ProjectionCtx &ctx, const void *weight,
+                        const T *input, T *output, int M, int N, int K) {
+  const T *w = reinterpret_cast<const T *>(weight);
+  return ctx.gemm->GemmTyped<T>(M, N, K, input, w, output);
+}
+
 } // namespace
 
 template <typename T> LlamaForwardTyped<T>::~LlamaForwardTyped() {
@@ -1575,6 +1608,13 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   cudaError_t err;
   PhaseTiming pt;
   pt.Begin(stream_, execution_policy_.phase_timing_enabled);
+  const ProjectionCtx pctx{d_act_q8_1_,
+                           d_act_q8_1_mmq_,
+                           d_mma_partials_,
+                           stream_,
+                           &execution_policy_,
+                           gemm_,
+                           execution_policy_.mmq_mma_max_prefill_batch};
 
   // Step 1: Upload token_ids to GPU (through pinned staging)
   // Pageable async H2D is staged by the driver with weaker ordering
@@ -1747,25 +1787,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1MmaGemv<T>(
-                                     q_raw, d_norm_out_, d_q_, d_act_q8_1_mmq_,
-                                     d_mma_partials_, seq_len,
-                                     num_heads_ * head_dim_, hidden_size_,
-                                     stream_, "q_proj", &execution_policy_,
-                                     execution_policy_
-                                         .mmq_mma_max_prefill_batch) ||
-                                 TryQ8_1Gemv<T>(q_raw, d_norm_out_, d_q_,
-                                                d_act_q8_1_, seq_len,
-                                                num_heads_ * head_dim_,
-                                                hidden_size_, stream_, "q_proj",
-                                                &execution_policy_);
+                          return TryQuantizedProjection(
+                              pctx, q_raw, d_norm_out_, d_q_, seq_len,
+                              num_heads_ * head_dim_, hidden_size_, "q_proj");
                         },
                         [&]() {
-                          const T *q_proj = reinterpret_cast<const T *>(
-                              weights_->LayerQProj(layer));
-                          if (!gemm_->GemmTyped<T>(
-                                  seq_len, num_heads_ * head_dim_, hidden_size_,
-                                  d_norm_out_, q_proj, d_q_)) {
+                          if (!RunDenseProjection(pctx,
+                                                  weights_->LayerQProj(layer),
+                                                  d_norm_out_, d_q_, seq_len,
+                                                  num_heads_ * head_dim_,
+                                                  hidden_size_)) {
                             log::Error("llama_forward", "Q projection failed");
                             return false;
                           }
@@ -1789,26 +1820,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1MmaGemv<T>(
-                                     k_raw, d_norm_out_, d_k_new_,
-                                     d_act_q8_1_mmq_, d_mma_partials_, seq_len,
-                                     num_kv_heads_ * head_dim_, hidden_size_,
-                                     stream_, "k_proj", &execution_policy_,
-                                     execution_policy_
-                                         .mmq_mma_max_prefill_batch) ||
-                                 TryQ8_1Gemv<T>(k_raw, d_norm_out_, d_k_new_,
-                                                d_act_q8_1_, seq_len,
-                                                num_kv_heads_ * head_dim_,
-                                                hidden_size_, stream_, "k_proj",
-                                                &execution_policy_);
+                          return TryQuantizedProjection(
+                              pctx, k_raw, d_norm_out_, d_k_new_, seq_len,
+                              num_kv_heads_ * head_dim_, hidden_size_, "k_proj");
                         },
                         [&]() {
-                          const T *k_proj = reinterpret_cast<const T *>(
-                              weights_->LayerKProj(layer));
-                          if (!gemm_->GemmTyped<T>(seq_len,
-                                                   num_kv_heads_ * head_dim_,
-                                                   hidden_size_, d_norm_out_,
-                                                   k_proj, d_k_new_)) {
+                          if (!RunDenseProjection(pctx,
+                                                  weights_->LayerKProj(layer),
+                                                  d_norm_out_, d_k_new_, seq_len,
+                                                  num_kv_heads_ * head_dim_,
+                                                  hidden_size_)) {
                             log::Error("llama_forward", "K projection failed");
                             return false;
                           }
@@ -1832,26 +1853,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1MmaGemv<T>(
-                                     v_raw, d_norm_out_, d_v_new_,
-                                     d_act_q8_1_mmq_, d_mma_partials_, seq_len,
-                                     num_kv_heads_ * head_dim_, hidden_size_,
-                                     stream_, "v_proj", &execution_policy_,
-                                     execution_policy_
-                                         .mmq_mma_max_prefill_batch) ||
-                                 TryQ8_1Gemv<T>(v_raw, d_norm_out_, d_v_new_,
-                                                d_act_q8_1_, seq_len,
-                                                num_kv_heads_ * head_dim_,
-                                                hidden_size_, stream_, "v_proj",
-                                                &execution_policy_);
+                          return TryQuantizedProjection(
+                              pctx, v_raw, d_norm_out_, d_v_new_, seq_len,
+                              num_kv_heads_ * head_dim_, hidden_size_, "v_proj");
                         },
                         [&]() {
-                          const T *v_proj = reinterpret_cast<const T *>(
-                              weights_->LayerVProj(layer));
-                          if (!gemm_->GemmTyped<T>(seq_len,
-                                                   num_kv_heads_ * head_dim_,
-                                                   hidden_size_, d_norm_out_,
-                                                   v_proj, d_v_new_)) {
+                          if (!RunDenseProjection(pctx,
+                                                  weights_->LayerVProj(layer),
+                                                  d_norm_out_, d_v_new_, seq_len,
+                                                  num_kv_heads_ * head_dim_,
+                                                  hidden_size_)) {
                             log::Error("llama_forward", "V projection failed");
                             return false;
                           }
@@ -2205,25 +2216,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1MmaGemv<T>(
-                                     gate_raw, d_norm_out_, d_ffn_gate_,
-                                     d_act_q8_1_mmq_, d_mma_partials_, seq_len,
-                                     intermediate_size_, hidden_size_, stream_,
-                                     "gate_proj", &execution_policy_,
-                                     execution_policy_
-                                         .mmq_mma_max_prefill_batch) ||
-                                 TryQ8_1Gemv<T>(
-                                     gate_raw, d_norm_out_, d_ffn_gate_,
-                                     d_act_q8_1_, seq_len, intermediate_size_,
-                                     hidden_size_, stream_, "gate_proj",
-                                     &execution_policy_);
+                          return TryQuantizedProjection(
+                              pctx, gate_raw, d_norm_out_, d_ffn_gate_, seq_len,
+                              intermediate_size_, hidden_size_, "gate_proj");
                         },
                         [&]() {
-                          const T *gate_proj = reinterpret_cast<const T *>(
-                              weights_->LayerGateProj(layer));
-                          if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_,
-                                                   hidden_size_, d_norm_out_,
-                                                   gate_proj, d_ffn_gate_)) {
+                          if (!RunDenseProjection(pctx,
+                                                  weights_->LayerGateProj(layer),
+                                                  d_norm_out_, d_ffn_gate_,
+                                                  seq_len, intermediate_size_,
+                                                  hidden_size_)) {
                             log::Error("llama_forward",
                                        "Gate projection failed");
                             return false;
@@ -2247,25 +2249,16 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
-                          return TryQ8_1MmaGemv<T>(
-                                     up_raw, d_norm_out_, d_ffn_up_,
-                                     d_act_q8_1_mmq_, d_mma_partials_, seq_len,
-                                     intermediate_size_, hidden_size_, stream_,
-                                     "up_proj", &execution_policy_,
-                                     execution_policy_
-                                         .mmq_mma_max_prefill_batch) ||
-                                 TryQ8_1Gemv<T>(up_raw, d_norm_out_, d_ffn_up_,
-                                                d_act_q8_1_, seq_len,
-                                                intermediate_size_,
-                                                hidden_size_, stream_,
-                                                "up_proj", &execution_policy_);
+                          return TryQuantizedProjection(
+                              pctx, up_raw, d_norm_out_, d_ffn_up_, seq_len,
+                              intermediate_size_, hidden_size_, "up_proj");
                         },
                         [&]() {
-                          const T *up_proj = reinterpret_cast<const T *>(
-                              weights_->LayerUpProj(layer));
-                          if (!gemm_->GemmTyped<T>(seq_len, intermediate_size_,
-                                                   hidden_size_, d_norm_out_,
-                                                   up_proj, d_ffn_up_)) {
+                          if (!RunDenseProjection(pctx,
+                                                  weights_->LayerUpProj(layer),
+                                                  d_norm_out_, d_ffn_up_,
+                                                  seq_len, intermediate_size_,
+                                                  hidden_size_)) {
                             log::Error("llama_forward", "Up projection failed");
                             return false;
                           }
@@ -2905,6 +2898,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
   }
   PhaseTiming pt;
   pt.Begin(stream_, phase_timing_enabled);
+  const ProjectionCtx pctx{d_act_q8_1_,
+                           d_act_q8_1_mmq_,
+                           d_mma_partials_,
+                           stream_,
+                           &execution_policy_,
+                           gemm_,
+                           execution_policy_.mmq_mma_max_prefill_batch};
 
   // Fast path: replay existing graph for this batch width. Graphs are
   // cached per width (LRU-capped) because decode width varies with EOS
