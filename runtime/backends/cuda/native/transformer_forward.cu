@@ -2866,10 +2866,10 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
   const bool cublas_capture_ok = gemm_ && gemm_->HasPinnedWorkspace();
   const bool capture_safe =
       weights_->HasQuantizedWeights()
-          ? DecodeGraphCaptureSafe(
-                weights_, num_layers_, B, hidden_size_, num_heads_,
-                num_kv_heads_, head_dim_, intermediate_size_, vocab_size_,
-                g_allow_fused_quantized_matmul, policy)
+          ? DecodeGraphCaptureSafe(weights_, num_layers_, B, hidden_size_,
+                                   num_heads_, num_kv_heads_, head_dim_,
+                                   intermediate_size_, vocab_size_,
+                                   g_allow_fused_quantized_matmul, policy)
           : cublas_capture_ok;
   {
     static bool logged_once = false;
@@ -4067,7 +4067,11 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                   stream_);
     }
     pt.lm_head_ms += pt.Mark();
-    pt.Report(num_layers_, 1);
+    // Report the real decode width: this function executes the whole
+    // batch (device-fed metadata), not a single sequence. The hardcoded
+    // 1 previously made every device-path decode forward log width=1,
+    // poisoning any width-over-time analysis of the phase-timing log.
+    pt.Report(num_layers_, batch_size);
 
     return true;
   };
@@ -4118,8 +4122,10 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
           decode_graph_lru_.pop_back();
           auto eit = decode_graphs_.find(evict_b);
           if (eit != decode_graphs_.end()) {
-            if (eit->second.exec) cudaGraphExecDestroy(eit->second.exec);
-            if (eit->second.graph) cudaGraphDestroy(eit->second.graph);
+            if (eit->second.exec)
+              cudaGraphExecDestroy(eit->second.exec);
+            if (eit->second.graph)
+              cudaGraphDestroy(eit->second.graph);
             decode_graphs_.erase(eit);
           }
         }
