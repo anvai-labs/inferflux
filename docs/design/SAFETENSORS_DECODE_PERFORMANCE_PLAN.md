@@ -331,7 +331,9 @@ layout is cached per-layer inside each `QuantizedWeightMap`
 (primary executor:1847 + decode lane :1386 + prefill lane :1387 — GGUF
 lanes own private maps because the map holds mutable scratch state;
 safetensors lanes share one map and have no MMQ path at all). Two passes
-build at load, one lazily at first decode (+543 MB). All stay live until
+build at load, one lazily at first decode (+543 MB measured; one ~18 MB
+Q6_K tensor of that pass builds during load, which is why the measured
+delta is 543 rather than the full 561 MB pass). All stay live until
 shutdown. llama.cpp needs zero such copies — its MMQ kernels read the
 native layout.
 
@@ -351,7 +353,7 @@ Corrections vs the first cut of this section (caught in adversarial review):
 there are exactly 3 `QuantizedWeightMap` instances per model, not 6 (the 6
 layout passes in the raw trace were cumulative allocation events, not a live
 set — netting frees by address shows a single load generation); the second
-593.5 MB vocab-sized buffer is a load-time TRANSIENT (dequanted output.weight
+622 MB vocab-sized buffer is a load-time TRANSIENT (dequanted output.weight
 freed by the post-warm-batch dequant-cache cleanup at t=1.77s), not a
 permanent tie-unaware double — steady state holds one 622 MB token_embd
 dequant; replica scratch is ~616 MB rows-scaled (not ~400 MB); the
