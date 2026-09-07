@@ -10,15 +10,13 @@ namespace inferflux {
 QuantizedWeightMap::~QuantizedWeightMap() {
   // Note: per-tensor GPU memory is managed by IModelLoader, we don't own it
 #ifdef INFERFLUX_HAS_CUDA
-  // Shared layouts are owned by the loader's tensors — destroying them here
-  // would double-free (LoadModel resets the loader before the maps). Only
-  // layouts this map built itself (per-map fallback path) are owned.
-  if (owns_mmq_layouts_) {
-    for (auto &lw : layers_) {
-      FusedQuantGemm::DestroyDownProjMmqLayout(lw.down_proj_mmq);
-      lw.down_proj_mmq = {};
-    }
+  // Free only the layouts this map built itself. Borrowed shared-cache
+  // copies belong to the loader's tensors; LoadModel resets the loader
+  // before the maps, so freeing them here would double-free.
+  for (const auto &layout : owned_mmq_layouts_) {
+    FusedQuantGemm::DestroyDownProjMmqLayout(layout);
   }
+  owned_mmq_layouts_.clear();
   ReleaseScratchBuffer();
 #endif
 }
@@ -500,7 +498,7 @@ MmqWeightInfo QuantizedWeightMap::GetMmqLayerDownProj(int layer) const {
     return {};
   }
 
-  owns_mmq_layouts_ = true;
+  owned_mmq_layouts_.push_back(layout);
   lw.down_proj_mmq = layout;
   return lw.down_proj_mmq;
 #endif

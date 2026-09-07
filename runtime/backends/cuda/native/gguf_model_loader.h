@@ -230,6 +230,10 @@ private:
   // File path
   std::filesystem::path model_path_;
 
+  // Serializes transformed-MMQ-layout first-builds and the byte-sum /
+  // teardown iterations over the layout fields.
+  mutable std::mutex mmq_layout_mu_;
+
   // Weight accessor cache.  Guarded by weight_cache_mutex_ because
   // concurrent GetWeightAccessor() calls from multiple threads (e.g.
   // overlap-lane init) would otherwise corrupt the map.

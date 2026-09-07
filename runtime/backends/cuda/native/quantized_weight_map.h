@@ -274,10 +274,14 @@ private:
   bool allow_fused_quantized_matmul_{true};
   bool batch_dequant_cache_enabled_{false};
   bool shared_mmq_layout_enabled_{true};
-  // True when this map built and owns its own MMQ layouts (per-map fallback
-  // path); false when layouts are borrowed from the loader's shared cache.
-  // Mutable: set from the const GetMmqLayerDownProj build path.
-  mutable bool owns_mmq_layouts_{false};
+  // Layouts this map built itself (per-map fallback path) and must free.
+  // Borrowed shared-cache copies are NOT tracked here — they are owned by
+  // the loader's tensors, and LoadModel resets the loader before the maps,
+  // so freeing them in the dtor would double-free. Per-entry tracking also
+  // keeps teardown exact when a map holds a mix (e.g., a transient
+  // cudaMalloc failure during the shared build fell back to a local build
+  // for one layer while every other layer borrowed the cache).
+  mutable std::vector<MmqWeightInfo> owned_mmq_layouts_;
 
   // Global weight accessors
   std::shared_ptr<IWeightAccessor> embed_tokens_accessor;

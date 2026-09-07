@@ -1100,6 +1100,7 @@ void GGUFModelLoader::FreeGPUMemoryImpl() {
   ClearDequantizedCache();
   // Shared transformed MMQ layouts are owned by their tensors; free them
   // here, not in any weight map (maps may be destroyed before the loader).
+  std::lock_guard<std::mutex> mmq_layout_lock(mmq_layout_mu_);
   for (auto &entry : tensors_) {
     auto &tensor = entry.second;
     if (tensor.mmq_layout_gpu) {
@@ -1148,9 +1149,9 @@ bool GGUFModelLoader::GetOrBuildDownProjMmqLayout(IWeightAccessor *accessor,
   // Serialize first build across the weight-map replicas (primary + lanes
   // warm up concurrently). BuildDownProjMmqLayout synchronizes its build
   // stream before returning, so publishing under this lock makes the layout
-  // safe to consume on any stream afterwards.
-  static std::mutex mmq_layout_mu;
-  std::lock_guard<std::mutex> lock(mmq_layout_mu);
+  // safe to consume on any stream afterwards. Member (not function-local):
+  // GetMmqTransformedLayoutBytes takes the same lock from serving threads.
+  std::lock_guard<std::mutex> lock(mmq_layout_mu_);
 
   if (tensor.mmq_layout_gpu) {
     if (tensor.mmq_layout_quant_type != quant_type ||
@@ -1160,7 +1161,7 @@ bool GGUFModelLoader::GetOrBuildDownProjMmqLayout(IWeightAccessor *accessor,
       return false;
     }
     *out = {tensor.mmq_layout_gpu, quant_type, rows, cols,
-            tensor.mmq_layout_tile_cols};
+            tensor.mmq_layout_tile_cols, tensor.mmq_layout_bytes};
     return true;
   }
 
@@ -1190,6 +1191,9 @@ bool GGUFModelLoader::GetOrBuildDownProjMmqLayout(IWeightAccessor *accessor,
 }
 
 size_t GGUFModelLoader::GetMmqTransformedLayoutBytes() const {
+  // Serialize against concurrent first-builds (lazy mid-serving build) so
+  // the byte sum and teardown iteration never race a publish.
+  std::lock_guard<std::mutex> lock(mmq_layout_mu_);
   size_t total = 0;
   for (const auto &entry : tensors_) {
     total += entry.second.mmq_layout_bytes;
