@@ -315,6 +315,7 @@ stale object files (WSL2 filesystem timestamp issue):
 
 **Key CUDA env vars:** (centralized in `NativeExecutionPolicy::FromEnv()`)
 - `INFERFLUX_DISABLE_BATCHED_DECODE=1` — opt out of batched decode (default-on)
+- `INFERFLUX_DISABLE_DECODE_RELAY=1` — disable the device-side decode token relay + fingerprint-guarded graph replay (forces H2D metadata upload every decode step; validation kill switch — engaged replays visible as `inferflux_scheduler_decode_relay_replays_total` in /metrics)
 - `INFERFLUX_DISABLE_CUDA_GRAPH=1` — disable CUDA graph capture (default-on for primary forward; lane forwards have graphs disabled automatically during overlap; lane overlap mutex fixes in 0ccbad3 prevent heap corruption)
 - `INFERFLUX_DISABLE_Q8_1_ACTIVATIONS=1` — disable pre-quantized Q8_1 activation path
 - `INFERFLUX_ENABLE_FUSED_GATE_UP_SILU=0|1` — toggle fused gate+up+SiLU MMVQ kernel (default on)

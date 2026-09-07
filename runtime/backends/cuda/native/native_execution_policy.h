@@ -11,6 +11,10 @@ namespace inferflux {
 struct NativeExecutionPolicy {
   bool enable_batched_decode{true};
   bool disable_cuda_graph{false};
+  // Disable the device-side decode token relay (DeviceTokenRelay +
+  // fingerprint-guarded graph replay), forcing the full H2D metadata
+  // upload every decode step. Validation kill switch for the relay.
+  bool disable_decode_relay{false};
   // Burst-pipelined decode: enqueue K decode steps (forward + sample +
   // on-device token feed) per ExecuteUnifiedBatchBurst() call and consume
   // tokens from a pinned ring while the GPU runs ahead. Default off until
@@ -144,6 +148,8 @@ struct NativeExecutionPolicy {
     // INFERFLUX_DISABLE_CUDA_GRAPH=1 if issues arise.
     policy.disable_cuda_graph =
         ParseBoolEnv("INFERFLUX_DISABLE_CUDA_GRAPH", false);
+    policy.disable_decode_relay =
+        ParseBoolEnv("INFERFLUX_DISABLE_DECODE_RELAY", false);
     policy.phase_timing_enabled =
         ParseBoolEnv("INFERFLUX_CUDA_PHASE_TIMING", false);
     policy.force_cublas = ParseBoolEnv("INFERFLUX_FORCE_CUBLAS", false);

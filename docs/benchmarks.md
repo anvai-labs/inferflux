@@ -86,6 +86,78 @@ paged/radix attention for exactly this workload, while `inferflux_cuda`'s
 safetensors path is a much newer, less-optimized code path than its GGUF
 path.
 
+### Nsight Systems profile: why `inferflux_cuda` trails vLLM/SGLang on safetensors (Sep 6 2026)
+
+Profiled with nsys (32 req × 64 tok, matching the c=16 benchmark; RTX 4000
+Ada, Qwen2.5-3B fp16 safetensors, 6.16 GB of weights read per forward).
+Artifacts: `nsys_profile_ifx_st_c16_clean/` and `..._c1/` (local, not
+committed). The gap decomposes into three measured factors, ranked:
+
+**1. Decode batch-width collapse — ~2.3x (the dominant loss).** A decode
+step re-reads all 6.16 GB of weights regardless of how many tokens it
+carries, so throughput ∝ average batch width. At c=16 the scheduler's own
+batch histogram is bimodal: **209 of ~417 decode steps ran at batch=1
+(38%)**, 59 at batch=2, and only ~99 steps at width 14-15 — weighted
+average ~5-7 tokens/step, versus vLLM decoding full-width 16 continuously.
+GPU call counts corroborate: FlashDecode ran 289 times for 2048 tokens
+(avg 7.1 sequences/step). GPU cost is nearly flat in batch (20.5 ms/token
+at batch 1 → 24.8 ms/step at batch 7.1, i.e. 3.5 ms/token), so merging the
+batch-1 steps into the full-width steps is close to free throughput.
+
+**2. GEMM kernels at ~half of memory-bandwidth roofline — ~2x vs physics,
+~parity vs vLLM.** 87% of GPU time is cuBLAS/cutlass bf16 GEMMs. At batch 1
+cuBLAS picks `gemvx` kernels (~300 GB/s achieved); at batch ~11 it picks
+`cutlass_80_wmma...` kernels with small grids (e.g. 688 blocks × 32 threads
+for M=16, N=11008, K=2048) at ~250 GB/s — against 576 GB/s peak. Per decode
+step: 24.8 ms GPU work vs a 10.7 ms roofline floor. vLLM's custom decode
+kernels land at a similar ~50% of roofline, so this factor is roughly
+parity with vLLM — but it is the largest headroom against the theoretical
+ceiling, and the fix (dedicated weight-read-first fused decode GEMV/GEMM
+kernels for skinny bf16 shapes, mirroring the GGUF MMVQ strategy, or
+cublasLt algo search) benefits both absolute throughput and the batch-width
+win.
+
+**3. Per-step host synchronization — ~1.12x.** The clean profile shows
+~7 chunky `cudaStreamSynchronize` per decode step (~2.8 ms each, waiting
+on step results), with the GPU ~88.5% busy overall. Unlike the GGUF decode
+path, the safetensors path does not replay a captured CUDA graph, so every
+step pays launch + sync round-trips. Graphing this path (as the GGUF decode
+path already does) is the straightforward fix.
+
+Cross-check: 2.3 (width) × ~1.15 (vLLM's slightly better kernels) × 1.12
+(syncs) ≈ 3.0 — matching the observed 2.4-2.7x gap within run-to-run
+variance.
+
+**Follow-up experiments (Sep 6, later same day) refined two of these:**
+
+- A `batch_accumulation_ms` A/B sweep (2/8/16 ms, 2 runs per point) showed
+  **no material width gain** (320.7 / 329.3 / 292.4 tok/s averages; 16 ms
+  strictly worse) — low-width steps come from EOS-staggered completions
+  (sequences stop at natural EOS at different lengths, a direct consequence
+  of the stop-token fix above) plus closed-loop client arrivals, not from a
+  merge-window bug. The scheduler does refill correctly when pending work
+  exists (85/206 steps at width 15-16 in a live-metrics run).
+- A standalone kernel spike (`tests/tools/bf16_gemv_bench.cu`) measured
+  cuBLAS on the exact projection shapes under **cold L2** — the realistic
+  condition, since attention kernels evict L2 between projections: 30-44%
+  of roofline (small shapes worst). A naive warp-per-row custom GEMV
+  matches but does not beat cold-L2 cuBLAS, falsifying the quick-rewrite
+  path; closing the 2x-vs-physics kernel gap needs the heavyweight design
+  (multi-row tiles, cp.async double buffering) or cheaper wins first.
+
+The staged plan (CUDA-graph the safetensors decode step, cublasLt algo
+search, gate/up fusion, then a specialist kernel) with all measurements and
+falsified hypotheses lives in
+[design/SAFETENSORS_DECODE_PERFORMANCE_PLAN](design/SAFETENSORS_DECODE_PERFORMANCE_PLAN.md).
+
+**Methodology caveat worth keeping:** `INFERFLUX_CUDA_PHASE_TIMING=1`
+synchronizes the stream between every phase of every layer (~324 syncs per
+decode step) and **halved measured throughput** (171 vs 252.6 tok/s
+profiled) while inflating apparent GPU idle from ~12% to ~55%. Use it only
+for relative phase attribution on short runs, never for throughput or
+idle-fraction claims — nsys kernel/API data needs no env flag and is
+uncontaminated.
+
 `inferflux_cuda` itself still scales far better on full precision than on
 quantized GGUF (~6.6x from c=1→c=16 here, vs ~3.33x average in Stage 1) —
 full-precision GEMV is less memory-bandwidth-bound per token, so the

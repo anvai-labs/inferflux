@@ -18,6 +18,10 @@ header() { echo -e "\n${BOLD}$1${NC}"; echo "$(printf '=%.0s' $(seq 1 ${#1}))"; 
 
 BACKEND_INPUT="${1:-inferflux_cuda}"
 MODEL_PATH="${2:-models/qwen2.5-3b-instruct/qwen2.5-3b-instruct-q4_k_m.gguf}"
+# Model format written into the generated config (auto|gguf|safetensors|hf).
+# auto lets the server detect from the path, so the same invocation works
+# for GGUF files and safetensors directories.
+FORMAT="${FORMAT:-auto}"
 OUTPUT_DIR="${3:-./nsys_backend_profile_${BACKEND_INPUT}_$(date +%Y%m%d_%H%M%S)}"
 BUILD_DIR="${BUILD_DIR:-./build-cuda}"
 SERVER_BIN="$BUILD_DIR/inferfluxd"
@@ -84,7 +88,8 @@ require_tools() {
   command -v nsys >/dev/null 2>&1 || { log_err "nsys not found"; exit 1; }
   command -v curl >/dev/null 2>&1 || { log_err "curl not found"; exit 1; }
   [ -x "$SERVER_BIN" ] || { log_err "inferfluxd not found at $SERVER_BIN"; exit 1; }
-  [ -f "$MODEL_PATH" ] || { log_err "model not found at $MODEL_PATH"; exit 1; }
+  # GGUF models are files; safetensors/HF models are directories.
+  [ -e "$MODEL_PATH" ] || { log_err "model not found at $MODEL_PATH"; exit 1; }
 }
 
 write_config() {
@@ -98,7 +103,7 @@ server:
 models:
   - id: bench-model
     path: "$(realpath "$MODEL_PATH")"
-    format: gguf
+    format: $FORMAT
     backend: $BACKEND_ID
     default: true
 
