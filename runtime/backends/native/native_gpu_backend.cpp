@@ -606,21 +606,46 @@ std::string NativeGpuBackend::Generate(
 
   runtime_->NativeFreeSequence(sequence_id);
 
-  UnifiedBatchInput prefill_input;
-  prefill_input.sequence_id = sequence_id;
-  prefill_input.n_past = 0;
-  prefill_input.tokens = prompt_tokens;
-  prefill_input.request_logits = true;
-  prefill_input.sampling = sampling;
-
-  auto first_step = runtime_->ExecuteUnifiedBatch({prefill_input});
-  if (first_step.empty() || !first_step.front().ok ||
-      first_step.front().token < 0) {
-    return {};
+  // Chunked prefill: never issue a single call wider than the configured
+  // chunk cap. The native forward sizes activation scratch to that cap, and
+  // the direct path bypasses the scheduler's chunking, so it must chunk
+  // here. Only the final chunk requests logits/sampling.
+  const int total_prompt = static_cast<int>(prompt_tokens.size());
+  const int chunk_cap =
+      std::max(1, static_cast<int>(loaded_config_.prefill_chunk_tokens));
+  UnifiedBatchOutput first_step;
+  {
+    int chunk_start = 0;
+    bool have_final = false;
+    while (chunk_start < total_prompt) {
+      const int chunk_end = std::min(chunk_start + chunk_cap, total_prompt);
+      UnifiedBatchInput prefill_input;
+      prefill_input.sequence_id = sequence_id;
+      prefill_input.n_past = chunk_start;
+      prefill_input.tokens.assign(prompt_tokens.begin() + chunk_start,
+                                  prompt_tokens.begin() + chunk_end);
+      prefill_input.request_logits = (chunk_end == total_prompt);
+      prefill_input.sampling = sampling;
+      auto step = runtime_->ExecuteUnifiedBatch({prefill_input});
+      if (step.empty() || !step.front().ok) {
+        return {};
+      }
+      if (prefill_input.request_logits) {
+        if (step.front().token < 0) {
+          return {};
+        }
+        first_step = std::move(step.front());
+        have_final = true;
+      }
+      chunk_start = chunk_end;
+    }
+    if (!have_final) {
+      return {};
+    }
   }
 
-  int current_token = first_step.front().token;
-  int n_past = static_cast<int>(prompt_tokens.size());
+  int current_token = first_step.token;
+  int n_past = total_prompt;
   int visible_tokens_generated = 0;
   int non_emitting_steps = 0;
   const int max_non_emitting_steps = std::max(max_tokens * 8, 32);
@@ -629,8 +654,8 @@ std::string NativeGpuBackend::Generate(
     if (tokenizer->IsTerminalGeneratedToken(current_token)) {
       return output;
     }
-    std::string piece = NormalizeNativeOutputPiece(tokenizer, current_token,
-                                                   first_step.front().piece);
+    std::string piece =
+        NormalizeNativeOutputPiece(tokenizer, current_token, first_step.piece);
     if (IsVisibleNativePiece(piece)) {
       output += piece;
       ++visible_tokens_generated;

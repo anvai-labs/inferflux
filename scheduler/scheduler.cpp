@@ -2140,6 +2140,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                 {seq_id, prefill_start, seq_generation}, &pr,
                 /*chunk_token_cap=*/config_.chunked_prefill_tokens);
             if (!prefill_ok) {
+              log::Warn("scheduler",
+                        "Phased prefill failed for request " +
+                            std::to_string(inf.id) + " (prompt_tokens=" +
+                            std::to_string(inf.bpe_prompt_tokens.size()) +
+                            "); falling back to full-prompt prefill");
               if (copied_prefix) {
                 pr = pending->resolved_backend->PrefillPartial(
                     inf.prompt, seq_id, prefill_start);
