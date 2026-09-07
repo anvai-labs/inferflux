@@ -156,6 +156,24 @@ instead of at cohort-rebuild boundaries, and cap solo-cohort drain by
 refilling from pending_decode_ mid-tick. Measurable target: width=1
 fraction from 38% to <10% on the same load.
 
+**Refined with the fixed logging (chronological run-length analysis):**
+the width sequence is NOT a smooth drain-ramp. It alternates between two
+modes: (a) "solo rounds" -- a single-sequence prefill forward (~20-token
+prompt) followed by ~63 consecutive width=1 decode forwards (~2.1 s),
+i.e. the executor presents B=1 to the burst path while it cycles the
+cohort sequence-by-sequence through its burst budget; and (b) "cohort
+mode" -- steady width=15-16 stretches of 13-40 forwards with natural
+drain ramps. Batched execution (mode b) demonstrably works, so the open
+question is precisely why the executor presents B=1 during mode (a)
+(candidate: decode-group assembly/chunking during mixed prefill+decode
+phases; `decode_batch_capacity = kv_cache_->MaxBatchSize()` interaction
+with auto-tune is not yet ruled out). The fix must live in the shared
+executor/scheduler layer (both GGUF-quantized and safetensors serving
+run through the same `ExecuteUnifiedBatchStep`/burst machinery), so a
+single fix covers both model formats. First step of that session: log
+the decode group size at burst invocation and the capacity, under INFO,
+in one instrumented run.
+
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled
