@@ -109,11 +109,22 @@ moment decode begins rather than at cohort rebuild; expect small gains
 3. **Fuse gate+up into one [2N, K] GEMM** — **FALSIFIED**: cold-L2 spike
    shows fused [22016, 2048] is 1.01-1.02x two [11008, 2048] calls
    (noise). Two back-to-back GEMMs are already fine; skip.
-4. **Specialist bf16 decode kernel** (the 2x-vs-physics prize): next
-   after 1, as a real project — large row-tiles per block (64-128 rows),
-   cp.async double-buffered K-stream, tensor-core-free FMUL pipeline sized
-   to 48 SMs, dispatch rule M<=8. Spike tool already provides the honest
-   cold-L2 benchmark harness to iterate against.
+4. **Specialist bf16 decode kernel — FALSIFIED at reachable effort
+   (Sep 6).** The deep-MLP design (warp-per-row, K-loop unrolled x8 with
+   per-iteration partial accumulators breaking the load->FMA dependency
+   chain, stride-32 tail) is now numerically correct (d=0.000 vs cuBLAS on
+   all 5 shapes x M<=4) and lands at **38-39% of DRAM roofline cold-L2 —
+   the same wall cuBLAS hits (38-45%)**. Two kernel bugs were found and
+   fixed en route (stride-1 tail overlapping lane ranges; x offsets not
+   tracking the unrolled weight offsets), plus a harness bug (variants
+   clobbered each other's output buffers and the reference). Conclusion:
+   ~40% of the 576 GB/s spec number is the practical streaming wall for
+   this access pattern on this part under cold L2 — the "2x vs physics"
+   framing was against an unreachable ceiling. Remaining (heavyweight,
+   uncertain payoff): TMA/cp.async.bulk pipelined tiles or wgmma-based
+   paths; revisit only with vendor-grade kernel-engineering effort. The
+   corrected spike (`tests/tools/bf16_gemv_bench.cu`) is the reference
+   harness for any future attempt.
 5. **Re-run the two-stage benchmark after each landing** (2x runs, per the
    variance protocol) and update `docs/benchmarks.md`.
 
