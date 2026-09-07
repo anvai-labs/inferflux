@@ -149,12 +149,77 @@ prefill/refill boundary instead of joining the running cohort. Decode
 is memory-bound: a width-1 step costs nearly as much GPU time as a
 width-16 step, so every solo step is ~15 tokens of foregone throughput.
 
-**Next scheduler lever (moderate effort, +25-40% potential at c=16):**
-admit/overlap waiting prefills during tail stretches -- e.g., proactively
-prefill newly arrived requests into the running cohort (mixed batches)
-instead of at cohort-rebuild boundaries, and cap solo-cohort drain by
-refilling from pending_decode_ mid-tick. Measurable target: width=1
-fraction from 38% to <10% on the same load.
+**FALSIFIED (Sep 7): the width-1 tail is workload-shaped, not
+monopolization.** Hypothesis tested: the solo bursts (a single sequence
+running up to its full 63-token remainder via TryGreedyBurstDecodeTokens)
+monopolize the pipeline while other requests wait; capping the solo burst
+to 8 tokens when prefill work is pending should recover width. Result:
+capped runs 181-189 tok/s vs 195-202 uncapped (instrumented, same
+driver) -- slightly WORSE; there is genuinely no other decode-ready work
+during solo rounds (closed-loop EOS stagger: the "waiting" requests
+belong to clients still blocked on their own in-flight responses). The
+width-1 fraction is workload physics for this arrival pattern, not a
+scheduler defect. Remaining honest levers for the vLLM gap (2.33x): the
+TMA/wgmma kernel class (uncertain, vendor-grade) and open-loop arrival
+patterns. Strategic recommendation: compete on memory footprint
+(2.3x less than vLLM's pre-allocation), quantized serving (leads
+llama.cpp), and single-binary deployment rather than matching vLLM's
+fp16 high-concurrency ceiling.
+
+**Refined with the fixed logging (chronological run-length analysis):**
+the width sequence is NOT a smooth drain-ramp. It alternates between two
+modes: (a) "solo rounds" -- a single-sequence prefill forward (~20-token
+prompt) followed by ~63 consecutive width=1 decode forwards (~2.1 s),
+i.e. the executor presents B=1 to the burst path while it cycles the
+cohort sequence-by-sequence through its burst budget; and (b) "cohort
+mode" -- steady width=15-16 stretches of 13-40 forwards with natural
+drain ramps. Batched execution (mode b) demonstrably works, so the open
+question is precisely why the executor presents B=1 during mode (a)
+(candidate: decode-group assembly/chunking during mixed prefill+decode
+phases; `decode_batch_capacity = kv_cache_->MaxBatchSize()` interaction
+with auto-tune is not yet ruled out). The fix must live in the shared
+executor/scheduler layer (both GGUF-quantized and safetensors serving
+run through the same `ExecuteUnifiedBatchStep`/burst machinery), so a
+single fix covers both model formats. First step of that session: log
+the decode group size at burst invocation and the capacity, under INFO,
+in one instrumented run.
+
+## 4c) Structural consolidation Stage 3 design (ready to execute)
+
+Stage 1 (PR #97) and Stage 2 (PR #98) migrated the BatchForwardDevice
+Q/K/V + gate/up sites to shared local helpers. Stage 3 migrates the
+remaining ~10 sites in Forward() and BatchForward's prefill path. The
+site shapes differ from BatchForwardDevice's in three ways the shared
+helpers must absorb:
+
+1. **MMA prefill cap**: Forward()'s cascade passes an extra
+   `execution_policy.mmq_mma_max_prefill_batch` argument to
+   TryQ8_1MmaGemv (decode path omits it). Helper signature needs an
+   `allow_mma_prefill_batch` / cap parameter, true on decode, capped on
+   prefill.
+2. **Per-projection error logging**: Forward()'s dense fallback logs
+   per projection ("Q projection failed") and returns false via the
+   surrounding error handling; BatchForwardDevice's is silent. Helper
+   takes the projection name (already a parameter) and an
+   error_label/log flag.
+3. **Capture guards**: Forward() never captures (no guard); the device
+   path guards every dense fallback. Guard stays at the call site —
+   the shared dense helper is guard-free and the device path wraps it.
+
+Helper signatures (member functions of LlamaForwardTyped<T>, defined in
+transformer_forward.cu):
+
+    bool TryQuantizedProjection(const QuantizedWeightInfo &raw,
+        const T *input, T *output, int M, int N, int K, const char *name,
+        int mma_max_batch /* pass execution_policy value or INT_MAX */);
+    bool RunDenseProjection(const void *weight, const T *input,
+        T *output, int M, int N, int K);  // guard-free; callers wrap
+
+Site inventory: Forward() Q/K/V (~1735-1870), o/gate/up/down/lm_head
+(~2050-2560); BatchForward prefill Q/K/V (~2194-2260) + FFN/lm_head;
+BatchForwardDevice o/down/lm_head stay explicit (genuine branching).
+Parity gates per stage: safetensors + GGUF determinism vs pre-change,
+isolation probe count, first-token probe.
 
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
