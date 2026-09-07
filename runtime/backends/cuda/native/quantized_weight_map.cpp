@@ -1,5 +1,6 @@
 #include "runtime/backends/cuda/native/quantized_weight_map.h"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
+#include "runtime/backends/cuda/native/gguf_model_loader.h"
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/quantization_handler.h"
 #include "server/logging/logger.h"
@@ -9,9 +10,14 @@ namespace inferflux {
 QuantizedWeightMap::~QuantizedWeightMap() {
   // Note: per-tensor GPU memory is managed by IModelLoader, we don't own it
 #ifdef INFERFLUX_HAS_CUDA
-  for (auto &lw : layers_) {
-    FusedQuantGemm::DestroyDownProjMmqLayout(lw.down_proj_mmq);
-    lw.down_proj_mmq = {};
+  // Shared layouts are owned by the loader's tensors — destroying them here
+  // would double-free (LoadModel resets the loader before the maps). Only
+  // layouts this map built itself (per-map fallback path) are owned.
+  if (owns_mmq_layouts_) {
+    for (auto &lw : layers_) {
+      FusedQuantGemm::DestroyDownProjMmqLayout(lw.down_proj_mmq);
+      lw.down_proj_mmq = {};
+    }
   }
   ReleaseScratchBuffer();
 #endif
@@ -461,6 +467,27 @@ MmqWeightInfo QuantizedWeightMap::GetMmqLayerDownProj(int layer) const {
     return {};
   }
 
+  // Preferred path: the loader-level per-tensor cache. The first replica to
+  // touch the layer builds the layout; every map (including this one) then
+  // borrows the same device buffer. The borrowed copy is memoized below but
+  // NOT owned — see the destructor.
+  if (shared_mmq_layout_enabled_) {
+    MmqWeightInfo shared{};
+    if (auto *gguf_loader =
+            dynamic_cast<runtime::cuda::native::GGUFModelLoader *>(loader_)) {
+      if (gguf_loader->GetOrBuildDownProjMmqLayout(lw.down_proj_accessor.get(),
+                                                   stream_, &shared)) {
+        std::lock_guard<std::mutex> lock(mmq_cache_mu_);
+        if (lw.down_proj_mmq.data) {
+          return lw.down_proj_mmq;
+        }
+        lw.down_proj_mmq = shared;
+        return lw.down_proj_mmq;
+      }
+    }
+    // Non-GGUF loader or build failure: fall through to the per-map path.
+  }
+
   std::lock_guard<std::mutex> lock(mmq_cache_mu_);
   if (lw.down_proj_mmq.data) {
     return lw.down_proj_mmq;
@@ -473,6 +500,7 @@ MmqWeightInfo QuantizedWeightMap::GetMmqLayerDownProj(int layer) const {
     return {};
   }
 
+  owns_mmq_layouts_ = true;
   lw.down_proj_mmq = layout;
   return lw.down_proj_mmq;
 #endif

@@ -148,6 +148,16 @@ public:
   }
   bool BatchDequantCacheEnabled() const { return batch_dequant_cache_enabled_; }
 
+  // When enabled (default), transformed down-proj MMQ layouts are shared
+  // through the loader's per-tensor cache: the first map to touch a layer
+  // builds it and every replica reuses the same device buffer (the map's
+  // cached copy is borrowed, not owned). When disabled, each map builds and
+  // owns its own layouts — the historical behavior.
+  void SetSharedMmqLayoutEnabled(bool enable) {
+    shared_mmq_layout_enabled_ = enable;
+  }
+  bool SharedMmqLayoutEnabled() const { return shared_mmq_layout_enabled_; }
+
   // --- Raw quantized weight accessors (for fused dequant-GEMV) ---
 
   QuantizedWeightInfo GetRawLayerQProj(int layer) const;
@@ -263,6 +273,11 @@ private:
   mutable std::mutex mmq_cache_mu_;
   bool allow_fused_quantized_matmul_{true};
   bool batch_dequant_cache_enabled_{false};
+  bool shared_mmq_layout_enabled_{true};
+  // True when this map built and owns its own MMQ layouts (per-map fallback
+  // path); false when layouts are borrowed from the loader's shared cache.
+  // Mutable: set from the const GetMmqLayerDownProj build path.
+  mutable bool owns_mmq_layouts_{false};
 
   // Global weight accessors
   std::shared_ptr<IWeightAccessor> embed_tokens_accessor;

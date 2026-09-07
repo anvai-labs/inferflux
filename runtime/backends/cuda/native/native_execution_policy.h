@@ -101,6 +101,10 @@ struct NativeExecutionPolicy {
   bool enable_fused_bias_add{true};
   bool enable_gemv_accumulate{true};
   bool enable_batch_dequant_cache{false};
+  // Share transformed down-proj MMQ layouts across weight-map replicas via
+  // the loader's per-tensor cache (saves ~one 561 MB model pass per extra
+  // replica for a 3B q4_k_m model).
+  bool disable_shared_mmq_layout{false};
   // Size forward scratch for the full context window instead of the prefill
   // chunk cap (historical behavior; costs ~4x scratch for a 3B model).
   bool full_seq_scratch{false};
@@ -230,6 +234,8 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_GEMV_ACCUMULATE", true);
     policy.enable_batch_dequant_cache =
         ParseBoolEnv("INFERFLUX_BATCH_DEQUANT_CACHE", false);
+    policy.disable_shared_mmq_layout =
+        ParseBoolEnv("INFERFLUX_DISABLE_SHARED_MMQ_LAYOUT", false);
     policy.full_seq_scratch =
         ParseBoolEnv("INFERFLUX_CUDA_FULL_SEQ_SCRATCH", false);
     policy.enable_fused_rope_kv_append =

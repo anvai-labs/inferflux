@@ -46,6 +46,7 @@ struct MmqWeightInfo {
   int rows{0};      // Logical output rows / columns in the destination matrix
   int cols{0};      // Logical K dimension
   int tile_cols{0}; // Number of output rows packed per layout tile
+  size_t bytes{0};  // Device bytes held by the transformed layout
 };
 
 /**

@@ -25,6 +25,11 @@ typedef __half half;
 #include <vector>
 
 namespace inferflux {
+
+// Defined in weight_map.h; only used via pointer here to keep this header
+// free of the executor-heavy include chain.
+struct MmqWeightInfo;
+
 namespace runtime {
 namespace cuda {
 namespace native {
@@ -41,6 +46,17 @@ public:
   void *gpu_data{nullptr};        // Quantized data on GPU
   half *dequantized_gpu{nullptr}; // Dequantized FP16 data on GPU (cached)
   size_t gpu_offset{0};           // Offset in unified GPU buffer
+
+  // Transformed (tile-major) down-proj MMQ layout shared by every
+  // QuantizedWeightMap replica. The layout is a pure function of the
+  // quantized tensor, so it is owned by the tensor and freed with the
+  // loader's GPU memory — never with a weight map.
+  void *mmq_layout_gpu{nullptr};
+  int mmq_layout_quant_type{-1};
+  int mmq_layout_rows{0};
+  int mmq_layout_cols{0};
+  int mmq_layout_tile_cols{0};
+  size_t mmq_layout_bytes{0};
 
   /**
    * @brief Get quantization handler for this tensor
@@ -94,6 +110,23 @@ public:
   DequantizedCachePolicy GetDequantizedCachePolicy() const override;
   void ClearDequantizedCache() override;
   bool HasDequantizedCache() const override;
+
+  /**
+   * @brief Shared transformed down-proj MMQ layout for a tensor.
+   *
+   * The transformed layout is a pure function of the quantized tensor, so
+   * every QuantizedWeightMap replica (primary + overlap lanes) shares the
+   * single copy owned by the tensor instead of building its own. The build
+   * is serialized and stream-synchronized before publishing, so any stream
+   * may consume the returned layout afterwards. Returns false when the
+   * accessor is not a GGUF tensor or the layout cannot be built; callers
+   * keep their per-map fallback path.
+   */
+  bool GetOrBuildDownProjMmqLayout(IWeightAccessor *accessor,
+                                   cudaStream_t stream, MmqWeightInfo *out);
+
+  /** Total device bytes held by cached transformed MMQ layouts. */
+  size_t GetMmqTransformedLayoutBytes() const;
 
   /**
    * @brief Get weight accessor for a specific tensor
@@ -223,6 +256,9 @@ public:
   void *GetGpuWeights(cudaStream_t stream) override;
   half *GetDequantizedGpuWeights(cudaStream_t stream) override;
   bool IsDequantizedCached() const override;
+
+  // Underlying tensor for loader-level shared caches.
+  GGUFTensorData *tensor() const { return tensor_; }
 
 private:
   GGUFTensorData *tensor_;
