@@ -221,6 +221,40 @@ BatchForwardDevice o/down/lm_head stay explicit (genuine branching).
 Parity gates per stage: safetensors + GGUF determinism vs pre-change,
 isolation probe count, first-token probe.
 
+## 4d) Coverage + profiling matrix (Sep 7): engines x formats x backends
+
+Coverage (verified this session on the dual-GPU box):
+
+| Engine | GGUF CUDA | GGUF ROCm | ST CUDA | ST ROCm |
+|---|---|---|---|---|
+| inferflux (native) | ✅ 344.6 tok/s c=16 | ✅ 36.3 | ✅ 318.8 | ❌ no HIP bf16 forward |
+| llama.cpp | ✅ 211.9 | ✅ 35.4 | ❌ GGUF-only | ❌ |
+| vLLM | ❌ no GGUF | ❌ CUDA venv | ✅ 720.8 | ❌ CUDA venv |
+| SGLang | ❌ no GGUF | ❌ CUDA venv | ✅ 619.0 | ❌ CUDA venv |
+| Ollama (remote) | ✅ 123.7 | n/a remote | ❌ | ❌ |
+
+InferFlux has the highest coverage: 4 of 6 working combos vs 3 (llama.cpp)
+and 2 (vLLM/SGLang). Notable: **inferflux_cuda now leads llama.cpp on GGUF
+at c>=8** (344.6 vs 211.9 at c=16 = 1.63x; 277.4 vs 247.9 at c=8) — the
+April snapshot had it 0.66-0.83x behind. ROCm GGUF works but at ~17-36
+tok/s (7x slower than CUDA; both inferflux_rocm and llama_cpp_rocm land
+identically — GGUF decode in the ROCm build rides the llama.cpp HIP
+kernels). ST-on-ROCm is blocked: no HIP bf16 forward is built.
+
+nsys kernel summaries (c=8 wave, 32x64): inferflux GGUF = native MMQ/MMVQ
+kernels (InferfluxMmqQ 326ms top); inferflux ST = cutlass bf16 wmma + FA2
+MMA; llama.cpp GGUF = mul_mat_q stream-k; vLLM = ampere fp16 CUTLASS GEMMs.
+
+**ncu SpeedOfLight finding (overturns the DRAM-streaming assumption):**
+the dominant InferFlux GGUF kernels run at **98-99% L1TEX/SM-memory
+throughput while DRAM sits at 14-15%**. The decode bottleneck is the
+L1/shared-memory pipeline (transaction density), not DRAM streaming —
+weight tiles are L2-resident across the small 3B model. Future kernel
+work should target L1TEX pressure (wider vector loads, fewer
+transactions, register tiling), not more aggressive DRAM prefetch. This
+also explains why the deep-MLP DRAM-focused redesign plateaued at the
+same ceiling as cuBLAS.
+
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled
