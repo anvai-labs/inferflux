@@ -430,9 +430,7 @@ private:
   // sequence slot manager to the published KV capacity — so a violation here
   // means a scheduler/backend capacity mismatch; the guard converts it into a
   // clean per-request failure instead of an out-of-bounds device write.
-  bool SeqIdInKvRange(int seq_id) const {
-    return seq_id >= 0 && kv_cache_ && seq_id < kv_cache_->MaxBatchSize();
-  }
+  bool SeqIdInKvRange(int seq_id) const;
   void RecordKvRangeViolation(int seq_id);
   std::atomic<int> kv_range_violations_{0};
 

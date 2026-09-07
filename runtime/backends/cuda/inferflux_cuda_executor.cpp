@@ -1296,6 +1296,10 @@ InferfluxCudaExecutor::PrimaryLaneResources() {
   return resources;
 }
 
+bool InferfluxCudaExecutor::SeqIdInKvRange(int seq_id) const {
+  return seq_id >= 0 && kv_cache_ && seq_id < kv_cache_->MaxBatchSize();
+}
+
 void InferfluxCudaExecutor::RecordKvRangeViolation(int seq_id) {
   const int n = kv_range_violations_.fetch_add(1, std::memory_order_relaxed);
   if (n < 8 || n % 1000 == 0) {
@@ -2945,10 +2949,9 @@ UnifiedBurstResult InferfluxCudaExecutor::NativeExecuteUnifiedBatchBurst(
     batch_seq_ids[b] = inputs[static_cast<std::size_t>(b)].sequence_id;
     if (!SeqIdInKvRange(batch_seq_ids[b])) {
       RecordKvRangeViolation(batch_seq_ids[b]);
-      for (auto &output : result.outputs) {
-        output.ok = false;
-        output.token = -1;
-      }
+      result.ok = false;
+      result.last_tokens.assign(static_cast<size_t>(B), -1);
+      result.finished.assign(static_cast<size_t>(B), true);
       return result;
     }
   }
