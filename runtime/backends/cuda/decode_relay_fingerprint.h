@@ -37,9 +37,13 @@ struct DecodeRelayFingerprint {
 };
 
 // True when the next decode batch is exactly the batch the relay is armed
-// for: `count` rows, same sequence ids, same slot generations, and each row at
-// the n_past the relay advanced it to (armed value = current n_past + 1).
-// The input vectors may be longer than `count` (callers reuse preallocated
+// for: `count` rows, same sequence ids, same slot generations, and each row
+// at the n_past the relay advanced it to. DeviceTokenRelayKernel writes
+// token_ids[b] = sampled_tokens[b] and n_past[b] += 1 after the arming step,
+// and the host advances its own n_past record by 1 for the next tick -- so
+// the armed next_n_past must EQUAL the presented n_past, and the armed tokens
+// are the sampled tokens the next step presents as its fed tokens. The input
+// vectors may be longer than `count` (callers reuse preallocated
 // max-capacity buffers); only the first `count` entries participate.
 inline bool DecodeRelayIdentityMatches(const DecodeRelayFingerprint &armed,
                                        const std::vector<int> &seq_ids,
@@ -60,7 +64,7 @@ inline bool DecodeRelayIdentityMatches(const DecodeRelayFingerprint &armed,
   for (size_t i = 0; i < count; ++i) {
     if (armed.seq_ids[i] != seq_ids[i] ||
         armed.generations[i] != generations[i] ||
-        armed.next_n_past[i] != n_past[i] + 1 ||
+        armed.next_n_past[i] != n_past[i] ||
         (check_tokens && armed.tokens[i] != tokens[i])) {
       return false;
     }

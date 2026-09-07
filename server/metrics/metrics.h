@@ -208,6 +208,7 @@ public:
                                     std::size_t incompatible);
 
   // InferFlux CUDA backend metrics
+  void RecordDecodeRelayReplay();
   void RecordInferfluxCudaForwardShape(bool is_decode, int batch_size);
   void RecordInferfluxCudaForwardLatency(double forward_ms);
   void RecordInferfluxCudaForwardPass(bool is_decode, int batch_size,
@@ -467,6 +468,7 @@ private:
 
   // InferFlux CUDA backend metrics
   std::atomic<uint64_t> inferflux_cuda_forward_prefill_total_{0};
+  std::atomic<uint64_t> decode_relay_replay_total_{0};
   std::atomic<uint64_t> inferflux_cuda_forward_decode_total_{0};
   std::atomic<uint64_t> inferflux_cuda_forward_batch_tokens_total_{0};
   std::atomic<uint64_t> inferflux_cuda_burst_decode_chunks_decode_total_{0};

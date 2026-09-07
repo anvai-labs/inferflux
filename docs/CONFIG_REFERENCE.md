@@ -338,6 +338,8 @@ Scope contract:
 | `INFERFLUX_CUDA_KV_BUDGET_MB` | explicit KV budget in MiB for auto-tuning |
 | `INFERFLUX_CUDA_KV_FREE_MEM_RATIO` | fraction of free VRAM used as KV budget when explicit budget is unset (`0.30` default) |
 | `INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL` | `runtime.cuda.quantized_runtime.require_fused_matmul` |
+| `INFERFLUX_DISABLE_CUDA_GRAPH` | disable decode CUDA graph capture/replay (graphs otherwise capture per decode width and replay via the device token relay) |
+| `INFERFLUX_DISABLE_DECODE_RELAY` | disable the device-side decode token relay (`DeviceTokenRelayKernel` + fingerprint-guarded graph replay); forces the full H2D metadata upload every decode step. Validation kill switch — engaged replays are visible as `inferflux_scheduler_decode_relay_replays_total` in `/metrics` |
 | `INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED` | reject generation admission with `503` when distributed KV transport is degraded (`false` default) |
 | `INFERFLUX_READYZ_DISAGG_TIMEOUT_DEBT_THRESHOLD` | distributed KV timeout debt threshold that forces `/readyz` to `503` (`6` default when streak threshold is enabled, `0` disables) |
 | `INFERFLUX_READYZ_DISAGG_TIMEOUT_STREAK_THRESHOLD` | consecutive distributed KV ticket timeouts that force `/readyz` to `503` (`3`, `0` disables) |

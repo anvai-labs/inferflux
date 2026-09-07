@@ -790,6 +790,10 @@ void MetricsRegistry::RecordDecodeWorkerStickyMerge(
       static_cast<uint64_t>(merged_requests), std::memory_order_relaxed);
 }
 
+void MetricsRegistry::RecordDecodeRelayReplay() {
+  decode_relay_replay_total_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void MetricsRegistry::RecordDecodeAssemblySnapshot(std::string_view mode,
                                                    std::size_t ready,
                                                    std::size_t selected,
@@ -2056,6 +2060,12 @@ std::string MetricsRegistry::RenderPrometheus() const {
       scheduler_decode_assembly_incompatible_);
 
   // --- InferFlux CUDA backend metrics ---
+  out << "# HELP inferflux_scheduler_decode_relay_replays_total Decode steps "
+         "replayed via the device-side token relay\n";
+  out << "# TYPE inferflux_scheduler_decode_relay_replays_total counter\n";
+  out << "inferflux_scheduler_decode_relay_replays_total "
+      << decode_relay_replay_total_.load() << "\n";
+
   out << "# HELP inferflux_cuda_forward_passes_total InferFlux CUDA forward "
          "passes by phase\n";
   out << "# TYPE inferflux_cuda_forward_passes_total counter\n";

@@ -3188,12 +3188,14 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
             decode_group[offset + static_cast<size_t>(b)].sequence_generation;
       }
       bool fwd_ok = false;
-      if (decode_relay_active_ &&
+      if (decode_relay_active_ && !execution_policy_.disable_decode_relay &&
           DecodeRelayIdentityMatches(decode_relay_armed_, batch_seq_ids,
                                      chunk_generations, batch_n_past,
                                      batch_tokens, static_cast<size_t>(B))) {
         fwd_ok = model_forward_->BatchForwardReplay(d_logits_, B);
-        if (!fwd_ok) {
+        if (fwd_ok) {
+          GlobalMetrics().RecordDecodeRelayReplay();
+        } else {
           // Graph replay failed — fall back to full BatchForward
           decode_relay_active_ = false;
         }
@@ -3295,8 +3297,11 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
                                            batch_seq_ids.begin() + B);
         decode_relay_armed_.generations = chunk_generations;
         decode_relay_armed_.next_n_past.resize(static_cast<size_t>(B));
-        decode_relay_armed_.tokens.assign(batch_tokens.begin(),
-                                          batch_tokens.begin() + B);
+        // The next step feeds THIS step's sampled tokens -- the relay kernel
+        // has already written them into the device metadata -- so the
+        // fingerprint must record them, not the tokens this step consumed.
+        decode_relay_armed_.tokens.assign(sampled_tokens.begin(),
+                                          sampled_tokens.begin() + B);
         for (int b = 0; b < B; ++b) {
           decode_relay_armed_.next_n_past[static_cast<size_t>(b)] =
               batch_n_past[b] + 1;
