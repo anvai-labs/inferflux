@@ -3646,28 +3646,15 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                               return true;
                             },
                             [&]() {
-                              return TryQ8_1MmaGemv<T>(
-                                         gate_raw, d_norm_out_, d_ffn_gate_,
-                                         d_act_q8_1_mmq_, d_mma_partials_, B,
-                                         intermediate_size_, hidden_size_,
-                                         stream_, "gate_proj", active_policy) ||
-                                     TryQ8_1Gemv<T>(gate_raw, d_norm_out_,
-                                                    d_ffn_gate_, d_act_q8_1_, B,
-                                                    intermediate_size_,
-                                                    hidden_size_, stream_,
-                                                    "gate_proj", active_policy);
+                              return try_quantized_projection(
+                                  gate_raw, d_norm_out_, d_ffn_gate_,
+                                  intermediate_size_, hidden_size_, "gate_proj");
                             },
                             [&]() {
-                              if (capturing && !cublas_capture_ok) {
-                                capture_abort = true;
-                                return false;
-                              }
-                              const T *gate_proj = reinterpret_cast<const T *>(
-                                  weights_->LayerGateProj(layer));
-                              gemm_->GemmTyped<T>(B, intermediate_size_,
-                                                  hidden_size_, d_norm_out_,
-                                                  gate_proj, d_ffn_gate_);
-                              return true;
+                              return run_dense_projection(
+                                  weights_->LayerGateProj(layer), d_norm_out_,
+                                  d_ffn_gate_, B, intermediate_size_,
+                                  hidden_size_);
                             })) {
                       return false;
                     }
@@ -3681,28 +3668,15 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                               return true;
                             },
                             [&]() {
-                              return TryQ8_1MmaGemv<T>(
-                                         up_raw, d_norm_out_, d_ffn_up_,
-                                         d_act_q8_1_mmq_, d_mma_partials_, B,
-                                         intermediate_size_, hidden_size_,
-                                         stream_, "up_proj", active_policy) ||
-                                     TryQ8_1Gemv<T>(up_raw, d_norm_out_,
-                                                    d_ffn_up_, d_act_q8_1_, B,
-                                                    intermediate_size_,
-                                                    hidden_size_, stream_,
-                                                    "up_proj", active_policy);
+                              return try_quantized_projection(
+                                  up_raw, d_norm_out_, d_ffn_up_,
+                                  intermediate_size_, hidden_size_, "up_proj");
                             },
                             [&]() {
-                              if (capturing && !cublas_capture_ok) {
-                                capture_abort = true;
-                                return false;
-                              }
-                              const T *up_proj = reinterpret_cast<const T *>(
-                                  weights_->LayerUpProj(layer));
-                              gemm_->GemmTyped<T>(B, intermediate_size_,
-                                                  hidden_size_, d_norm_out_,
-                                                  up_proj, d_ffn_up_);
-                              return true;
+                              return run_dense_projection(
+                                  weights_->LayerUpProj(layer), d_norm_out_,
+                                  d_ffn_up_, B, intermediate_size_,
+                                  hidden_size_);
                             })) {
                       return false;
                     }
