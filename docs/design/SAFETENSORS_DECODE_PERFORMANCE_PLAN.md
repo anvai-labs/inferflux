@@ -241,6 +241,27 @@ tok/s (7x slower than CUDA; both inferflux_rocm and llama_cpp_rocm land
 identically — GGUF decode in the ROCm build rides the llama.cpp HIP
 kernels). ST-on-ROCm is blocked: no HIP bf16 forward is built.
 
+**Memory-pressure dimension (same matrix, c=16 GPU peaks):**
+
+| Row | GPU peak | vs baseline |
+|---|---|---|
+| inferflux GGUF CUDA | 7,148 MB | +3,006 MB vs llama.cpp |
+| llama.cpp GGUF CUDA | 4,142 MB | baseline |
+| Ollama GGUF (remote) | 658 MB | own-GPU accounting, not comparable |
+| inferflux ST CUDA | 8,750 MB | — |
+| vLLM ST CUDA | 19,970 MB | 2.28x InferFlux |
+| SGLang ST CUDA | 17,436 MB | 2.0x InferFlux |
+
+The decisive competitive framing falls out of the throughput/memory pair:
+**tokens per second per GB of GPU memory at c=16 is nearly identical between
+InferFlux (36.4) and vLLM (36.1)** — vLLM's 2.26x throughput lead is bought
+entirely with 2.28x more pre-allocated memory. On memory-constrained cards
+the comparison inverts: vLLM's 20 GB pre-allocation cannot serve
+Qwen2.5-3B on a 12 GB card at all in this configuration, while InferFlux
+serves it in 8.75 GB with headroom. GGUF quantized serving shrinks this
+further (7.1 GB for Q4_K_M with native kernels leading llama.cpp at
+c>=8).
+
 **Output-accuracy verification (the throughput table is meaningful):**
 all working combos were validated for response correctness, not just speed:
 - GGUF CUDA: harness semantic similarity HIGH for all engine pairs at all
