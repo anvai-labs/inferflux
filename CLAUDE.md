@@ -294,9 +294,12 @@ Primary bottleneck: FFN MMVQ kernels (45% of decode time).
 See docs/TechDebt_and_Competitive_Roadmap.md for optimization roadmap.
 
 IMPORTANT: After any source changes, do a clean CUDA rebuild to avoid
-stale object files (WSL2 filesystem timestamp issue):
-  rm -rf build-cuda && cmake -S . -B build-cuda -DENABLE_CUDA=ON && \
-  cmake --build build-cuda -j$(nproc) --target inferfluxd
+stale object files (WSL2 filesystem timestamp issue). On dual-GPU boxes
+with ROCm installed, pass -DENABLE_ROCM=OFF explicitly: ENABLE_ROCM
+defaults ON and a combined CUDA+ROCm configure fails with conflicting
+dim3 declarations (hip_runtime.h vs CUDA vector_types.h in the same TU):
+  rm -rf build-cuda && cmake -S . -B build-cuda -DENABLE_CUDA=ON \
+    -DENABLE_ROCM=OFF && cmake --build build-cuda -j$(nproc) --target inferfluxd
 ```
 
 **Quality fixes applied:**
