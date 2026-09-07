@@ -141,18 +141,31 @@ never hold, so the primary-path relay has been dead code since it landed
 (only the burst path's closed device loop relays).
 
 A naive fix (arm stores `sampled_tokens`; compare `armed.next_n_past ==
-presented_n_past`) was attempted and **reverted**: with the relay forced
-live, `inferflux_batched_isolation_probe` reported 16 divergent sequences
--- but the identical count occurs with graphs disabled, i.e. the probe
-cannot distinguish relay corruption from the pre-existing bf16
-batch-vs-single numerics divergence (batch-width-dependent kernel
-selection changes reduction order). Without a correctness signal that
-separates the two, a live relay cannot be validated. Proper fix path:
-device-side tracing of the relayed metadata
-(`INFERFLUX_DEBUG_SEQUENCE_SLOTS` + decode_mapping) against host
-expectations, on a branch where the numerics divergence is first
-quantified (or fp32-forced) so corruption is detectable. Prize: the
-per-step H2D metadata upload + host batch assembly (~0.5-1 ms/step).
+presented_n_past`) was first attempted and **reverted**: the
+`inferflux_batched_isolation_probe` reported 16 divergent sequences with
+the relay live -- but the identical count occurs with graphs disabled,
+i.e. the probe cannot distinguish relay corruption from the pre-existing
+bf16 batch-vs-single numerics divergence, so the probe cannot validate
+the relay either way (it counts numerics divergence, not corruption).
+
+**Unblocked and landed (Sep 6)** with a validation signal that separates
+the two: a relay kill switch (`INFERFLUX_DISABLE_DECODE_RELAY=1`) enables
+a bit-identical ON/OFF comparison through identical batch compositions,
+where any output difference is attributable to the relay alone (the
+kernel, buffers, and graph are unchanged). The fix was re-applied
+(arm stores `sampled_tokens`; the check compares `armed.next_n_past ==
+presented_n_past` directly, matching DeviceTokenRelayKernel's actual
+device-side writes line-for-line), the fingerprint unit tests were
+rewritten for the corrected contract, and a
+`inferflux_scheduler_decode_relay_replays_total` counter proves
+engagement (404 replays on a 2x32-request safetensors load, 275 on GGUF).
+Validation: relay ON vs OFF **bit-identical** across 32 concurrent
+requests spanning 3 distinct batch-width contexts; GGUF path
+deterministic and matching the pre-fix output set; 525/525 unit tests.
+Throughput: neutral-to-marginal on this driver (the skipped H2D upload
+is microseconds; most of the relay's saving overlaps host work that was
+already hidden by the graphs), so this lands primarily as a
+correctness/observability fix that re-activates dead code.
 
 ## 5) Measurement protocol (keep using it)
 
