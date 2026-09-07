@@ -4260,6 +4260,10 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id, int n_past_start,
   if (!model_forward_ || !sampler_ || n_tokens <= 0) {
     return 0;
   }
+  if (!SeqIdInKvRange(sequence_id)) {
+    RecordKvRangeViolation(sequence_id);
+    return 0;
+  }
   std::lock_guard<std::mutex> lock(shared_pipeline_mutex_);
 
   // This burst drives d_batch_meta_ with its own relay loop; the primary
