@@ -305,7 +305,52 @@ saturation for this kernel's mix, not fixable idleness. Kernel-level
 follow-up would need SASS analysis (smem bank pattern / ldmatrix
 scheduling), not occupancy tuning.
 
-## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
+## 4e) Memory-overhead investigation (Sep 7): root cause found
+
+Question: GGUF q4_k_m peaks at 7,148 MB vs llama.cpp 4,142 MB (+3.0 GB).
+Weights are identical. Where does the +3 GB go?
+
+Method: fresh nsys capture with `--cuda-memory-usage=true` (GGUF config,
+c=16 load), sqlite export, CUDA_GPU_MEMORY_USAGE_EVENTS bucketed by exact
+allocation size, phase (startup t<=2s / first-decode window / after), and
+calling thread (correlationId join). Every family factored exactly against
+Qwen2.5-3B shapes (hidden=2048, ffn=11008, vocab=151,936, 36 layers,
+kv_heads=2, head_dim=128). Startup net 5,848 MB + first-decode growth
+543 MB = 6.4 GB live, matching nvidia-smi.
+
+The whale: **3,367 MB of transformed down-proj MMQ weight layouts -- six
+full-model copies**. `FusedQuantGemm::BuildDownProjMmqLayout`
+(fused_quant_gemm.cu:1912) re-lays-out every layer's down_proj weight for
+the mma.sync MMQ path (Q4_K 12,681,216 B / Q6_K 18,493,440 B per tensor;
+q4_k_m uses Q6_K down-proj on 18 of 36 layers -> 18+18 per pass, 561 MB
+per model pass). The layout is cached per-layer in a QuantizedWeightMap
+(quantized_weight_map.cpp:437), but every execution context builds its
+own map: 108 Q4_K + 108 Q6_K allocations across the capture = exactly 6
+model passes (3 built on the main thread at load, 3 more on lane worker
+threads at first decode; one extra pass lands lazily in the load window,
++543 MB). llama.cpp needs zero such copies -- its MMQ reads native layout.
+
+Full peak decomposition (GGUF q4_k_m, live at c=16):
+
+| Block | Size | Verdict |
+|---|---|---|
+| Native quantized weight buffer (single cudaMalloc, file-sized) | 2,002 MB | legit (same as llama.cpp weights) |
+| Transformed down-proj MMQ layouts, 6 copies x 561 MB | 3,367 MB | waste x5 -- fix: share one layout per weight tensor across contexts |
+| KV cache (16 batch x 2048 seq worst case, 36 layers) | 1,152 MB | structural over-provision vs llama.cpp shared pool |
+| lm_head + token_embd fp16 dequant (2 x 593.5 MB, tied weights) | 1,187 MB | one copy redundant -- tie-aware cache saves ~594 MB |
+| Forward replicas: 3x (scratch ~115 MB + fp32 residual 16 MB) | ~400 MB | overlap feature cost, now counted |
+| Fused gate+up transformed layout, 12 x 25.4 MB | 304 MB | same sharing fix as down-proj |
+| fp16 dequant-cache spill (43 MB x7 gate, 8 MB x24 q/o, misc) | ~500 MB | only needed by cublas fallback paths; should be evictable |
+| cublas/cublasLt workspaces, samplers, CUDA context | ~150 MB | legit |
+
+Efficiency summary vs llama.cpp: ~3.4 GB of the +3.0 GB overhead is
+multiplied weight-layout/dequant copies (fixable by per-tensor global
+sharing + tie-aware lm_head caching, worth ~3.4 GB), ~1.2 GB is
+worst-case KV pre-allocation (fixable by growth or a shared token pool),
+~0.4 GB is the prefill/decode overlap feature. The 2.0 GB weight buffer
+itself is already optimal.
+
+## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled
 tokens + n_past+1 written into device metadata by `DeviceTokenRelay`, plus
