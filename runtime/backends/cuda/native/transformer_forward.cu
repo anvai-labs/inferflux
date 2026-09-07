@@ -2967,6 +2967,31 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
   // If fused GEMV can't handle a projection during capture, we set
   // `capture_abort` and fall back to direct execution after ending capture.
   bool capture_abort = false;
+
+  // Quantized fast-path cascade for one projection: MMA GEMV (sm90+ shape
+  // tier) then plain Q8_1 GEMV. Shared by every projection site on the
+  // device-path decode so the cascade lives in exactly one place.
+  auto try_quantized_projection = [&](const QuantizedWeightInfo &raw,
+                                      const T *input, T *output, int rows,
+                                      int N, const char *name) {
+    return TryQ8_1MmaGemv<T>(raw, input, output, d_act_q8_1_mmq_,
+                             d_mma_partials_, B, N, rows, stream_, name,
+                             active_policy) ||
+           TryQ8_1Gemv<T>(raw, input, output, d_act_q8_1_, B, N, rows, stream_,
+                          name, active_policy);
+  };
+  // Dense (bf16/fp16 weight) fallback: capture-guarded cuBLAS. During graph
+  // capture without a pinned-workspace guarantee the stage aborts capture
+  // instead of running an uncapturable allocation.
+  auto run_dense_projection = [&](const void *weight, const T *input,
+                                  T *output, int M, int N, int K) {
+    if (capturing && !cublas_capture_ok) {
+      capture_abort = true;
+      return false;
+    }
+    const T *w = reinterpret_cast<const T *>(weight);
+    return gemm_->GemmTyped<T>(M, N, K, input, w, output);
+  };
   auto RunCompute = [&]() -> bool {
     // Embedding [B, hidden_size] — write directly to residual stream.
     {
@@ -3085,27 +3110,14 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             return true;
                           },
                           [&]() {
-                            return TryQ8_1MmaGemv<T>(
-                                       q_raw, d_norm_out_, d_q_,
-                                       d_act_q8_1_mmq_, d_mma_partials_, B,
-                                       num_heads_ * head_dim_, hidden_size_,
-                                       stream_, "q_proj", active_policy) ||
-                                   TryQ8_1Gemv<T>(
-                                       q_raw, d_norm_out_, d_q_, d_act_q8_1_, B,
-                                       num_heads_ * head_dim_, hidden_size_,
-                                       stream_, "q_proj", active_policy);
+                            return try_quantized_projection(
+                                q_raw, d_norm_out_, d_q_, num_heads_ * head_dim_,
+                                hidden_size_, "q_proj");
                           },
                           [&]() {
-                            if (capturing && !cublas_capture_ok) {
-                              capture_abort = true;
-                              return false;
-                            }
-                            const T *q_proj = reinterpret_cast<const T *>(
-                                weights_->LayerQProj(layer));
-                            gemm_->GemmTyped<T>(B, num_heads_ * head_dim_,
-                                                hidden_size_, d_norm_out_,
-                                                q_proj, d_q_);
-                            return true;
+                            return run_dense_projection(
+                                weights_->LayerQProj(layer), d_norm_out_,
+                                d_q_, B, num_heads_ * head_dim_, hidden_size_);
                           })) {
                     return false;
                   }
@@ -3119,28 +3131,16 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             return true;
                           },
                           [&]() {
-                            return TryQ8_1MmaGemv<T>(
-                                       k_raw, d_norm_out_, d_k_new_,
-                                       d_act_q8_1_mmq_, d_mma_partials_, B,
-                                       num_kv_heads_ * head_dim_, hidden_size_,
-                                       stream_, "k_proj", active_policy) ||
-                                   TryQ8_1Gemv<T>(k_raw, d_norm_out_, d_k_new_,
-                                                  d_act_q8_1_, B,
-                                                  num_kv_heads_ * head_dim_,
-                                                  hidden_size_, stream_,
-                                                  "k_proj", active_policy);
+                            return try_quantized_projection(
+                                k_raw, d_norm_out_, d_k_new_,
+                                num_kv_heads_ * head_dim_, hidden_size_,
+                                "k_proj");
                           },
                           [&]() {
-                            if (capturing && !cublas_capture_ok) {
-                              capture_abort = true;
-                              return false;
-                            }
-                            const T *k_proj = reinterpret_cast<const T *>(
-                                weights_->LayerKProj(layer));
-                            gemm_->GemmTyped<T>(B, num_kv_heads_ * head_dim_,
-                                                hidden_size_, d_norm_out_,
-                                                k_proj, d_k_new_);
-                            return true;
+                            return run_dense_projection(
+                                weights_->LayerKProj(layer), d_norm_out_,
+                                d_k_new_, B, num_kv_heads_ * head_dim_,
+                                hidden_size_);
                           })) {
                     return false;
                   }
@@ -3154,28 +3154,16 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             return true;
                           },
                           [&]() {
-                            return TryQ8_1MmaGemv<T>(
-                                       v_raw, d_norm_out_, d_v_new_,
-                                       d_act_q8_1_mmq_, d_mma_partials_, B,
-                                       num_kv_heads_ * head_dim_, hidden_size_,
-                                       stream_, "v_proj", active_policy) ||
-                                   TryQ8_1Gemv<T>(v_raw, d_norm_out_, d_v_new_,
-                                                  d_act_q8_1_, B,
-                                                  num_kv_heads_ * head_dim_,
-                                                  hidden_size_, stream_,
-                                                  "v_proj", active_policy);
+                            return try_quantized_projection(
+                                v_raw, d_norm_out_, d_v_new_,
+                                num_kv_heads_ * head_dim_, hidden_size_,
+                                "v_proj");
                           },
                           [&]() {
-                            if (capturing && !cublas_capture_ok) {
-                              capture_abort = true;
-                              return false;
-                            }
-                            const T *v_proj = reinterpret_cast<const T *>(
-                                weights_->LayerVProj(layer));
-                            gemm_->GemmTyped<T>(B, num_kv_heads_ * head_dim_,
-                                                hidden_size_, d_norm_out_,
-                                                v_proj, d_v_new_);
-                            return true;
+                            return run_dense_projection(
+                                weights_->LayerVProj(layer), d_norm_out_,
+                                d_v_new_, B, num_kv_heads_ * head_dim_,
+                                hidden_size_);
                           })) {
                     return false;
                   }
