@@ -128,6 +128,34 @@ moment decode begins rather than at cohort rebuild; expect small gains
 5. **Re-run the two-stage benchmark after each landing** (2x runs, per the
    variance protocol) and update `docs/benchmarks.md`.
 
+## 4b) Width-tail quantification (Sep 6, definitive): the last big lever
+
+With the phase-timing width logging fixed (`BatchForwardDevice` had
+hardcoded `tokens=1` in its report -- every device-path decode forward
+logged width=1, poisoning earlier width analyses), a 2x32-request c=16
+capture gives the definitive decode-width distribution over 703 sampled
+forwards:
+
+- **width=1: 266 forwards (38%)** -- solo decode during wave tails
+- width=2-14: ~227 (32%) -- EOS-staggered drain/refill transitions
+- width=15-21: 185 (26%) -- full cohorts (20-21 = mixed decode+prefill)
+- Mean width 7.7; prefill compute is only ~1% of logged time (prefill
+  is NOT the stall); mixed decode+prefill batches already occur (9%).
+
+Mechanism: with EOS enabled, sequences finish at varied lengths (7-64
+tokens), so each client wave's cohort drains over a long tail where the
+last survivors decode solo -- and newly admitted requests wait behind a
+prefill/refill boundary instead of joining the running cohort. Decode
+is memory-bound: a width-1 step costs nearly as much GPU time as a
+width-16 step, so every solo step is ~15 tokens of foregone throughput.
+
+**Next scheduler lever (moderate effort, +25-40% potential at c=16):**
+admit/overlap waiting prefills during tail stretches -- e.g., proactively
+prefill newly arrived requests into the running cohort (mixed batches)
+instead of at cohort-rebuild boundaries, and cap solo-cohort drain by
+refilling from pending_decode_ mid-tick. Measurable target: width=1
+fraction from 38% to <10% on the same load.
+
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled
