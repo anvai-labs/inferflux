@@ -45,6 +45,20 @@ inline std::size_t EstimateKvCacheBytes(int max_batch, int max_seq,
   return total;
 }
 
+// Activation-scratch geometry for the native forward pass. Scratch is
+// addressed by token row, so its row count must cover the largest single
+// backend call: a prefill chunk (bounded by the scheduler's chunked-prefill
+// cap) or a full decode batch (one row per sequence). Sizing to max_seq_len
+// reserved ~4x the working set for a 3B model; the seq cap keeps the
+// formula safe when callers request larger chunks than the KV window.
+inline int ComputeScratchRows(int max_seq_len, int max_batch,
+                              int prefill_chunk_cap) {
+  const int seq = std::max(0, max_seq_len);
+  const int batch = std::max(1, max_batch);
+  const int chunk = std::min(std::max(1, prefill_chunk_cap), seq);
+  return std::max(chunk, batch);
+}
+
 struct KvCachePlanInput {
   int requested_max_batch{32};
   int requested_max_seq{4096};

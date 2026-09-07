@@ -159,6 +159,9 @@ public:
   virtual void SetStream(cudaStream_t /*stream*/) {}
 
   virtual void SetExecutionPolicy(const NativeExecutionPolicy & /*policy*/) {}
+  // Widest single-call prefill chunk the host will issue; scratch sizing
+  // input. No-op by default for forwards without row-scaled scratch.
+  virtual void SetPrefillChunkTokens(int /*tokens*/) {}
 
   /**
    * Return the vocab size for offset calculations in batched forward.

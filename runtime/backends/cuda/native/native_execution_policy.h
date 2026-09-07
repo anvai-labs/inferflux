@@ -101,6 +101,9 @@ struct NativeExecutionPolicy {
   bool enable_fused_bias_add{true};
   bool enable_gemv_accumulate{true};
   bool enable_batch_dequant_cache{false};
+  // Size forward scratch for the full context window instead of the prefill
+  // chunk cap (historical behavior; costs ~4x scratch for a 3B model).
+  bool full_seq_scratch{false};
 
   // Fused kernel redesign flags (P1+P2 validated: parity-exact, zero
   // regression)
@@ -227,6 +230,8 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_ENABLE_GEMV_ACCUMULATE", true);
     policy.enable_batch_dequant_cache =
         ParseBoolEnv("INFERFLUX_BATCH_DEQUANT_CACHE", false);
+    policy.full_seq_scratch =
+        ParseBoolEnv("INFERFLUX_CUDA_FULL_SEQ_SCRATCH", false);
     policy.enable_fused_rope_kv_append =
         ParseBoolEnv("INFERFLUX_ENABLE_FUSED_ROPE_KV_APPEND", true);
     policy.enable_fused_gemv_norm_quant_epilogue =

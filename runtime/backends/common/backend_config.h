@@ -40,6 +40,11 @@ struct LlamaBackendConfig {
   bool inferflux_cuda_require_fused_quantized_matmul{false};
   std::string
       mmproj_path; // Path to multimodal projector; empty = vision disabled.
+  // Widest single prefill call the scheduler will issue (tokens). Mirrors
+  // the scheduler's chunked_prefill_tokens so the native forward can size
+  // activation scratch to the actual working set instead of the context
+  // window.
+  int32_t prefill_chunk_tokens{512};
   // Maximum number of KV-cache sequences that can be live simultaneously.
   // Increased from 16 to 128 for production concurrent workloads.
   // Managed by SequenceSlotManager for timeout-based eviction.

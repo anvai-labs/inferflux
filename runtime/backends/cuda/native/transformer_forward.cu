@@ -1153,7 +1153,8 @@ struct ProjectionCtx {
   cudaStream_t stream{nullptr};
   const NativeExecutionPolicy *policy{nullptr};
   CublasGemm *gemm{nullptr};
-  int mma_max_batch{-1}; // -1: MMA tier self-gates (decode); prefill passes the policy cap
+  int mma_max_batch{
+      -1}; // -1: MMA tier self-gates (decode); prefill passes the policy cap
 };
 
 template <typename T>
@@ -1193,9 +1194,16 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   cudaError_t err;
 
   // Scratch buffers must fit both:
-  //   - Single long sequence: max_seq_len_ tokens (prefill)
+  //   - A single prefill chunk: the host never issues a call wider than
+  //     prefill_chunk_tokens_ (scheduler chunked-prefill cap)
   //   - Batched decode: max_batch_size_ sequences x 1 token each
-  size_t rows = static_cast<size_t>(std::max(max_seq_len_, max_batch_size_));
+  // Sizing to the full max_seq_len_ (INFERFLUX_CUDA_FULL_SEQ_SCRATCH=1)
+  // reserves ~4x the working set for a 3B model.
+  scratch_rows_ = runtime::cuda::native::ComputeScratchRows(
+      max_seq_len_, max_batch_size_,
+      execution_policy_.full_seq_scratch ? max_seq_len_
+                                         : prefill_chunk_tokens_);
+  size_t rows = static_cast<size_t>(scratch_rows_);
 
   // Always-live buffers (cannot alias).
   if (!alloc(&d_hidden_, rows * hidden_size_))
@@ -1600,6 +1608,15 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                     std::to_string(max_seq_len_));
     return false;
   }
+  if (scratch_rows_ != 0 && seq_len > scratch_rows_) {
+    log::Error("llama_forward",
+               "seq_len " + std::to_string(seq_len) + " exceeds scratch rows " +
+                   std::to_string(scratch_rows_) + " (prefill chunk cap " +
+                   std::to_string(prefill_chunk_tokens_) +
+                   "); raise chunked_prefill_tokens or set "
+                   "INFERFLUX_CUDA_FULL_SEQ_SCRATCH=1");
+    return false;
+  }
   const bool allow_fused_quantized_matmul =
       !weights_ || weights_->AllowFusedQuantizedMatmul();
   ScopedFusedMatmulPolicy fused_policy(allow_fused_quantized_matmul);
@@ -1792,11 +1809,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                               num_heads_ * head_dim_, hidden_size_, "q_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerQProj(layer),
-                                                  d_norm_out_, d_q_, seq_len,
-                                                  num_heads_ * head_dim_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerQProj(layer),
+                                  d_norm_out_, d_q_, seq_len,
+                                  num_heads_ * head_dim_, hidden_size_)) {
                             log::Error("llama_forward", "Q projection failed");
                             return false;
                           }
@@ -1822,14 +1838,14 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                         [&]() {
                           return TryQuantizedProjection(
                               pctx, k_raw, d_norm_out_, d_k_new_, seq_len,
-                              num_kv_heads_ * head_dim_, hidden_size_, "k_proj");
+                              num_kv_heads_ * head_dim_, hidden_size_,
+                              "k_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerKProj(layer),
-                                                  d_norm_out_, d_k_new_, seq_len,
-                                                  num_kv_heads_ * head_dim_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerKProj(layer),
+                                  d_norm_out_, d_k_new_, seq_len,
+                                  num_kv_heads_ * head_dim_, hidden_size_)) {
                             log::Error("llama_forward", "K projection failed");
                             return false;
                           }
@@ -1855,14 +1871,14 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                         [&]() {
                           return TryQuantizedProjection(
                               pctx, v_raw, d_norm_out_, d_v_new_, seq_len,
-                              num_kv_heads_ * head_dim_, hidden_size_, "v_proj");
+                              num_kv_heads_ * head_dim_, hidden_size_,
+                              "v_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerVProj(layer),
-                                                  d_norm_out_, d_v_new_, seq_len,
-                                                  num_kv_heads_ * head_dim_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerVProj(layer),
+                                  d_norm_out_, d_v_new_, seq_len,
+                                  num_kv_heads_ * head_dim_, hidden_size_)) {
                             log::Error("llama_forward", "V projection failed");
                             return false;
                           }
@@ -2221,11 +2237,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                               intermediate_size_, hidden_size_, "gate_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerGateProj(layer),
-                                                  d_norm_out_, d_ffn_gate_,
-                                                  seq_len, intermediate_size_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerGateProj(layer),
+                                  d_norm_out_, d_ffn_gate_, seq_len,
+                                  intermediate_size_, hidden_size_)) {
                             log::Error("llama_forward",
                                        "Gate projection failed");
                             return false;
@@ -2254,11 +2269,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                               intermediate_size_, hidden_size_, "up_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerUpProj(layer),
-                                                  d_norm_out_, d_ffn_up_,
-                                                  seq_len, intermediate_size_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerUpProj(layer),
+                                  d_norm_out_, d_ffn_up_, seq_len,
+                                  intermediate_size_, hidden_size_)) {
                             log::Error("llama_forward", "Up projection failed");
                             return false;
                           }
@@ -2983,8 +2997,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
   // Dense (bf16/fp16 weight) fallback: capture-guarded cuBLAS. During graph
   // capture without a pinned-workspace guarantee the stage aborts capture
   // instead of running an uncapturable allocation.
-  auto run_dense_projection = [&](const void *weight, const T *input,
-                                  T *output, int M, int N, int K) {
+  auto run_dense_projection = [&](const void *weight, const T *input, T *output,
+                                  int M, int N, int K) {
     if (capturing && !cublas_capture_ok) {
       capture_abort = true;
       return false;
@@ -3111,13 +3125,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                           },
                           [&]() {
                             return try_quantized_projection(
-                                q_raw, d_norm_out_, d_q_, num_heads_ * head_dim_,
-                                hidden_size_, "q_proj");
+                                q_raw, d_norm_out_, d_q_,
+                                num_heads_ * head_dim_, hidden_size_, "q_proj");
                           },
                           [&]() {
                             return run_dense_projection(
-                                weights_->LayerQProj(layer), d_norm_out_,
-                                d_q_, B, num_heads_ * head_dim_, hidden_size_);
+                                weights_->LayerQProj(layer), d_norm_out_, d_q_,
+                                B, num_heads_ * head_dim_, hidden_size_);
                           })) {
                     return false;
                   }
@@ -3648,7 +3662,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             [&]() {
                               return try_quantized_projection(
                                   gate_raw, d_norm_out_, d_ffn_gate_,
-                                  intermediate_size_, hidden_size_, "gate_proj");
+                                  intermediate_size_, hidden_size_,
+                                  "gate_proj");
                             },
                             [&]() {
                               return run_dense_projection(

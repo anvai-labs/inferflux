@@ -248,7 +248,8 @@ struct PrefillStepState {
 bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
                               const InferenceRequest &inference,
                               const PrefillStepState &state,
-                              PrefillResult *result) {
+                              PrefillResult *result,
+                              int chunk_token_cap = 2048) {
   const int sequence_id = state.sequence_id;
   const int n_past_start = state.n_past_start;
   if (!backend || !result || sequence_id < 0) {
@@ -271,7 +272,9 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
     backend->FreeSequence(sequence_id);
   }
 
-  const int token_cap = std::max(1, backend->UnifiedBatchTokenCapacity());
+  const int token_cap =
+      std::min(std::max(1, backend->UnifiedBatchTokenCapacity()),
+               std::max(1, chunk_token_cap));
   int chunk_start = bounded_start;
   UnifiedBatchOutput final_output{};
   while (chunk_start < static_cast<int>(prompt_tokens.size())) {
@@ -2134,7 +2137,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
 
             bool prefill_ok = ExecutePhasedPrefillStep(
                 pending->resolved_backend.get(), inf,
-                {seq_id, prefill_start, seq_generation}, &pr);
+                {seq_id, prefill_start, seq_generation}, &pr,
+                /*chunk_token_cap=*/config_.chunked_prefill_tokens);
             if (!prefill_ok) {
               if (copied_prefix) {
                 pr = pending->resolved_backend->PrefillPartial(

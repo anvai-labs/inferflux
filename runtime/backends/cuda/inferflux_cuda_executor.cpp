@@ -1381,6 +1381,8 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
   lane_policy.disable_cuda_graph = true;
   decode_lane_forward_->SetExecutionPolicy(lane_policy);
   prefill_lane_forward_->SetExecutionPolicy(lane_policy);
+  decode_lane_forward_->SetPrefillChunkTokens(config.prefill_chunk_tokens);
+  prefill_lane_forward_->SetPrefillChunkTokens(config.prefill_chunk_tokens);
 
   if (is_gguf_path) {
     decode_lane_quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
@@ -1866,6 +1868,8 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
       return false;
     }
     model_forward_->SetExecutionPolicy(execution_policy_);
+    model_forward_->SetPrefillChunkTokens(
+        static_cast<int>(config.prefill_chunk_tokens));
     auto gguf_config = ConvertModelInfo(model_info_);
     if (!model_forward_->Initialize(gguf_config, *quantized_weight_adapter_,
                                     kv_cache_.get(), gemm_.get(),
@@ -1892,6 +1896,8 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
       return false;
     }
     model_forward_->SetExecutionPolicy(execution_policy_);
+    model_forward_->SetPrefillChunkTokens(
+        static_cast<int>(config.prefill_chunk_tokens));
     if (!model_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
                                     gemm_.get(), compute_stream_)) {
       log::Error("inferflux_cuda_executor",
