@@ -184,6 +184,43 @@ single fix covers both model formats. First step of that session: log
 the decode group size at burst invocation and the capacity, under INFO,
 in one instrumented run.
 
+## 4c) Structural consolidation Stage 3 design (ready to execute)
+
+Stage 1 (PR #97) and Stage 2 (PR #98) migrated the BatchForwardDevice
+Q/K/V + gate/up sites to shared local helpers. Stage 3 migrates the
+remaining ~10 sites in Forward() and BatchForward's prefill path. The
+site shapes differ from BatchForwardDevice's in three ways the shared
+helpers must absorb:
+
+1. **MMA prefill cap**: Forward()'s cascade passes an extra
+   `execution_policy.mmq_mma_max_prefill_batch` argument to
+   TryQ8_1MmaGemv (decode path omits it). Helper signature needs an
+   `allow_mma_prefill_batch` / cap parameter, true on decode, capped on
+   prefill.
+2. **Per-projection error logging**: Forward()'s dense fallback logs
+   per projection ("Q projection failed") and returns false via the
+   surrounding error handling; BatchForwardDevice's is silent. Helper
+   takes the projection name (already a parameter) and an
+   error_label/log flag.
+3. **Capture guards**: Forward() never captures (no guard); the device
+   path guards every dense fallback. Guard stays at the call site —
+   the shared dense helper is guard-free and the device path wraps it.
+
+Helper signatures (member functions of LlamaForwardTyped<T>, defined in
+transformer_forward.cu):
+
+    bool TryQuantizedProjection(const QuantizedWeightInfo &raw,
+        const T *input, T *output, int M, int N, int K, const char *name,
+        int mma_max_batch /* pass execution_policy value or INT_MAX */);
+    bool RunDenseProjection(const void *weight, const T *input,
+        T *output, int M, int N, int K);  // guard-free; callers wrap
+
+Site inventory: Forward() Q/K/V (~1735-1870), o/gate/up/down/lm_head
+(~2050-2560); BatchForward prefill Q/K/V (~2194-2260) + FFN/lm_head;
+BatchForwardDevice o/down/lm_head stay explicit (genuine branching).
+Parity gates per stage: safetensors + GGUF determinism vs pre-change,
+isolation probe count, first-token probe.
+
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled
