@@ -275,6 +275,9 @@ private:
   // Model loading
   std::unique_ptr<SafetensorsLoader> loader_;
   std::unique_ptr<runtime::cuda::native::IModelLoader> model_loader_;
+  // Widest prefill call (tokens) from LlamaBackendConfig::prefill_chunk_tokens;
+  // forwarded to every forward replica for scratch sizing.
+  int prefill_chunk_tokens_{512};
   runtime::cuda::native::ModelInfo model_info_;
   std::filesystem::path loaded_model_path_;
   bool model_loaded_{false};

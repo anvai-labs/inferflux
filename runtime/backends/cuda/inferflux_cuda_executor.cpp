@@ -1381,8 +1381,8 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
   lane_policy.disable_cuda_graph = true;
   decode_lane_forward_->SetExecutionPolicy(lane_policy);
   prefill_lane_forward_->SetExecutionPolicy(lane_policy);
-  decode_lane_forward_->SetPrefillChunkTokens(config.prefill_chunk_tokens);
-  prefill_lane_forward_->SetPrefillChunkTokens(config.prefill_chunk_tokens);
+  decode_lane_forward_->SetPrefillChunkTokens(prefill_chunk_tokens_);
+  prefill_lane_forward_->SetPrefillChunkTokens(prefill_chunk_tokens_);
 
   if (is_gguf_path) {
     decode_lane_quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
@@ -1868,8 +1868,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
       return false;
     }
     model_forward_->SetExecutionPolicy(execution_policy_);
-    model_forward_->SetPrefillChunkTokens(
-        static_cast<int>(config.prefill_chunk_tokens));
+    model_forward_->SetPrefillChunkTokens(prefill_chunk_tokens_);
     auto gguf_config = ConvertModelInfo(model_info_);
     if (!model_forward_->Initialize(gguf_config, *quantized_weight_adapter_,
                                     kv_cache_.get(), gemm_.get(),
@@ -1896,8 +1895,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
       return false;
     }
     model_forward_->SetExecutionPolicy(execution_policy_);
-    model_forward_->SetPrefillChunkTokens(
-        static_cast<int>(config.prefill_chunk_tokens));
+    model_forward_->SetPrefillChunkTokens(prefill_chunk_tokens_);
     if (!model_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
                                     gemm_.get(), compute_stream_)) {
       log::Error("inferflux_cuda_executor",
@@ -2049,6 +2047,7 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
   log::Info("inferflux_cuda_executor",
             "Loading InferFlux CUDA model from: " + model_path.string());
   loaded_model_path_ = model_path;
+  prefill_chunk_tokens_ = static_cast<int>(config.prefill_chunk_tokens);
   memory_ledger_.Clear();
   active_max_batch_ = 0;
   active_max_seq_ = 0;

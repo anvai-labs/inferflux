@@ -8,6 +8,7 @@
 #include "runtime/backends/cuda/native/kernels/fused_gemv_accum_norm_quant.cuh"
 #include "runtime/backends/cuda/native/kernels/fused_rope_kv_append.cuh"
 #include "runtime/backends/cuda/native/kernels/mmq_mma.cuh"
+#include "runtime/backends/cuda/native/kv_cache_planner.h"
 #include "runtime/backends/cuda/native/llama_forward.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/native_dispatch_policy.h"
