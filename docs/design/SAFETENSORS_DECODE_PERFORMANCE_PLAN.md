@@ -375,6 +375,40 @@ writes whenever >16 sequences are resident), and native-CUDA embeddings
 (NativeEmbed, ephemeral seq ids >=900000) appends KV far out of bounds on
 every call.
 
+### 4e-results: post-fix measurement (Sep 7, all three merged)
+
+With #108 (KV admission guards + batch-aware planner), #109 (shared MMQ
+layout cache), and #110 (scratch right-sizing + direct-Generate chunking)
+merged, the same nsys `--cuda-memory-usage=true` capture on the same GGUF
+config + c=16 load measures:
+
+- **Netted steady-state live: 6,391 -> 4,762 MB (-1,629 MB)**. Books close
+  within rounding (~6 MB residual): -1,122 MB (three MMQ layout passes ->
+  one) and -501 MB measured (scratch rows 2048 -> 512 across three
+  replicas; the §4e estimate was ~460). Mid-serving ledger: weights
+  domain 2,660 MB = 2,099 weight buffer + one 561 MB shared layout pass
+  (`weights.mmq_layouts` item); three blocks >= 50 MB account for 3,929 MB
+  (weights, KV, retained token_embd dequant).
+- **Throughput: 422 and 456 tok/s at c=16** (two runs) vs 384 pre-series
+  baseline — no regression, possibly scratch-locality improvement (harness
+  variance ~30%; treat as parity-or-better).
+- Greedy determinism clean (1 distinct output of 8 concurrent identical
+  prompts), long-prompt (954/999-token) prefills through both unified and
+  direct paths coherent, zero guard violations, zero CUDA errors.
+- GGUF nvidia-smi-equivalent peak is now dominated by the load-time
+  transient churn (~600 MB dequant + lane warm) on top of a ~4.8 GB
+  steady state; the remaining gap to llama.cpp's 4,142 MB is dominated by
+  the 1,208 MB worst-case KV reserve plus the retained token_embd dequant
+  (a qualitative comparison — llama.cpp's footprint also includes its own
+  demand-grown KV, so the two peaks are not an additive decomposition).
+
+En-route fixes that the series carries: the KV seq-id OOB (unguarded
+device writes whenever >16 sequences were resident — now admission-bounded
+and backstopped), native-CUDA embeddings writing K/V out of bounds on
+every call (fail-closed; proper KV-free path in #111), the direct
+Generate path issuing whole-prompt single calls (now chunked), and the
+phased-prefill path bypassing chunked_prefill_tokens.
+
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled

@@ -31,7 +31,7 @@ Open: width-1 decode tail during closed-loop EOS stagger (workload-
 | Vision and product coherence | A- | Server-first, dual-CUDA strategy; native path now leads llama.cpp at high concurrency on full precision (c=16: 1.56x, 2 runs) |
 | Capabilities | A- | Streaming, embeddings, logprobs, chat templates shared across formats, decode CUDA graphs + relay with kill switches, GGUF metadata API |
 | Scalability and economy | B+ | Safetensors 3.16x scaling (c=1→c=16, 2-run avg); decode graphs remove launch storms; memory footprint ~2.3x less than vLLM's pre-allocation |
-| Resource efficiency | B | Scratch aliasing, FlashDecode splits, KV budget tuning. GGUF overhead +2.9-3.6 GB vs llama.cpp (Sep measurement range; up from +1.3 GB Apr reading — not yet re-explained) |
+| Resource efficiency | A- | Memory-overhead campaign (Sep): GGUF overhead root-caused and fixed (-1.6 GB measured, #108/#109/#110); scratch aliasing, FlashDecode splits, KV budget tuning; known residuals tracked (#111-#113) |
 | Design and implementation | A- | ProjectionCtx single-sources the projection dispatch chain for both model formats; falsification-driven perf campaign; 525 CPU tests |
 | TDD and CI maturity | B+ | 525 CPU tests (2833 assertions), parity gates per refactor stage, isolation probe, engagement counters for perf changes |
 | OSS release readiness | B+ | Canonical docs current (check_docs_contract enforced), 4-backend + vLLM/SGLang benchmark coverage, kill switches documented |
@@ -88,7 +88,7 @@ build (CUDA graphs, relay, cublasLt now apply to it as well).
 | ~~P1~~ | ~~Decode relay fingerprint provably inert~~ | **FIXED (Sep)** | Contract matched to DeviceTokenRelayKernel; engagement counter `inferflux_scheduler_decode_relay_replays_total`; kill switch `INFERFLUX_DISABLE_DECODE_RELAY` |
 | ~~P2~~ | ~~Decode CUDA graphs on safetensors path~~ | **DONE (Sep)** | Per-width LRU graph set (+17%); kill switch `INFERFLUX_DISABLE_CUDA_GRAPH` |
 | P1 | GGUF multi-variant decode numerics | Documented, benign | Concurrent GGUF loads produce 2-3 coherent output variants (decode-composition-dependent kernel selection). Present with relay/graphs on and off. Investigate only on user report |
-| P1 | GGUF overhead +2.9-3.6 GB vs llama.cpp | Open | Grew from the +1.3 GB Apr reading; not re-explained. KV pre-allocation + workspace structural |
+| ~~P1~~ | ~~GGUF overhead +2.9-3.6 GB vs llama.cpp~~ | **FIXED (Sep)** | Root-caused via nsys memory trace (#107 §4e): 3x per-replica MMQ layout copies + full-window scratch + unguarded KV. #108/#109/#110 land shared layouts, demand-sized scratch, and admission bounds: netted steady 6,391 -> 4,762 MB (-1.6 GB), throughput parity-or-better (422-456 tok/s c=16). Residual vs llama.cpp = worst-case KV reserve |
 | P1 | Native structured output | Not started | Grammar-constrained generation still delegates to the llama.cpp parity backend |
 | P1 | Speculative decoding integration | Partial | Draft+validate wired; not production-validated on either format |
 | P2 | Distributed sequence ownership cleanup | In progress | KV channel + SHM transport production-tested; cleanup hardening remains |
@@ -120,7 +120,7 @@ must be proven via counters or kernel traces, not inferred.
 |---|---|---|
 | 1 | Width-tail refill policy (admit waiting prefills into running cohorts during EOS-staggered tails) | Last moderate lever: +25-40% at c=16 if width-1 fraction drops below 10% — mechanism identified, falsification record shows naive caps fail; needs cohort-refill design |
 | 2 | Re-measure GGUF path on the current build | The Apr GGUF snapshot predates CUDA graphs, relay, cublasLt — all now apply to GGUF too |
-| 3 | GGUF memory-overhead investigation | +2.9-3.6 GB vs llama.cpp unexplained since the Aug reading |
+| ~~3~~ | ~~GGUF memory-overhead investigation~~ | **DONE** — root cause + fixes landed (#107/#108/#109/#110); follow-ups #111-#113 |
 | 4 | Heavyweight kernel path (TMA/wgmma) | Only with a concrete customer case; quick-win class falsified |
 | 5 | Differentiation features | Memory footprint, quantized serving, single binary — the measured strengths |
 
