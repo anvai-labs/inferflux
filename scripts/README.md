@@ -55,6 +55,7 @@ External engine notes:
 - `vllm` and `sglang` are treated as OpenAI-compatible HTTP backends in the multi-backend benchmark.
 - They can either be pre-started externally or auto-launched locally by the harness.
 - Set `AUTOSTART_VLLM=true` and/or `AUTOSTART_SGLANG=true` to have the benchmark launch and tear them down one at a time.
+- When the ROCm toolchain is installed system-wide (e.g. `/usr/bin/hipcc`), SGLang's kernel JIT misdetects HIP and fails to build. Export `TVM_FFI_GPU_BACKEND=cuda` for the benchmark (or globally) to force the CUDA toolchain.
 - Use `VLLM_MODEL` / `SGLANG_MODEL` to override auto-discovery from `/v1/models`.
 - Use `VLLM_MODEL_PATH` / `SGLANG_MODEL_PATH` to point local autostart at a safetensors model directory.
 - Use `SGLANG_PYTHON` if you need to override the default `./.venv-sglang/bin/python -m sglang.launch_server` entrypoint.
