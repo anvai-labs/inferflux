@@ -303,9 +303,6 @@ std::string ResolveGgufArtifactPath(const std::string &path) {
   namespace fs = std::filesystem;
   std::error_code ec;
   const fs::path fs_path(path);
-  if (ec) {
-    return "";
-  }
   if (fs::is_regular_file(fs_path, ec)) {
     if (ToLower(fs_path.extension().string()) == ".gguf") {
       return path;

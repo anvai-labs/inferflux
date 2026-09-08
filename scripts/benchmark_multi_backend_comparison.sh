@@ -295,16 +295,28 @@ print("unknown")
 PYEOF
 }
 
-# Largest *.gguf next to (or inside) the model path — the artifact the
-# server's GGUF-sidecar fallback would load for llama.cpp-style backends.
+# GGUF sidecar artifact for llama.cpp-style backends on non-GGUF models.
+# Lookup order: $LLAMA_SIDECAR_PATH (explicit override), a sidecar/
+# subdirectory of the model dir (kept out of the top level so model-format
+# auto-detection still sees the safetensors layout), then the top level.
+# Case-insensitive to match the server's resolver.
 find_llama_sidecar_gguf() {
     local model_path=$1
     local dir="$model_path"
     if [ -f "$model_path" ]; then
         dir=$(dirname "$model_path")
     fi
-    find "$dir" -maxdepth 1 -name '*.gguf' -print0 2>/dev/null |
-        xargs -0 -r ls -S 2>/dev/null | head -1
+    local -a candidates=()
+    [ -n "${LLAMA_SIDECAR_PATH:-}" ] && candidates+=("$LLAMA_SIDECAR_PATH")
+    candidates+=("$dir/sidecar" "$dir")
+    local c
+    for c in "${candidates[@]}"; do
+        local hit
+        hit=$(find "$c" -maxdepth 1 -iname '*.gguf' -type f -print0 2>/dev/null |
+            xargs -0 -r ls -S 2>/dev/null | head -1)
+        [ -n "$hit" ] && { echo "$hit"; return 0; }
+    done
+    return 0
 }
 
 backend_supports_model_format() {
@@ -657,8 +669,8 @@ server:
 
 models:
   - id: bench-model
-    path: "$(realpath "$MODEL_PATH")"
-    format: $MODEL_FORMAT
+    path: "$(realpath "${BACKEND_MODEL_PATH[$backend]:-$MODEL_PATH}")"
+    format: ${BACKEND_MODEL_FORMAT[$backend]:-$MODEL_FORMAT}
     backend: $backend
     default: true
 
@@ -1724,6 +1736,9 @@ main() {
     declare -A BACKEND_KIND
     declare -A BACKEND_AVAILABLE
     declare -A BACKEND_FORMAT_COMPATIBLE
+    declare -A BACKEND_MODEL_PATH
+    declare -A BACKEND_MODEL_FORMAT
+    declare -A BACKEND_SIDECAR_NOTE
     local requested_backends=("${ALL_BACKENDS[@]}")
     if [ -n "$INFERFLUX_BENCH_SINGLE_BACKEND" ]; then
         requested_backends=("$INFERFLUX_BENCH_SINGLE_BACKEND")
@@ -1746,6 +1761,12 @@ main() {
     BACKEND_PORTS[vllm]="$VLLM_HOST"
     BACKEND_KIND[vllm]=vllm
 
+    # Per-backend model override: llama backends on non-GGUF models are
+    # benchmarked against their GGUF sidecar artifact, not the raw model.
+    BACKEND_MODEL_PATH[llama_cpp_cuda]="$MODEL_PATH"
+    BACKEND_MODEL_FORMAT[llama_cpp_cuda]="$MODEL_FORMAT"
+    BACKEND_SIDECAR_NOTE[llama_cpp_cuda]=""
+
     BACKEND_PORTS[sglang]="$SGLANG_HOST"
     BACKEND_KIND[sglang]=sglang
 
@@ -1754,18 +1775,22 @@ main() {
         if backend_supports_model_format "$backend" "$MODEL_FORMAT"; then
             BACKEND_FORMAT_COMPATIBLE[$backend]=true
         elif [[ "$backend" == llama_cpp_* && "$MODEL_FORMAT" == "safetensors" ]]; then
-            # llama.cpp cannot ingest safetensors directly; the server's
-            # router falls back to a GGUF sidecar in the model directory.
-            # Benchmark that path when a sidecar artifact exists.
+            # llama.cpp cannot ingest safetensors directly. Benchmark its
+            # GGUF-sidecar path when an artifact exists: point this backend's
+            # server config at the sidecar file with format gguf (the router
+            # also resolves sidecars for directory inputs on its own).
             local sidecar
             sidecar=$(find_llama_sidecar_gguf "$MODEL_PATH")
             if [ -n "$sidecar" ]; then
                 BACKEND_FORMAT_COMPATIBLE[$backend]=true
+                BACKEND_MODEL_PATH[$backend]=$sidecar
+                BACKEND_MODEL_FORMAT[$backend]="gguf"
+                BACKEND_SIDECAR_NOTE[$backend]="(f16 GGUF sidecar: $(basename "$sidecar"))"
                 log_warn "$backend will serve safetensors via GGUF sidecar: $(basename "$sidecar")"
             else
                 BACKEND_FORMAT_COMPATIBLE[$backend]=false
                 BACKEND_AVAILABLE[$backend]=false
-                log_warn "Skipping $backend benchmark (safetensors model has no GGUF sidecar in $MODEL_PATH)"
+                log_warn "Skipping $backend benchmark (safetensors model has no GGUF sidecar; place one in $MODEL_PATH/sidecar or set LLAMA_SIDECAR_PATH)"
             fi
         else
             BACKEND_FORMAT_COMPATIBLE[$backend]=false

@@ -335,8 +335,8 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
     }
 
     // Auto-detection can resolve a mixed directory (safetensors + GGUF
-    // sidecar, or multiple GGUF shards) to format "gguf" while the path
-    // still points at the directory. Single-file loaders need the artifact.
+    // sidecar) to format "gguf" while the path still points at the
+    // directory. Single-file loaders need the artifact.
     for (auto &attempt : load_attempts) {
       if (attempt.format == "gguf") {
         auto artifact = ResolveGgufArtifactPath(attempt.path);
