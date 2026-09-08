@@ -130,6 +130,7 @@ must be proven via counters or kernel traces, not inferred.
 
 | # | Work item | Impact |
 |---|---|---|
+| 0 | Close the stock `llama-server` gap at c>=8 (+26-31% over `inferflux_cuda` on the burst battery, same 3.0 GB — see positioning §0b) | New top target: the campaign's llama.cpp rows measure the wrapper; stock llama-server with deliberate slot/context sizing is the honest throughput ceiling to chase |
 | 1 | Width-tail refill policy (admit waiting prefills into running cohorts during EOS-staggered tails) | Last moderate lever: +25-40% at c=16 if width-1 fraction drops below 10% — mechanism identified, falsification record shows naive caps fail; needs cohort-refill design |
 | 2 | Re-measure GGUF path on the current build | The Apr GGUF snapshot predates CUDA graphs, relay, cublasLt — all now apply to GGUF too |
 | ~~3~~ | ~~GGUF memory-overhead investigation~~ | **DONE** — root cause + fixes landed (#107/#108/#109/#110); follow-ups #111-#113 |

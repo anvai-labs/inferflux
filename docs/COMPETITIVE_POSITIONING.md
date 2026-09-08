@@ -42,6 +42,37 @@ Note: the AMD R9700 dropped out of WSL passthrough mid-session (`/dev/kfd`
 absent); ROCm cells retain the Sep 7 morning spot measurements and should be
 re-run when the host restores the device.
 
+### 0b) Stock llama.cpp server — the missing baseline (Sep 8)
+
+The campaign rows for "llama.cpp" measure InferFlux's **wrapper**
+(`llama_cpp_cuda`: InferFlux scheduler -> llama.cpp library), not the stock
+`llama-server` that ships with llama.cpp and carries its own continuous
+batching. Benchmarked separately (same model, same concurrent battery, 2-run
+averages, 256-token completions; built from the pinned submodule with CUDA;
+`-ngl 99 -c 4096 -np 16 -fa on` — the insights-applied configuration):
+
+| Backend | c=1 | c=8 | c=16 | GPU peak |
+|---|---|---|---|---|
+| `inferflux_cuda` | 95.8 | 310.1 | 506.6 | 5.4 GB |
+| wrapper `llama_cpp_cuda` (seqs=16, post-#117) | 104.7 | 311.7 | 590.8 | 3.0 GB |
+| stock `llama-server` (16 slots) | 104.4 | **390.1** | **664.4** | **3.0 GB** |
+
+- **Stock llama-server leads this burst workload at c>=8**: +26-31% over
+  `inferflux_cuda` and +12% over the tuned wrapper at c=16, at the same
+  3.0 GB as the tuned wrapper. The campaign's "1.44x over llama.cpp at
+  c=16" claim holds only against the wrapper (and on the campaign's
+  32x64-token workload); against stock llama-server on this battery,
+  `inferflux_cuda` trails at c>=8.
+- Output inspection: stock-server responses are coherent and correct; its
+  greedy outputs vary more across slots (batch-composition numerics, same
+  phenomenon both engines show).
+- The two llama.cpp deployments serve different purposes: the wrapper
+  exists for InferFlux's scheduler/auth/policy surface, stock llama-server
+  for raw throughput. Closing the stock-server gap at c>=8 is the new
+  performance target; the campaign's workload (many short completions)
+  vs this battery (few 256-token completions) rank the engines
+  differently, so both measurements are kept side by side.
+
 ## 1) Current Position
 
 Throughput, tok/s, 2-run average (RTX 4000 Ada, Qwen2.5-3B; multi-backend
