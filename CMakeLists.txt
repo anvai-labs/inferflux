@@ -602,6 +602,10 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   add_executable(benchmark_downproj_q81 tests/unit/benchmark_downproj_q81.cu)
   add_executable(benchmark_gate_up_kernels tests/unit/benchmark_gate_up_kernels.cu)
   add_executable(benchmark_q6k_kernels tests/unit/benchmark_q6k_kernels.cu)
+  add_executable(benchmark_q4k_mmq_rig tests/unit/benchmark_q4k_mmq_rig.cu)
+  target_include_directories(benchmark_q4k_mmq_rig PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(benchmark_q4k_mmq_rig PRIVATE inferflux_core inferflux_cuda_kernels)
   target_include_directories(benchmark_q6k_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_include_directories(benchmark_downproj_q81 PRIVATE
