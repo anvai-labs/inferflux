@@ -1,7 +1,9 @@
 #include "runtime/backends/llama/llama_cpp_backend.h"
+
 #include "runtime/backends/backend_utils.h"
 #include "runtime/execution/parallel_context.h"
 #include "server/logging/logger.h"
+#include <cctype>
 
 #include <llama.h>
 
@@ -77,6 +79,29 @@ int EffectiveBatchTokenCap(const llama_context *ctx, int config_batch_size) {
 } // namespace
 
 namespace inferflux {
+namespace {
+
+// Map a KV cache type name to its ggml element type for llama.cpp contexts.
+ggml_type KvCacheGgmlType(const std::string &name) {
+  const std::string lower = [&] {
+    std::string out;
+    out.reserve(name.size());
+    for (char c : name) {
+      out.push_back(
+          static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return out;
+  }();
+  if (lower == "q8_0" || lower == "q8") {
+    return GGML_TYPE_Q8_0;
+  }
+  if (lower == "q4_0" || lower == "q4") {
+    return GGML_TYPE_Q4_0;
+  }
+  return GGML_TYPE_F16;
+}
+
+} // namespace
 
 namespace {
 std::mutex g_llama_init_mutex;
@@ -304,6 +329,11 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
   // LLAMA_FLASH_ATTN_TYPE_ENABLED lets llama.cpp choose FA on any supported
   // backend (Metal, CUDA); the tile parameter is stored for future FA3 CUDA
   // integration.
+  // KV cache element type (both K and V). llama.cpp defaults to f16;
+  // q8_0 halves KV memory at a small quality cost, q4_0 quarters it.
+  ctx_params.type_k = KvCacheGgmlType(config.llama_kv_cache_type);
+  ctx_params.type_v = KvCacheGgmlType(config.llama_kv_cache_type);
+
   ctx_params.flash_attn_type = config.use_flash_attention
                                    ? LLAMA_FLASH_ATTN_TYPE_ENABLED
                                    : LLAMA_FLASH_ATTN_TYPE_DISABLED;

@@ -48,7 +48,15 @@ struct LlamaBackendConfig {
   // Maximum number of KV-cache sequences that can be live simultaneously.
   // Increased from 16 to 128 for production concurrent workloads.
   // Managed by SequenceSlotManager for timeout-based eviction.
+  // NOTE: for llama.cpp-backed backends this becomes n_seq_max, which
+  // partitions the context across sequences (n_ctx_seq = n_ctx / n_seq_max)
+  // and scales the per-sequence output reserve — 128 reserves substantial
+  // VRAM; right-size it to the intended admission concurrency (and never
+  // below the scheduler's circulating slot ids) when tuning memory.
   int max_parallel_sequences{128};
+  // KV-cache element type for llama.cpp-backed backends: f16 (default,
+  // llama.cpp stock) | q8_0 | q4_0. Applies to both K and V caches.
+  std::string llama_kv_cache_type{"f16"};
 
   // Distributed Parallelism Degrees.
   int tp_degree{1}; // Tensor Parallel degree
