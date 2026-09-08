@@ -1296,6 +1296,23 @@ InferfluxCudaExecutor::PrimaryLaneResources() {
   return resources;
 }
 
+bool InferfluxCudaExecutor::SeqIdInKvRange(int seq_id) const {
+  return seq_id >= 0 && kv_cache_ && seq_id < kv_cache_->MaxBatchSize();
+}
+
+void InferfluxCudaExecutor::RecordKvRangeViolation(int seq_id) {
+  const int n = kv_range_violations_.fetch_add(1, std::memory_order_relaxed);
+  if (n < 8 || n % 1000 == 0) {
+    log::Error("inferflux_cuda_executor",
+               "Sequence id " + std::to_string(seq_id) +
+                   " outside KV slot capacity " +
+                   std::to_string(kv_cache_ ? kv_cache_->MaxBatchSize() : 0) +
+                   " (violation " + std::to_string(n + 1) +
+                   "); failing the request instead of writing KV out of "
+                   "bounds — check scheduler/native capacity clamp");
+  }
+}
+
 InferfluxCudaExecutor::LaneExecutionResources
 InferfluxCudaExecutor::GetLaneResources(bool decode_lane) {
   if (CanRunLaneOverlap()) {
@@ -1594,6 +1611,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
   int max_batch = bootstrap_config_.kv_max_batch;
   int max_seq = bootstrap_config_.kv_max_seq;
   bool max_seq_overridden = bootstrap_config_.kv_max_seq_overridden;
+  const bool max_batch_overridden = bootstrap_config_.kv_max_batch_overridden;
   if (!bootstrap_config_.invalid_kv_max_batch.empty()) {
     log::Warn("inferflux_cuda_executor",
               "Ignoring invalid INFERFLUX_CUDA_KV_MAX_BATCH='" +
@@ -1668,6 +1686,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
           kv_element_bytes);
   kv_plan_input.auto_tune_enabled = kv_auto_tune;
   kv_plan_input.max_seq_overridden = max_seq_overridden;
+  kv_plan_input.max_batch_overridden = max_batch_overridden;
   kv_plan_input.explicit_budget_bytes = kv_budget_bytes;
   kv_plan_input.free_bytes = free_bytes;
   kv_plan_input.budget_ratio = kv_budget_ratio;
@@ -1695,7 +1714,15 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
                        std::to_string(total_bytes / kMiB) + " MiB"
                  : "") +
             ")");
-  } else {
+  }
+  if (kv_plan.auto_tuned_batch) {
+    log::Info("inferflux_cuda_executor",
+              "KV auto-tune reduced max_batch to " + std::to_string(max_batch) +
+                  " (planned=" + std::to_string(kv_plan.planned_bytes / kMiB) +
+                  " MiB, budget=" +
+                  std::to_string(kv_plan.budget_bytes / kMiB) + " MiB)");
+  }
+  if (!kv_plan.auto_tuned_seq) {
     const std::string budget_source =
         kv_budget_bytes > 0 ? "explicit"
                             : (free_bytes > 0 ? "free_mem" : "none");
@@ -2329,6 +2356,12 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto &input = inputs[i];
     if (input.tokens.size() == 1 && input.request_logits) {
+      if (!SeqIdInKvRange(input.sequence_id)) {
+        RecordKvRangeViolation(input.sequence_id);
+        result.outputs[i].ok = false;
+        result.outputs[i].token = -1;
+        continue;
+      }
       decode_group.push_back(
           {static_cast<int>(i), input.request_id, input.client_request_id,
            input.tokens[0], input.n_past, input.sequence_id,
@@ -2464,6 +2497,10 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
 
     const int token_count = static_cast<int>(input.tokens.size());
     const auto forward_start = std::chrono::steady_clock::now();
+    if (!SeqIdInKvRange(input.sequence_id)) {
+      RecordKvRangeViolation(input.sequence_id);
+      continue;
+    }
     if (!resources.forward->Forward(input.tokens, input.n_past,
                                     input.sequence_id, resources.logits)) {
       log::Error("inferflux_cuda_executor", "Lane Forward failed");
@@ -2910,6 +2947,13 @@ UnifiedBurstResult InferfluxCudaExecutor::NativeExecuteUnifiedBatchBurst(
     batch_tokens[b] = inputs[static_cast<std::size_t>(b)].tokens[0];
     batch_n_past[b] = inputs[static_cast<std::size_t>(b)].n_past;
     batch_seq_ids[b] = inputs[static_cast<std::size_t>(b)].sequence_id;
+    if (!SeqIdInKvRange(batch_seq_ids[b])) {
+      RecordKvRangeViolation(batch_seq_ids[b]);
+      result.ok = false;
+      result.last_tokens.assign(static_cast<size_t>(B), -1);
+      result.finished.assign(static_cast<size_t>(B), true);
+      return result;
+    }
   }
 
   // Per-sequence step budget: policy chunk, caller cap, batch-wide token
@@ -3111,6 +3155,12 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
   for (size_t i = 0; i < inputs.size(); ++i) {
     const auto &input = inputs[i];
     if (input.tokens.size() == 1 && input.request_logits) {
+      if (!SeqIdInKvRange(input.sequence_id)) {
+        RecordKvRangeViolation(input.sequence_id);
+        outputs[i].ok = false;
+        outputs[i].token = -1;
+        continue;
+      }
       decode_group.push_back(
           {static_cast<int>(i), input.request_id, input.client_request_id,
            input.tokens[0], input.n_past, input.sequence_id,
@@ -3401,6 +3451,11 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
     UnifiedBatchOutput &output = outputs[idx];
     output.ok = false;
     output.token = -1;
+
+    if (!SeqIdInKvRange(input.sequence_id)) {
+      RecordKvRangeViolation(input.sequence_id);
+      continue;
+    }
 
     bool is_decode = (input.tokens.size() == 1);
     int batch_tokens = static_cast<int>(input.tokens.size());
@@ -4128,6 +4183,20 @@ std::vector<float> InferfluxCudaExecutor::NativeEmbed(const std::string &text) {
   static std::atomic<int> embed_seq_counter{900000};
   const int embed_seq_id = embed_seq_counter.fetch_add(1);
 
+  // The embedding pass reuses Forward(), which appends K/V for its sequence.
+  // Synthetic ids far exceed the KV slot capacity, so running the pass would
+  // write device memory far out of bounds. Fail closed until embeddings get
+  // a dedicated KV-free forward path.
+  if (!SeqIdInKvRange(embed_seq_id)) {
+    log::Error("inferflux_cuda_executor",
+               "NativeEmbed: refusing to run — synthetic sequence id " +
+                   std::to_string(embed_seq_id) +
+                   " is outside KV capacity and the embedding forward still "
+                   "appends KV state (native embeddings unavailable)");
+    cudaFree(d_embed);
+    return {};
+  }
+
   bool ok = model_forward_->EmbedForward(tokens, embed_seq_id, d_embed);
   if (!ok) {
     cudaFree(d_embed);
@@ -4189,6 +4258,10 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id, int n_past_start,
                                              std::vector<int> *out_tokens) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!model_forward_ || !sampler_ || n_tokens <= 0) {
+    return 0;
+  }
+  if (!SeqIdInKvRange(sequence_id)) {
+    RecordKvRangeViolation(sequence_id);
     return 0;
   }
   std::lock_guard<std::mutex> lock(shared_pipeline_mutex_);

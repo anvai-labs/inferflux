@@ -584,6 +584,27 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
       model_selection_options_(model_selection_options) {
   batch_policy_ = CreateBatchSelectionPolicy(config_.batch_policy);
 
+  // Native CUDA backends publish their KV slot capacity via metrics before the
+  // scheduler is constructed (router model load runs first). Sequence ids
+  // handed to the backend come from the slot manager, so the slot manager —
+  // not just the batch width — must be bounded by that capacity: retained and
+  // retiring leases keep high slot ids circulating, and the native KV cache
+  // indexes device memory by raw sequence id. Backends that publish no
+  // capacity (metric 0) keep the historical defaults.
+  size_t slot_capacity = kMaxSequenceSlots;
+  if (const int kv_capacity = metrics_->GetInferfluxCudaKvMaxSequences();
+      kv_capacity > 0) {
+    if (config_.max_batch_size > kv_capacity) {
+      log::Info("scheduler", "Clamping scheduler max_batch_size " +
+                                 std::to_string(config_.max_batch_size) +
+                                 " to native KV slot capacity " +
+                                 std::to_string(kv_capacity));
+      config_.max_batch_size = kv_capacity;
+    }
+    slot_capacity =
+        std::min<size_t>(kMaxSequenceSlots, static_cast<size_t>(kv_capacity));
+  }
+
   BatchExecutor::UnifiedBatchTuning tuning;
   tuning.decode_burst_tokens = config_.decode_burst_tokens;
   tuning.chunked_prefill_tokens = config_.chunked_prefill_tokens;
@@ -594,7 +615,7 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
 
   // Initialize sequence slot manager for universal KV cache tracking.
   slot_manager_ =
-      std::make_unique<scheduler::SequenceSlotManager>(kMaxSequenceSlots);
+      std::make_unique<scheduler::SequenceSlotManager>(slot_capacity);
 
   // Enable decode worker pool when a positive pool size is configured.
   // With use_decode_workers_=true, ProcessBatch only runs Prefill and

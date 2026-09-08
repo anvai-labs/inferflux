@@ -55,6 +55,7 @@ struct KvCachePlanInput {
 
   bool auto_tune_enabled{true};
   bool max_seq_overridden{false};
+  bool max_batch_overridden{false};
 
   // Explicit budget takes precedence when set (>0).
   std::size_t explicit_budget_bytes{0};
@@ -71,6 +72,7 @@ struct KvCachePlanOutput {
   std::size_t planned_bytes{0};
   std::size_t budget_bytes{0};
   bool auto_tuned_seq{false};
+  bool auto_tuned_batch{false};
 };
 
 inline KvCachePlanOutput PlanKvCache(const KvCachePlanInput &input) {
@@ -93,34 +95,62 @@ inline KvCachePlanOutput PlanKvCache(const KvCachePlanInput &input) {
     out.budget_bytes = static_cast<std::size_t>(scaled);
   }
 
-  if (!input.auto_tune_enabled || input.max_seq_overridden ||
-      input.bytes_per_token_per_sequence == 0 || out.budget_bytes == 0 ||
-      out.requested_bytes <= out.budget_bytes) {
+  if (!input.auto_tune_enabled || input.bytes_per_token_per_sequence == 0 ||
+      out.budget_bytes == 0 || out.requested_bytes <= out.budget_bytes) {
     out.planned_bytes = out.requested_bytes;
     return out;
   }
 
-  const std::size_t denom =
-      detail::SaturatingMul(static_cast<std::size_t>(out.max_batch),
-                            input.bytes_per_token_per_sequence);
-  if (denom == 0 || denom == std::numeric_limits<std::size_t>::max()) {
-    out.planned_bytes = out.requested_bytes;
-    return out;
+  // Stage 1: shrink sequence length first (preserves per-sequence context);
+  // skipped when the operator pinned it via INFERFLUX_CUDA_KV_MAX_SEQ.
+  if (!input.max_seq_overridden) {
+    const std::size_t seq_denom =
+        detail::SaturatingMul(static_cast<std::size_t>(out.max_batch),
+                              input.bytes_per_token_per_sequence);
+    if (seq_denom != 0 &&
+        seq_denom != std::numeric_limits<std::size_t>::max()) {
+      std::size_t seq_by_budget = out.budget_bytes / seq_denom;
+      seq_by_budget = std::min<std::size_t>(
+          seq_by_budget,
+          static_cast<std::size_t>(std::numeric_limits<int>::max()));
+      int tuned_seq = static_cast<int>(seq_by_budget);
+      tuned_seq = std::max(tuned_seq, input.min_max_seq);
+      if (input.model_max_position_embeddings > 0) {
+        tuned_seq = std::min(tuned_seq, input.model_max_position_embeddings);
+      }
+      if (tuned_seq < out.max_seq) {
+        out.max_seq = tuned_seq;
+        out.auto_tuned_seq = true;
+      }
+    }
   }
 
-  std::size_t seq_by_budget = out.budget_bytes / denom;
-  seq_by_budget = std::min<std::size_t>(
-      seq_by_budget, static_cast<std::size_t>(std::numeric_limits<int>::max()));
-  int tuned_seq = static_cast<int>(seq_by_budget);
-  tuned_seq = std::max(tuned_seq, input.min_max_seq);
-  if (input.model_max_position_embeddings > 0) {
-    tuned_seq = std::min(tuned_seq, input.model_max_position_embeddings);
+  out.planned_bytes = EstimateKvCacheBytes(out.max_batch, out.max_seq,
+                                           input.bytes_per_token_per_sequence);
+
+  // Stage 2: shrink batch width when the sequence-tuned plan still exceeds
+  // the budget; skipped when the operator pinned it via
+  // INFERFLUX_CUDA_KV_MAX_BATCH.
+  if (out.planned_bytes > out.budget_bytes && !input.max_batch_overridden &&
+      out.max_seq > 0) {
+    const std::size_t batch_denom =
+        detail::SaturatingMul(static_cast<std::size_t>(out.max_seq),
+                              input.bytes_per_token_per_sequence);
+    if (batch_denom != 0 &&
+        batch_denom != std::numeric_limits<std::size_t>::max()) {
+      std::size_t batch_by_budget = out.budget_bytes / batch_denom;
+      batch_by_budget = std::min<std::size_t>(
+          batch_by_budget,
+          static_cast<std::size_t>(std::numeric_limits<int>::max()));
+      int tuned_batch = static_cast<int>(batch_by_budget);
+      tuned_batch = std::max(tuned_batch, input.min_max_batch);
+      if (tuned_batch < out.max_batch) {
+        out.max_batch = tuned_batch;
+        out.auto_tuned_batch = true;
+      }
+    }
   }
 
-  if (tuned_seq < out.max_seq) {
-    out.max_seq = tuned_seq;
-    out.auto_tuned_seq = true;
-  }
   out.planned_bytes = EstimateKvCacheBytes(out.max_batch, out.max_seq,
                                            input.bytes_per_token_per_sequence);
   return out;

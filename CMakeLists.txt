@@ -54,6 +54,7 @@ add_library(inferflux_core STATIC
   runtime/backends/native/native_inference_runtime.h
   runtime/backends/cuda/native/dispatch_operator_health.cpp
   runtime/backends/cuda/native/dispatch_operator_health.h
+  runtime/backends/cuda/native/native_bootstrap_config.cpp
   model/tokenizer_factory.cpp
   model/tokenizer_factory.h
   runtime/backends/backend_capabilities.cpp
@@ -306,8 +307,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/safetensors_parser.h
     runtime/backends/cuda/inferflux_cuda_executor.cpp
     runtime/backends/cuda/inferflux_cuda_executor.h
-    runtime/backends/cuda/native/native_bootstrap_config.cpp
-    runtime/backends/cuda/native/weight_map.cpp
+      runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/cublas_gemm.cpp
     runtime/backends/cuda/native/native_dispatch_registry.cpp
     runtime/backends/cuda/native/native_dispatch_policy.cpp

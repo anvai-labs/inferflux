@@ -2373,3 +2373,57 @@ TEST_CASE("Scheduler lpm policy prioritizes prefix-affinity request",
   REQUIRE(hot_backend->FirstSubmissionTicket() <
           cold_backend->FirstSubmissionTicket());
 }
+
+TEST_CASE("Scheduler clamps admission to native KV slot capacity",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+
+  MetricsRegistry metrics;
+  metrics.SetInferfluxCudaKvCacheOccupancy(/*active=*/0, /*max=*/16);
+
+  Scheduler::Config config;
+  config.max_batch_size = 32;
+  config.metrics = &metrics;
+  Scheduler scheduler(tokenizer, device, cache, nullptr,
+                      /*speculative_decoder=*/nullptr,
+                      /*prefix_cache=*/nullptr, /*fairness_config=*/{},
+                      /*disagg_config=*/{},
+                      /*model_selection_options=*/ModelSelectionOptions{},
+                      config);
+
+  SchedulerTestAccess access(scheduler);
+  // The slot manager — not just the batch width — is bounded by the published
+  // KV capacity: raw slot ids index the native KV cache without a bounds
+  // check, and retained leases keep high ids circulating.
+  REQUIRE(access.slot_manager() != nullptr);
+  REQUIRE(access.slot_manager()->GetMaxSlots() == 16);
+  REQUIRE(access.max_batch_size() == 16);
+}
+
+TEST_CASE("Scheduler keeps default admission without a native KV capacity",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+
+  MetricsRegistry metrics;
+  // No native backend published a capacity (stays 0).
+
+  Scheduler::Config config;
+  config.max_batch_size = 32;
+  config.metrics = &metrics;
+  Scheduler scheduler(tokenizer, device, cache, nullptr,
+                      /*speculative_decoder=*/nullptr,
+                      /*prefix_cache=*/nullptr, /*fairness_config=*/{},
+                      /*disagg_config=*/{},
+                      /*model_selection_options=*/ModelSelectionOptions{},
+                      config);
+
+  SchedulerTestAccess access(scheduler);
+  REQUIRE(access.slot_manager()->GetMaxSlots() == 128);
+  REQUIRE(access.max_batch_size() == 32);
+}
