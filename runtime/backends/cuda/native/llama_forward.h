@@ -125,6 +125,11 @@ public:
   std::string ProbeDispatchPaths() override;
   void SetStream(cudaStream_t stream) override;
   void SetExecutionPolicy(const NativeExecutionPolicy &policy) override;
+  void SetPrefillChunkTokens(int tokens) override {
+    prefill_chunk_tokens_ = std::max(1, tokens);
+  }
+  // Rows of token-addressable scratch; every call must keep seq_len <= this.
+  int scratch_rows() const { return scratch_rows_; }
 
   void FreeScratchBuffers() override;
   std::size_t DeviceWorkspaceBytes() const override {
@@ -156,6 +161,10 @@ private:
   int vocab_size_{0};
   int max_seq_len_{0};
   int max_batch_size_{32};
+  // Scratch row budget: max(prefill chunk cap, max_batch), capped by the
+  // KV window. 0 = not allocated yet.
+  int prefill_chunk_tokens_{512};
+  int scratch_rows_{0};
   float rope_freq_base_{10000.0f};
   float rms_norm_eps_{1e-5f};
   int rope_type_{0}; // 0 = kNorm (consecutive), 2 = kNeox (split-half)

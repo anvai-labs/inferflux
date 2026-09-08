@@ -1398,6 +1398,8 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
   lane_policy.disable_cuda_graph = true;
   decode_lane_forward_->SetExecutionPolicy(lane_policy);
   prefill_lane_forward_->SetExecutionPolicy(lane_policy);
+  decode_lane_forward_->SetPrefillChunkTokens(prefill_chunk_tokens_);
+  prefill_lane_forward_->SetPrefillChunkTokens(prefill_chunk_tokens_);
 
   if (is_gguf_path) {
     decode_lane_quantized_weight_map_ = std::make_unique<QuantizedWeightMap>();
@@ -1893,6 +1895,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
       return false;
     }
     model_forward_->SetExecutionPolicy(execution_policy_);
+    model_forward_->SetPrefillChunkTokens(prefill_chunk_tokens_);
     auto gguf_config = ConvertModelInfo(model_info_);
     if (!model_forward_->Initialize(gguf_config, *quantized_weight_adapter_,
                                     kv_cache_.get(), gemm_.get(),
@@ -1919,6 +1922,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
       return false;
     }
     model_forward_->SetExecutionPolicy(execution_policy_);
+    model_forward_->SetPrefillChunkTokens(prefill_chunk_tokens_);
     if (!model_forward_->Initialize(config, *weight_map_, kv_cache_.get(),
                                     gemm_.get(), compute_stream_)) {
       log::Error("inferflux_cuda_executor",
@@ -2070,6 +2074,7 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
   log::Info("inferflux_cuda_executor",
             "Loading InferFlux CUDA model from: " + model_path.string());
   loaded_model_path_ = model_path;
+  prefill_chunk_tokens_ = static_cast<int>(config.prefill_chunk_tokens);
   memory_ledger_.Clear();
   active_max_batch_ = 0;
   active_max_seq_ = 0;
@@ -2219,13 +2224,15 @@ bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
     UnifiedBatchInput warm_prefill;
     warm_prefill.sequence_id = 0;
     warm_prefill.n_past = 0;
-    // Clamp to the KV cache's max sequence length: with a small auto-tuned
-    // max_seq (< 256) the warm Forward would fail its length check and the
-    // warm-up would silently no-op, re-exposing the first-mixed-call
-    // corruption it exists to absorb.
-    const int warm_len = std::min(std::max(256, min_prefill_tokens_),
-                                  kv_cache_ ? kv_cache_->MaxSeqLen()
-                                            : std::numeric_limits<int>::max());
+    // Clamp to the KV cache's max sequence length AND the prefill chunk cap:
+    // the warm Forward must satisfy the same bounds a real call does (scratch
+    // rows = chunk cap; seq window = KV max_seq), or it fails its length
+    // checks and the warm-up silently no-ops, re-exposing the
+    // first-mixed-call corruption it exists to absorb.
+    int warm_len = std::min(std::max(256, min_prefill_tokens_),
+                            kv_cache_ ? kv_cache_->MaxSeqLen()
+                                      : std::numeric_limits<int>::max());
+    warm_len = std::min(warm_len, prefill_chunk_tokens_);
     warm_prefill.tokens.assign(static_cast<size_t>(warm_len), 1);
     warm_prefill.request_logits = false;
     warm_prefill.request_id = -1;

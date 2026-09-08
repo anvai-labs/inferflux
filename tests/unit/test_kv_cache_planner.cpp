@@ -206,4 +206,18 @@ TEST_CASE("KV planner batch shrink only fires when seq tuning still "
 }
 
 } // namespace
+
+TEST_CASE("ComputeScratchRows sizes to chunk cap, batch floor, and seq cap",
+          "[kv_planner]") {
+  // Typical 3B server config: 512-token chunks, 16-wide decode, 2048 window.
+  REQUIRE(ComputeScratchRows(2048, 16, 512) == 512);
+  // Batch wider than the chunk still gets a row per sequence.
+  REQUIRE(ComputeScratchRows(2048, 1024, 512) == 1024);
+  // Chunk cap clamps to the KV window when the window is smaller.
+  REQUIRE(ComputeScratchRows(256, 16, 512) == 256);
+  // Degenerate inputs stay sane.
+  REQUIRE(ComputeScratchRows(0, 16, 512) == 16);
+  REQUIRE(ComputeScratchRows(2048, 0, 512) == 512);
+}
+
 } // namespace inferflux::runtime::cuda::native

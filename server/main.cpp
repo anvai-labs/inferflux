@@ -1143,6 +1143,9 @@ int main(int argc, char **argv) {
       cuda_phase_overlap_min_prefill_tokens;
   primary_cfg.cuda_phase_overlap_prefill_replica =
       cuda_enabled && cuda_phase_overlap_prefill_replica;
+  // Keep the backend's widest prefill call aligned with the scheduler's
+  // chunked-prefill cap so activation scratch tracks the working set.
+  primary_cfg.prefill_chunk_tokens = scheduler_config.chunked_prefill_tokens;
 
 #ifndef INFERFLUX_HAS_CUDA
   if (cuda_enabled) {
