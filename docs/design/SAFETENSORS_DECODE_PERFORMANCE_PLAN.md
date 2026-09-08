@@ -422,7 +422,7 @@ End-to-end: stock `llama-server` 884 tok/s vs `inferflux_cuda` 574 tok/s
 
 **Methodology trap worth remembering**: with nsys's default
 `--cuda-graph-trace=graph`, per-kernel records exclude graph-replayed
-kernels — 91-93% of real GPU busy time is invisible and any per-kernel
+kernels — 88-94% of real GPU busy time is invisible and any per-kernel
 analysis of that capture describes only the non-graphed sliver. Decode on
 both engines runs inside CUDA graphs, so per-kernel profiling requires
 `--cuda-graph-trace=node`. An earlier cut of this section made exactly
@@ -442,7 +442,10 @@ kernel records).
 | **TOTAL busy** | **1,591.0 us/tok** | **716.4 us/tok** | **2.22x** |
 | duty cycle (busy/wall) | 91% | 63% | — |
 
-(The an earlier 4.6x/17x figures in a first cut of this section came from
+(Family rows are raw per-kernel sums and overlap slightly; the TOTAL row
+is the merged-interval union, so rows sum to a little more than TOTAL.)
+
+(The earlier 4.6x/17x figures in a first cut of this section came from
 summing the non-graphed sliver and a token-count asymmetry — both engines
 here generated the full 12,288 tokens, verified from response usage.)
 
@@ -460,7 +463,7 @@ here generated the full 12,288 tokens, verified from response usage.)
    printed rule estimates a 91.67% local speedup from occupancy alone.
    llama.cpp's `flash_attn_ext_f16` covers batch + KV splits across 96
    blocks (stream-K decomposition + fixup). Per-launch costs are shape
-   dependent (inferflux's observed grids ranged (2,2,1) ~196 us to
+   dependent (inferflux's observed grids ranged (2,2,1) ~179-205 us (median/mean) to
    (16,2,1) ~2.7 ms), so the fix is structural: whole-batch launches with
    KV-split decomposition and less shared memory per block.
 3. **Sampling and standalone dequant are NOT priorities**: 0.5% and 0.7%
