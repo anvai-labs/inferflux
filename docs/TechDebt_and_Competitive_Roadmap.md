@@ -38,44 +38,51 @@ Open: width-1 decode tail during closed-loop EOS stagger (workload-
 
 ## 2) Competitive Benchmark
 
-### Safetensors (full precision) — Sep 5-6 2026, RTX 4000 Ada, Qwen2.5-3B
+### Safetensors (full precision) — Sep 7 2026, RTX 4000 Ada, Qwen2.5-3B
 
-2-run protocol (variance ~30% on this harness; averages shown where both runs agree):
-
-```
-Backend        c=1 tok/s   c=16 tok/s   Scale (c=1→16)   GPU Peak
-─────────────  ─────────   ──────────   ──────────────   ────────
-inferflux_cuda   ~45         ~298-311     ~6.7x            ~8.6 GB
-vLLM             ~36-49      ~585-725     ~18x             ~20 GB
-SGLang           ~48         ~651-664     ~14x             ~17.7 GB
-LM Studio        ~114        ~70-74       ~0.6x            ~3.0 GB
-```
-
-- vLLM/SGLang lead at high concurrency (2.1-2.5x): mature paged/radix
-  attention plus true continuous batching keep per-request latency flat;
-  InferFlux's grows with load (batch-composition numerics documented).
-- **Memory: InferFlux 8.6 GB vs vLLM 20 GB / SGLang 17.7 GB** — half the
-  footprint at 2.3x the gap in throughput is the differentiation trade.
-- The remaining gap decomposes as effective decode width (workload-shaped
-  under closed-loop EOS stagger) plus the practical streaming ceiling
-  (~40% of spec bandwidth for both InferFlux and cuBLAS cold-L2; falsified
-  quick kernel win). Full decomposition and falsification records:
-  `docs/design/SAFETENSORS_DECODE_PERFORMANCE_PLAN.md`.
-
-### GGUF (Q4_K_M) — Apr 15 2026 snapshot (not re-run in Sep campaign)
+2-run average per cell (multi-backend harness; 0 classified failures):
 
 ```
-Backend             c=1 tok/s   c=4 tok/s   c=8 tok/s   Scale   GPU Peak
-─────────────────   ─────────   ─────────   ─────────   ─────   ────────
-inferflux_cuda        76.3       153.4       168.1     2.2x    7079 MB
-llama_cpp_cuda        99.8       184.4       252.8     2.5x    5811 MB
-Ollama¹               ~98        ~111        ~113     1.2x    5434 MB
-LM Studio¹            ~109        ~81         ~70     0.6x    7892 MB
-
-¹ Remote host. Historical Apr snapshot — the Sep campaign optimized the
-safetensors path; the GGUF path is due a re-measurement on the current
-build (CUDA graphs, relay, cublasLt now apply to it as well).
+Backend        c=1    c=4    c=8    c=16   scale    GPU peak
+─────────────  ────   ────   ────   ─────  ──────   ─────────
+inferflux_cuda 47.7   143.8  206.2  338.2  ~6.9x    8.3-8.7 GB
+vLLM           36.9   160.2  336.0  675.3  ~15x     ~20.1 GB
+SGLang         38.1   156.9  307.0  515.3  ~15x     18.2-20.1 GB
+LM Studio      115.8  75.2   73.0   71.5   ~0.6x    2.9-3.1 GB
 ```
+
+- Gap to vLLM/SGLang narrowed to **1.52-2.00x at c=16** (was 2.37-2.70x on
+  Sep 4-6), while serving at 2.3-2.4x less GPU memory. The post-#110 scratch
+  right-sizing likely contributed to the inferflux gain (338 vs 298-311).
+- SGLang on this host requires `TVM_FFI_GPU_BACKEND=cuda`: with the ROCm
+  toolchain installed system-wide, its JIT misdetects HIP and fails to build
+  kernels (`/usr/bin/hipcc` shadows the CUDA path).
+
+### GGUF (Q4_K_M) — Sep 7 2026 (post memory campaign), RTX 4000 Ada
+
+2-run average per cell (multi-backend harness; 0 classified failures;
+gguf-compare harness confirms the memory and c=1/4/8 ordering):
+
+```
+Backend          c=1    c=4    c=8    c=16   scale   GPU peak
+───────────────  ────   ────   ────   ─────  ─────   ─────────────
+inferflux_cuda   103.4  163.8  265.8  332.7  3.22x   5.5 GB (ledger)
+llama_cpp_cuda   119.8  198.7  284.0  231.4  1.93x   4.1 GB (same harness)
+Ollama (local)   121.3  124.1  124.2  123.1  ~1.0x   ~1.0 GB
+LM Studio        115.4  74.7   76.2   75.0   ~0.65x  2.9-3.1 GB
+```
+
+- `inferflux_cuda` leads llama.cpp at c=16 on the same harness (1.44x, both
+  runs agree) after the memory campaign; llama.cpp stays ahead at c=1-4 and
+  c=8 is contested (runs split around parity).
+- GGUF memory overhead vs llama.cpp is now **+1,392 MB** on the identical
+  workload (was +3,006 MB pre-campaign, +1,268-1,394 MB in the Apr/Aug
+  readings) — see performance plan §4e-results.
+- ROCm cells (inferflux_rocm / llama_cpp_rocm, GGUF and safetensors): the
+  R9700 dropped out of WSL passthrough mid-session (`/dev/kfd` absent).
+  Last spot measurements from Sep 7 morning: inferflux_rocm ~17-36 tok/s at
+  c=1-8 on GGUF; ST-on-ROCm remains unbuilt (no HIP bf16 forward).
+  Re-run when the host restores the device.
 
 ## 3) Debt Register
 

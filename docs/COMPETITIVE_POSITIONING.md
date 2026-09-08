@@ -1,42 +1,69 @@
 # Competitive Positioning
 
-**Snapshot date:** September 4, 2026 (2-run average, GGUF stage — see
-[benchmarks](benchmarks.md) for the full methodology note on run-to-run
-variance)
+**Snapshot date:** September 7, 2026 (2-run average per cell, RTX 4000 Ada,
+Qwen2.5-3B; multi-backend harness with response classification — see
+[benchmarks](benchmarks.md) for the methodology note on run-to-run variance)
 
 ```
-InferFlux Positioning (Sep 2026, GGUF Q4_K_M, Qwen2.5-3B, 2-run avg):
+InferFlux Positioning (Sep 7 2026, 2-run avg, tok/s):
 
-  ┌──────────────────────────────────────────────────┐
-  │                                                  │
-  │    InferFlux inferflux_cuda ★                    │
-  │    ├─ 356 tok/s at c=16 (~1.56x vs llama.cpp)    │
-  │    ├─ c=8 roughly at parity with llama.cpp       │
-  │    ├─ ~2.88x faster than Ollama at c=16          │
-  │    ├─ High semantic parity (0.89-0.95 cosine)    │
-  │    └─ Best scaling: ~3.33x (c=1→c=16)            │
-  │                                                  │
-  │    InferFlux llama_cpp_cuda                       │
-  │    ├─ Fastest at c=1-4 (both runs agree)          │
-  │    └─ ~228 tok/s at c=16 (avg; range 224-233)     │
-  │                                                  │
-  │    Ollama (remote, Go + llama.cpp)                │
-  │    └─ ~124 tok/s flat, all concurrency (plateaus)│
-  │                                                  │
-  └──────────────────────────────────────────────────┘
+  ┌───────────────────────────────────────────────────────────┐
+  │ GGUF Q4_K_M                                               │
+  │  InferFlux inferflux_cuda ★                               │
+  │   ├─ 333 tok/s at c=16 (~1.44x vs llama.cpp same harness) │
+  │   ├─ ~2.7x faster than local Ollama at c=16               │
+  │   ├─ 3.22x scaling (c=1→c=16)                             │
+  │   └─ 0 classified failures; 5,478 MB loaded (ledger)      │
+  │  llama_cpp_cuda: 120/143/199/284/231 (c=1/2/4/8/16)       │
+  │                                                           │
+  │ SAFETENSORS bf16                                          │
+  │  vLLM     675 tok/s at c=16   (2.00x over inferflux)      │
+  │  SGLang   515 tok/s at c=16   (1.52x over inferflux)      │
+  │  InferFlux 338 tok/s at c=16  (6.9x scaling; was ~6.6x)   │
+  │  gap narrowed from 2.37-2.70x (Sep 4) to 1.52-2.00x       │
+  │                                                           │
+  │ Memory at the same workload (GPU peak, GB)                │
+  │  GGUF: inferflux 5.5 (ledger) vs llama.cpp 4.1            │
+  │  ST:   inferflux 8.3-8.7 vs vLLM ~20.1 vs SGLang 18.2-20.1│
+  └───────────────────────────────────────────────────────────┘
 ```
+
+## 0) Feasibility matrix (what runs where)
+
+| Engine | GGUF / CUDA | Safetensors / CUDA | GGUF / ROCm | Safetensors / ROCm |
+|---|---|---|---|---|
+| `inferflux_cuda` / `inferflux_rocm` | ✓ | ✓ | ✓ (last measured Sep 7 morning: ~17-36 tok/s c=1-8; GPU passthrough currently absent on the bench host) | ✗ no HIP bf16 forward built |
+| llama.cpp (`llama_cpp_cuda` / `llama_cpp_rocm`) | ✓ | harness skips — the server supports GGUF-sidecar fallback but it is not benchmarked here | ✓ (blocked with host) | via sidecar; blocked with host |
+| vLLM | ✗ (GGUF unsupported in this venv) | ✓ | ✗ not installed for ROCm | ✗ |
+| SGLang | ✗ | ✓ (requires `TVM_FFI_GPU_BACKEND=cuda` when ROCm toolchain is on PATH — its JIT otherwise misdetects HIP) | ✗ not installed | ✗ |
+| Ollama / LM Studio | ✓ (local Ollama plateaus ~123 tok/s flat) | LM Studio only | — | — |
+
+Note: the AMD R9700 dropped out of WSL passthrough mid-session (`/dev/kfd`
+absent); ROCm cells retain the Sep 7 morning spot measurements and should be
+re-run when the host restores the device.
 
 ## 1) Current Position
 
+Throughput, tok/s, 2-run average (RTX 4000 Ada, Qwen2.5-3B; multi-backend
+harness; per-cell response classification reported 0 failures everywhere):
+
+| Backend | GGUF c=1 | GGUF c=4 | GGUF c=8 | GGUF c=16 | ST c=1 | ST c=4 | ST c=8 | ST c=16 | GPU peak (GB) |
+|---|---|---|---|---|---|---|---|---|---|
+| `inferflux_cuda` | 103.4 | 163.8 | 265.8 | **332.7** | 47.7 | 143.8 | 206.2 | **338.2** | 5.5 GGUF (ledger) / 8.3-8.7 ST |
+| llama.cpp CUDA | **119.8** | **198.7** | **284.0** | 231.4 | — | — | — | — | 4.1 (gguf-compare harness) |
+| vLLM | — | — | — | — | 36.9 | 160.2 | 336.0 | **675.3** | ~20.1 |
+| SGLang | — | — | — | — | 38.1 | 156.9 | 307.0 | **515.3** | 18.2-20.1 |
+| Ollama (local) | 121.3 | 124.1 | 124.2 | 123.1 | — | — | — | — | ~1.0 |
+| LM Studio | 115.4 | 74.7 | 76.2 | 75.0 | 115.8 | 75.2 | 73.0 | 71.5 | 2.9-3.1 |
+
 | Category | Reading |
 |---|---|
-| Native CUDA serving at high concurrency | **Leads llama.cpp at c=16 in both of two runs** (avg 356.3 vs 228.1 tok/s = 1.56x; individual runs 1.50x and 1.62x). Still clearly behind at c=1-4. c=8 is genuinely contested — the two runs disagreed on which backend led. |
-| vs Ollama | **~2.88x faster** at c=16 (356.3 vs 123.8 tok/s avg). Ollama is the most reproducible backend measured — plateaus flat (~122-126 tok/s) across all concurrency in both runs, no cross-request batching. |
-| vs LM Studio | Full-precision safetensors run (post-fix): LM Studio's best showing is c=1 (~103 tok/s), then degrades; `inferflux_cuda` overtakes it from c=4 onward and reaches ~279 tok/s at c=16. |
-| vs vLLM / SGLang on full precision | **Both clearly beat `inferflux_cuda`'s safetensors path** at concurrency — vLLM 753.4 tok/s and SGLang 659.8 tok/s at c=16 vs `inferflux_cuda`'s 278.7 (2.70x and 2.37x). Both scale near-linearly (~15.3x vLLM, ~13.7x SGLang vs `inferflux_cuda`'s ~6.6x, c=1→c=16). Expected: both are purpose-built serving engines with mature paged/radix attention; `inferflux_cuda`'s safetensors path is newer and less optimized than its GGUF path. Not a claim to contest today — a clear improvement target instead. |
-| Output quality (GGUF) | High semantic parity across all backends (0.893-0.945 cosine similarity, all concurrency levels, both runs) — no backend produced degenerate output. |
-| Output quality (safetensors) | **Fixed.** `inferflux_cuda`'s safetensors output had undecoded byte-level BPE artifacts (`Ġ`/`Ċ` instead of spaces/newlines) *and*, found while fixing that, never applied a real chat template or resolved the correct EOS token — so it also failed to stop generation, hallucinating fake conversation turns after answering. Both root-caused and fixed (see [benchmarks](benchmarks.md) for the full trace); verified via 12 new/extended unit tests, a live end-to-end API check returning clean text with `finish_reason: "stop"`, and a post-fix benchmark re-run (numbers above) whose `total_tokens` dropped from 2048 to 2025 — direct evidence of correct stopping, not just the two hand-checked repro prompts. |
-| Measurement caution | Stage 1 (GGUF) throughput varied up to ~30% between two back-to-back runs at the same concurrency, especially for `llama_cpp_cuda`. Single-run benchmark numbers on this harness should not be treated as precise; average multiple runs before citing a specific ratio. |
+| Native CUDA serving at high concurrency (GGUF) | **Leads llama.cpp at c=16 on the same harness in both runs** (avg 332.7 vs 231.4 = 1.44x; runs 1.38x and 1.49x). llama.cpp stays clearly ahead at c=1-4 (0.86x/0.82x); c=8 is contested (runs split around 0.92-1.02x). |
+| GGUF memory | `inferflux_cuda` peak 5,478 MB vs llama.cpp 4,086 MB on the identical gguf-compare workload (**+1,392 MB**, down from +3,006 MB before the Sep 7 memory campaign). Ledger split: weights+shared MMQ layouts 2,660 MB, KV reserve 1,208 MB, workspaces ~275 MB. |
+| vs Ollama (GGUF) | **~2.7x faster** at c=16 (332.7 vs 123.1). Local Ollama plateaus flat (~120-125) at every concurrency — no cross-request batching. |
+| vs vLLM / SGLang (safetensors) | Still behind at concurrency but the gap narrowed: c=16 avg 338.2 vs vLLM 675.3 (**2.00x**) and SGLang 515.3 (**1.52x**) — was 2.37-2.70x on Sep 4. vLLM/SGLang scale ~15-19x from c=1; `inferflux_cuda` ~7x. Both engines also carry the memory bill: `inferflux_cuda` serves the same workload at **2.3-2.4x less GPU memory** (8.3-8.7 GB vs ~18.2-20.1 GB). |
+| Output quality | 0 classified failures across every backend, format, and concurrency cell in this campaign; GGUF semantic parity vs llama.cpp mean Jaccard ~0.50 / overlap ~0.65 on 64-token greedy generations (unchanged by the memory campaign). |
+| Measurement caution | Run-to-run variance up to ~30% on this harness (c=4 GGUF swung 146-182 across runs). All cited numbers are 2-run averages; never cite a single run. |
 | Operator rigor | Production-grade: metrics, audit, RBAC, guardrails, health probes |
 | Architecture quality | RAII, DIP, strategy pattern; extensive unit test suite, 0 bare `catch(...)` |
 
@@ -47,7 +74,7 @@ InferFlux Positioning (Sep 2026, GGUF Q4_K_M, Qwen2.5-3B, 2-run avg):
 | Request dispatch | C++ unified batch → single GPU kernel | Go goroutine → CGo → llama.cpp per-request | Node.js event loop → llama.cpp server |
 | Language boundary | None (C++→CUDA) | Go→C (CGo, ~1-5μs/call × N) | JS→HTTP→C++ (subprocess) |
 | Batching | IBatchSelectionPolicy groups N sequences into 1 forward pass | No cross-request batching | No batching (sequential) |
-| Scaling (GGUF, c=1→c=16, 2-run avg) | ~3.33x | ~1.00x (flat) | not measured on GGUF this run |
+| Scaling (GGUF, c=1→c=16, 2-run avg) | ~3.22x | ~1.01x (flat) | ~0.65x (degrades) |
 | GC/runtime pauses | None | Go GC stop-the-world | V8 GC + event loop stalls |
 
 ## 3) What Is Distinctive
@@ -67,7 +94,7 @@ InferFlux Positioning (Sep 2026, GGUF Q4_K_M, Qwen2.5-3B, 2-run avg):
 | GPU memory overhead (+2.9 to +3.6 GB vs llama_cpp_cuda on GGUF, 2-run range) | **Resolved (Sep 7)**: root-caused via nsys memory trace and fixed in #108/#109/#110 — netted steady live 6,391 → 4,762 MB (−1,629 MB) with throughput parity-or-better. Residual vs llama.cpp is dominated by the worst-case KV reserve (see performance plan §4e-results). |
 | `inferflux_cuda` still behind llama_cpp_cuda at c=1-4 | Consistent both runs; the c=1-4 gap is the active competitive target |
 | c=8 crossover point is noisy | Don't rely on a specific c=8 ratio in either direction until more runs are collected |
-| `inferflux_cuda` well behind vLLM/SGLang on full-precision safetensors | 2.37-2.70x behind at c=16 (post-fix), widening with concurrency (both scale near-linearly, `inferflux_cuda` doesn't). |
+| `inferflux_cuda` behind vLLM/SGLang on full-precision safetensors | Narrowed to **1.52-2.00x at c=16** (Sep 7: 338 vs 515/675 tok/s; was 2.37-2.70x on Sep 4) while serving at 2.3-2.4x less GPU memory. Both rivals scale near-linearly (~15-19x c=1→c=16); `inferflux_cuda` ~7x. |
 | ~~`inferflux_cuda` safetensors output malformed / never stops~~ | **Fixed.** Byte-level BPE decode, chat-template rendering (now shared with GGUFTokenizer via `model/chat_template_renderer.{h,cpp}`), and config.json-based BOS/EOS fallback all landed together — see [benchmarks](benchmarks.md) for the full trace. |
 | Native structured output | Still delegates to llama.cpp parity backend |
 | GPU CI enforcement | Eight hosted checks protect `main`; trusted CUDA+ROCm release gate operational |
@@ -77,8 +104,8 @@ InferFlux Positioning (Sep 2026, GGUF Q4_K_M, Qwen2.5-3B, 2-run avg):
 
 | Question | Answer |
 |---|---|
-| What can we claim? | Leads llama.cpp at c=16 (~1.56x, reproduced across two runs), ~2.88x faster than Ollama at c=16, high semantic parity across all backends on GGUF |
-| What should not be oversold? | Throughput at c=1-4 (llama_cpp_cuda clearly wins there), any single-run c=8 number (it flipped direction between runs), GPU memory efficiency at c=1-4 (the Sep 7 fixes closed the bulk of the GGUF overhead; the worst-case KV reserve remains by design), and full-precision safetensors speed — vLLM/SGLang beat `inferflux_cuda` there by 2.4-2.7x even post-fix |
+| What can we claim? | Leads llama.cpp at c=16 on the same harness (~1.44x, both runs agree), ~2.7x faster than Ollama at c=16, 0 classified failures campaign-wide, high semantic parity, and 2.3-2.4x less GPU memory than vLLM/SGLang on safetensors (1.5-2.0x their throughput) |
+| What should not be oversold? | Throughput at c=1-4 (llama_cpp_cuda clearly wins there), any single-run number (variance to ~30%), the residual GGUF memory overhead (+1.4 GB, dominated by the worst-case KV reserve), and full-precision safetensors speed — vLLM/SGLang still lead by 1.5-2.0x at c=16 |
 | Developer pitch | "The performance of custom CUDA kernels with the compatibility of llama.cpp, in a single binary with OpenAI-compatible APIs" |
 
 ## 6) References
