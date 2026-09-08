@@ -43,13 +43,18 @@ Open: width-1 decode tail during closed-loop EOS stagger (workload-
 2-run average per cell (multi-backend harness; 0 classified failures):
 
 ```
-Backend        c=1    c=4    c=8    c=16   scale    GPU peak
-─────────────  ────   ────   ────   ─────  ──────   ─────────
-inferflux_cuda 47.7   143.8  206.2  338.2  ~7.1x    8.3-8.7 GB
-vLLM           36.9   160.2  336.0  675.3  ~18.3x   ~20.1 GB
-SGLang         38.1   156.9  307.0  515.3  ~13.5x   18.2-20.1 GB
-LM Studio      115.8  75.2   73.0   71.5   ~0.6x    2.9-3.1 GB
+Backend           c=1    c=4    c=8    c=16   scale    GPU peak
+────────────────  ────   ────   ────   ─────  ──────   ─────────
+inferflux_cuda    47.7   143.8  206.2  338.2  ~7.1x    8.3-8.7 GB
+llama.cpp (f16¹)  44.7   82.5   143.8   93.0  ~2.1x    ~8.0 GB
+vLLM              36.9   160.2  336.0  675.3  ~18.3x   ~20.1 GB
+SGLang            38.1   156.9  307.0  515.3  ~13.5x   18.2-20.1 GB
+LM Studio         115.8  75.2   73.0   71.5   ~0.6x    2.9-3.1 GB
 ```
+
+¹ llama.cpp cannot read safetensors directly: its cell runs an f16 GGUF
+sidecar of the same weights (highest-precision llama.cpp serving), so it
+measures a different quantization than the q4_k_m GGUF row.
 
 - Gap to vLLM/SGLang narrowed to **1.52-2.00x at c=16** (was 2.37-2.70x on
   Sep 4-6), while serving at 2.3-2.4x less GPU memory. The post-#110 scratch

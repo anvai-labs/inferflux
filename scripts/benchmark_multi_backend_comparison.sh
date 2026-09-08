@@ -295,6 +295,18 @@ print("unknown")
 PYEOF
 }
 
+# Largest *.gguf next to (or inside) the model path — the artifact the
+# server's GGUF-sidecar fallback would load for llama.cpp-style backends.
+find_llama_sidecar_gguf() {
+    local model_path=$1
+    local dir="$model_path"
+    if [ -f "$model_path" ]; then
+        dir=$(dirname "$model_path")
+    fi
+    find "$dir" -maxdepth 1 -name '*.gguf' -print0 2>/dev/null |
+        xargs -0 -r ls -S 2>/dev/null | head -1
+}
+
 backend_supports_model_format() {
     local backend=$1
     local format=$2
@@ -1741,6 +1753,20 @@ main() {
     for backend in "${requested_backends[@]}"; do
         if backend_supports_model_format "$backend" "$MODEL_FORMAT"; then
             BACKEND_FORMAT_COMPATIBLE[$backend]=true
+        elif [[ "$backend" == llama_cpp_* && "$MODEL_FORMAT" == "safetensors" ]]; then
+            # llama.cpp cannot ingest safetensors directly; the server's
+            # router falls back to a GGUF sidecar in the model directory.
+            # Benchmark that path when a sidecar artifact exists.
+            local sidecar
+            sidecar=$(find_llama_sidecar_gguf "$MODEL_PATH")
+            if [ -n "$sidecar" ]; then
+                BACKEND_FORMAT_COMPATIBLE[$backend]=true
+                log_warn "$backend will serve safetensors via GGUF sidecar: $(basename "$sidecar")"
+            else
+                BACKEND_FORMAT_COMPATIBLE[$backend]=false
+                BACKEND_AVAILABLE[$backend]=false
+                log_warn "Skipping $backend benchmark (safetensors model has no GGUF sidecar in $MODEL_PATH)"
+            fi
         else
             BACKEND_FORMAT_COMPATIBLE[$backend]=false
             BACKEND_AVAILABLE[$backend]=false

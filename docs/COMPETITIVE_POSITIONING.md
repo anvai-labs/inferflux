@@ -33,7 +33,7 @@ InferFlux Positioning (Sep 7 2026, 2-run avg, tok/s):
 | Engine | GGUF / CUDA | Safetensors / CUDA | GGUF / ROCm | Safetensors / ROCm |
 |---|---|---|---|---|
 | `inferflux_cuda` / `inferflux_rocm` | ✓ | ✓ | ✓ (last measured Sep 7 morning: ~17-36 tok/s c=1-8; GPU passthrough currently absent on the bench host) | ✗ no HIP bf16 forward built |
-| llama.cpp (`llama_cpp_cuda` / `llama_cpp_rocm`) | ✓ | harness skips — the server supports GGUF-sidecar fallback but it is not benchmarked here | ✓ (blocked with host) | via sidecar; blocked with host |
+| llama.cpp (`llama_cpp_cuda` / `llama_cpp_rocm`) | ✓ | ✓ via f16 GGUF sidecar (harness-enabled; the router resolves a `*.gguf` sidecar in the model dir) | ✓ (blocked with host) | via sidecar; blocked with host |
 | vLLM | ✗ (GGUF unsupported in this venv) | ✓ | ✗ not installed for ROCm | ✗ |
 | SGLang | ✗ | ✓ (requires `TVM_FFI_GPU_BACKEND=cuda` when ROCm toolchain is on PATH — its JIT otherwise misdetects HIP) | ✗ not installed | ✗ |
 | Ollama / LM Studio | ✓ (local Ollama plateaus ~123 tok/s flat) | LM Studio only | — | — |
@@ -50,11 +50,17 @@ harness; per-cell response classification reported 0 failures everywhere):
 | Backend | GGUF c=1 | GGUF c=4 | GGUF c=8 | GGUF c=16 | ST c=1 | ST c=4 | ST c=8 | ST c=16 | GPU peak (GB) |
 |---|---|---|---|---|---|---|---|---|---|
 | `inferflux_cuda` | 103.4 | 163.8 | 265.8 | **332.7** | 47.7 | 143.8 | 206.2 | **338.2** | 5.5 GGUF loaded / 8.3-8.7 ST |
-| llama.cpp CUDA | **119.8** | **198.7** | **284.0** | 231.4 | — | — | — | — | 4.1 (gguf-compare harness) |
+| llama.cpp CUDA | **119.8** | **198.7** | **284.0** | 231.4 | 44.7 | 82.5 | 143.8 | 93.0¹ | 4.1 GGUF / 8.0 ST¹ |
 | vLLM | — | — | — | — | 36.9 | 160.2 | 336.0 | **675.3** | ~20.1 |
 | SGLang | — | — | — | — | 38.1 | 156.9 | 307.0 | **515.3** | 18.2-20.1 |
 | Ollama (local) | 121.3 | 124.1 | 124.2 | 123.1 | — | — | — | — | ~1.0 (run 2 sampled ~2.9 — attribution inconsistent) |
 | LM Studio | 115.4 | 71.7 | 76.2 | 75.0 | 115.8 | 75.2 | 73.0 | 71.5 | 2.9-3.1 |
+
+¹ llama.cpp cannot ingest safetensors directly; its ST cell runs an f16 GGUF
+sidecar of the same weights (llama.cpp's standard path for HF weights), so it
+measures llama.cpp at f16 — a different quantization than its own q4_k_m GGUF
+row. Throughput degrades from c=8 to c=16 (f16 KV pressure); run-to-run
+variance on this cell is the highest measured (c=16: 87.9-98.0).
 
 | Category | Reading |
 |---|---|
@@ -62,6 +68,7 @@ harness; per-cell response classification reported 0 failures everywhere):
 | GGUF memory | `inferflux_cuda` peak 5,478 MB vs llama.cpp 4,086 MB on the identical gguf-compare workload (**+1,392 MB**, down from +3,006 MB before the Sep 7 memory campaign). Ledger split: weights+shared MMQ layouts 2,660 MB, KV reserve 1,208 MB, workspaces ~275 MB. |
 | vs Ollama (GGUF) | **~2.7x faster** at c=16 (332.7 vs 123.1). Local Ollama plateaus flat (~120-125) at every concurrency — no cross-request batching. |
 | vs vLLM / SGLang (safetensors) | Still behind at concurrency but the gap narrowed: c=16 avg 338.2 vs vLLM 675.3 (**2.00x**) and SGLang 515.3 (**1.52x**) — was 2.37-2.70x on Sep 4. vLLM/SGLang scale ~14-18x from c=1; `inferflux_cuda` ~7x. Both engines also carry the memory bill: `inferflux_cuda` serves the same workload at **2.3-2.4x less GPU memory** (8.3-8.7 GB vs ~18.2-20.1 GB). |
+| vs llama.cpp on full-precision weights | `inferflux_cuda` **3.6x faster** at c=16 (338.2 vs 93.0, 2-run avg) on the same safetensors weights (llama.cpp via f16 GGUF sidecar — its highest-precision serving mode), and comparable memory (8.3-8.7 vs 8.0 GB). |
 | Output quality | 0 classified failures in every gguf-compare cell (24 measurements — the only harness that emits the field; 12 cells x 2 runs); GGUF semantic parity vs llama.cpp on this campaign's 64-token greedy generations: mean Jaccard ~0.55 / overlap ~0.69. |
 | Measurement caution | Run-to-run variance up to ~30% on this harness (c=4 GGUF swung 146-182 across runs). All cited numbers are 2-run averages; never cite a single run. |
 | Operator rigor | Production-grade: metrics, audit, RBAC, guardrails, health probes |
