@@ -1160,8 +1160,12 @@ bool GGUFModelLoader::GetOrBuildDownProjMmqLayout(IWeightAccessor *accessor,
                 "MMQ layout signature mismatch for tensor " + tensor.info.name);
       return false;
     }
-    *out = {tensor.mmq_layout_gpu, quant_type, rows, cols,
-            tensor.mmq_layout_tile_cols, tensor.mmq_layout_bytes};
+    *out = {tensor.mmq_layout_gpu,
+            quant_type,
+            rows,
+            cols,
+            tensor.mmq_layout_tile_cols,
+            tensor.mmq_layout_bytes};
     return true;
   }
 
