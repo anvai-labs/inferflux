@@ -340,6 +340,8 @@ Scope contract:
 | `INFERFLUX_CUDA_REQUIRE_FUSED_MATMUL` | `runtime.cuda.quantized_runtime.require_fused_matmul` |
 | `INFERFLUX_DISABLE_CUDA_GRAPH` | disable decode CUDA graph capture/replay (graphs otherwise capture per decode width and replay via the device token relay) |
 | `INFERFLUX_DISABLE_DECODE_RELAY` | disable the device-side decode token relay (`DeviceTokenRelayKernel` + fingerprint-guarded graph replay); forces the full H2D metadata upload every decode step. Validation kill switch — engaged replays are visible as `inferflux_scheduler_decode_relay_replays_total` in `/metrics` |
+| `INFERFLUX_LLAMA_MAX_PARALLEL_SEQS` | llama.cpp wrapper `n_seq_max` — sizes the total llama.cpp KV pool. The default 128 reserves large VRAM (32k KV tokens for a 3B model); right-size to the intended admission concurrency (e.g. `16` measured −25% VRAM and +5-10% throughput on Qwen2.5-3B q4_k_m). YAML: `runtime.cuda.max_parallel_sequences` (env wins) |
+| `INFERFLUX_LLAMA_KV_CACHE_TYPE` | llama.cpp wrapper KV element type for both K and V: `f16` (default) / `q8_0` / `q4_0`. `q8_0` saves ~66 MB on a 3B model but measured 15-20% slower — memory-constrained deployments only |
 | `INFERFLUX_DISABLE_SHARED_MMQ_LAYOUT` | share transformed down-proj MMQ layouts across weight-map replicas via the loader's per-tensor cache instead of building one copy per replica (primary + overlap lanes). Set `1` to restore per-replica layouts |
 | `INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED` | reject generation admission with `503` when distributed KV transport is degraded (`false` default) |
 | `INFERFLUX_READYZ_DISAGG_TIMEOUT_DEBT_THRESHOLD` | distributed KV timeout debt threshold that forces `/readyz` to `503` (`6` default when streak threshold is enabled, `0` disables) |
