@@ -216,6 +216,7 @@ int main(int argc, char **argv) {
   std::string tls_key_path;
   bool cuda_enabled = false;
   bool cuda_flash_attention_enabled = false;
+  int llama_max_parallel_sequences_configured = -1;
   int cuda_flash_attention_tile = 128;
   std::string cuda_attention_kernel = "auto";
   std::string inferflux_cuda_kv_cache_dtype = "auto";
@@ -353,6 +354,13 @@ int main(int argc, char **argv) {
           cuda_flash_attention_enabled =
               config["runtime"]["cuda"]["flash_attention"]["enabled"]
                   .as<bool>();
+        }
+        if (config["runtime"]["cuda"]["max_parallel_sequences"]) {
+          const int parsed =
+              config["runtime"]["cuda"]["max_parallel_sequences"].as<int>();
+          if (parsed > 0) {
+            llama_max_parallel_sequences_configured = parsed;
+          }
         }
         if (config["runtime"]["cuda"] &&
             config["runtime"]["cuda"]["flash_attention"] &&
@@ -1133,6 +1141,21 @@ int main(int argc, char **argv) {
   primary_cfg.flash_attention_tile = cuda_flash_attention_tile;
   primary_cfg.cuda_attention_kernel = cuda_attention_kernel;
   primary_cfg.inferflux_cuda_kv_cache_dtype = inferflux_cuda_kv_cache_dtype;
+  // llama.cpp wrapper tuning: KV element type and KV-pool sequence count.
+  // The pool size (n_seq_max) drives llama.cpp's KV VRAM reservation, so
+  // operators should right-size it to the intended admission concurrency.
+  if (const char *env_kv_type = std::getenv("INFERFLUX_LLAMA_KV_CACHE_TYPE")) {
+    primary_cfg.llama_kv_cache_type = env_kv_type;
+  }
+  if (const char *env_seqs = std::getenv("INFERFLUX_LLAMA_MAX_PARALLEL_SEQS")) {
+    const long parsed = std::strtol(env_seqs, nullptr, 10);
+    if (parsed > 0) {
+      primary_cfg.max_parallel_sequences = static_cast<int>(parsed);
+    }
+  } else if (llama_max_parallel_sequences_configured > 0) {
+    primary_cfg.max_parallel_sequences =
+        llama_max_parallel_sequences_configured;
+  }
   primary_cfg.inferflux_cuda_dequantized_cache_policy =
       inferflux_cuda_dequantized_cache_policy;
   primary_cfg.inferflux_cuda_require_fused_quantized_matmul =
