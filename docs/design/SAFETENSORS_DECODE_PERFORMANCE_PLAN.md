@@ -383,8 +383,9 @@ merged, the same nsys `--cuda-memory-usage=true` capture on the same GGUF
 config + c=16 load measures:
 
 - **Netted steady-state live: 6,391 -> 4,762 MB (-1,629 MB)**. Books close
-  exactly: -1,122 MB (three MMQ layout passes -> one) and -501 MB (scratch
-  rows 2048 -> 512 across three replicas). Mid-serving ledger: weights
+  within rounding (~6 MB residual): -1,122 MB (three MMQ layout passes ->
+  one) and -501 MB measured (scratch rows 2048 -> 512 across three
+  replicas; the §4e estimate was ~460). Mid-serving ledger: weights
   domain 2,660 MB = 2,099 weight buffer + one 561 MB shared layout pass
   (`weights.mmq_layouts` item); three blocks >= 50 MB account for 3,929 MB
   (weights, KV, retained token_embd dequant).
@@ -396,8 +397,10 @@ config + c=16 load measures:
   direct paths coherent, zero guard violations, zero CUDA errors.
 - GGUF nvidia-smi-equivalent peak is now dominated by the load-time
   transient churn (~600 MB dequant + lane warm) on top of a ~4.8 GB
-  steady state; vs llama.cpp 4,142 MB the residual is the 1,208 MB
-  worst-case KV reserve plus the retained token_embd dequant.
+  steady state; the remaining gap to llama.cpp's 4,142 MB is dominated by
+  the 1,208 MB worst-case KV reserve plus the retained token_embd dequant
+  (a qualitative comparison — llama.cpp's footprint also includes its own
+  demand-grown KV, so the two peaks are not an additive decomposition).
 
 En-route fixes that the series carries: the KV seq-id OOB (unguarded
 device writes whenever >16 sequences were resident — now admission-bounded

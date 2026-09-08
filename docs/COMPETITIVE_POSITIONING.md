@@ -64,7 +64,7 @@ InferFlux Positioning (Sep 2026, GGUF Q4_K_M, Qwen2.5-3B, 2-run avg):
 
 | Gap | Status |
 |---|---|
-| GPU memory overhead (+2.9 to +3.6 GB vs llama_cpp_cuda on GGUF, 2-run range) | Partially mitigated (aliasing, splits, budget). Structural from pre-allocated workspace; grew from the +1.3 GB 2026-08-31 reading — not yet re-explained, worth a follow-up rather than assumed regression. |
+| GPU memory overhead (+2.9 to +3.6 GB vs llama_cpp_cuda on GGUF, 2-run range) | **Resolved (Sep 7)**: root-caused via nsys memory trace and fixed in #108/#109/#110 — netted steady live 6,391 → 4,762 MB (−1,629 MB) with throughput parity-or-better. Residual vs llama.cpp is dominated by the worst-case KV reserve (see performance plan §4e-results). |
 | `inferflux_cuda` still behind llama_cpp_cuda at c=1-4 | Consistent both runs; the c=1-4 gap is the active competitive target |
 | c=8 crossover point is noisy | Don't rely on a specific c=8 ratio in either direction until more runs are collected |
 | `inferflux_cuda` well behind vLLM/SGLang on full-precision safetensors | 2.37-2.70x behind at c=16 (post-fix), widening with concurrency (both scale near-linearly, `inferflux_cuda` doesn't). |
@@ -78,7 +78,7 @@ InferFlux Positioning (Sep 2026, GGUF Q4_K_M, Qwen2.5-3B, 2-run avg):
 | Question | Answer |
 |---|---|
 | What can we claim? | Leads llama.cpp at c=16 (~1.56x, reproduced across two runs), ~2.88x faster than Ollama at c=16, high semantic parity across all backends on GGUF |
-| What should not be oversold? | Throughput at c=1-4 (llama_cpp_cuda clearly wins there), any single-run c=8 number (it flipped direction between runs), GPU memory efficiency (+2.9-3.6 GB and not yet re-explained since the Apr/Aug readings), and full-precision safetensors speed — vLLM/SGLang beat `inferflux_cuda` there by 2.4-2.7x even post-fix |
+| What should not be oversold? | Throughput at c=1-4 (llama_cpp_cuda clearly wins there), any single-run c=8 number (it flipped direction between runs), GPU memory efficiency at c=1-4 (the Sep 7 fixes closed the bulk of the GGUF overhead; the worst-case KV reserve remains by design), and full-precision safetensors speed — vLLM/SGLang beat `inferflux_cuda` there by 2.4-2.7x even post-fix |
 | Developer pitch | "The performance of custom CUDA kernels with the compatibility of llama.cpp, in a single binary with OpenAI-compatible APIs" |
 
 ## 6) References
