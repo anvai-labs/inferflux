@@ -55,6 +55,15 @@ External engine notes:
 - `vllm` and `sglang` are treated as OpenAI-compatible HTTP backends in the multi-backend benchmark.
 - They can either be pre-started externally or auto-launched locally by the harness.
 - Set `AUTOSTART_VLLM=true` and/or `AUTOSTART_SGLANG=true` to have the benchmark launch and tear them down one at a time.
+- Stock `llama-server` comparison: build it out-of-tree from the pinned
+  submodule with a conda-free environment — the operative fix is `env -i`
+  (anaconda's sysroot libm otherwise breaks the link; apply it to BOTH the
+  configure and build steps): `env -i PATH=/usr/local/cuda/bin:/usr/bin:/bin
+  HOME=$HOME cmake -S external/llama.cpp -B /tmp/llama-server-build
+  -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release && env -i
+  PATH=/usr/local/cuda/bin:/usr/bin:/bin HOME=$HOME cmake --build
+  /tmp/llama-server-build --target llama-server`. Suggested flags to mirror
+  the tuned wrapper: `-ngl 99 -c 4096 -np 16 -fa on`.
 - When the ROCm toolchain is installed system-wide (e.g. `/usr/bin/hipcc`), SGLang's kernel JIT misdetects HIP and fails to build. Export `TVM_FFI_GPU_BACKEND=cuda` for the benchmark (or globally) to force the CUDA toolchain.
 - Use `VLLM_MODEL` / `SGLANG_MODEL` to override auto-discovery from `/v1/models`.
 - Use `VLLM_MODEL_PATH` / `SGLANG_MODEL_PATH` to point local autostart at a safetensors model directory.

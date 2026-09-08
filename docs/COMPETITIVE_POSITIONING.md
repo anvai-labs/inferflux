@@ -42,6 +42,39 @@ Note: the AMD R9700 dropped out of WSL passthrough mid-session (`/dev/kfd`
 absent); ROCm cells retain the Sep 7 morning spot measurements and should be
 re-run when the host restores the device.
 
+### 0b) Stock llama.cpp server — the missing baseline (Sep 8)
+
+The campaign rows for "llama.cpp" measure InferFlux's **wrapper**
+(`llama_cpp_cuda`: InferFlux scheduler -> llama.cpp library), not the stock
+`llama-server` that ships with llama.cpp and carries its own continuous
+batching. Benchmarked separately (same model, same concurrent battery, 2-run
+averages, 256-token completions; built from the pinned submodule with CUDA;
+`-ngl 99 -c 4096 -np 16 -fa on` — the insights-applied configuration):
+
+| Backend | c=1 | c=8 | c=16 | GPU peak |
+|---|---|---|---|---|
+| `inferflux_cuda` | 95.8 | 310.1 | 506.6 | 5.4 GB |
+| wrapper `llama_cpp_cuda` (seqs=16, post-#117) | 104.7 | 311.7 | 590.8 | 3.0 GB |
+| stock `llama-server` (16 slots) | 104.4 | **390.1** | **664.4** | **3.0 GB** |
+
+- **Stock llama-server leads this burst workload at c>=8**: +20-31% over
+  `inferflux_cuda` and +12-13% over the tuned wrapper (per-run range across
+  the two runs), at the same 3.0 GB as the tuned wrapper. The campaign's "1.44x over llama.cpp at
+  c=16" claim holds only against the wrapper (and on the campaign's
+  32x64-token workload); against stock llama-server on this battery,
+  `inferflux_cuda` trails at c>=8.
+- Output inspection: stock-server responses are coherent and correct; its
+  greedy outputs vary more across slots (batch-composition numerics, same
+  phenomenon both engines show).
+- The two llama.cpp deployments serve different purposes: the wrapper
+  exists for InferFlux's scheduler/auth/policy surface, stock llama-server
+  for raw throughput. Closing the stock-server gap at c>=8 is the new
+  performance target; the campaign's workload (many short completions)
+  vs this battery (longer 256-token completions, 3 unique prompts shared
+  by all requests — prefix-cache-friendly, identically for every engine)
+  rank the engines differently, so both measurements are kept side by
+  side.
+
 ## 1) Current Position
 
 Throughput, tok/s, 2-run average (RTX 4000 Ada, Qwen2.5-3B; multi-backend
@@ -111,7 +144,7 @@ variance on this cell is the highest measured (c=16: 87.9-98.0).
 
 | Question | Answer |
 |---|---|
-| What can we claim? | Leads llama.cpp at c=16 on the same harness (~1.44x, both runs agree), ~2.7x faster than Ollama at c=16, 0 classified failures campaign-wide, high semantic parity, and 2.3-2.4x less GPU memory than vLLM/SGLang on safetensors (1.5-2.0x their throughput) |
+| What can we claim? | Leads the llama.cpp wrapper at c=16 on the same harness (~1.44x, both runs agree; see §0b for the stock llama-server baseline), ~2.7x faster than Ollama at c=16, 0 classified failures campaign-wide, high semantic parity, and 2.3-2.4x less GPU memory than vLLM/SGLang on safetensors (1.5-2.0x their throughput) |
 | What should not be oversold? | Throughput at c=1-4 (llama_cpp_cuda clearly wins there), any single-run number (variance to ~30%), the residual GGUF memory overhead (+1.4 GB, dominated by the worst-case KV reserve), and full-precision safetensors speed — vLLM/SGLang still lead by 1.5-2.0x at c=16 |
 | Developer pitch | "The performance of custom CUDA kernels with the compatibility of llama.cpp, in a single binary with OpenAI-compatible APIs" |
 
