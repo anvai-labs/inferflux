@@ -76,7 +76,28 @@ cudaError_t FlashDecodeMultiSeqIndirect(
     size_t ptr_workspace_bytes);
 
 /**
- * FlashDecodeWarpPerHead: warp-per-Q-head decode attention — no shared
+ * FlashDecodePacked: GQA-packed warp-per-head-pair decode attention.
+ * Each warp owns two Q-heads (dots stay in-register via shuffle reduction —
+ * no cross-warp smem round-trips), K/V tiles are staged as half (32 KB ->
+ * 3 blocks/SM vs 1 for the FP32-tile kernels), fp32 accumulation throughout.
+ * Requires head_dim == 128 and GQARatio == 8; other shapes fall back to
+ * FlashDecodeMultiSeqStrided. Shape-static (CUDA-graph safe).
+ * Knob: INFERFLUX_CUDA_ATTN_PACKED_DECODE=0 disables.
+ */
+template <typename T>
+cudaError_t FlashDecodePacked(const T *Q, const T *kv_buffer, T *O,
+                              const int *d_seq_ids, const int *d_kv_lens,
+                              int layer, int batch_size, int num_heads,
+                              int num_kv_heads, int head_dim,
+                              size_t slot_stride, size_t layer_stride,
+                              size_t kv_stride, float scale,
+                              cudaStream_t stream = 0,
+                              void *split_workspace = nullptr,
+                              size_t split_workspace_bytes = 0,
+                              int max_kv_hint = 0);
+
+/**
+ * FlashDecodeWarpPerHead: warp-per-Q-head decode attention - no shared
  * memory, no block barriers, no split workspace or combine kernel.
  * Single launch; preferred at decode contexts where the full-KV scan by
  * num_heads warps already saturates bandwidth.

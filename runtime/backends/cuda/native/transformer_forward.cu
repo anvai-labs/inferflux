@@ -3307,7 +3307,21 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       {
         NVTX_SCOPE("FlashAttention2");
         float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
-        if (kv_contiguous && policy.enable_attn_split_kv && d_attn_partials_) {
+        // GQA-packed decode (PR-1): warp-per-head-pair, half K/V tiles,
+        // in-register dot reduction. Requires the contiguous-cache decode
+        // shape head_dim 128 / GQA 8; everything else falls through.
+        if (kv_contiguous && policy.enable_attn_packed_decode &&
+            head_dim_ == 128 && num_kv_heads_ > 0 &&
+            num_heads_ == num_kv_heads_ * 8) {
+          err = cuda_kernel::FlashDecodePacked<T>(
+              d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_,
+              d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_, head_dim_,
+              kv_cache_->SlotStride(), kv_cache_->LayerStride(),
+              kv_cache_->KvStride(), attn_scale, stream_,
+              d_attn_split_workspace_, attn_split_workspace_bytes_,
+              max_seq_len_);
+        } else if (kv_contiguous && policy.enable_attn_split_kv &&
+                   d_attn_partials_) {
           // Split geometry is fixed at capture time from the configured
           // context length so graph replays stay shape-static; per-sequence
           // kv_lens early-exit empty chunks on device.
