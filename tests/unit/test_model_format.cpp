@@ -39,6 +39,39 @@ TEST_CASE("Model format normalization accepts aliases", "[model_format]") {
   REQUIRE(NormalizeModelFormat("unknown").empty());
 }
 
+TEST_CASE("ResolveGgufArtifactPath resolves files, directories, and misses",
+          "[model_format]") {
+  const auto dir = MakeTempDir("gguf_artifact");
+  REQUIRE(ResolveGgufArtifactPath(dir.string()).empty());
+
+  // A *.gguf file resolves to itself; non-gguf files do not resolve.
+  TouchFile(dir / "weights.gguf");
+  REQUIRE(ResolveGgufArtifactPath((dir / "weights.gguf").string()) ==
+          (dir / "weights.gguf").string());
+  TouchFile(dir / "model.safetensors");
+  REQUIRE(ResolveGgufArtifactPath((dir / "model.safetensors").string())
+              .empty());
+  REQUIRE(ResolveGgufArtifactPath((dir / "does-not-exist.gguf").string())
+              .empty());
+
+  // A directory with gguf files resolves to the best-scoring artifact
+  // (quant-aware ranking, f16 as the catch-all).
+  TouchFile(dir / "model-f16.gguf");
+  REQUIRE(ResolveGgufArtifactPath(dir.string()) ==
+          (dir / "model-f16.gguf").string());
+  TouchFile(dir / "model-q4_k_m.gguf");
+  REQUIRE(ResolveGgufArtifactPath(dir.string()) ==
+          (dir / "model-q4_k_m.gguf").string());
+
+  // Extension match is case-insensitive.
+  TouchFile(dir / "UPPER.GGUF");
+  REQUIRE(ResolveGgufArtifactPath((dir / "UPPER.GGUF").string()) ==
+          (dir / "UPPER.GGUF").string());
+
+  std::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
 TEST_CASE("ResolveLlamaLoadPath picks highest-ranked GGUF sidecar",
           "[model_format]") {
   const auto dir = MakeTempDir("ranked");
