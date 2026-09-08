@@ -355,11 +355,17 @@ int main(int argc, char **argv) {
               config["runtime"]["cuda"]["flash_attention"]["enabled"]
                   .as<bool>();
         }
-        if (config["runtime"]["cuda"]["max_parallel_sequences"]) {
-          const int parsed =
-              config["runtime"]["cuda"]["max_parallel_sequences"].as<int>();
-          if (parsed > 0) {
-            llama_max_parallel_sequences_configured = parsed;
+        // runtime.llama.* matches the startup advisor's emitted snippet;
+        // runtime.cuda.* is accepted as the legacy alias.
+        for (const char *key : {"llama", "cuda"}) {
+          if (config["runtime"][key] &&
+              config["runtime"][key]["max_parallel_sequences"]) {
+            const int parsed =
+                config["runtime"][key]["max_parallel_sequences"].as<int>();
+            if (parsed > 0) {
+              llama_max_parallel_sequences_configured = parsed;
+              break;
+            }
           }
         }
         if (config["runtime"]["cuda"] &&
@@ -1146,10 +1152,17 @@ int main(int argc, char **argv) {
   // operators should right-size it to the intended admission concurrency.
   if (const char *env_kv_type = std::getenv("INFERFLUX_LLAMA_KV_CACHE_TYPE")) {
     primary_cfg.llama_kv_cache_type = env_kv_type;
+    inferflux::log::Info("server", "llama wrapper KV cache type set to " +
+                                       primary_cfg.llama_kv_cache_type);
   }
   if (const char *env_seqs = std::getenv("INFERFLUX_LLAMA_MAX_PARALLEL_SEQS")) {
-    const long parsed = std::strtol(env_seqs, nullptr, 10);
-    if (parsed > 0) {
+    char *end = nullptr;
+    const long parsed = std::strtol(env_seqs, &end, 10);
+    if (end == env_seqs || *end != '\0' || parsed < 1 || parsed > 256) {
+      inferflux::log::Warn(
+          "server", "Ignoring invalid INFERFLUX_LLAMA_MAX_PARALLEL_SEQS='" +
+                        std::string(env_seqs) + "' (valid range 1-256)");
+    } else {
       primary_cfg.max_parallel_sequences = static_cast<int>(parsed);
     }
   } else if (llama_max_parallel_sequences_configured > 0) {

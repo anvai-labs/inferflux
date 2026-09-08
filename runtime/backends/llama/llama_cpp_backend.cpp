@@ -79,6 +79,7 @@ int EffectiveBatchTokenCap(const llama_context *ctx, int config_batch_size) {
 } // namespace
 
 namespace inferflux {
+namespace {
 
 // Map a KV cache type name to its ggml element type for llama.cpp contexts.
 ggml_type KvCacheGgmlType(const std::string &name) {
@@ -99,6 +100,8 @@ ggml_type KvCacheGgmlType(const std::string &name) {
   }
   return GGML_TYPE_F16;
 }
+
+} // namespace
 
 namespace {
 std::mutex g_llama_init_mutex;
