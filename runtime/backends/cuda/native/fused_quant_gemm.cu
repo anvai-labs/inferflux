@@ -1932,12 +1932,14 @@ bool FusedQuantGemm::BuildDownProjMmqLayout(const QuantizedWeightInfo &weight,
       static_cast<int>((transformed_blocks + kThreads - 1) / kThreads);
 
   void *transformed = nullptr;
+  size_t transformed_bytes = 0;
   const auto qtype = static_cast<GGUF::TensorType>(weight.quant_type);
   switch (qtype) {
   case GGUF::TensorType::Q4_K: {
     block_q4_k *typed = nullptr;
-    if (cudaMalloc(reinterpret_cast<void **>(&typed),
-                   transformed_blocks * sizeof(block_q4_k)) != cudaSuccess) {
+    transformed_bytes = transformed_blocks * sizeof(block_q4_k);
+    if (cudaMalloc(reinterpret_cast<void **>(&typed), transformed_bytes) !=
+        cudaSuccess) {
       return false;
     }
     transform_downproj_mmq_layout<<<blocks, kThreads, 0, stream>>>(
@@ -1948,8 +1950,9 @@ bool FusedQuantGemm::BuildDownProjMmqLayout(const QuantizedWeightInfo &weight,
   }
   case GGUF::TensorType::Q6_K: {
     block_q6_k *typed = nullptr;
-    if (cudaMalloc(reinterpret_cast<void **>(&typed),
-                   transformed_blocks * sizeof(block_q6_k)) != cudaSuccess) {
+    transformed_bytes = transformed_blocks * sizeof(block_q6_k);
+    if (cudaMalloc(reinterpret_cast<void **>(&typed), transformed_bytes) !=
+        cudaSuccess) {
       return false;
     }
     transform_downproj_mmq_layout<<<blocks, kThreads, 0, stream>>>(
@@ -1968,7 +1971,8 @@ bool FusedQuantGemm::BuildDownProjMmqLayout(const QuantizedWeightInfo &weight,
     return false;
   }
 
-  *layout = {transformed, weight.quant_type, rows, cols, tile_cols};
+  *layout = {transformed, weight.quant_type, rows, cols, tile_cols,
+             transformed_bytes};
   return true;
 }
 

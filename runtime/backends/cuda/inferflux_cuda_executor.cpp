@@ -321,6 +321,9 @@ void WarmQuantizedLaneCache(inferflux::QuantizedWeightMap *weight_map) {
     (void)weight_map->LayerQProjBias(layer);
     (void)weight_map->LayerKProjBias(layer);
     (void)weight_map->LayerVProjBias(layer);
+    // Borrow the shared transformed MMQ layout (no-op for the second and
+    // later replicas; builds once per tensor in the loader).
+    (void)weight_map->GetMmqLayerDownProj(layer);
   }
 }
 
@@ -991,6 +994,22 @@ void InferfluxCudaExecutor::RefreshMemoryLedger() {
                               weights_bytes, weights_bytes);
   }
 
+  // Shared transformed MMQ layouts live on the GGUF loader's tensors.
+  if (model_loader_) {
+    auto *gguf_loader = dynamic_cast<runtime::cuda::native::GGUFModelLoader *>(
+        model_loader_.get());
+    if (gguf_loader) {
+      const std::size_t mmq_layout_bytes =
+          gguf_loader->GetMmqTransformedLayoutBytes();
+      if (mmq_layout_bytes > 0) {
+        memory_ledger_.UpsertItem("weights.mmq_layouts",
+                                  runtime::cuda::native::MemoryDomain::kWeights,
+                                  runtime::cuda::native::MemoryLifetime::kModel,
+                                  mmq_layout_bytes, mmq_layout_bytes);
+      }
+    }
+  }
+
   auto record_qwm_scratch = [&](const char *label,
                                 const QuantizedWeightMap *map) {
     if (!map) {
@@ -1420,10 +1439,14 @@ bool InferfluxCudaExecutor::InitializeLaneOverlapResources(
         allow_fused_quantized_matmul);
     decode_lane_quantized_weight_map_->SetBatchDequantCacheEnabled(
         execution_policy_.enable_batch_dequant_cache);
+    decode_lane_quantized_weight_map_->SetSharedMmqLayoutEnabled(
+        !execution_policy_.disable_shared_mmq_layout);
     prefill_lane_quantized_weight_map_->SetAllowFusedQuantizedMatmul(
         allow_fused_quantized_matmul);
     prefill_lane_quantized_weight_map_->SetBatchDequantCacheEnabled(
         execution_policy_.enable_batch_dequant_cache);
+    prefill_lane_quantized_weight_map_->SetSharedMmqLayoutEnabled(
+        !execution_policy_.disable_shared_mmq_layout);
 
     decode_lane_quantized_weight_adapter_ =
         std::make_unique<QuantizedWeightMapAdapter>(
@@ -1884,6 +1907,8 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
         allow_fused_quantized_matmul);
     quantized_weight_map_->SetBatchDequantCacheEnabled(
         execution_policy_.enable_batch_dequant_cache);
+    quantized_weight_map_->SetSharedMmqLayoutEnabled(
+        !execution_policy_.disable_shared_mmq_layout);
     quantized_weight_adapter_ = std::make_unique<QuantizedWeightMapAdapter>(
         quantized_weight_map_.get());
     // GGUF always dequantizes to FP16, so use LlamaForwardTyped<half>

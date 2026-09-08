@@ -726,6 +726,7 @@ add_executable(inferflux_tests
   tests/unit/test_backend_interface.cpp
   tests/unit/test_native_bootstrap_config.cpp
   tests/unit/test_decode_relay_fingerprint.cpp
+  tests/unit/test_native_policy_env.cpp
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_startup_advisor.cpp

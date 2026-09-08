@@ -2603,6 +2603,12 @@ template <typename T> void LlamaForwardTyped<T>::WarmWeightCaches() {
   weights_->FinalNorm();
   // Pre-warm LM head to avoid first-token TTFT penalty from lazy dequant.
   weights_->LmHead();
+  // Build the transformed down-proj MMQ layouts up front: the first capture
+  // of a decode graph containing them would otherwise abort on the build's
+  // internal cudaStreamSynchronize and burn a retry.
+  for (int l = 0; l < num_layers_; ++l) {
+    (void)weights_->LayerDownProjMmq(l);
+  }
   // Clear any CUDA errors from pre-warm (e.g., missing bias tensors return
   // nullptr without error, but some edge-case allocations may fail).
   cudaGetLastError();
