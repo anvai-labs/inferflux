@@ -409,6 +409,73 @@ every call (fail-closed; proper KV-free path in #111), the direct
 Generate path issuing whole-prompt single calls (now chunked), and the
 phased-prefill path bypassing chunked_prefill_tokens.
 
+### 4f) Profiling vs stock llama-server (Sep 8): where the GGUF decode time goes
+
+Setting: identical decode-heavy battery (48 requests x 256 tokens at c=16,
+3 shared prompts, Qwen2.5-3B q4_k_m, FA on both). nsys `--trace=cuda`
+captures of both engines, ncu SpeedOfLight+Occupancy on the attention
+kernels.
+
+**End-to-end**: stock `llama-server` (`-ngl 99 -c 4096 -np 16 -fa on`)
+sustains 1,066 tok/s vs `inferflux_cuda` 468 tok/s (2.28x) on this
+battery.
+
+**GPU busy time for the same 12,288 generated tokens** (nsys, kernels
+merged-overlap):
+
+| Family | inferflux_cuda | llama-server | ratio |
+|---|---|---|---|
+| matmul (MMQ/mul_mat_q) | 99.8 us/tok | 35.1 us/tok | 2.8x |
+| attention | 35.6 us/tok | 2.1 us/tok | **17x** |
+| MMVQ/GEMV | 17.2 us/tok | (in mul_mat family) | — |
+| sampling/argmax | 11.8 us/tok | ~0 | — |
+| standalone dequant | 11.1 us/tok | ~0 | — |
+| elementwise/quant | 6.8 us/tok | 1.9 us/tok | 3.6x |
+| **TOTAL** | **184.6 us/tok** | **39.9 us/tok** | **4.6x** |
+| kernels/token | 4.90 | 1.30 | 3.8x |
+
+**The attention kernel is the single largest defect.** ncu on
+`FlashAttention2MMAGQAKernel<half,8>` (decode, batch 16):
+
+- grid (16,2,1) x 128 threads = **32 blocks total** (one per
+  sequence x kv-head) -> 0.67 waves; most SMs idle.
+- **Theoretical occupancy 8.33%, limited by shared memory**
+  (1 block/SM); ncu estimates 91.67% local speedup available.
+- SM throughput 11.6%, memory 25% — latency-bound, neither pipe busy.
+- ~247 us per layer-step launch (nsys) = 17x llama.cpp's
+  `flash_attn_ext_f16` (~8.6-21 us/launch; 96 blocks via stream-K
+  decomposition covering batch + KV splits, 16.7% occupancy).
+
+Bridge plan (ranked by measured headroom):
+
+1. **Attention**: restructure the decode FA kernel to cover the whole
+   batch per launch (llama.cpp-style batch/KV-split decomposition with a
+   fixup pass) and cut shared memory so >=2 blocks/SM fit. Target: 435 ms
+   -> <60 ms per 12k tokens (-16% total GPU time).
+2. **Sampling**: `BatchedArgmaxKernel` runs 12 launches/step at ~96 us
+   (144 ms total) — fuse into one launch per step over all sequences.
+3. **Standalone dequant**: 92 launches x ~1.5 ms (136 ms) — these are
+   dequant-cache materializations on the serving path; keep weights
+   resident per the existing cache policies instead.
+4. **Matmul**: inferflux's Q4_K/Q6_K mma kernels total 2.8x llama.cpp's
+   per-token time; per-launch they are 11x smaller (63.8 us vs 734 us) —
+   larger per-launch work (tile batching across slots, fewer syncs) is
+   the follow-up; needs ncu per-kernel comparison before touching code.
+5. **Launch amplification**: 4.9 kernels/token vs 1.3 — CUDA-graph the
+   GGUF decode step end-to-end once the per-kernel fixes land.
+
+**Why vLLM/SGLang still beat llama.cpp** (general, not measured here):
+paged/radix KV gives token-level batching with tensor-core attention
+kernels (FlashAttention/FlashInfer) and eliminates fragmentation; chunked
+prefill mixes prompt tokens into the running decode batch so the GPU
+never stalls on a prompt phase; automatic prefix caching reuses tokens
+across requests; whole decode steps run under CUDA graphs with fused
+norms/RoPE. llama.cpp optimizes for small-batch latency and GGUF quant
+breadth; its slots are sequence-bound, so prefill phases stall decode and
+per-step kernels stay GEMV-shaped. At c=16 with 256-token sequences the
+stock server still wins on kernel quality (see 4e/4f), but the serving
+architecture is the ceiling vLLM/SGLang design around.
+
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled
