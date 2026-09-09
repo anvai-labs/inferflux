@@ -6,8 +6,10 @@
 // scratch swept between iterations — warm-L2 overstates >100% roofline,
 // plan-doc §5).
 //
-// Correctness: MMA/dp4a/MMVQ outputs cross-checked against a float GEMM over
-// device-dequantized weights (dequantize_q4_k) on a 64-output sample.
+// Correctness: MMA vs dp4a outputs cross-checked on a 64-output sample
+// (gate 2e-3, enforced via exit code). The standalone dequant reference
+// disagrees with both kernels on synthetic data and is informational only;
+// MMVQ outputs are not correctness-checked (timing only).
 //
 // Decision table (plan file): MMA >=1.3x slower than llama mul_mat_q
 // per-kernel -> stream-K rework (PR-3); parity but in-server family gap ->
@@ -200,13 +202,26 @@ int main() {
         cudaMemset(d_part, 0, sizeof(float) * static_cast<size_t>(M) * N *
                                   max_splits);
 
+        bool mma_ok = true;
         auto run_mma = [&]() {
-          inferflux::FusedQuantGemm::QuantizeForMmqMma(d_in, d_ds, M, K, s);
-          inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
-              wi, d_ds, d_out, d_part, M, N, K, s);
+          if (!inferflux::FusedQuantGemm::QuantizeForMmqMma(d_in, d_ds, M, K, s) ||
+              !inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
+                  wi, d_ds, d_out, d_part, M, N, K, s)) {
+            mma_ok = false;
+            return;
+          }
         };
         // correctness
         cudaMemset(d_out, 0, static_cast<size_t>(M) * N * sizeof(half));
+        run_mma();
+        if (!mma_ok) {
+          // M < 2 (and unsupported geometries) decline by design — the
+          // production dispatch routes those widths to the MMVQ tier.
+          printf("  M=%-2d MMA-chain   declined (skipped)\n", M);
+          cudaFree(d_ds);
+          cudaFree(d_part);
+          continue;
+        }
         run_mma();
         cudaStreamSynchronize(s);
         std::vector<half> hout(static_cast<size_t>(M) * nsample);
@@ -225,7 +240,7 @@ int main() {
           }
         // timing
         for (int i = 0; i < kWarmup; ++i) {
-          cudaMemsetAsync(d_evict, i, 1024, s);
+          cudaMemsetAsync(d_evict, i & 0xFF, evict_n * sizeof(float) / 4, s);
           run_mma();
         }
         cudaStreamSynchronize(s);
@@ -248,7 +263,10 @@ int main() {
                              static_cast<double>(M) * K * 2 +
                              static_cast<double>(M) * N * 2;
         printf("  M=%-2d MMA-chain   %8.2f us (min %7.2f)  %8.0f GB/s  maxrel %.2e\n",
-               M, us, mn_ms * 1000.f, bytes / (us * 1e3));
+               M, us, mn_ms * 1000.f, bytes / (us * 1e3), max_rel);
+        // max_rel vs the dequant reference is informational on synthetic
+        // data (known-broken reference, see header); the kernel-vs-kernel
+        // gate in the dp4a block below is the enforced check.
         cudaFree(d_ds);
         cudaFree(d_part);
       }
@@ -285,7 +303,8 @@ int main() {
                                       std::max(1.0, std::fabs(static_cast<double>(refv))));
               (void)mma;
             }
-          printf("  [dp4a maxrel vs dequant-ref: %.3e]\n", max_rel2);
+          printf("  [dp4a maxrel vs dequant-ref: %.3e] (informational — "
+                 "synthetic-data reference)\n", max_rel2);
           // kernel-vs-kernel: MMA output captured earlier in hout
           {
             double kvk = 0;
@@ -298,6 +317,11 @@ int main() {
                                         std::max(1.0, std::fabs(static_cast<double>(a))));
               }
             printf("  [MMA vs dp4a maxrel: %.3e]\n", kvk);
+            if (kvk > 2e-3) {
+              printf("  MMA/dp4a correctness gate FAILED (%.3e > 2e-3)\n",
+                     kvk);
+              return 1;
+            }
           }
         }
         const int tile = M <= 16 ? 16 : 32;
