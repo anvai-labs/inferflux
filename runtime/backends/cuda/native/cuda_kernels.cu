@@ -1,5 +1,7 @@
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
+#include "runtime/backends/cuda/native/gguf_util.h"
+#include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 #include <cmath>
 #include <cstdint>
 
@@ -277,6 +279,80 @@ cudaError_t EmbeddingLookup(const T *table, const int *token_ids, T *output,
       table, token_ids, output, seq_len, hidden_size);
   return cudaGetLastError();
 }
+
+// ============================================================================
+// Embedding Lookup from quantized table (Q4_K / Q6_K row gather)
+// ============================================================================
+
+template <typename T>
+__global__ void EmbeddingLookupDequantKernel(
+    const void *__restrict__ table, int quant_type,
+    const int *__restrict__ token_ids, T *__restrict__ output, int seq_len,
+    int hidden_size, int blocks_per_row) {
+  // DtypeTraits has no float specialization; dispatch at the write.
+  const bool out_is_float = std::is_same_v<T, float>;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = seq_len * hidden_size;
+  if (idx >= total)
+    return;
+
+  const int pos = idx / hidden_size;
+  const int dim = idx % hidden_size;
+  const int token_id = token_ids[pos];
+  const int sb = (dim % QK_K) / 32;
+  const int e = dim % 32;
+
+  float value = 0.0f;
+  if (quant_type == static_cast<int>(::inferflux::runtime::cuda::native::GGUF::TensorType::Q4_K)) {
+    const ::inferflux::runtime::cuda::native::block_q4_k &blk =
+        static_cast<
+            const ::inferflux::runtime::cuda::native::block_q4_k *>(table)[
+            static_cast<size_t>(token_id) * blocks_per_row + dim / QK_K];
+    const float d = __half2float(__ushort_as_half(blk.d));
+    const float dmin = __half2float(__ushort_as_half(blk.dmin));
+    value = ::inferflux::runtime::cuda::native::dequant_q4k_element(blk, d, dmin, sb, e);
+  } else {
+    const ::inferflux::runtime::cuda::native::block_q6_k &blk =
+        static_cast<
+            const ::inferflux::runtime::cuda::native::block_q6_k *>(table)[
+            static_cast<size_t>(token_id) * blocks_per_row + dim / QK_K];
+    const float d = __half2float(__ushort_as_half(blk.d));
+    const int g = (dim % QK_K) / 128;
+    const int sub = ((dim % QK_K) / 32) % 4;
+    value = ::inferflux::runtime::cuda::native::dequant_q6k_element(
+        blk, d, g, sub, e);
+  }
+  if constexpr (std::is_same_v<T, float>) {
+    output[idx] = value;
+  } else {
+    output[idx] = DtypeTraits<T>::from_float(value);
+  }
+}
+
+template <typename T>
+cudaError_t EmbeddingLookupDequant(const void *table, int quant_type,
+                                   const int *token_ids, T *output,
+                                   int seq_len, int hidden_size,
+                                   cudaStream_t stream) {
+  const int total = seq_len * hidden_size;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  const int blocks_per_row = hidden_size / QK_K;
+  EmbeddingLookupDequantKernel<T><<<blocks, threads, 0, stream>>>(
+      table, quant_type, token_ids, output, seq_len, hidden_size,
+      blocks_per_row);
+  return cudaGetLastError();
+}
+
+template cudaError_t EmbeddingLookupDequant<float>(
+    const void *table, int quant_type, const int *token_ids, float *output,
+    int seq_len, int hidden_size, cudaStream_t stream);
+template cudaError_t EmbeddingLookupDequant<half>(
+    const void *table, int quant_type, const int *token_ids, half *output,
+    int seq_len, int hidden_size, cudaStream_t stream);
+template cudaError_t EmbeddingLookupDequant<__nv_bfloat16>(
+    const void *table, int quant_type, const int *token_ids,
+    __nv_bfloat16 *output, int seq_len, int hidden_size, cudaStream_t stream);
 
 // ============================================================================
 // Half/BF16 to Float conversion (templated)

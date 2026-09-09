@@ -76,6 +76,21 @@ bool CheckCudaStatus(cudaError_t status, const char *component,
 }
 
 bool ShouldRetainDequantizedTensor(const std::string &name) {
+  // PR-5 row-gather (EXPERIMENTAL, default off): when on, embeddings
+  // dequantize per row at lookup and the 622 MB full-precision token_embd
+  // copy is never materialized. Known hazard before this can default on:
+  // for tied models lm_head aliases token_embd, and the fp16 buffers the
+  // tied LmHead() path caches go stale once the batch-scoped cleanup frees
+  // the non-retained dequant (garbage outputs from batch 2 on). Resolve the
+  // lm_head cache lifetime first (issue #113).
+  static const bool embed_row_gather = [] {
+    const char *raw = std::getenv("INFERFLUX_CUDA_EMBED_ROW_GATHER");
+    return raw && (raw[0] == '1' || raw[0] == 't');
+  }();
+  if (embed_row_gather &&
+      (name == "token_embd.weight" || name == "tok_emb.weight")) {
+    return false;
+  }
   return name == "token_embd.weight" || name == "tok_emb.weight";
 }
 

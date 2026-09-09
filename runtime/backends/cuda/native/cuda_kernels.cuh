@@ -43,6 +43,17 @@ template <typename T>
 cudaError_t EmbeddingLookup(const T *table, const int *token_ids, T *output,
                             int seq_len, int hidden_size, cudaStream_t stream);
 
+// EmbeddingLookupDequant: gather rows from a raw quantized embedding table
+// (Q4_K or Q6_K), dequantizing each element on the fly with the same
+// per-element helpers the bulk dequantize kernels use — bit-identical to
+// EmbeddingLookup over the dequantized table without materializing the
+// full-precision copy (622 MB on a 3B model).
+template <typename T>
+cudaError_t EmbeddingLookupDequant(const void *table, int quant_type,
+                                   const int *token_ids, T *output,
+                                   int seq_len, int hidden_size,
+                                   cudaStream_t stream);
+
 template <typename T>
 cudaError_t HalfToFloat(const T *input, float *output, int count,
                         cudaStream_t stream);
