@@ -3096,17 +3096,15 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                       // Prequantized MMAs instead of paying the quantizer
                       // inside each call. Falls back to the per-call
                       // quantize when the shared quantize declines.
-                      static const bool qkv_shared_quant = [] {
-                        const char *raw =
-                            std::getenv("INFERFLUX_CUDA_QKV_SHARED_QUANT");
-                        return !raw || std::string(raw) != "0";
-                      }();
+                      static const bool qkv_shared_quant =
+                          ParseBoolEnv("INFERFLUX_CUDA_QKV_SHARED_QUANT",
+                                       true);
                       if (qkv_shared_quant &&
                           inferflux::FusedQuantGemm::QuantizeForMmqMma(
                               mma_input,
                               static_cast<runtime::cuda::native::BlockQ8_1MmqDs
                                               *>(d_act_q8_1_mmq_),
-                              B, num_heads_ * head_dim_, stream_,
+                              B, hidden_size_, stream_,
                               active_policy) &&
                           inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
                               q_raw,
