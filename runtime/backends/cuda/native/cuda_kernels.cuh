@@ -50,9 +50,8 @@ cudaError_t EmbeddingLookup(const T *table, const int *token_ids, T *output,
 // full-precision copy (622 MB on a 3B model).
 template <typename T>
 cudaError_t EmbeddingLookupDequant(const void *table, int quant_type,
-                                   const int *token_ids, T *output,
-                                   int seq_len, int hidden_size,
-                                   cudaStream_t stream);
+                                   const int *token_ids, T *output, int seq_len,
+                                   int hidden_size, cudaStream_t stream);
 
 template <typename T>
 cudaError_t HalfToFloat(const T *input, float *output, int count,
@@ -247,8 +246,8 @@ cudaError_t MeanPool(const T *input, float *output, int seq_len,
  * After this kernel, the graph can be replayed immediately without host sync.
  */
 cudaError_t DeviceTokenRelay(const int *sampled_tokens, int *batch_meta,
-                              int batch_size, int max_batch_size,
-                              cudaStream_t stream);
+                             int batch_size, int max_batch_size,
+                             cudaStream_t stream);
 
 /**
  * AppendTokenToBuffer: Copy one sampled token to a position in an
@@ -256,7 +255,7 @@ cudaError_t DeviceTokenRelay(const int *sampled_tokens, int *batch_meta,
  * on device without per-token D2H sync.
  */
 cudaError_t AppendTokenToBuffer(const int *sampled_token, int *token_buffer,
-                                 int position, cudaStream_t stream);
+                                int position, cudaStream_t stream);
 
 /**
  * DeviceCheckEos: Check if any sampled token matches the EOS token ID.
@@ -264,8 +263,8 @@ cudaError_t AppendTokenToBuffer(const int *sampled_token, int *token_buffer,
  * The host can poll this flag periodically instead of syncing per token.
  */
 cudaError_t DeviceCheckEos(const int *sampled_tokens, int batch_size,
-                            int eos_token_id, int *d_has_eos,
-                            cudaStream_t stream);
+                           int eos_token_id, int *d_has_eos,
+                           cudaStream_t stream);
 
 /**
  * ConvertHalfToFloat: Convert half/bfloat16 tensor to float on device.
@@ -273,7 +272,7 @@ cudaError_t DeviceCheckEos(const int *sampled_tokens, int batch_size,
  */
 template <typename T>
 cudaError_t ConvertHalfToFloat(const T *d_input, float *d_output,
-                                size_t num_elements, cudaStream_t stream);
+                               size_t num_elements, cudaStream_t stream);
 
 } // namespace cuda_kernel
 } // namespace inferflux

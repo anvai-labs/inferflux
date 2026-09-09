@@ -312,7 +312,14 @@ void WarmQuantizedLaneCache(inferflux::QuantizedWeightMap *weight_map) {
   // Warm only small permanent-cache tensors up front so overlap lanes don't
   // race first-touch dequantized cache creation in the shared GGUF loader.
   // Keep lm_head lazy to avoid eager large allocations in memory-first mode.
-  (void)weight_map->EmbedTokens();
+  // Row-gather mode: skip the fp16 embed materialization entirely — the
+  // gather path reads the raw table, and with retention skipped the fp16
+  // copy would both defeat the saving and dangle after batch cleanup.
+  inferflux::QuantizedWeightInfo embed_raw;
+  const bool embed_raw_active = weight_map->GetRawEmbedTokens().data != nullptr;
+  if (!embed_raw_active) {
+    (void)weight_map->EmbedTokens();
+  }
   (void)weight_map->FinalNorm();
   const int layers = weight_map->NumLayers();
   for (int layer = 0; layer < layers; ++layer) {

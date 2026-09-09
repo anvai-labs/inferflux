@@ -504,6 +504,13 @@ MmqWeightInfo QuantizedWeightMap::GetMmqLayerDownProj(int layer) const {
 #endif
 }
 
+QuantizedWeightInfo QuantizedWeightMap::GetRawEmbedTokens() const {
+  if (!embed_tokens_accessor) {
+    return {};
+  }
+  return MakeRawInfo(embed_tokens_accessor, stream_);
+}
+
 QuantizedWeightInfo QuantizedWeightMap::GetRawLmHead() const {
   return MakeRawInfo(lm_head_accessor, stream_);
 }
