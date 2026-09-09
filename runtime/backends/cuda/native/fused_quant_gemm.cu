@@ -1971,8 +1971,8 @@ bool FusedQuantGemm::BuildDownProjMmqLayout(const QuantizedWeightInfo &weight,
     return false;
   }
 
-  *layout = {transformed, weight.quant_type, rows, cols, tile_cols,
-             transformed_bytes};
+  *layout = {transformed, weight.quant_type, rows,
+             cols,        tile_cols,         transformed_bytes};
   return true;
 }
 
@@ -2116,7 +2116,8 @@ bool FusedQuantGemm::GemvMmqMmaPrequantized(
     splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                       static_cast<int>(kMmqMmaMaxSplits));
   }
-  if (M > 8 && M <= p.mmq_mma_max_batch) {
+  if (M > 8 && M <= p.mmq_mma_max_batch &&
+      (p.mmq_mma_force_split_fat || total_ctas < sm_count)) {
     splits = std::max(splits, 2);
   }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
@@ -2188,8 +2189,12 @@ bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
   const int total_ctas = n_tiles * ((M + 15) / 16);
   int splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                         static_cast<int>(kMmqMmaMaxSplits));
-  if (M > 8 && M <= p.mmq_mma_max_batch) {
-    splits = std::max(splits, 2); // decode M=16 tail-wave balance (2.5x)
+  if (M > 8 && M <= p.mmq_mma_max_batch &&
+      (p.mmq_mma_force_split_fat || total_ctas < sm_count)) {
+    // decode M=16 tail-wave balance (2.5x) when the knob forces it or the
+    // grid under-fills the SM array; large-N shapes skip the partial
+    // writes + reduce launch when the knob is disabled.
+    splits = std::max(splits, 2);
   }
 
   dim3 qgrid((K / 128 + 3) / 4, M);

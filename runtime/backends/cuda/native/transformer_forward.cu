@@ -3091,6 +3091,46 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                       }
                       const half *mma_input = static_cast<const half *>(
                           qkv_norm != nullptr ? d_norm_out_ : qkv_input);
+                      // The three projections share the same normalized
+                      // input: quantize it once (DS layout) and run three
+                      // Prequantized MMAs instead of paying the quantizer
+                      // inside each call. Falls back to the per-call
+                      // quantize when the shared quantize declines.
+                      static const bool qkv_shared_quant =
+                          ParseBoolEnv("INFERFLUX_CUDA_QKV_SHARED_QUANT",
+                                       true);
+                      if (qkv_shared_quant &&
+                          inferflux::FusedQuantGemm::QuantizeForMmqMma(
+                              mma_input,
+                              static_cast<runtime::cuda::native::BlockQ8_1MmqDs
+                                              *>(d_act_q8_1_mmq_),
+                              B, hidden_size_, stream_,
+                              active_policy) &&
+                          inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
+                              q_raw,
+                              static_cast<
+                                  const runtime::cuda::native::BlockQ8_1MmqDs
+                                      *>(d_act_q8_1_mmq_),
+                              d_q_, d_mma_partials_, B, num_heads_ * head_dim_,
+                              hidden_size_, stream_, active_policy) &&
+                          inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
+                              k_raw,
+                              static_cast<
+                                  const runtime::cuda::native::BlockQ8_1MmqDs
+                                      *>(d_act_q8_1_mmq_),
+                              d_k_new_, d_mma_partials_, B,
+                              num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                              active_policy) &&
+                          inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
+                              v_raw,
+                              static_cast<
+                                  const runtime::cuda::native::BlockQ8_1MmqDs
+                                      *>(d_act_q8_1_mmq_),
+                              d_v_new_, d_mma_partials_, B,
+                              num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                              active_policy)) {
+                        return true;
+                      }
                       if (TryQ8_1MmaGemv<T>(
                               q_raw, mma_input, d_q_, d_act_q8_1_mmq_,
                               d_mma_partials_, B, num_heads_ * head_dim_,
@@ -3314,8 +3354,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
             head_dim_ == 128 && num_kv_heads_ > 0 &&
             num_heads_ == num_kv_heads_ * 8) {
           err = cuda_kernel::FlashDecodePacked<T>(
-              d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_,
-              d_batch_kv_lens_, layer, B, num_heads_, num_kv_heads_, head_dim_,
+              d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_, d_batch_kv_lens_,
+              layer, B, num_heads_, num_kv_heads_, head_dim_,
               kv_cache_->SlotStride(), kv_cache_->LayerStride(),
               kv_cache_->KvStride(), attn_scale, stream_,
               d_attn_split_workspace_, attn_split_workspace_bytes_,
