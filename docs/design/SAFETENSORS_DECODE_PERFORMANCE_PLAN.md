@@ -503,6 +503,37 @@ breadth; its slots are sequence-bound, so prefill phases stall decode. At
 c=16 the stock server's kernels already beat inferflux's (this section);
 the serving architecture is the ceiling vLLM/SGLang design around.
 
+### 4g) Throughput + memory campaign outcome (Sep 8)
+
+Campaign per the throughput+memory plan: #117 wrapper knobs, #120 rig,
+#121 launch structure, #122 packed-attention smem fix, #124 KV default +
+append bounds. Results on the 48x256 c=16 battery (2-run averages,
+Qwen2.5-3B q4_k_m):
+
+- **Memory: 5.4 GB -> 4.8 GB loaded (-~600 MB)** via the KV default
+  right-sizing (16 x 1,024 = 604 MB, user-approved); KV ledger verifies
+  603,979,776 B. PR-5 row-gather (-622 MB) is the remaining memory item
+  to reach the <= 4.2 GB stretch.
+- **Throughput: variance-bound on this battery** — post-campaign runs
+  458-651 tok/s vs pre-campaign 496-574. The per-kernel fixes (attention
+  smem, launch structure) landed as modest wins individually; the
+  battery's 30% variance swamps them. The decode-heavy llamaserver-style
+  comparison (1,066 vs 468 tok/s at the time of 4f) remains the
+  sharper benchmark for the attention gap.
+- **Correctness**: decode-append bounds closed at every entry (prefill
+  guards, decode-assembly guards both paths, greedy-burst clamp, burst
+  preflight); 1,100-token prompts fail cleanly instead of silently
+  corrupting the neighboring slot's KV; determinism 1-distinct-of-8;
+  0 violations on the standard battery.
+- **Falsified**: warp-per-head-pair packed attention WITHOUT __shared__
+  (measured 303 tok/s — local-memory spill; with __shared__ it is a
+  modest +7% average, shipped default-on with kill switch).
+
+Remaining (ranked): #113 token_embd row-gather (memory), the
+tensor-core attention tile rewrite (throughput, the real 7.3x fix),
+#125 UX surfacing, #126 GPU-gated guard test, #123 FFN partials sizing
+hazard.
+
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled
