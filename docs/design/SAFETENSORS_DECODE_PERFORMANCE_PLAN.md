@@ -468,6 +468,18 @@ here generated the full 12,288 tokens, verified from response usage.)
    KV-split decomposition and less shared memory per block.
 3. **Sampling and standalone dequant are NOT priorities**: 0.5% and 0.7%
    of busy time. (An earlier cut called them out from the sliver data.)
+
+**Bridge attempt falsified (Sep 8)**: a warp-per-head-pair packed decode
+attention kernel (in-register shuffle dots, half K/V tiles, 32 KB smem =
+3 blocks/SM, one sync/tile — replacing the block-cooperative dots and
+FP32 tiles) measured 303 tok/s vs 574 baseline at c=16 on the identical
+battery, 1.9x WORSE. The per-(KV-row, head) shuffle reductions (~640 per
+tile per warp) cost more than the block-cooperative dot round-trips they
+replace, and the halved smem did not compensate. Kept behind
+`INFERFLUX_CUDA_ATTN_PACKED_DECODE` (default off) as a recorded negative
+result. Attention-parity work should proceed directly to the tensor-core
+tile design (mma.m16n8k16 + ldmatrix + GQA head packing + cp.async, as
+in flash_attn_ext_f16).
 4. **Duty cycle**: inferflux keeps the GPU 91% busy while llama-server
    sits at 63% — inferflux loses less time to gaps, but spends what it
    keeps inefficiently.

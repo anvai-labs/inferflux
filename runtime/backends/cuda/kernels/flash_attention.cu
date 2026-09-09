@@ -1326,6 +1326,292 @@ FlashDecodeWarpPerHead(const T *Q, const T *kv_buffer, T *O,
   }
 }
 
+// ---------------------------------------------------------------------------
+// FlashDecodePacked (PR-1, plan: throughput+memory): GQA-packed warp-per-
+// head-pair decode attention. Profiling (plan-doc 4f) showed the decode
+// attention family at 7.3x llama.cpp per token: the block-cooperative
+// kernels stage K/V as FP32 (75,776 B smem -> 1 block/SM) and pay three
+// __syncthreads + two smem round-trips per KV tile. This kernel gives each
+// warp two Q-heads (dots reduce in-register via shuffles — no cross-warp
+// traffic), stages K/V as half (32 KB -> 3 blocks/SM), keeps fp32
+// accumulation, and syncs once per tile. Requires head_dim == 128 and
+// GQARatio == 8 (the Qwen2.5-3B GQA-8 decode shape); the dispatcher falls
+// back to LaunchGQADecode otherwise. Shape-static: CUDA-graph safe.
+template <typename T, int GQARatio, int HEAD_DIM>
+__global__ void FlashDecodePackedKernel(
+    const T *__restrict__ Q, const T *__restrict__ kv_buffer,
+    T *__restrict__ O, float *__restrict__ partial_O,
+    float *__restrict__ partial_max, float *__restrict__ partial_sum,
+    const int *__restrict__ seq_ids, const int *__restrict__ kv_lens,
+    int layer, int num_heads, int num_kv_heads, int num_splits,
+    size_t slot_stride, size_t layer_stride, size_t kv_stride, float scale) {
+  static_assert(HEAD_DIM == 128, "packed decode requires head_dim 128");
+  constexpr int kWarps = 4;               // 128 threads
+  constexpr int kHeadsPerWarp = GQARatio / kWarps; // 2 for GQA-8
+  constexpr int kDimsPerLane = HEAD_DIM / 32;      // 4
+  constexpr int kTile = 64;               // KV rows per tile
+
+  const int b = blockIdx.x;
+  const int kv_head_idx = blockIdx.y;
+  const int split_id = blockIdx.z;
+  const int d = threadIdx.x;
+  const int warp_id = d / 32;
+  const int lane = d & 31;
+
+  const int kv_len = kv_lens[b];
+  const int split_len = (kv_len + num_splits - 1) / num_splits;
+  const int kv_begin = split_id * split_len;
+  const int kv_end = min(kv_begin + split_len, kv_len);
+
+  float q_reg[kHeadsPerWarp][kDimsPerLane];
+  float o_acc[kHeadsPerWarp][kDimsPerLane];
+  float row_max[kHeadsPerWarp];
+  float row_sum[kHeadsPerWarp];
+
+#pragma unroll
+  for (int hh = 0; hh < kHeadsPerWarp; ++hh) {
+    const int head_idx = kv_head_idx * GQARatio + warp_id * kHeadsPerWarp + hh;
+    const bool head_ok = head_idx < num_heads;
+#pragma unroll
+    for (int j = 0; j < kDimsPerLane; ++j) {
+      const int dim = lane + 32 * j;
+      q_reg[hh][j] =
+          head_ok
+              ? DtypeTraits<T>::to_float(Q[static_cast<size_t>(b) *
+                                               num_heads * HEAD_DIM +
+                                           head_idx * HEAD_DIM + dim])
+              : 0.0f;
+      o_acc[hh][j] = 0.0f;
+    }
+    row_max[hh] = -INFINITY;
+    row_sum[hh] = 0.0f;
+  }
+
+  if (kv_begin >= kv_len) {
+    // No work in this split — publish identity state for the combine pass.
+    const size_t split_base =
+        ((static_cast<size_t>(b) * num_kv_heads + kv_head_idx) * num_splits +
+         split_id) *
+        GQARatio;
+    for (int i = d; i < GQARatio * HEAD_DIM; i += kWarps * 32) {
+      partial_O[split_base * HEAD_DIM + i] = 0.0f;
+    }
+    if (d < GQARatio) {
+      partial_max[split_base + d] = -INFINITY;
+      partial_sum[split_base + d] = 0.0f;
+    }
+    return;
+  }
+
+  const size_t seq_offset = static_cast<size_t>(seq_ids[b]) * slot_stride;
+  const size_t layer_offset = static_cast<size_t>(layer) * layer_stride;
+  const T *K = kv_buffer + seq_offset + layer_offset;
+  const T *V = K + kv_stride;
+  const int kv_stride_elems = num_kv_heads * HEAD_DIM;
+
+  // Staged in the storage dtype (half for the GQA-8 Qwen shape) — half
+  // tiles are what keep smem at 32 KB and occupancy at 3 blocks/SM.
+  T s_k[kTile * HEAD_DIM];
+  T s_v[kTile * HEAD_DIM];
+
+  for (int kv_start = kv_begin; kv_start < kv_end; kv_start += kTile) {
+    const int tile_len = min(kTile, kv_end - kv_start);
+    const int total_elements = tile_len * HEAD_DIM;
+    for (int i = d; i < total_elements; i += kWarps * 32) {
+      const int t = i / HEAD_DIM;
+      const int dim = i % HEAD_DIM;
+      const size_t kv_offset =
+          static_cast<size_t>(kv_start + t) *
+              static_cast<size_t>(kv_stride_elems) +
+          static_cast<size_t>(kv_head_idx * HEAD_DIM + dim);
+      s_k[i] = K[kv_offset];
+      s_v[i] = V[kv_offset];
+    }
+    __syncthreads();
+
+    for (int hh = 0; hh < kHeadsPerWarp; ++hh) {
+      const int head_idx = kv_head_idx * GQARatio + warp_id * kHeadsPerWarp + hh;
+      if (head_idx >= num_heads)
+        break;
+      for (int t = 0; t < tile_len; ++t) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int j = 0; j < kDimsPerLane; ++j) {
+          const int dim = lane + 32 * j;
+          partial += q_reg[hh][j] *
+                     DtypeTraits<T>::to_float(s_k[t * HEAD_DIM + dim]);
+        }
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1) {
+          partial += __shfl_down_sync(0xFFFFFFFF, partial, offset);
+        }
+        const float score = __shfl_sync(0xFFFFFFFF, partial, 0) * scale;
+        const float new_max = fmaxf(row_max[hh], score);
+        const float rescale = expf(row_max[hh] - new_max);
+        const float exp_w = expf(score - new_max);
+#pragma unroll
+        for (int j = 0; j < kDimsPerLane; ++j) {
+          const int dim = lane + 32 * j;
+          o_acc[hh][j] = o_acc[hh][j] * rescale +
+                         exp_w * DtypeTraits<T>::to_float(s_v[t * HEAD_DIM + dim]);
+        }
+        row_sum[hh] = row_sum[hh] * rescale + exp_w;
+        row_max[hh] = new_max;
+      }
+    }
+    __syncthreads();
+  }
+
+  // Publish results. Each lane holds dims {lane, lane+32, lane+64, lane+96}
+  // of its two heads (kDimsPerLane strided stores per head).
+  if (num_splits > 1) {
+    const size_t split_base =
+        ((static_cast<size_t>(b) * num_kv_heads + kv_head_idx) * num_splits +
+         split_id) *
+        GQARatio;
+#pragma unroll
+    for (int hh = 0; hh < kHeadsPerWarp; ++hh) {
+      const int g = warp_id * kHeadsPerWarp + hh;
+      if (g >= GQARatio)
+        break;
+      const int head_idx = kv_head_idx * GQARatio + g;
+#pragma unroll
+      for (int j = 0; j < kDimsPerLane; ++j) {
+        partial_O[(split_base + g) * HEAD_DIM + lane + 32 * j] = o_acc[hh][j];
+      }
+      if (lane == 0) {
+        partial_max[split_base + g] = row_max[hh];
+        partial_sum[split_base + g] = row_sum[hh];
+      }
+    }
+  } else {
+    // Single split: write the normalized output directly.
+#pragma unroll
+    for (int hh = 0; hh < kHeadsPerWarp; ++hh) {
+      const int head_idx = kv_head_idx * GQARatio + warp_id * kHeadsPerWarp + hh;
+      if (head_idx >= num_heads)
+        break;
+      const float inv = row_sum[hh] > 0.0f ? 1.0f / row_sum[hh] : 0.0f;
+#pragma unroll
+      for (int j = 0; j < kDimsPerLane; ++j) {
+        const int dim = lane + 32 * j;
+        O[static_cast<size_t>(b) * num_heads * HEAD_DIM +
+          head_idx * HEAD_DIM + dim] =
+            DtypeTraits<T>::from_float(o_acc[hh][j] * inv);
+      }
+    }
+  }
+}
+
+template <typename T, int GQARatio, int HEAD_DIM>
+cudaError_t LaunchGQADecodePacked(
+    const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,
+    const int *d_kv_lens, int layer, int batch_size, int num_heads,
+    int num_kv_heads, size_t slot_stride, size_t layer_stride,
+    size_t kv_stride, float scale, cudaStream_t stream,
+    void *split_workspace, size_t split_workspace_bytes, int max_kv_hint) {
+  constexpr int kThreads = 128;
+  constexpr int kSmem = 2 * 64 * HEAD_DIM * sizeof(T);
+  if (kSmem > 48 * 1024) {
+    cudaFuncSetAttribute(FlashDecodePackedKernel<T, GQARatio, HEAD_DIM>,
+                         cudaFuncAttributeMaxDynamicSharedMemorySize, kSmem);
+  }
+
+  const int num_splits =
+      (max_kv_hint > 0 && max_kv_hint <= 512) ? 1 : kFlashDecodeSplits;
+  const size_t partial_O_bytes = static_cast<size_t>(batch_size) *
+                                 num_kv_heads * num_splits * GQARatio *
+                                 HEAD_DIM * sizeof(float);
+  const size_t partial_scalar_bytes = static_cast<size_t>(batch_size) *
+                                      num_kv_heads * num_splits * GQARatio *
+                                      sizeof(float);
+  const size_t total_workspace =
+      partial_O_bytes + 2 * partial_scalar_bytes;
+
+  if (num_splits > 1 &&
+      (!split_workspace || split_workspace_bytes < total_workspace)) {
+    // Caller lacks split workspace — fall back to the stock family.
+    return LaunchGQADecode<T, GQARatio>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, HEAD_DIM, slot_stride, layer_stride, kv_stride, scale,
+        stream, split_workspace, split_workspace_bytes, max_kv_hint);
+  }
+
+  float *partial_O = static_cast<float *>(split_workspace);
+  float *partial_max = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(split_workspace) + partial_O_bytes);
+  float *partial_sum = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(split_workspace) + partial_O_bytes +
+      partial_scalar_bytes);
+
+  dim3 grid(batch_size, num_kv_heads, num_splits);
+  FlashDecodePackedKernel<T, GQARatio, HEAD_DIM>
+      <<<grid, kThreads, kSmem, stream>>>(Q, kv_buffer, O, partial_O,
+                                          partial_max, partial_sum, d_seq_ids,
+                                          d_kv_lens, layer, num_heads,
+                                          num_kv_heads, num_splits,
+                                          slot_stride, layer_stride, kv_stride,
+                                          scale);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess)
+    return err;
+
+  if (num_splits > 1) {
+    int reduce_threads = HEAD_DIM;
+    dim3 reduce_grid(batch_size, num_heads);
+    FlashDecodeReduceSplitsKernel<T><<<reduce_grid, reduce_threads, 0, stream>>>(
+        partial_O, partial_max, partial_sum, O, num_heads, num_kv_heads,
+        HEAD_DIM, num_splits);
+    err = cudaGetLastError();
+  } else {
+    err = cudaGetLastError();
+  }
+  return err;
+}
+
+template <typename T>
+cudaError_t FlashDecodePacked(const T *Q, const T *kv_buffer, T *O,
+                              const int *d_seq_ids, const int *d_kv_lens,
+                              int layer, int batch_size, int num_heads,
+                              int num_kv_heads, int head_dim,
+                              size_t slot_stride, size_t layer_stride,
+                              size_t kv_stride, float scale,
+                              cudaStream_t stream, void *split_workspace,
+                              size_t split_workspace_bytes, int max_kv_hint) {
+  const int gqa_ratio = (num_kv_heads > 0 && num_heads > num_kv_heads)
+                            ? (num_heads / num_kv_heads)
+                            : 1;
+  if (head_dim != 128) {
+    return LaunchGQADecode<T, 8>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream, split_workspace, split_workspace_bytes, max_kv_hint);
+  }
+  if (gqa_ratio == 8) {
+    return LaunchGQADecodePacked<T, 8, 128>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, slot_stride, layer_stride, kv_stride, scale, stream,
+        split_workspace, split_workspace_bytes, max_kv_hint);
+  }
+  return LaunchGQADecode<T, 4>(
+      Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+      num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+      stream, split_workspace, split_workspace_bytes, max_kv_hint);
+}
+
+template cudaError_t FlashDecodePacked<half>(
+    const half *Q, const half *kv_buffer, half *O, const int *d_seq_ids,
+    const int *d_kv_lens, int layer, int batch_size, int num_heads,
+    int num_kv_heads, int head_dim, size_t slot_stride, size_t layer_stride,
+    size_t kv_stride, float scale, cudaStream_t stream, void *split_workspace,
+    size_t split_workspace_bytes, int max_kv_hint);
+template cudaError_t FlashDecodePacked<__nv_bfloat16>(
+    const __nv_bfloat16 *Q, const __nv_bfloat16 *kv_buffer, __nv_bfloat16 *O,
+    const int *d_seq_ids, const int *d_kv_lens, int layer, int batch_size,
+    int num_heads, int num_kv_heads, int head_dim, size_t slot_stride,
+    size_t layer_stride, size_t kv_stride, float scale, cudaStream_t stream,
+    void *split_workspace, size_t split_workspace_bytes, int max_kv_hint);
+
 template <typename T>
 cudaError_t FlashDecodeMultiSeqStrided(
     const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,

@@ -26,6 +26,12 @@ struct NativeExecutionPolicy {
   // Split-parallel decode attention (S3): parallelize FlashDecode over
   // Q-heads (short context) and KV chunks (long context). Default off.
   bool enable_attn_split_kv{false};
+  // GQA-packed warp-per-head-pair decode attention (head_dim 128, GQA 8):
+  // FALSIFIED (Sep 8): measured 303 tok/s vs 574 baseline at c=16 — the
+  // per-(KV-row, head) shuffle reductions cost more than the block-
+  // cooperative dots they replace, and half tiles did not compensate.
+  // Kept behind this knob as a recorded negative result; default off.
+  bool enable_attn_packed_decode{false};
   int attn_split_chunk{512};
   int attn_split_qsplit_override{-1};
   // Prefer the packed dp4a tier over Q8_1 activations for tiny decode
@@ -135,6 +141,8 @@ struct NativeExecutionPolicy {
         ParseIntEnv("INFERFLUX_CUDA_DECODE_BURST_MAX_MS", 40, 1, 1000);
     policy.enable_attn_split_kv =
         ParseBoolEnv("INFERFLUX_CUDA_ATTN_SPLIT_KV", false);
+    policy.enable_attn_packed_decode =
+        ParseBoolEnv("INFERFLUX_CUDA_ATTN_PACKED_DECODE", false);
     policy.attn_split_chunk =
         ParseIntEnv("INFERFLUX_CUDA_ATTN_SPLIT_CHUNK", 512, 64, 8192);
     policy.attn_split_qsplit_override =
