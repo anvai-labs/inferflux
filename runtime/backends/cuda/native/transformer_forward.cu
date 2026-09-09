@@ -1331,13 +1331,21 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
     if (err != cudaSuccess)
       return false;
     device_workspace_bytes_ += blocks_per_row * act_rows * sizeof(BlockQ8_1Mmq);
+    // Partials are indexed [split][row][N] with N = the projection's output
+    // width. The gate/up projections (N = intermediate_size_) are wider than
+    // hidden_size_, and their forced K-split at M 9-16 writes the full N —
+    // size by the widest projection or the gate/up partials overrun the
+    // allocation (issue #123).
+    const size_t mma_partials_width =
+        std::max(static_cast<size_t>(hidden_size_),
+                 static_cast<size_t>(intermediate_size_));
     err = cudaMalloc(&d_mma_partials_, static_cast<size_t>(kMmqMmaMaxSplits) *
-                                           mma_rows * hidden_size_ *
+                                           mma_rows * mma_partials_width *
                                            sizeof(float));
     if (err != cudaSuccess)
       return false;
     device_workspace_bytes_ += static_cast<size_t>(kMmqMmaMaxSplits) *
-                               mma_rows * hidden_size_ * sizeof(float);
+                               mma_rows * mma_partials_width * sizeof(float);
   }
   // Logits buffer sized for batched decode: [max_batch_size, vocab_size]
   if (!alloc(&d_logits_typed_,
