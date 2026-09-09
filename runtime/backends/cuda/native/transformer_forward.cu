@@ -1595,6 +1595,44 @@ bool LlamaForwardTyped<T>::Initialize(
   return true;
 }
 
+// PR-5 row-gather: when the embedding table is a supported quantized type
+// and the knob is on, embeddings gather+dequantize rows directly from the
+// raw table instead of materializing a full-precision copy (622 MB on a
+// 3B model). Returns the GGUF quant type to gather, or -1 for the legacy
+// fp16-table path.
+struct EmbedGatherPlan {
+  const void *table;
+  int quant_type;
+};
+template <typename T>
+static EmbedGatherPlan ResolveEmbedGather(const WeightMap *weights) {
+  EmbedGatherPlan plan{nullptr, -1};
+  if constexpr (!std::is_same_v<T, half>) {
+    return plan;
+  }
+  // Opt-in (default off): see gguf_model_loader ShouldRetainDequantizedTensor
+  // for the tied-lm_head hazard that blocks defaulting on (issue #113).
+  static const bool enabled = [] {
+    const char *raw = std::getenv("INFERFLUX_CUDA_EMBED_ROW_GATHER");
+    return raw && (raw[0] == '1' || raw[0] == 't');
+  }();
+  if (!enabled || !weights) {
+    return plan;
+  }
+  QuantizedWeightInfo info;
+  if (!weights->EmbedTokensRaw(info)) {
+    return plan;
+  }
+  if (info.quant_type ==
+          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K) ||
+      info.quant_type ==
+          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
+    plan.table = info.data;
+    plan.quant_type = info.quant_type;
+  }
+  return plan;
+}
+
 template <typename T>
 bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                    int n_past, int sequence_id,
@@ -1677,11 +1715,22 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   // Step 2: Embedding lookup
   // WeightMap is always WeightMapTyped<half> currently, but the embed_tokens
   // pointer points to the same GPU data regardless of type. We cast it.
-  const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
+  const auto embed_gather = ResolveEmbedGather<T>(weights_);
+  const T *embed = embed_gather.quant_type < 0
+                       ? reinterpret_cast<const T *>(weights_->EmbedTokens())
+                       : nullptr;
   // Embed directly to residual stream, eliminating the D2D copy.
   {
     NVTX_SCOPE("Embedding");
-    if (fp32_residual_active_) {
+    if (embed_gather.quant_type >= 0 && fp32_residual_active_) {
+      err = cuda_kernel::EmbeddingLookupDequant(
+          embed_gather.table, embed_gather.quant_type, d_token_ids_,
+          d_residual_f32_, seq_len, hidden_size_, stream_);
+    } else if (embed_gather.quant_type >= 0) {
+      err = cuda_kernel::EmbeddingLookupDequant(
+          embed_gather.table, embed_gather.quant_type, d_token_ids_,
+          d_residual_, seq_len, hidden_size_, stream_);
+    } else if (fp32_residual_active_) {
       err = cuda_kernel::EmbeddingLookupF32<T>(
           embed, d_token_ids_, d_residual_f32_, seq_len, hidden_size_, stream_);
     } else {
@@ -2592,7 +2641,9 @@ template <typename T> void LlamaForwardTyped<T>::WarmWeightCaches() {
   // and converted via cudaStreamSynchronize on first access — which is
   // illegal inside a CUDA graph capture region.  Calling this at model-load
   // time ensures the caches are populated before the first BatchForward().
-  weights_->EmbedTokens();
+  if (ResolveEmbedGather<T>(weights_).quant_type < 0) {
+    weights_->EmbedTokens();
+  }
   for (int l = 0; l < num_layers_; ++l) {
     weights_->LayerInputNorm(l);
     weights_->LayerPostAttnNorm(l);
@@ -3017,8 +3068,20 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
     // Embedding [B, hidden_size] — write directly to residual stream.
     {
       NVTX_SCOPE("Embedding");
-      const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
-      if (fp32_residual_active_) {
+      const auto embed_gather = ResolveEmbedGather<T>(weights_);
+      const T *embed =
+          embed_gather.quant_type < 0
+              ? reinterpret_cast<const T *>(weights_->EmbedTokens())
+              : nullptr;
+      if (embed_gather.quant_type >= 0 && fp32_residual_active_) {
+        err = cuda_kernel::EmbeddingLookupDequant(
+            embed_gather.table, embed_gather.quant_type, d_batch_token_ids_,
+            d_residual_f32_, B, hidden_size_, stream_);
+      } else if (embed_gather.quant_type >= 0) {
+        err = cuda_kernel::EmbeddingLookupDequant(
+            embed_gather.table, embed_gather.quant_type, d_batch_token_ids_,
+            d_residual_, B, hidden_size_, stream_);
+      } else if (fp32_residual_active_) {
         err = cuda_kernel::EmbeddingLookupF32<T>(embed, d_batch_token_ids_,
                                                  d_residual_f32_, B,
                                                  hidden_size_, stream_);
@@ -3097,15 +3160,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                       // inside each call. Falls back to the per-call
                       // quantize when the shared quantize declines.
                       static const bool qkv_shared_quant =
-                          ParseBoolEnv("INFERFLUX_CUDA_QKV_SHARED_QUANT",
-                                       true);
+                          ParseBoolEnv("INFERFLUX_CUDA_QKV_SHARED_QUANT", true);
                       if (qkv_shared_quant &&
                           inferflux::FusedQuantGemm::QuantizeForMmqMma(
                               mma_input,
                               static_cast<runtime::cuda::native::BlockQ8_1MmqDs
                                               *>(d_act_q8_1_mmq_),
-                              B, hidden_size_, stream_,
-                              active_policy) &&
+                              B, hidden_size_, stream_, active_policy) &&
                           inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
                               q_raw,
                               static_cast<

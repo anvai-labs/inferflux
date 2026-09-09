@@ -169,6 +169,9 @@ public:
   QuantizedWeightInfo GetRawLayerDownProj(int layer) const;
   MmqWeightInfo GetMmqLayerDownProj(int layer) const;
   QuantizedWeightInfo GetRawLmHead() const;
+  /// Raw quantized embedding table (Q4_K/Q6_K) for the row-gather path;
+  /// zero-value info when the table is not quantized.
+  QuantizedWeightInfo GetRawEmbedTokens() const;
 
   /**
    * @brief Check if a weight tensor exists

@@ -55,6 +55,10 @@ public:
   }
 
   const half *EmbedTokens() const override { return qwm_->EmbedTokens(); }
+  bool EmbedTokensRaw(QuantizedWeightInfo &out) const override {
+    out = qwm_->GetRawEmbedTokens();
+    return out.data != nullptr;
+  }
   const half *FinalNorm() const override { return qwm_->FinalNorm(); }
   const half *LmHead() const override { return qwm_->LmHead(); }
 
