@@ -2394,6 +2394,20 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
         result.outputs[i].token = -1;
         continue;
       }
+      if (input.n_past >= kv_cache_->MaxSeqLen()) {
+        // The slot's KV extent is exhausted: this decode step appends at
+        // row input.n_past — past the slot. Fail the request.
+        RecordKvRangeViolation(input.sequence_id);
+        log::Warn("inferflux_cuda_executor",
+                  "Sequence " + std::to_string(input.sequence_id) +
+                      " reached KV max_seq " +
+                      std::to_string(kv_cache_->MaxSeqLen()) +
+                      " during decode; failing the request (raise "
+                      "INFERFLUX_CUDA_KV_MAX_SEQ for long-context workloads)");
+        result.outputs[i].ok = false;
+        result.outputs[i].token = -1;
+        continue;
+      }
       decode_group.push_back(
           {static_cast<int>(i), input.request_id, input.client_request_id,
            input.tokens[0], input.n_past, input.sequence_id,
@@ -2531,6 +2545,20 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
     const auto forward_start = std::chrono::steady_clock::now();
     if (!SeqIdInKvRange(input.sequence_id)) {
       RecordKvRangeViolation(input.sequence_id);
+      continue;
+    }
+    if (input.n_past + token_count > kv_cache_->MaxSeqLen()) {
+      // Chunked prefill keeps per-call seq_len bounded; the slot's KV
+      // extent is what a long prompt can still exceed. Reject rather than
+      // appending rows past this slot's 1,024/2,048-token extent (which
+      // would corrupt the neighboring slot's region).
+      RecordKvRangeViolation(input.sequence_id);
+      log::Warn(
+          "inferflux_cuda_executor",
+          "Prefill length " + std::to_string(input.n_past + token_count) +
+              " exceeds KV max_seq " + std::to_string(kv_cache_->MaxSeqLen()) +
+              " (slot " + std::to_string(input.sequence_id) +
+              "); raise INFERFLUX_CUDA_KV_MAX_SEQ for long-context workloads");
       continue;
     }
     if (!resources.forward->Forward(input.tokens, input.n_past,
@@ -2979,7 +3007,7 @@ UnifiedBurstResult InferfluxCudaExecutor::NativeExecuteUnifiedBatchBurst(
     batch_tokens[b] = inputs[static_cast<std::size_t>(b)].tokens[0];
     batch_n_past[b] = inputs[static_cast<std::size_t>(b)].n_past;
     batch_seq_ids[b] = inputs[static_cast<std::size_t>(b)].sequence_id;
-    if (!SeqIdInKvRange(batch_seq_ids[b])) {
+    if (!SeqIdInKvRange(batch_seq_ids[b]) || batch_n_past[b] >= max_seq_len) {
       RecordKvRangeViolation(batch_seq_ids[b]);
       result.ok = false;
       result.last_tokens.assign(static_cast<size_t>(B), -1);
@@ -3189,6 +3217,20 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
     if (input.tokens.size() == 1 && input.request_logits) {
       if (!SeqIdInKvRange(input.sequence_id)) {
         RecordKvRangeViolation(input.sequence_id);
+        outputs[i].ok = false;
+        outputs[i].token = -1;
+        continue;
+      }
+      if (input.n_past >= kv_cache_->MaxSeqLen()) {
+        // The slot's KV extent is exhausted: this decode step appends at
+        // row input.n_past — past the slot. Fail the request.
+        RecordKvRangeViolation(input.sequence_id);
+        log::Warn("inferflux_cuda_executor",
+                  "Sequence " + std::to_string(input.sequence_id) +
+                      " reached KV max_seq " +
+                      std::to_string(kv_cache_->MaxSeqLen()) +
+                      " during decode; failing the request (raise "
+                      "INFERFLUX_CUDA_KV_MAX_SEQ for long-context workloads)");
         outputs[i].ok = false;
         outputs[i].token = -1;
         continue;
@@ -3486,6 +3528,18 @@ InferfluxCudaExecutor::ExecuteUnifiedBatch(
 
     if (!SeqIdInKvRange(input.sequence_id)) {
       RecordKvRangeViolation(input.sequence_id);
+      continue;
+    }
+    if (input.n_past + static_cast<int>(input.tokens.size()) >
+        kv_cache_->MaxSeqLen()) {
+      RecordKvRangeViolation(input.sequence_id);
+      log::Warn(
+          "inferflux_cuda_executor",
+          "Prefill length " +
+              std::to_string(input.n_past +
+                             static_cast<int>(input.tokens.size())) +
+              " exceeds KV max_seq " + std::to_string(kv_cache_->MaxSeqLen()) +
+              "; raise INFERFLUX_CUDA_KV_MAX_SEQ for long-context workloads");
       continue;
     }
 
@@ -4295,6 +4349,16 @@ int InferfluxCudaExecutor::BurstDecodeGreedy(int sequence_id, int n_past_start,
   if (!SeqIdInKvRange(sequence_id)) {
     RecordKvRangeViolation(sequence_id);
     return 0;
+  }
+  if (n_past_start + n_tokens > kv_cache_->MaxSeqLen()) {
+    n_tokens = std::max(0, kv_cache_->MaxSeqLen() - n_past_start);
+    if (n_tokens == 0) {
+      log::Warn("inferflux_cuda_executor",
+                "Greedy burst: sequence " + std::to_string(sequence_id) +
+                    " at KV max_seq; failing the request (raise "
+                    "INFERFLUX_CUDA_KV_MAX_SEQ for long-context workloads)");
+      return 0;
+    }
   }
   std::lock_guard<std::mutex> lock(shared_pipeline_mutex_);
 

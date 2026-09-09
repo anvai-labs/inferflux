@@ -333,7 +333,7 @@ Scope contract:
 | `INFERFLUX_CUDA_WIDE_GATE_UP` | wide-load (uint4) fused gate/up MMVQ kernel for M<=8 (`1` default; `0` opts out) |
 | `INFERFLUX_CUDA_WIDE_ACCUM` | wide-load o_proj residual accumulate kernel (`1` default; `0` opts out) |
 | `INFERFLUX_CUDA_KV_MAX_BATCH` | InferFlux CUDA KV cache `max_batch` hard override |
-| `INFERFLUX_CUDA_KV_MAX_SEQ` | InferFlux CUDA KV cache `max_seq` hard override (disables seq auto-tune) |
+| `INFERFLUX_CUDA_KV_MAX_SEQ` | InferFlux CUDA KV cache `max_seq` hard override (disables seq auto-tune). **Default per-slot context is 1,024 tokens** (16 slots × 1,024 = 604 MB); sequences exceeding the slot extent fail cleanly (prefill guard + decode assembly guard; no context shift) — raise this for long-context workloads |
 | `INFERFLUX_CUDA_KV_AUTO_TUNE` | enable/disable InferFlux CUDA KV seq auto-tuning (`true` default) |
 | `INFERFLUX_CUDA_KV_BUDGET_MB` | explicit KV budget in MiB for auto-tuning |
 | `INFERFLUX_CUDA_KV_FREE_MEM_RATIO` | fraction of free VRAM used as KV budget when explicit budget is unset (`0.30` default) |
