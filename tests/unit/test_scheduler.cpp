@@ -2374,6 +2374,44 @@ TEST_CASE("Scheduler lpm policy prioritizes prefix-affinity request",
           cold_backend->FirstSubmissionTicket());
 }
 
+TEST_CASE("Scheduler rejects requests exceeding the KV context budget",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<ReadyStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "cap-model";
+  info.path = "/tmp/cap.gguf";
+  info.backend = "cuda";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  MetricsRegistry metrics;
+  metrics.SetInferfluxCudaKvCacheOccupancy(/*active=*/0, /*max=*/16);
+
+  Scheduler::Config config;
+  config.metrics = &metrics;
+  Scheduler scheduler(tokenizer, device, cache, router,
+                      /*speculative_decoder=*/nullptr,
+                      /*prefix_cache=*/nullptr, /*fairness_config=*/{},
+                      /*disagg_config=*/{},
+                      /*model_selection_options=*/ModelSelectionOptions{},
+                      config);
+
+  InferenceRequest req;
+  req.prompt = "hello";
+  req.max_tokens = 1 << 20;
+  auto resp = scheduler.Generate(std::move(req)).get();
+
+  WARN(resp.completion);
+  REQUIRE(resp.no_backend);
+  REQUIRE(resp.completion.find("context_overflow") != std::string::npos);
+}
+
 TEST_CASE("Scheduler clamps admission to native KV slot capacity",
           "[scheduler]") {
   SimpleTokenizer tokenizer;

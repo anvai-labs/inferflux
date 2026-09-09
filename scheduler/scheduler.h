@@ -248,6 +248,9 @@ private:
   FairnessConfig fairness_config_;
   DisaggregatedConfig disagg_config_;
   Config config_;
+  // Native KV per-slot capacity published at construction (0 = none). Used
+  // for context-overflow admission and the slot-manager sizing clamp.
+  int native_kv_capacity_{0};
   std::unique_ptr<IBatchSelectionPolicy> batch_policy_;
   MetricsRegistry *metrics_; // Non-owning; defaults to &GlobalMetrics().
   mutable std::mutex model_selection_options_mutex_;
