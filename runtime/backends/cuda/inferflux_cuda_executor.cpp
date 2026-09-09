@@ -2552,6 +2552,7 @@ InferfluxCudaExecutor::ExecuteLaneBatch(
       // extent is what a long prompt can still exceed. Reject rather than
       // appending rows past this slot's 1,024/2,048-token extent (which
       // would corrupt the neighboring slot's region).
+      RecordKvRangeViolation(input.sequence_id);
       log::Warn(
           "inferflux_cuda_executor",
           "Prefill length " + std::to_string(input.n_past + token_count) +
