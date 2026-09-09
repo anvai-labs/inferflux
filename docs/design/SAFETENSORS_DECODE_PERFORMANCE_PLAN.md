@@ -469,17 +469,22 @@ here generated the full 12,288 tokens, verified from response usage.)
 3. **Sampling and standalone dequant are NOT priorities**: 0.5% and 0.7%
    of busy time. (An earlier cut called them out from the sliver data.)
 
-**Bridge attempt falsified (Sep 8)**: a warp-per-head-pair packed decode
-attention kernel (in-register shuffle dots, half K/V tiles, 32 KB smem =
-3 blocks/SM, one sync/tile — replacing the block-cooperative dots and
-FP32 tiles) measured 303 tok/s vs 574 baseline at c=16 on the identical
-battery, 1.9x WORSE. The per-(KV-row, head) shuffle reductions (~640 per
-tile per warp) cost more than the block-cooperative dot round-trips they
-replace, and the halved smem did not compensate. Kept behind
-`INFERFLUX_CUDA_ATTN_PACKED_DECODE` (default off) as a recorded negative
-result. Attention-parity work should proceed directly to the tensor-core
-tile design (mma.m16n8k16 + ldmatrix + GQA head packing + cp.async, as
-in flash_attn_ext_f16).
+**Bridge attempt — first measurement falsified, corrected positive
+(Sep 8)**: the warp-per-head-pair packed decode attention kernel
+(in-register shuffle dots, half K/V tiles, 32 KB smem = 3 blocks/SM,
+one sync/tile) first measured 303 tok/s vs 574 baseline — but a
+post-merge review caught that its K/V tiles were missing `__shared__`
+(spilling ~32 KB/thread to local memory), so the measurement ran a
+local-memory-spilling kernel, not the designed one. With
+`__shared__` restored: 532/651 tok/s (2 runs, avg 591) vs 574/496
+baseline — **avg +10%**, determinism 1-distinct-of-8, outputs coherent.
+Shipped default-on behind `INFERFLUX_CUDA_ATTN_PACKED_DECODE=0` kill
+switch. The remaining ~4x attention gap vs llama.cpp still needs the
+tensor-core tile design (mma.m16n8k16 + ldmatrix + GQA packing +
+cp.async, as in flash_attn_ext_f16). Lesson recorded: kernel variables
+indexed by runtime values must be explicitly `__shared__`; a missing
+qualifier is silent (nvcc accepts automatic arrays) and only visible as
+a throughput collapse.
 4. **Duty cycle**: inferflux keeps the GPU 91% busy while llama-server
    sits at 63% — inferflux loses less time to gaps, but spends what it
    keeps inefficiently.
