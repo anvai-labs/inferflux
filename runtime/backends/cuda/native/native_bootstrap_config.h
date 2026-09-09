@@ -9,7 +9,10 @@ struct NativeBootstrapConfig {
   std::string dtype_override;
   std::string kv_precision_choice{"auto"};
   int kv_max_batch{16};
-  int kv_max_seq{2048};
+  // Per-slot context default: 1,024 tokens x 16 slots = 604 MB KV (was
+  // 2,048 x 16 = 1,208 MB). Longer prompts reject at admission; restore
+  // via INFERFLUX_CUDA_KV_MAX_SEQ (user decision, Sep 8 memory campaign).
+  int kv_max_seq{1024};
   bool kv_max_seq_overridden{false};
   bool kv_max_batch_overridden{false};
   bool kv_auto_tune{true};
