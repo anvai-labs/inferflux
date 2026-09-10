@@ -8,6 +8,7 @@
 #include "runtime/backends/cuda/native/kernels/fused_gemv_accum_norm_quant.cuh"
 #include "runtime/backends/cuda/native/kernels/fused_rope_kv_append.cuh"
 #include "runtime/backends/cuda/native/kernels/mmq_mma.cuh"
+#include "runtime/backends/cuda/native/kv_cache_planner.h"
 #include "runtime/backends/cuda/native/llama_forward.h"
 #include "runtime/backends/cuda/native/model_loader.h"
 #include "runtime/backends/cuda/native/native_dispatch_policy.h"
@@ -1153,7 +1154,8 @@ struct ProjectionCtx {
   cudaStream_t stream{nullptr};
   const NativeExecutionPolicy *policy{nullptr};
   CublasGemm *gemm{nullptr};
-  int mma_max_batch{-1}; // -1: MMA tier self-gates (decode); prefill passes the policy cap
+  int mma_max_batch{
+      -1}; // -1: MMA tier self-gates (decode); prefill passes the policy cap
 };
 
 template <typename T>
@@ -1193,9 +1195,16 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
   cudaError_t err;
 
   // Scratch buffers must fit both:
-  //   - Single long sequence: max_seq_len_ tokens (prefill)
+  //   - A single prefill chunk: the host never issues a call wider than
+  //     prefill_chunk_tokens_ (scheduler chunked-prefill cap)
   //   - Batched decode: max_batch_size_ sequences x 1 token each
-  size_t rows = static_cast<size_t>(std::max(max_seq_len_, max_batch_size_));
+  // Sizing to the full max_seq_len_ (INFERFLUX_CUDA_FULL_SEQ_SCRATCH=1)
+  // reserves ~4x the working set for a 3B model.
+  scratch_rows_ = runtime::cuda::native::ComputeScratchRows(
+      max_seq_len_, max_batch_size_,
+      execution_policy_.full_seq_scratch ? max_seq_len_
+                                         : prefill_chunk_tokens_);
+  size_t rows = static_cast<size_t>(scratch_rows_);
 
   // Always-live buffers (cannot alias).
   if (!alloc(&d_hidden_, rows * hidden_size_))
@@ -1322,13 +1331,21 @@ template <typename T> bool LlamaForwardTyped<T>::AllocateScratch() {
     if (err != cudaSuccess)
       return false;
     device_workspace_bytes_ += blocks_per_row * act_rows * sizeof(BlockQ8_1Mmq);
+    // Partials are indexed [split][row][N] with N = the projection's output
+    // width. The gate/up projections (N = intermediate_size_) are wider than
+    // hidden_size_, and their forced K-split at M 9-16 writes the full N —
+    // size by the widest projection or the gate/up partials overrun the
+    // allocation (issue #123).
+    const size_t mma_partials_width =
+        std::max(static_cast<size_t>(hidden_size_),
+                 static_cast<size_t>(intermediate_size_));
     err = cudaMalloc(&d_mma_partials_, static_cast<size_t>(kMmqMmaMaxSplits) *
-                                           mma_rows * hidden_size_ *
+                                           mma_rows * mma_partials_width *
                                            sizeof(float));
     if (err != cudaSuccess)
       return false;
     device_workspace_bytes_ += static_cast<size_t>(kMmqMmaMaxSplits) *
-                               mma_rows * hidden_size_ * sizeof(float);
+                               mma_rows * mma_partials_width * sizeof(float);
   }
   // Logits buffer sized for batched decode: [max_batch_size, vocab_size]
   if (!alloc(&d_logits_typed_,
@@ -1586,6 +1603,44 @@ bool LlamaForwardTyped<T>::Initialize(
   return true;
 }
 
+// PR-5 row-gather: when the embedding table is a supported quantized type
+// and the knob is on, embeddings gather+dequantize rows directly from the
+// raw table instead of materializing a full-precision copy (622 MB on a
+// 3B model). Returns the GGUF quant type to gather, or -1 for the legacy
+// fp16-table path.
+struct EmbedGatherPlan {
+  const void *table;
+  int quant_type;
+};
+template <typename T>
+static EmbedGatherPlan ResolveEmbedGather(const WeightMap *weights) {
+  EmbedGatherPlan plan{nullptr, -1};
+  if constexpr (!std::is_same_v<T, half>) {
+    return plan;
+  }
+  // Opt-in (default off): see gguf_model_loader ShouldRetainDequantizedTensor
+  // for the tied-lm_head hazard that blocks defaulting on (issue #113).
+  static const bool enabled = [] {
+    const char *raw = std::getenv("INFERFLUX_CUDA_EMBED_ROW_GATHER");
+    return raw && (raw[0] == '1' || raw[0] == 't');
+  }();
+  if (!enabled || !weights) {
+    return plan;
+  }
+  QuantizedWeightInfo info;
+  if (!weights->EmbedTokensRaw(info)) {
+    return plan;
+  }
+  if (info.quant_type ==
+          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q4_K) ||
+      info.quant_type ==
+          static_cast<int>(runtime::cuda::native::GGUF::TensorType::Q6_K)) {
+    plan.table = info.data;
+    plan.quant_type = info.quant_type;
+  }
+  return plan;
+}
+
 template <typename T>
 bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                    int n_past, int sequence_id,
@@ -1598,6 +1653,15 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
     log::Error("llama_forward", "seq_len " + std::to_string(seq_len) +
                                     " exceeds max " +
                                     std::to_string(max_seq_len_));
+    return false;
+  }
+  if (scratch_rows_ != 0 && seq_len > scratch_rows_) {
+    log::Error("llama_forward",
+               "seq_len " + std::to_string(seq_len) + " exceeds scratch rows " +
+                   std::to_string(scratch_rows_) + " (prefill chunk cap " +
+                   std::to_string(prefill_chunk_tokens_) +
+                   "); raise chunked_prefill_tokens or set "
+                   "INFERFLUX_CUDA_FULL_SEQ_SCRATCH=1");
     return false;
   }
   const bool allow_fused_quantized_matmul =
@@ -1659,11 +1723,22 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
   // Step 2: Embedding lookup
   // WeightMap is always WeightMapTyped<half> currently, but the embed_tokens
   // pointer points to the same GPU data regardless of type. We cast it.
-  const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
+  const auto embed_gather = ResolveEmbedGather<T>(weights_);
+  const T *embed = embed_gather.quant_type < 0
+                       ? reinterpret_cast<const T *>(weights_->EmbedTokens())
+                       : nullptr;
   // Embed directly to residual stream, eliminating the D2D copy.
   {
     NVTX_SCOPE("Embedding");
-    if (fp32_residual_active_) {
+    if (embed_gather.quant_type >= 0 && fp32_residual_active_) {
+      err = cuda_kernel::EmbeddingLookupDequant(
+          embed_gather.table, embed_gather.quant_type, d_token_ids_,
+          d_residual_f32_, seq_len, hidden_size_, stream_);
+    } else if (embed_gather.quant_type >= 0) {
+      err = cuda_kernel::EmbeddingLookupDequant(
+          embed_gather.table, embed_gather.quant_type, d_token_ids_,
+          d_residual_, seq_len, hidden_size_, stream_);
+    } else if (fp32_residual_active_) {
       err = cuda_kernel::EmbeddingLookupF32<T>(
           embed, d_token_ids_, d_residual_f32_, seq_len, hidden_size_, stream_);
     } else {
@@ -1792,11 +1867,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                               num_heads_ * head_dim_, hidden_size_, "q_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerQProj(layer),
-                                                  d_norm_out_, d_q_, seq_len,
-                                                  num_heads_ * head_dim_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerQProj(layer),
+                                  d_norm_out_, d_q_, seq_len,
+                                  num_heads_ * head_dim_, hidden_size_)) {
                             log::Error("llama_forward", "Q projection failed");
                             return false;
                           }
@@ -1822,14 +1896,14 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                         [&]() {
                           return TryQuantizedProjection(
                               pctx, k_raw, d_norm_out_, d_k_new_, seq_len,
-                              num_kv_heads_ * head_dim_, hidden_size_, "k_proj");
+                              num_kv_heads_ * head_dim_, hidden_size_,
+                              "k_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerKProj(layer),
-                                                  d_norm_out_, d_k_new_, seq_len,
-                                                  num_kv_heads_ * head_dim_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerKProj(layer),
+                                  d_norm_out_, d_k_new_, seq_len,
+                                  num_kv_heads_ * head_dim_, hidden_size_)) {
                             log::Error("llama_forward", "K projection failed");
                             return false;
                           }
@@ -1855,14 +1929,14 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                         [&]() {
                           return TryQuantizedProjection(
                               pctx, v_raw, d_norm_out_, d_v_new_, seq_len,
-                              num_kv_heads_ * head_dim_, hidden_size_, "v_proj");
+                              num_kv_heads_ * head_dim_, hidden_size_,
+                              "v_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerVProj(layer),
-                                                  d_norm_out_, d_v_new_, seq_len,
-                                                  num_kv_heads_ * head_dim_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerVProj(layer),
+                                  d_norm_out_, d_v_new_, seq_len,
+                                  num_kv_heads_ * head_dim_, hidden_size_)) {
                             log::Error("llama_forward", "V projection failed");
                             return false;
                           }
@@ -2221,11 +2295,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                               intermediate_size_, hidden_size_, "gate_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerGateProj(layer),
-                                                  d_norm_out_, d_ffn_gate_,
-                                                  seq_len, intermediate_size_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerGateProj(layer),
+                                  d_norm_out_, d_ffn_gate_, seq_len,
+                                  intermediate_size_, hidden_size_)) {
                             log::Error("llama_forward",
                                        "Gate projection failed");
                             return false;
@@ -2254,11 +2327,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                               intermediate_size_, hidden_size_, "up_proj");
                         },
                         [&]() {
-                          if (!RunDenseProjection(pctx,
-                                                  weights_->LayerUpProj(layer),
-                                                  d_norm_out_, d_ffn_up_,
-                                                  seq_len, intermediate_size_,
-                                                  hidden_size_)) {
+                          if (!RunDenseProjection(
+                                  pctx, weights_->LayerUpProj(layer),
+                                  d_norm_out_, d_ffn_up_, seq_len,
+                                  intermediate_size_, hidden_size_)) {
                             log::Error("llama_forward", "Up projection failed");
                             return false;
                           }
@@ -2577,7 +2649,9 @@ template <typename T> void LlamaForwardTyped<T>::WarmWeightCaches() {
   // and converted via cudaStreamSynchronize on first access — which is
   // illegal inside a CUDA graph capture region.  Calling this at model-load
   // time ensures the caches are populated before the first BatchForward().
-  weights_->EmbedTokens();
+  if (ResolveEmbedGather<T>(weights_).quant_type < 0) {
+    weights_->EmbedTokens();
+  }
   for (int l = 0; l < num_layers_; ++l) {
     weights_->LayerInputNorm(l);
     weights_->LayerPostAttnNorm(l);
@@ -2588,6 +2662,12 @@ template <typename T> void LlamaForwardTyped<T>::WarmWeightCaches() {
   weights_->FinalNorm();
   // Pre-warm LM head to avoid first-token TTFT penalty from lazy dequant.
   weights_->LmHead();
+  // Build the transformed down-proj MMQ layouts up front: the first capture
+  // of a decode graph containing them would otherwise abort on the build's
+  // internal cudaStreamSynchronize and burn a retry.
+  for (int l = 0; l < num_layers_; ++l) {
+    (void)weights_->LayerDownProjMmq(l);
+  }
   // Clear any CUDA errors from pre-warm (e.g., missing bias tensors return
   // nullptr without error, but some edge-case allocations may fail).
   cudaGetLastError();
@@ -2983,8 +3063,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
   // Dense (bf16/fp16 weight) fallback: capture-guarded cuBLAS. During graph
   // capture without a pinned-workspace guarantee the stage aborts capture
   // instead of running an uncapturable allocation.
-  auto run_dense_projection = [&](const void *weight, const T *input,
-                                  T *output, int M, int N, int K) {
+  auto run_dense_projection = [&](const void *weight, const T *input, T *output,
+                                  int M, int N, int K) {
     if (capturing && !cublas_capture_ok) {
       capture_abort = true;
       return false;
@@ -2996,8 +3076,20 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
     // Embedding [B, hidden_size] — write directly to residual stream.
     {
       NVTX_SCOPE("Embedding");
-      const T *embed = reinterpret_cast<const T *>(weights_->EmbedTokens());
-      if (fp32_residual_active_) {
+      const auto embed_gather = ResolveEmbedGather<T>(weights_);
+      const T *embed =
+          embed_gather.quant_type < 0
+              ? reinterpret_cast<const T *>(weights_->EmbedTokens())
+              : nullptr;
+      if (embed_gather.quant_type >= 0 && fp32_residual_active_) {
+        err = cuda_kernel::EmbeddingLookupDequant(
+            embed_gather.table, embed_gather.quant_type, d_batch_token_ids_,
+            d_residual_f32_, B, hidden_size_, stream_);
+      } else if (embed_gather.quant_type >= 0) {
+        err = cuda_kernel::EmbeddingLookupDequant(
+            embed_gather.table, embed_gather.quant_type, d_batch_token_ids_,
+            d_residual_, B, hidden_size_, stream_);
+      } else if (fp32_residual_active_) {
         err = cuda_kernel::EmbeddingLookupF32<T>(embed, d_batch_token_ids_,
                                                  d_residual_f32_, B,
                                                  hidden_size_, stream_);
@@ -3070,6 +3162,44 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                       }
                       const half *mma_input = static_cast<const half *>(
                           qkv_norm != nullptr ? d_norm_out_ : qkv_input);
+                      // The three projections share the same normalized
+                      // input: quantize it once (DS layout) and run three
+                      // Prequantized MMAs instead of paying the quantizer
+                      // inside each call. Falls back to the per-call
+                      // quantize when the shared quantize declines.
+                      static const bool qkv_shared_quant =
+                          ParseBoolEnv("INFERFLUX_CUDA_QKV_SHARED_QUANT", true);
+                      if (qkv_shared_quant &&
+                          inferflux::FusedQuantGemm::QuantizeForMmqMma(
+                              mma_input,
+                              static_cast<runtime::cuda::native::BlockQ8_1MmqDs
+                                              *>(d_act_q8_1_mmq_),
+                              B, hidden_size_, stream_, active_policy) &&
+                          inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
+                              q_raw,
+                              static_cast<
+                                  const runtime::cuda::native::BlockQ8_1MmqDs
+                                      *>(d_act_q8_1_mmq_),
+                              d_q_, d_mma_partials_, B, num_heads_ * head_dim_,
+                              hidden_size_, stream_, active_policy) &&
+                          inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
+                              k_raw,
+                              static_cast<
+                                  const runtime::cuda::native::BlockQ8_1MmqDs
+                                      *>(d_act_q8_1_mmq_),
+                              d_k_new_, d_mma_partials_, B,
+                              num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                              active_policy) &&
+                          inferflux::FusedQuantGemm::GemvMmqMmaPrequantized(
+                              v_raw,
+                              static_cast<
+                                  const runtime::cuda::native::BlockQ8_1MmqDs
+                                      *>(d_act_q8_1_mmq_),
+                              d_v_new_, d_mma_partials_, B,
+                              num_kv_heads_ * head_dim_, hidden_size_, stream_,
+                              active_policy)) {
+                        return true;
+                      }
                       if (TryQ8_1MmaGemv<T>(
                               q_raw, mma_input, d_q_, d_act_q8_1_mmq_,
                               d_mma_partials_, B, num_heads_ * head_dim_,
@@ -3111,13 +3241,13 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                           },
                           [&]() {
                             return try_quantized_projection(
-                                q_raw, d_norm_out_, d_q_, num_heads_ * head_dim_,
-                                hidden_size_, "q_proj");
+                                q_raw, d_norm_out_, d_q_,
+                                num_heads_ * head_dim_, hidden_size_, "q_proj");
                           },
                           [&]() {
                             return run_dense_projection(
-                                weights_->LayerQProj(layer), d_norm_out_,
-                                d_q_, B, num_heads_ * head_dim_, hidden_size_);
+                                weights_->LayerQProj(layer), d_norm_out_, d_q_,
+                                B, num_heads_ * head_dim_, hidden_size_);
                           })) {
                     return false;
                   }
@@ -3286,7 +3416,21 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
       {
         NVTX_SCOPE("FlashAttention2");
         float attn_scale = 1.0f / sqrtf(static_cast<float>(head_dim_));
-        if (kv_contiguous && policy.enable_attn_split_kv && d_attn_partials_) {
+        // GQA-packed decode (PR-1): warp-per-head-pair, half K/V tiles,
+        // in-register dot reduction. Requires the contiguous-cache decode
+        // shape head_dim 128 / GQA 8; everything else falls through.
+        if (kv_contiguous && policy.enable_attn_packed_decode &&
+            head_dim_ == 128 && num_kv_heads_ > 0 &&
+            num_heads_ == num_kv_heads_ * 8) {
+          err = cuda_kernel::FlashDecodePacked<T>(
+              d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_, d_batch_kv_lens_,
+              layer, B, num_heads_, num_kv_heads_, head_dim_,
+              kv_cache_->SlotStride(), kv_cache_->LayerStride(),
+              kv_cache_->KvStride(), attn_scale, stream_,
+              d_attn_split_workspace_, attn_split_workspace_bytes_,
+              max_seq_len_);
+        } else if (kv_contiguous && policy.enable_attn_split_kv &&
+                   d_attn_partials_) {
           // Split geometry is fixed at capture time from the configured
           // context length so graph replays stay shape-static; per-sequence
           // kv_lens early-exit empty chunks on device.
@@ -3648,7 +3792,8 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                             [&]() {
                               return try_quantized_projection(
                                   gate_raw, d_norm_out_, d_ffn_gate_,
-                                  intermediate_size_, hidden_size_, "gate_proj");
+                                  intermediate_size_, hidden_size_,
+                                  "gate_proj");
                             },
                             [&]() {
                               return run_dense_projection(

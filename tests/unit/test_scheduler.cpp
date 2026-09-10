@@ -100,6 +100,8 @@ class ReadyStubBackend : public LlamaCppBackend {
 public:
   explicit ReadyStubBackend(std::string output) : output_(std::move(output)) {}
 
+  std::string Name() const override { return "inferflux_cuda"; }
+
   bool LoadModel(const std::filesystem::path &,
                  const LlamaBackendConfig &) override {
     return true;
@@ -2372,4 +2374,95 @@ TEST_CASE("Scheduler lpm policy prioritizes prefix-affinity request",
   REQUIRE(cold_backend->FirstSubmissionTicket() > 0);
   REQUIRE(hot_backend->FirstSubmissionTicket() <
           cold_backend->FirstSubmissionTicket());
+}
+
+TEST_CASE("Scheduler rejects requests exceeding the KV context budget",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<ReadyStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "cap-model";
+  info.path = "/tmp/cap.gguf";
+  info.backend = "cuda";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  MetricsRegistry metrics;
+  metrics.SetInferfluxCudaKvMaxSeq(/*max_seq=*/16);
+
+  Scheduler::Config config;
+  config.metrics = &metrics;
+  Scheduler scheduler(tokenizer, device, cache, router,
+                      /*speculative_decoder=*/nullptr,
+                      /*prefix_cache=*/nullptr, /*fairness_config=*/{},
+                      /*disagg_config=*/{},
+                      /*model_selection_options=*/ModelSelectionOptions{},
+                      config);
+
+  InferenceRequest req;
+  req.prompt = "hello";
+  req.max_tokens = 1 << 20;
+  auto resp = scheduler.Generate(std::move(req)).get();
+
+  REQUIRE(resp.no_backend);
+  REQUIRE(resp.completion.find("context_overflow") != std::string::npos);
+}
+
+TEST_CASE("Scheduler clamps admission to native KV slot capacity",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+
+  MetricsRegistry metrics;
+  metrics.SetInferfluxCudaKvCacheOccupancy(/*active=*/0, /*max=*/16);
+
+  Scheduler::Config config;
+  config.max_batch_size = 32;
+  config.metrics = &metrics;
+  Scheduler scheduler(tokenizer, device, cache, nullptr,
+                      /*speculative_decoder=*/nullptr,
+                      /*prefix_cache=*/nullptr, /*fairness_config=*/{},
+                      /*disagg_config=*/{},
+                      /*model_selection_options=*/ModelSelectionOptions{},
+                      config);
+
+  SchedulerTestAccess access(scheduler);
+  // The slot manager — not just the batch width — is bounded by the published
+  // KV capacity: raw slot ids index the native KV cache without a bounds
+  // check, and retained leases keep high ids circulating.
+  REQUIRE(access.slot_manager() != nullptr);
+  REQUIRE(access.slot_manager()->GetMaxSlots() == 16);
+  REQUIRE(access.max_batch_size() == 16);
+}
+
+TEST_CASE("Scheduler keeps default admission without a native KV capacity",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+
+  MetricsRegistry metrics;
+  // No native backend published a capacity (stays 0).
+
+  Scheduler::Config config;
+  config.max_batch_size = 32;
+  config.metrics = &metrics;
+  Scheduler scheduler(tokenizer, device, cache, nullptr,
+                      /*speculative_decoder=*/nullptr,
+                      /*prefix_cache=*/nullptr, /*fairness_config=*/{},
+                      /*disagg_config=*/{},
+                      /*model_selection_options=*/ModelSelectionOptions{},
+                      config);
+
+  SchedulerTestAccess access(scheduler);
+  REQUIRE(access.slot_manager()->GetMaxSlots() == 128);
+  REQUIRE(access.max_batch_size() == 32);
 }

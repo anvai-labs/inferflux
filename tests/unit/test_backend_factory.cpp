@@ -202,6 +202,23 @@ TEST_CASE("MergeBackendConfig disables accelerator-only flags on CPU",
   REQUIRE(merged.gpu_layers == 0);
   REQUIRE_FALSE(merged.use_flash_attention);
   REQUIRE(merged.flash_attention_tile == 64);
+
+  // Quantized KV requires FlashAttention; with FA force-disabled on this
+  // target the KV type normalizes back to f16 instead of failing the load.
+  defaults.llama_kv_cache_type = "q8_0";
+  auto merged_qkv = MergeBackendConfig(defaults, selection);
+  REQUIRE_FALSE(merged_qkv.use_flash_attention);
+  REQUIRE(merged_qkv.llama_kv_cache_type == "f16");
+
+  // FA-enabled targets keep the requested quantized KV type.
+  auto cuda_selection = selection;
+  cuda_selection.backend_label = "llama_cpp_cuda";
+  cuda_selection.target = LlamaBackendTarget::kCuda;
+  cuda_selection.config.use_flash_attention = true;
+  defaults.use_flash_attention = true;
+  auto merged_cuda = MergeBackendConfig(defaults, cuda_selection);
+  REQUIRE(merged_cuda.use_flash_attention);
+  REQUIRE(merged_cuda.llama_kv_cache_type == "q8_0");
 }
 
 TEST_CASE("MergeBackendConfig applies CUDA defaults when unset",

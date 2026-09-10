@@ -1,5 +1,7 @@
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
 #include "runtime/backends/cuda/native/cuda_kernels.cuh"
+#include "runtime/backends/cuda/native/gguf_util.h"
+#include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 #include <cmath>
 #include <cstdint>
 
@@ -279,6 +281,83 @@ cudaError_t EmbeddingLookup(const T *table, const int *token_ids, T *output,
 }
 
 // ============================================================================
+// Embedding Lookup from quantized table (Q4_K / Q6_K row gather)
+// ============================================================================
+
+template <typename T>
+__global__ void
+EmbeddingLookupDequantKernel(const void *__restrict__ table, int quant_type,
+                             const int *__restrict__ token_ids,
+                             T *__restrict__ output, int seq_len,
+                             int hidden_size, int blocks_per_row) {
+  // DtypeTraits has no float specialization; dispatch at the write.
+  const bool out_is_float = std::is_same_v<T, float>;
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const int total = seq_len * hidden_size;
+  if (idx >= total)
+    return;
+
+  const int pos = idx / hidden_size;
+  const int dim = idx % hidden_size;
+  const int token_id = token_ids[pos];
+  const int sb = (dim % QK_K) / 32;
+  const int e = dim % 32;
+
+  float value = 0.0f;
+  if (quant_type ==
+      static_cast<int>(
+          ::inferflux::runtime::cuda::native::GGUF::TensorType::Q4_K)) {
+    const ::inferflux::runtime::cuda::native::block_q4_k &blk =
+        static_cast<const ::inferflux::runtime::cuda::native::block_q4_k *>(
+            table)[static_cast<size_t>(token_id) * blocks_per_row + dim / QK_K];
+    const float d = __half2float(__ushort_as_half(blk.d));
+    const float dmin = __half2float(__ushort_as_half(blk.dmin));
+    value = ::inferflux::runtime::cuda::native::dequant_q4k_element(
+        blk, d, dmin, sb, e);
+  } else {
+    const ::inferflux::runtime::cuda::native::block_q6_k &blk =
+        static_cast<const ::inferflux::runtime::cuda::native::block_q6_k *>(
+            table)[static_cast<size_t>(token_id) * blocks_per_row + dim / QK_K];
+    const float d = __half2float(__ushort_as_half(blk.d));
+    const int g = (dim % QK_K) / 128;
+    const int sub = ((dim % QK_K) / 32) % 4;
+    value = ::inferflux::runtime::cuda::native::dequant_q6k_element(blk, d, g,
+                                                                    sub, e);
+  }
+  if constexpr (std::is_same_v<T, float>) {
+    output[idx] = value;
+  } else {
+    output[idx] = DtypeTraits<T>::from_float(value);
+  }
+}
+
+template <typename T>
+cudaError_t EmbeddingLookupDequant(const void *table, int quant_type,
+                                   const int *token_ids, T *output, int seq_len,
+                                   int hidden_size, cudaStream_t stream) {
+  const int total = seq_len * hidden_size;
+  const int threads = 256;
+  const int blocks = (total + threads - 1) / threads;
+  const int blocks_per_row = hidden_size / QK_K;
+  EmbeddingLookupDequantKernel<T>
+      <<<blocks, threads, 0, stream>>>(table, quant_type, token_ids, output,
+                                       seq_len, hidden_size, blocks_per_row);
+  return cudaGetLastError();
+}
+
+template cudaError_t
+EmbeddingLookupDequant<float>(const void *table, int quant_type,
+                              const int *token_ids, float *output, int seq_len,
+                              int hidden_size, cudaStream_t stream);
+template cudaError_t
+EmbeddingLookupDequant<half>(const void *table, int quant_type,
+                             const int *token_ids, half *output, int seq_len,
+                             int hidden_size, cudaStream_t stream);
+template cudaError_t EmbeddingLookupDequant<__nv_bfloat16>(
+    const void *table, int quant_type, const int *token_ids,
+    __nv_bfloat16 *output, int seq_len, int hidden_size, cudaStream_t stream);
+
+// ============================================================================
 // Half/BF16 to Float conversion (templated)
 // ============================================================================
 
@@ -508,9 +587,8 @@ cudaError_t RmsNormMixed(const float *input, const T *weight, T *output,
     t <<= 1;
   threads = t;
   int smem = threads * sizeof(float);
-  RmsNormMixedKernel<T>
-      <<<count, threads, smem, stream>>>(input, weight, output, hidden_size,
-                                         eps);
+  RmsNormMixedKernel<T><<<count, threads, smem, stream>>>(input, weight, output,
+                                                          hidden_size, eps);
   return cudaGetLastError();
 }
 
@@ -537,12 +615,11 @@ cudaError_t ResidualAddMixed(float *residual, const T *input, int count,
 // ResidualAddRmsNormMixed: residual(FP32) += input(T); output(T) =
 // RmsNorm(residual).
 template <typename T>
-__global__ void
-ResidualAddRmsNormMixedKernel(float *__restrict__ residual,
-                              const T *__restrict__ input,
-                              const T *__restrict__ weight,
-                              T *__restrict__ output, int hidden_size,
-                              float eps) {
+__global__ void ResidualAddRmsNormMixedKernel(float *__restrict__ residual,
+                                              const T *__restrict__ input,
+                                              const T *__restrict__ weight,
+                                              T *__restrict__ output,
+                                              int hidden_size, float eps) {
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
   float *res_row = residual + row * hidden_size;
@@ -553,7 +630,8 @@ ResidualAddRmsNormMixedKernel(float *__restrict__ residual,
   // Pass 1: residual += input (in FP32), compute sum of squares
   float local_sum = 0.0f;
   for (int i = tid; i < hidden_size; i += blockDim.x) {
-    float val = res_row[i] + DtypeTraits<T>::to_float(input[row * hidden_size + i]);
+    float val =
+        res_row[i] + DtypeTraits<T>::to_float(input[row * hidden_size + i]);
     res_row[i] = val; // stays FP32
     local_sum += val * val;
   }
@@ -587,9 +665,8 @@ cudaError_t ResidualAddRmsNormMixed(float *residual, const T *input,
     t <<= 1;
   threads = t;
   int smem = threads * sizeof(float);
-  ResidualAddRmsNormMixedKernel<T>
-      <<<count, threads, smem, stream>>>(residual, input, weight, output,
-                                         hidden_size, eps);
+  ResidualAddRmsNormMixedKernel<T><<<count, threads, smem, stream>>>(
+      residual, input, weight, output, hidden_size, eps);
   return cudaGetLastError();
 }
 
@@ -697,12 +774,11 @@ template cudaError_t BiasAdd<__nv_bfloat16>(__nv_bfloat16 *,
 // ============================================================================
 
 template <typename T>
-__global__ void BiasAddTripleKernel(T *__restrict__ q, T *__restrict__ k,
-                                    T *__restrict__ v,
-                                    const T *__restrict__ q_bias,
-                                    const T *__restrict__ k_bias,
-                                    const T *__restrict__ v_bias, int rows,
-                                    int q_dim, int k_dim, int v_dim) {
+__global__ void
+BiasAddTripleKernel(T *__restrict__ q, T *__restrict__ k, T *__restrict__ v,
+                    const T *__restrict__ q_bias, const T *__restrict__ k_bias,
+                    const T *__restrict__ v_bias, int rows, int q_dim,
+                    int k_dim, int v_dim) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int q_total = rows * q_dim;
   const int k_total = rows * k_dim;
@@ -742,10 +818,11 @@ cudaError_t BiasAddTriple(T *q, T *k, T *v, const T *q_bias, const T *k_bias,
 template cudaError_t BiasAddTriple<half>(half *, half *, half *, const half *,
                                          const half *, const half *, int, int,
                                          int, int, cudaStream_t);
-template cudaError_t BiasAddTriple<__nv_bfloat16>(
-    __nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *, const __nv_bfloat16 *,
-    const __nv_bfloat16 *, const __nv_bfloat16 *, int, int, int, int,
-    cudaStream_t);
+template cudaError_t
+BiasAddTriple<__nv_bfloat16>(__nv_bfloat16 *, __nv_bfloat16 *, __nv_bfloat16 *,
+                             const __nv_bfloat16 *, const __nv_bfloat16 *,
+                             const __nv_bfloat16 *, int, int, int, int,
+                             cudaStream_t);
 
 // ============================================================================
 // Non-templated backward-compatible overloads (delegate to half instantiation)
@@ -1017,10 +1094,9 @@ template cudaError_t BatchedKvAppendStrided<__nv_bfloat16>(
 template <typename T>
 __global__ void BatchedKvAppendIndirectKernel(
     const T *__restrict__ k_new, const T *__restrict__ v_new,
-    T *const *__restrict__ slot_base_ptrs,
-    const int *__restrict__ d_seq_ids, const int *__restrict__ d_n_past,
-    int layer, int batch_size, int kv_dim, size_t layer_stride,
-    size_t kv_stride) {
+    T *const *__restrict__ slot_base_ptrs, const int *__restrict__ d_seq_ids,
+    const int *__restrict__ d_n_past, int layer, int batch_size, int kv_dim,
+    size_t layer_stride, size_t kv_stride) {
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   const int total = batch_size * kv_dim;
   if (idx >= total)
@@ -1049,16 +1125,17 @@ cudaError_t BatchedKvAppendIndirect(const T *k_new, const T *v_new,
   const int total = batch_size * kv_dim;
   const int threads = 256;
   const int blocks = (total + threads - 1) / threads;
-  BatchedKvAppendIndirectKernel<T>
-      <<<blocks, threads, 0, stream>>>(k_new, v_new, slot_base_ptrs, d_seq_ids,
-                                       d_n_past, layer, batch_size, kv_dim,
-                                       layer_stride, kv_stride);
+  BatchedKvAppendIndirectKernel<T><<<blocks, threads, 0, stream>>>(
+      k_new, v_new, slot_base_ptrs, d_seq_ids, d_n_past, layer, batch_size,
+      kv_dim, layer_stride, kv_stride);
   return cudaGetLastError();
 }
 
-template cudaError_t BatchedKvAppendIndirect<half>(
-    const half *, const half *, half *const *, const int *, const int *, int,
-    int, int, size_t, size_t, cudaStream_t);
+template cudaError_t BatchedKvAppendIndirect<half>(const half *, const half *,
+                                                   half *const *, const int *,
+                                                   const int *, int, int, int,
+                                                   size_t, size_t,
+                                                   cudaStream_t);
 template cudaError_t BatchedKvAppendIndirect<__nv_bfloat16>(
     const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *const *,
     const int *, const int *, int, int, int, size_t, size_t, cudaStream_t);
@@ -1119,26 +1196,26 @@ template cudaError_t MeanPool<__nv_bfloat16>(const __nv_bfloat16 *, float *,
 template cudaError_t RmsNormMixed<half>(const float *, const half *, half *,
                                         int, int, float, cudaStream_t);
 template cudaError_t RmsNormMixed<__nv_bfloat16>(const float *,
-                                                  const __nv_bfloat16 *,
-                                                  __nv_bfloat16 *, int, int,
-                                                  float, cudaStream_t);
+                                                 const __nv_bfloat16 *,
+                                                 __nv_bfloat16 *, int, int,
+                                                 float, cudaStream_t);
 template cudaError_t ResidualAddMixed<half>(float *, const half *, int,
                                             cudaStream_t);
 template cudaError_t ResidualAddMixed<__nv_bfloat16>(float *,
-                                                      const __nv_bfloat16 *,
-                                                      int, cudaStream_t);
+                                                     const __nv_bfloat16 *, int,
+                                                     cudaStream_t);
 template cudaError_t ResidualAddRmsNormMixed<half>(float *, const half *,
-                                                    const half *, half *, int,
-                                                    int, float, cudaStream_t);
-template cudaError_t ResidualAddRmsNormMixed<__nv_bfloat16>(
-    float *, const __nv_bfloat16 *, const __nv_bfloat16 *, __nv_bfloat16 *,
-    int, int, float, cudaStream_t);
+                                                   const half *, half *, int,
+                                                   int, float, cudaStream_t);
+template cudaError_t
+ResidualAddRmsNormMixed<__nv_bfloat16>(float *, const __nv_bfloat16 *,
+                                       const __nv_bfloat16 *, __nv_bfloat16 *,
+                                       int, int, float, cudaStream_t);
 template cudaError_t EmbeddingLookupF32<half>(const half *, const int *,
-                                               float *, int, int,
-                                               cudaStream_t);
+                                              float *, int, int, cudaStream_t);
 template cudaError_t EmbeddingLookupF32<__nv_bfloat16>(const __nv_bfloat16 *,
-                                                        const int *, float *,
-                                                        int, int, cudaStream_t);
+                                                       const int *, float *,
+                                                       int, int, cudaStream_t);
 
 // ============================================================================
 // Device-side token relay for zero-copy decode loop
@@ -1151,7 +1228,8 @@ __global__ void DeviceTokenRelayKernel(const int *__restrict__ sampled_tokens,
   if (b >= batch_size)
     return;
 
-  // batch_meta layout: [token_ids(max_B)][n_past(max_B)][seq_ids(max_B)][kv_lens(max_B)]
+  // batch_meta layout:
+  // [token_ids(max_B)][n_past(max_B)][seq_ids(max_B)][kv_lens(max_B)]
   int *token_ids = batch_meta;
   int *n_past = batch_meta + max_batch_size;
   // seq_ids stays unchanged (same sequences)
@@ -1166,8 +1244,8 @@ __global__ void DeviceTokenRelayKernel(const int *__restrict__ sampled_tokens,
 }
 
 cudaError_t DeviceTokenRelay(const int *sampled_tokens, int *batch_meta,
-                              int batch_size, int max_batch_size,
-                              cudaStream_t stream) {
+                             int batch_size, int max_batch_size,
+                             cudaStream_t stream) {
   if (batch_size <= 0)
     return cudaSuccess;
   // Single block, B threads — tiny kernel, runs in <1us
@@ -1184,9 +1262,9 @@ __global__ void AppendTokenToBufferKernel(const int *__restrict__ src,
 }
 
 cudaError_t AppendTokenToBuffer(const int *sampled_token, int *token_buffer,
-                                 int position, cudaStream_t stream) {
+                                int position, cudaStream_t stream) {
   AppendTokenToBufferKernel<<<1, 1, 0, stream>>>(sampled_token, token_buffer,
-                                                   position);
+                                                 position);
   return cudaGetLastError();
 }
 
@@ -1202,14 +1280,14 @@ __global__ void DeviceCheckEosKernel(const int *__restrict__ sampled_tokens,
 }
 
 cudaError_t DeviceCheckEos(const int *sampled_tokens, int batch_size,
-                            int eos_token_id, int *d_has_eos,
-                            cudaStream_t stream) {
+                           int eos_token_id, int *d_has_eos,
+                           cudaStream_t stream) {
   if (batch_size <= 0)
     return cudaSuccess;
   // Reset flag, then check
   cudaMemsetAsync(d_has_eos, 0, sizeof(int), stream);
-  DeviceCheckEosKernel<<<1, batch_size, 0, stream>>>(
-      sampled_tokens, batch_size, eos_token_id, d_has_eos);
+  DeviceCheckEosKernel<<<1, batch_size, 0, stream>>>(sampled_tokens, batch_size,
+                                                     eos_token_id, d_has_eos);
   return cudaGetLastError();
 }
 
@@ -1230,7 +1308,7 @@ __global__ void ConvertHalfToFloatKernel(const T *__restrict__ input,
 
 template <typename T>
 cudaError_t ConvertHalfToFloat(const T *d_input, float *d_output,
-                                size_t num_elements, cudaStream_t stream) {
+                               size_t num_elements, cudaStream_t stream) {
   if (num_elements == 0) {
     return cudaSuccess;
   }
@@ -1238,18 +1316,18 @@ cudaError_t ConvertHalfToFloat(const T *d_input, float *d_output,
   const int block_size = 256;
   const int num_blocks = (num_elements + block_size - 1) / block_size;
 
-  ConvertHalfToFloatKernel<T><<<num_blocks, block_size, 0, stream>>>(
-      d_input, d_output, num_elements);
+  ConvertHalfToFloatKernel<T>
+      <<<num_blocks, block_size, 0, stream>>>(d_input, d_output, num_elements);
 
   return cudaGetLastError();
 }
 
 // Explicit instantiations
 template cudaError_t ConvertHalfToFloat<half>(const half *, float *, size_t,
-                                                cudaStream_t);
+                                              cudaStream_t);
 template cudaError_t ConvertHalfToFloat<__nv_bfloat16>(const __nv_bfloat16 *,
-                                                         float *, size_t,
-                                                         cudaStream_t);
+                                                       float *, size_t,
+                                                       cudaStream_t);
 
 } // namespace cuda_kernel
 } // namespace inferflux

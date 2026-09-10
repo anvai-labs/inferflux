@@ -54,6 +54,7 @@ add_library(inferflux_core STATIC
   runtime/backends/native/native_inference_runtime.h
   runtime/backends/cuda/native/dispatch_operator_health.cpp
   runtime/backends/cuda/native/dispatch_operator_health.h
+  runtime/backends/cuda/native/native_bootstrap_config.cpp
   model/tokenizer_factory.cpp
   model/tokenizer_factory.h
   runtime/backends/backend_capabilities.cpp
@@ -306,8 +307,7 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     runtime/backends/cuda/native/safetensors_parser.h
     runtime/backends/cuda/inferflux_cuda_executor.cpp
     runtime/backends/cuda/inferflux_cuda_executor.h
-    runtime/backends/cuda/native/native_bootstrap_config.cpp
-    runtime/backends/cuda/native/weight_map.cpp
+      runtime/backends/cuda/native/weight_map.cpp
     runtime/backends/cuda/native/cublas_gemm.cpp
     runtime/backends/cuda/native/native_dispatch_registry.cpp
     runtime/backends/cuda/native/native_dispatch_policy.cpp
@@ -602,6 +602,10 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   add_executable(benchmark_downproj_q81 tests/unit/benchmark_downproj_q81.cu)
   add_executable(benchmark_gate_up_kernels tests/unit/benchmark_gate_up_kernels.cu)
   add_executable(benchmark_q6k_kernels tests/unit/benchmark_q6k_kernels.cu)
+  add_executable(benchmark_q4k_mmq_rig tests/unit/benchmark_q4k_mmq_rig.cu)
+  target_include_directories(benchmark_q4k_mmq_rig PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(benchmark_q4k_mmq_rig PRIVATE inferflux_core inferflux_cuda_kernels)
   target_include_directories(benchmark_q6k_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_include_directories(benchmark_downproj_q81 PRIVATE
@@ -726,6 +730,7 @@ add_executable(inferflux_tests
   tests/unit/test_backend_interface.cpp
   tests/unit/test_native_bootstrap_config.cpp
   tests/unit/test_decode_relay_fingerprint.cpp
+  tests/unit/test_native_policy_env.cpp
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_startup_advisor.cpp

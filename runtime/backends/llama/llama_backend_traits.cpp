@@ -1,6 +1,8 @@
 #include "runtime/backends/llama/llama_backend_traits.h"
 
 #include <algorithm>
+
+#include "server/logging/logger.h"
 #include <cctype>
 
 namespace inferflux {
@@ -115,6 +117,30 @@ LlamaBackendConfig TuneLlamaBackendConfig(LlamaBackendTarget target,
       tuned.use_flash_attention = false;
     }
   }
+
+  // Quantized KV requires FlashAttention upstream (llama.cpp errors at
+  // context creation otherwise, e.g. CPU/Vulkan/OpenCL targets or the Grok
+  // arch) — fall back to f16 rather than failing the load.
+  const std::string kv_type_lower = [&] {
+    std::string out;
+    out.reserve(tuned.llama_kv_cache_type.size());
+    for (char c : tuned.llama_kv_cache_type) {
+      out.push_back(
+          static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    return out;
+  }();
+  if ((kv_type_lower == "q8_0" || kv_type_lower == "q8" ||
+       kv_type_lower == "q4_0" || kv_type_lower == "q4") &&
+      !tuned.use_flash_attention) {
+    log::Warn("llama_backend",
+              "KV cache type " + tuned.llama_kv_cache_type +
+                  " requires FlashAttention; falling back to f16");
+    tuned.llama_kv_cache_type = "f16";
+  }
+  // llama.cpp hard-caps sequences per context (LLAMA_MAX_SEQ, 256).
+  tuned.max_parallel_sequences =
+      std::clamp(tuned.max_parallel_sequences, 1, 256);
 
   if (tuned.flash_attention_tile <= 0) {
     tuned.flash_attention_tile = 128;

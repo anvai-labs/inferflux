@@ -299,6 +299,23 @@ std::string ResolveLlamaLoadPath(const std::string &path,
   return "";
 }
 
+std::string ResolveGgufArtifactPath(const std::string &path) {
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  const fs::path fs_path(path);
+  if (fs::is_regular_file(fs_path, ec)) {
+    if (ToLower(fs_path.extension().string()) == ".gguf") {
+      return path;
+    }
+    return "";
+  }
+  if (fs::is_directory(fs_path, ec)) {
+    const auto best = SelectBestGgufInDirectory(fs_path);
+    return best.empty() ? std::string() : best.string();
+  }
+  return "";
+}
+
 bool IsLoadableByLlamaBackend(const std::string &resolved_format) {
   return NormalizeModelFormat(resolved_format) == "gguf";
 }

@@ -118,5 +118,106 @@ TEST_CASE("KV planner keeps plan unchanged when budget cannot be computed",
   REQUIRE(out.requested_bytes == 4 * kGiB);
 }
 
+TEST_CASE("KV planner auto-tunes batch down to budget when seq is pinned",
+          "[kv_planner]") {
+  KvCachePlanInput input;
+  input.requested_max_batch = 32;
+  input.requested_max_seq = 4096;
+  input.min_max_batch = 4;
+  input.min_max_seq = 128;
+  input.bytes_per_token_per_sequence = 65536;
+  input.auto_tune_enabled = true;
+  input.max_seq_overridden = true;
+  input.max_batch_overridden = false;
+  input.explicit_budget_bytes = 1 * kGiB;
+
+  const KvCachePlanOutput out = PlanKvCache(input);
+  REQUIRE(out.auto_tuned_seq == false);
+  REQUIRE(out.max_seq == 4096);
+  REQUIRE(out.auto_tuned_batch == true);
+  REQUIRE(out.max_batch == 4);
+  REQUIRE(out.planned_bytes == 1 * kGiB);
+  REQUIRE(out.planned_bytes <= out.budget_bytes);
+}
+
+TEST_CASE("KV planner batch auto-tune respects the minimum batch floor",
+          "[kv_planner]") {
+  KvCachePlanInput input;
+  input.requested_max_batch = 32;
+  input.requested_max_seq = 4096;
+  input.min_max_batch = 16;
+  input.min_max_seq = 128;
+  input.bytes_per_token_per_sequence = 65536;
+  input.auto_tune_enabled = true;
+  input.max_seq_overridden = true;
+  input.max_batch_overridden = false;
+  input.explicit_budget_bytes = 1 * kGiB;
+
+  const KvCachePlanOutput out = PlanKvCache(input);
+  REQUIRE(out.auto_tuned_batch == true);
+  REQUIRE(out.max_batch == 16);
+  // The floor binds: the plan still exceeds the budget, but planned_bytes
+  // reflects the smallest admissible allocation.
+  REQUIRE(out.planned_bytes > out.budget_bytes);
+  REQUIRE(out.planned_bytes == static_cast<std::size_t>(16) * 4096 * 65536);
+}
+
+TEST_CASE("KV planner leaves batch alone when explicitly overridden",
+          "[kv_planner]") {
+  KvCachePlanInput input;
+  input.requested_max_batch = 32;
+  input.requested_max_seq = 4096;
+  input.min_max_batch = 4;
+  input.min_max_seq = 128;
+  input.bytes_per_token_per_sequence = 65536;
+  input.auto_tune_enabled = true;
+  input.max_seq_overridden = true;
+  input.max_batch_overridden = true;
+  input.explicit_budget_bytes = 1 * kGiB;
+
+  const KvCachePlanOutput out = PlanKvCache(input);
+  REQUIRE(out.auto_tuned_seq == false);
+  REQUIRE(out.auto_tuned_batch == false);
+  REQUIRE(out.max_batch == 32);
+  REQUIRE(out.planned_bytes == out.requested_bytes);
+}
+
+TEST_CASE("KV planner batch shrink only fires when seq tuning still "
+          "exceeds budget",
+          "[kv_planner]") {
+  KvCachePlanInput input;
+  input.requested_max_batch = 32;
+  input.requested_max_seq = 4096;
+  input.min_max_batch = 4;
+  input.min_max_seq = 128;
+  input.bytes_per_token_per_sequence = 65536;
+  input.auto_tune_enabled = true;
+  input.max_seq_overridden = false;
+  input.max_batch_overridden = false;
+  input.explicit_budget_bytes = 1 * kGiB;
+
+  const KvCachePlanOutput out = PlanKvCache(input);
+  // Sequence tuning alone brings the plan to exactly the budget.
+  REQUIRE(out.auto_tuned_seq == true);
+  REQUIRE(out.max_seq == 512);
+  REQUIRE(out.auto_tuned_batch == false);
+  REQUIRE(out.max_batch == 32);
+  REQUIRE(out.planned_bytes == 1 * kGiB);
+}
+
 } // namespace
+
+TEST_CASE("ComputeScratchRows sizes to chunk cap, batch floor, and seq cap",
+          "[kv_planner]") {
+  // Typical 3B server config: 512-token chunks, 16-wide decode, 2048 window.
+  REQUIRE(ComputeScratchRows(2048, 16, 512) == 512);
+  // Batch wider than the chunk still gets a row per sequence.
+  REQUIRE(ComputeScratchRows(2048, 1024, 512) == 1024);
+  // Chunk cap clamps to the KV window when the window is smaller.
+  REQUIRE(ComputeScratchRows(256, 16, 512) == 256);
+  // Degenerate inputs stay sane.
+  REQUIRE(ComputeScratchRows(0, 16, 512) == 16);
+  REQUIRE(ComputeScratchRows(2048, 0, 512) == 512);
+}
+
 } // namespace inferflux::runtime::cuda::native

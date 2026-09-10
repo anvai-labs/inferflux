@@ -1,7 +1,6 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#ifdef INFERFLUX_HAS_CUDA
-
+// Pure env parsing — no CUDA symbols; compiled on CPU CI too.
 #include "runtime/backends/cuda/native/native_bootstrap_config.h"
 #include "support/scoped_env.h"
 
@@ -25,7 +24,7 @@ TEST_CASE("NativeBootstrapConfig: uses hinted KV precision and default sizing",
   REQUIRE(config.dtype_override.empty());
   REQUIRE(config.kv_precision_choice == "bf16");
   REQUIRE(config.kv_max_batch == 16);
-  REQUIRE(config.kv_max_seq == 2048);
+  REQUIRE(config.kv_max_seq == 1024);
   REQUIRE_FALSE(config.kv_max_seq_overridden);
   REQUIRE(config.kv_auto_tune);
   REQUIRE(config.kv_budget_bytes == 0);
@@ -58,6 +57,30 @@ TEST_CASE(
   REQUIRE(config.invalid_kv_free_mem_ratio == "bad");
 }
 
-} // namespace inferflux
+TEST_CASE("NativeBootstrapConfig: flags max_batch override separately",
+          "[native_bootstrap]") {
+  {
+    ScopedEnvVar kv_batch("INFERFLUX_CUDA_KV_MAX_BATCH", nullptr);
+    ScopedEnvVar kv_seq("INFERFLUX_CUDA_KV_MAX_SEQ", nullptr);
+    const auto config = NativeBootstrapConfig::FromEnv("auto");
+    REQUIRE(config.kv_max_batch == 16);
+    REQUIRE_FALSE(config.kv_max_batch_overridden);
+  }
+  {
+    ScopedEnvVar kv_batch("INFERFLUX_CUDA_KV_MAX_BATCH", "8");
+    ScopedEnvVar kv_seq("INFERFLUX_CUDA_KV_MAX_SEQ", nullptr);
+    const auto config = NativeBootstrapConfig::FromEnv("auto");
+    REQUIRE(config.kv_max_batch == 8);
+    REQUIRE(config.kv_max_batch_overridden);
+  }
+  {
+    ScopedEnvVar kv_batch("INFERFLUX_CUDA_KV_MAX_BATCH", "nope");
+    ScopedEnvVar kv_seq("INFERFLUX_CUDA_KV_MAX_SEQ", nullptr);
+    const auto config = NativeBootstrapConfig::FromEnv("auto");
+    REQUIRE(config.kv_max_batch == 16);
+    REQUIRE_FALSE(config.kv_max_batch_overridden);
+    REQUIRE(config.invalid_kv_max_batch == "nope");
+  }
+}
 
-#endif // INFERFLUX_HAS_CUDA
+} // namespace inferflux

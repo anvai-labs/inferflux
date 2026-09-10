@@ -1932,12 +1932,14 @@ bool FusedQuantGemm::BuildDownProjMmqLayout(const QuantizedWeightInfo &weight,
       static_cast<int>((transformed_blocks + kThreads - 1) / kThreads);
 
   void *transformed = nullptr;
+  size_t transformed_bytes = 0;
   const auto qtype = static_cast<GGUF::TensorType>(weight.quant_type);
   switch (qtype) {
   case GGUF::TensorType::Q4_K: {
     block_q4_k *typed = nullptr;
-    if (cudaMalloc(reinterpret_cast<void **>(&typed),
-                   transformed_blocks * sizeof(block_q4_k)) != cudaSuccess) {
+    transformed_bytes = transformed_blocks * sizeof(block_q4_k);
+    if (cudaMalloc(reinterpret_cast<void **>(&typed), transformed_bytes) !=
+        cudaSuccess) {
       return false;
     }
     transform_downproj_mmq_layout<<<blocks, kThreads, 0, stream>>>(
@@ -1948,8 +1950,9 @@ bool FusedQuantGemm::BuildDownProjMmqLayout(const QuantizedWeightInfo &weight,
   }
   case GGUF::TensorType::Q6_K: {
     block_q6_k *typed = nullptr;
-    if (cudaMalloc(reinterpret_cast<void **>(&typed),
-                   transformed_blocks * sizeof(block_q6_k)) != cudaSuccess) {
+    transformed_bytes = transformed_blocks * sizeof(block_q6_k);
+    if (cudaMalloc(reinterpret_cast<void **>(&typed), transformed_bytes) !=
+        cudaSuccess) {
       return false;
     }
     transform_downproj_mmq_layout<<<blocks, kThreads, 0, stream>>>(
@@ -1968,7 +1971,8 @@ bool FusedQuantGemm::BuildDownProjMmqLayout(const QuantizedWeightInfo &weight,
     return false;
   }
 
-  *layout = {transformed, weight.quant_type, rows, cols, tile_cols};
+  *layout = {transformed, weight.quant_type, rows,
+             cols,        tile_cols,         transformed_bytes};
   return true;
 }
 
@@ -2112,7 +2116,8 @@ bool FusedQuantGemm::GemvMmqMmaPrequantized(
     splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                       static_cast<int>(kMmqMmaMaxSplits));
   }
-  if (M > 8 && M <= p.mmq_mma_max_batch) {
+  if (M > 8 && M <= p.mmq_mma_max_batch &&
+      (p.mmq_mma_force_split_fat || total_ctas < sm_count)) {
     splits = std::max(splits, 2);
   }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
@@ -2184,8 +2189,12 @@ bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
   const int total_ctas = n_tiles * ((M + 15) / 16);
   int splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                         static_cast<int>(kMmqMmaMaxSplits));
-  if (M > 8 && M <= p.mmq_mma_max_batch) {
-    splits = std::max(splits, 2); // decode M=16 tail-wave balance (2.5x)
+  if (M > 8 && M <= p.mmq_mma_max_batch &&
+      (p.mmq_mma_force_split_fat || total_ctas < sm_count)) {
+    // decode M=16 tail-wave balance (2.5x) when the knob forces it or the
+    // grid under-fills the SM array; large-N shapes skip the partial
+    // writes + reduce launch when the knob is disabled.
+    splits = std::max(splits, 2);
   }
 
   dim3 qgrid((K / 128 + 3) / 4, M);
