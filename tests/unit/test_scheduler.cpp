@@ -100,6 +100,8 @@ class ReadyStubBackend : public LlamaCppBackend {
 public:
   explicit ReadyStubBackend(std::string output) : output_(std::move(output)) {}
 
+  std::string Name() const override { return "inferflux_cuda"; }
+
   bool LoadModel(const std::filesystem::path &,
                  const LlamaBackendConfig &) override {
     return true;
@@ -2391,7 +2393,7 @@ TEST_CASE("Scheduler rejects requests exceeding the KV context budget",
   REQUIRE(router->SetDefaultModel(info.id));
 
   MetricsRegistry metrics;
-  metrics.SetInferfluxCudaKvCacheOccupancy(/*active=*/0, /*max=*/16);
+  metrics.SetInferfluxCudaKvMaxSeq(/*max_seq=*/16);
 
   Scheduler::Config config;
   config.metrics = &metrics;
@@ -2407,7 +2409,6 @@ TEST_CASE("Scheduler rejects requests exceeding the KV context budget",
   req.max_tokens = 1 << 20;
   auto resp = scheduler.Generate(std::move(req)).get();
 
-  WARN(resp.completion);
   REQUIRE(resp.no_backend);
   REQUIRE(resp.completion.find("context_overflow") != std::string::npos);
 }
