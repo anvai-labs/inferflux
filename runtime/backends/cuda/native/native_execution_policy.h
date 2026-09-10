@@ -35,8 +35,9 @@ struct NativeExecutionPolicy {
   // Tensor-core (mma.m16n8k16) decode attention: GQA heads packed into the
   // mma N dimension, 4 warps splitting each 128-row KV chunk, f16 PV
   // accumulation. head_dim 128 / GQA 8 / fp16 only. Kernel-vs-kernel rig
-  // (benchmark_fa_decode_rig): 1.4-3x faster than the packed kernel across
-  // kv 128-1024. Default off pending in-server A/B;
+  // (benchmark_fa_decode_rig, B=16): warm-L2 1.24-1.65x vs the packed
+  // kernel (win grows with kv; cold-L2 parity at kv <= 256), 4-12x vs the
+  // fp32-tile split family. Default off pending in-server A/B;
   // INFERFLUX_CUDA_ATTN_MMA_DECODE=1 enables.
   bool enable_attn_mma_decode{false};
   // Force K-split >= 2 for decode-MMA projections with M > 8 even when the

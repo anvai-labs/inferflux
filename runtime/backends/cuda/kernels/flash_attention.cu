@@ -3,6 +3,7 @@
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
 #include <cmath>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace inferflux {
 namespace cuda_kernel {
@@ -1516,6 +1517,9 @@ __global__ void FlashDecodePackedKernel(
 // f16 accumulation with a 2^-20 FTZ guard. Same partials layout as
 // FlashDecodeGQASplitKernel (combine via FlashDecodeReduceSplitsKernel).
 // Shape-static (head_dim 128 / GQA 8) and CUDA-graph safe.
+// Kernel-vs-kernel (benchmark_fa_decode_rig, B=16, RTX 4000 Ada):
+// warm-L2 1.24-1.65x vs the packed kernel (win grows with kv; cold-L2
+// parity at kv<=256), 4-12x vs the fp32-tile split family.
 // Fragment geometry reference: tests/unit/benchmark_fa_decode_rig.cu.
 // ============================================================================
 
@@ -1549,8 +1553,11 @@ __device__ __forceinline__ void MmaDecodePv(int (&d)[2], const int (&a)[4],
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-__device__ __forceinline__ float MmaDecodeFtz(float x) {
-  return x < 9.53674316e-7f ? 0.f : x;
+// Online-softmax rescale with llama.cpp FTZ semantics: flush when the
+// logit gap exceeds 20 nats (SOFTMAX_FTZ_THRESHOLD applies to the
+// exponent difference) so the fp16 accumulator never denormals.
+__device__ __forceinline__ float MmaDecodeRescale(float diff) {
+  return diff < -20.f ? 0.f : __expf(diff);
 }
 
 // K A-fragment: [16 rows x 16 dims] of the padded K tile (row-major).
@@ -1712,7 +1719,7 @@ __global__ void FlashDecodeMmaGqaKernel(
     float rsc[2];
 #pragma unroll
     for (int e = 0; e < 2; ++e) {
-      rsc[e] = MmaDecodeFtz(__expf(m_run[e] - new_m[e]));
+      rsc[e] = MmaDecodeRescale(m_run[e] - new_m[e]);
       m_run[e] = new_m[e];
       l_run[e] *= rsc[e];
     }
@@ -1835,7 +1842,7 @@ __global__ void FlashDecodeMmaGqaKernel(
       float bl = 0.f;
 #pragma unroll
       for (int w = 0; w < 4; ++w) {
-        const float f = MmaDecodeFtz(__expf(mg_m[w * 8 + h] - bm));
+        const float f = MmaDecodeRescale(mg_m[w * 8 + h] - bm);
         mg_rf[w * 8 + h] = f;
         bl += mg_l[w * 8 + h] * f;
       }
@@ -1875,8 +1882,11 @@ LaunchGQADecodeMma(const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,
                                       sizeof(float);
   const size_t total_workspace = partial_O_bytes + 2 * partial_scalar_bytes;
 
-  if (num_splits > 1 &&
-      (!split_workspace || split_workspace_bytes < total_workspace)) {
+  // The mma path always writes partials and always runs the combine, so
+  // a missing or undersized workspace is fatal here even at one split
+  // (unlike the split family, there is no direct-write kernel to fall
+  // back to inside this launcher).
+  if (!split_workspace || split_workspace_bytes < total_workspace) {
     return LaunchGQADecode<T, GQARatio>(
         Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
         num_kv_heads, HEAD_DIM, slot_stride, layer_stride, kv_stride, scale,
