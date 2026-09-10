@@ -479,7 +479,13 @@ local-memory-spilling kernel, not the designed one. With
 `__shared__` restored: 532/651 tok/s (2 runs, avg 591) vs 574/496
 baseline — **avg +10%**, determinism 1-distinct-of-8, outputs coherent.
 Shipped default-on behind `INFERFLUX_CUDA_ATTN_PACKED_DECODE=0` kill
-switch. The remaining ~4x attention gap vs llama.cpp still needs the
+switch.
+   **Second attempt also falsified (Sep 9)**: staging the block-cooperative
+   split decode kernel's K/V tiles as the cache dtype instead of FP32
+   (lossless, 75.8 -> ~43 KB smem, 2 blocks/SM) measured 440-465 tok/s vs
+   the 496-574 baseline band — bit-identical outputs but neutral-to-
+   negative. The kernel is per-element ALU/latency bound, not smem-
+   occupancy bound; tile dtype alone does not move it. The remaining ~4x attention gap vs llama.cpp still needs the
 tensor-core tile design (mma.m16n8k16 + ldmatrix + GQA packing +
 cp.async, as in flash_attn_ext_f16). Lesson recorded: kernel variables
 indexed by runtime values must be explicitly `__shared__`; a missing
