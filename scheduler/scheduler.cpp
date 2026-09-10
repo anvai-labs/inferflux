@@ -606,7 +606,6 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
     }
     slot_capacity =
         std::min<size_t>(kMaxSequenceSlots, static_cast<size_t>(kv_capacity));
-    native_kv_capacity_ = kv_capacity;
   }
 
   BatchExecutor::UnifiedBatchTuning tuning;
@@ -2002,6 +2001,34 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // PagedAttention Block Allocation: calculate additional blocks needed.
         std::size_t prompt_len = inf.bpe_prompt_tokens.size();
 
+        // Context-overflow rejection (PR #124 follow-up / issue #125):
+        // fail before compute AND before paged-block reservation when
+        // prompt + generation cannot fit one slot's KV extent (kv max_seq
+        // = tokens per slot, NOT the slot count). Published only by the
+        // inferflux_cuda executor; other backends context-shift instead.
+        if (pending->resolved_backend &&
+            pending->resolved_backend->Name() == "inferflux_cuda" &&
+            metrics_->GetInferfluxCudaKvMaxSeq() > 0) {
+          const int kv_max_seq = metrics_->GetInferfluxCudaKvMaxSeq();
+          if (kv_max_seq > 0 &&
+              static_cast<long long>(inf.bpe_prompt_tokens.size()) +
+                      inf.max_tokens >
+                  kv_max_seq) {
+            InferenceResult overflow;
+            overflow.no_backend = true;
+            overflow.completion =
+                "context_overflow: prompt " +
+                std::to_string(inf.bpe_prompt_tokens.size()) +
+                " + max_tokens " + std::to_string(inf.max_tokens) +
+                " exceeds the per-slot context of " +
+                std::to_string(kv_max_seq) +
+                " tokens (raise INFERFLUX_CUDA_KV_MAX_SEQ for long-context "
+                "workloads, or reduce max_tokens)";
+            pending->promise.set_value(std::move(overflow));
+            continue;
+          }
+        }
+
         // Logical blocks already covered by the cached prefix.
         std::size_t warm_blocks = cached_blocks.size();
         std::size_t total_blocks_needed =
@@ -2038,29 +2065,6 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               new_blocks.clear();
             }
           }
-        }
-
-        // Context-overflow rejection (PR #124 follow-up / issue #125):
-        // fail before compute when prompt + generation cannot fit one
-        // slot's KV extent (kv max_seq — tokens per slot, NOT the slot
-        // count). The native CUDA backends publish this; other backends
-        // context-shift (no published cap).
-        if (const int kv_max_seq = metrics_->GetInferfluxCudaKvMaxSeq();
-            kv_max_seq > 0 &&
-            static_cast<long long>(inf.bpe_prompt_tokens.size()) +
-                    inf.max_tokens >
-                kv_max_seq) {
-          InferenceResult overflow;
-          overflow.no_backend = true;
-          overflow.completion =
-              "context_overflow: prompt " +
-              std::to_string(inf.bpe_prompt_tokens.size()) + " + max_tokens " +
-              std::to_string(inf.max_tokens) +
-              " exceeds the per-slot context of " + std::to_string(kv_max_seq) +
-              " tokens (raise INFERFLUX_CUDA_KV_MAX_SEQ for long-context "
-              "workloads)";
-          pending->promise.set_value(std::move(overflow));
-          continue;
         }
 
         uint64_t seq_generation =

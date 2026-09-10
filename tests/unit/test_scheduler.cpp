@@ -100,6 +100,8 @@ class ReadyStubBackend : public LlamaCppBackend {
 public:
   explicit ReadyStubBackend(std::string output) : output_(std::move(output)) {}
 
+  std::string Name() const override { return "inferflux_cuda"; }
+
   bool LoadModel(const std::filesystem::path &,
                  const LlamaBackendConfig &) override {
     return true;
