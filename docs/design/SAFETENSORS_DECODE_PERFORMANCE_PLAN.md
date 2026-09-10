@@ -478,8 +478,14 @@ post-merge review caught that its K/V tiles were missing `__shared__`
 local-memory-spilling kernel, not the designed one. With
 `__shared__` restored: 532/651 tok/s (2 runs, avg 591) vs 574/496
 baseline — **avg +10%**, determinism 1-distinct-of-8, outputs coherent.
-Shipped default-on behind `INFERFLUX_CUDA_ATTN_PACKED_DECODE=0` kill
-switch.
+   **Correction (Sep 10)**: #122's "default stays on" was not actually
+landed — `enable_attn_packed_decode` kept its original `false` default
+and the knob was undocumented, so the +7% kernel was opt-in only and
+every profile above (including the 7.3x attention gap) measured the
+fp32-tile split kernel. The default flip + stale-comment fix + knob
+documentation landed separately (the 7.3x gap therefore still stands
+as the rewrite target; the packed kernel is the interim baseline the
+tensor-core kernel must beat, not the shipped default).
    **Second attempt also falsified (Sep 9)**: staging the block-cooperative
    split decode kernel's K/V tiles as the cache dtype instead of FP32
    (lossless, 75.8 -> ~43 KB smem, 2 blocks/SM) measured 440-465 tok/s vs
