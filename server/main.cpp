@@ -339,6 +339,16 @@ int main(int argc, char **argv) {
               backend_priority.push_back(ToLower(hint.as<std::string>()));
             }
           }
+        } else if (config["runtime"]["backend_priority"] &&
+                   config["runtime"]["backend_priority"].IsScalar()) {
+          // Comma-separated string form — same syntax as
+          // INFERFLUX_BACKEND_PRIORITY. Ignoring it here silently dropped
+          // configs to the built-in CPU-first priority.
+          auto parsed_priority = ParseBackendPriorityList(
+              config["runtime"]["backend_priority"].as<std::string>());
+          if (!parsed_priority.empty()) {
+            backend_priority = std::move(parsed_priority);
+          }
         }
         if (config["runtime"]["mps_layers"])
           mps_layers = config["runtime"]["mps_layers"].as<int>();
