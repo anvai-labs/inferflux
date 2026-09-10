@@ -343,7 +343,8 @@ int main(int argc, char **argv) {
                    config["runtime"]["backend_priority"].IsScalar()) {
           // Comma-separated string form — same syntax as
           // INFERFLUX_BACKEND_PRIORITY. Ignoring it here silently dropped
-          // configs to the built-in CPU-first priority.
+          // configs using this form to the built-in default priority
+          // (cpu for CUDA-less builds, cuda otherwise).
           auto parsed_priority = ParseBackendPriorityList(
               config["runtime"]["backend_priority"].as<std::string>());
           if (!parsed_priority.empty()) {

@@ -187,6 +187,11 @@ When strict mode is enabled, unsupported explicit native requests fail with `422
 For `backend: cuda` requests, runtime fallback order is:
 `inferflux_cuda` -> `llama_cpp_cuda` -> `rocm` (if compiled) -> `mlx` (if compiled) -> `mps` (if compiled) -> `cpu`.
 
+`runtime.backend_priority` accepts two forms: a YAML sequence
+(`[inferflux_cuda, llama_cpp_cuda, cpu]`) or a scalar comma-separated string
+(`"inferflux_cuda,llama_cpp_cuda,cpu"`) — the same syntax as the
+`INFERFLUX_BACKEND_PRIORITY` environment variable, which overrides both.
+
 ## 7) Runtime Tuning Cheat Sheet
 
 ### Scheduler
