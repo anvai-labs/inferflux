@@ -315,6 +315,12 @@ public:
   int GetInferfluxCudaKvMaxSequences() const {
     return inferflux_cuda_kv_max_sequences_.load(std::memory_order_relaxed);
   }
+  void SetInferfluxCudaKvMaxSeq(int max_seq) {
+    inferflux_cuda_kv_max_seq_.store(max_seq, std::memory_order_relaxed);
+  }
+  int GetInferfluxCudaKvMaxSeq() const {
+    return inferflux_cuda_kv_max_seq_.load(std::memory_order_relaxed);
+  }
   uint64_t GetInferfluxCudaKvPlannedBytes() const {
     return inferflux_cuda_kv_planned_bytes_.load(std::memory_order_relaxed);
   }
@@ -508,6 +514,7 @@ private:
       inferflux_cuda_rowpair_selection_counts_;
   std::atomic<int> inferflux_cuda_kv_active_sequences_{0};
   std::atomic<int> inferflux_cuda_kv_max_sequences_{0};
+  std::atomic<int> inferflux_cuda_kv_max_seq_{0};
   std::atomic<uint64_t> inferflux_cuda_kv_autotune_events_total_{0};
   std::atomic<int> inferflux_cuda_kv_requested_max_seq_{0};
   std::atomic<int> inferflux_cuda_kv_planned_max_seq_{0};

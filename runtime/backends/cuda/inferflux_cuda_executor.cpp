@@ -1731,6 +1731,7 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
   max_seq = kv_plan.max_seq;
   active_max_batch_ = max_batch;
   active_max_seq_ = max_seq;
+  GlobalMetrics().SetInferfluxCudaKvMaxSeq(max_seq);
 
   if (kv_plan.auto_tuned_seq) {
     log::Info(
