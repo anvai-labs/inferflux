@@ -480,12 +480,15 @@ local-memory-spilling kernel, not the designed one. With
 baseline — **avg +10%**, determinism 1-distinct-of-8, outputs coherent.
    **Correction (Sep 10)**: #122's "default stays on" was not actually
 landed — `enable_attn_packed_decode` kept its original `false` default
-and the knob was undocumented, so the +7% kernel was opt-in only and
-every profile above (including the 7.3x attention gap) measured the
-fp32-tile split kernel. The default flip + stale-comment fix + knob
-documentation landed separately (the 7.3x gap therefore still stands
-as the rewrite target; the packed kernel is the interim baseline the
-tensor-core kernel must beat, not the shipped default).
+and the knob was undocumented, so the packed kernel (+7-10% average:
++10% in the 2-run A/B above, +7% in the §4g battery) was opt-in only;
+the profiles above ran the pre-#122 decode path (finding 2's ncu
+target is `FlashAttention2MMAGQAKernel` at qlen=1, and the burst
+family numbers are the fp32-tile split kernel). The default flip +
+stale-comment fix + knob documentation landed as a follow-up: packed
+is now the shipped default for the head_dim-128/GQA-8 contiguous
+shape, and is the baseline the tensor-core rewrite must beat
+(kernel-vs-kernel numbers: `benchmark_fa_decode_rig`).
    **Second attempt also falsified (Sep 9)**: staging the block-cooperative
    split decode kernel's K/V tiles as the cache dtype instead of FP32
    (lossless, 75.8 -> ~43 KB smem, 2 blocks/SM) measured 440-465 tok/s vs
