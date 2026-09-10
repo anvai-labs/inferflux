@@ -69,6 +69,7 @@ NativeBootstrapConfig::FromEnv(const std::string &kv_precision_hint) {
     int val = 0;
     if (ParsePositiveIntSetting(env, &val) && val <= 128) {
       config.kv_max_batch = val;
+      config.kv_max_batch_overridden = true;
     } else {
       config.invalid_kv_max_batch = env;
     }

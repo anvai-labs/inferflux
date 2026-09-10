@@ -148,6 +148,16 @@ public:
   }
   bool BatchDequantCacheEnabled() const { return batch_dequant_cache_enabled_; }
 
+  // When enabled (default), transformed down-proj MMQ layouts are shared
+  // through the loader's per-tensor cache: the first map to touch a layer
+  // builds it and every replica reuses the same device buffer (the map's
+  // cached copy is borrowed, not owned). When disabled, each map builds and
+  // owns its own layouts — the historical behavior.
+  void SetSharedMmqLayoutEnabled(bool enable) {
+    shared_mmq_layout_enabled_ = enable;
+  }
+  bool SharedMmqLayoutEnabled() const { return shared_mmq_layout_enabled_; }
+
   // --- Raw quantized weight accessors (for fused dequant-GEMV) ---
 
   QuantizedWeightInfo GetRawLayerQProj(int layer) const;
@@ -159,6 +169,9 @@ public:
   QuantizedWeightInfo GetRawLayerDownProj(int layer) const;
   MmqWeightInfo GetMmqLayerDownProj(int layer) const;
   QuantizedWeightInfo GetRawLmHead() const;
+  /// Raw quantized embedding table (Q4_K/Q6_K) for the row-gather path;
+  /// zero-value info when the table is not quantized.
+  QuantizedWeightInfo GetRawEmbedTokens() const;
 
   /**
    * @brief Check if a weight tensor exists
@@ -263,6 +276,15 @@ private:
   mutable std::mutex mmq_cache_mu_;
   bool allow_fused_quantized_matmul_{true};
   bool batch_dequant_cache_enabled_{false};
+  bool shared_mmq_layout_enabled_{true};
+  // Layouts this map built itself (per-map fallback path) and must free.
+  // Borrowed shared-cache copies are NOT tracked here — they are owned by
+  // the loader's tensors, and LoadModel resets the loader before the maps,
+  // so freeing them in the dtor would double-free. Per-entry tracking also
+  // keeps teardown exact when a map holds a mix (e.g., a transient
+  // cudaMalloc failure during the shared build fell back to a local build
+  // for one layer while every other layer borrowed the cache).
+  mutable std::vector<MmqWeightInfo> owned_mmq_layouts_;
 
   // Global weight accessors
   std::shared_ptr<IWeightAccessor> embed_tokens_accessor;

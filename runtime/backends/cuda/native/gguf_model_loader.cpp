@@ -1,4 +1,6 @@
 #include "runtime/backends/cuda/native/gguf_model_loader.h"
+#include "runtime/backends/cuda/native/fused_quant_gemm.h"
+#include "runtime/backends/cuda/native/weight_map.h"
 #include "server/diagnostics/crash_handler.h"
 #include "server/logging/logger.h"
 #include <algorithm>
@@ -74,6 +76,21 @@ bool CheckCudaStatus(cudaError_t status, const char *component,
 }
 
 bool ShouldRetainDequantizedTensor(const std::string &name) {
+  // PR-5 row-gather (EXPERIMENTAL, default off): when on, embeddings
+  // dequantize per row at lookup and the 622 MB full-precision token_embd
+  // copy is never materialized. Known hazard before this can default on:
+  // for tied models lm_head aliases token_embd, and the fp16 buffers the
+  // tied LmHead() path caches go stale once the batch-scoped cleanup frees
+  // the non-retained dequant (garbage outputs from batch 2 on). Resolve the
+  // lm_head cache lifetime first (issue #113).
+  static const bool embed_row_gather = [] {
+    const char *raw = std::getenv("INFERFLUX_CUDA_EMBED_ROW_GATHER");
+    return raw && (raw[0] == '1' || raw[0] == 't');
+  }();
+  if (embed_row_gather &&
+      (name == "token_embd.weight" || name == "tok_emb.weight")) {
+    return false;
+  }
   return name == "token_embd.weight" || name == "tok_emb.weight";
 }
 
@@ -1096,6 +1113,17 @@ void GGUFModelLoader::FreeGPUMemory() { FreeGPUMemoryImpl(); }
 
 void GGUFModelLoader::FreeGPUMemoryImpl() {
   ClearDequantizedCache();
+  // Shared transformed MMQ layouts are owned by their tensors; free them
+  // here, not in any weight map (maps may be destroyed before the loader).
+  std::lock_guard<std::mutex> mmq_layout_lock(mmq_layout_mu_);
+  for (auto &entry : tensors_) {
+    auto &tensor = entry.second;
+    if (tensor.mmq_layout_gpu) {
+      CheckCudaStatus(cudaFree(tensor.mmq_layout_gpu), "gguf_loader",
+                      "cudaFree(mmq layout)");
+      tensor.mmq_layout_gpu = nullptr;
+    }
+  }
   if (d_quantized_buffer_) {
     CheckCudaStatus(cudaFree(d_quantized_buffer_), "gguf_loader",
                     "cudaFree(quantized buffer)");
@@ -1111,6 +1139,86 @@ void GGUFModelLoader::FreeGPUMemoryImpl() {
 void *GGUFModelLoader::GetGPUBuffer() const { return d_quantized_buffer_; }
 
 size_t GGUFModelLoader::GetGPUSize() const { return quantized_buffer_size_; }
+
+bool GGUFModelLoader::GetOrBuildDownProjMmqLayout(IWeightAccessor *accessor,
+                                                  cudaStream_t stream,
+                                                  MmqWeightInfo *out) {
+  if (!accessor || !out || !accessor->IsQuantized()) {
+    return false;
+  }
+  auto *gguf_accessor = dynamic_cast<GGUFWeightAccessor *>(accessor);
+  if (!gguf_accessor || !gguf_accessor->tensor()) {
+    return false;
+  }
+  GGUFTensorData &tensor = *gguf_accessor->tensor();
+  if (!tensor.gpu_data) {
+    return false;
+  }
+
+  const auto dims = accessor->GetDimensions();
+  const int rows = static_cast<int>(dims.first);
+  const int cols = static_cast<int>(dims.second);
+  const int quant_type =
+      static_cast<int>(StringToTensorType(accessor->GetDataType()));
+
+  // Serialize first build across the weight-map replicas (primary + lanes
+  // warm up concurrently). BuildDownProjMmqLayout synchronizes its build
+  // stream before returning, so publishing under this lock makes the layout
+  // safe to consume on any stream afterwards. Member (not function-local):
+  // GetMmqTransformedLayoutBytes takes the same lock from serving threads.
+  std::lock_guard<std::mutex> lock(mmq_layout_mu_);
+
+  if (tensor.mmq_layout_gpu) {
+    if (tensor.mmq_layout_quant_type != quant_type ||
+        tensor.mmq_layout_rows != rows || tensor.mmq_layout_cols != cols) {
+      log::Warn("gguf_loader",
+                "MMQ layout signature mismatch for tensor " + tensor.info.name);
+      return false;
+    }
+    *out = {tensor.mmq_layout_gpu,
+            quant_type,
+            rows,
+            cols,
+            tensor.mmq_layout_tile_cols,
+            tensor.mmq_layout_bytes};
+    return true;
+  }
+
+  QuantizedWeightInfo raw;
+  raw.data = tensor.gpu_data;
+  raw.quant_type = quant_type;
+  raw.num_elements = static_cast<int64_t>(dims.first * dims.second);
+  if (!FusedQuantGemm::SupportsDownProjMmq(raw.quant_type)) {
+    return false;
+  }
+
+  MmqWeightInfo layout;
+  if (!FusedQuantGemm::BuildDownProjMmqLayout(raw, rows, cols, &layout,
+                                              stream)) {
+    return false;
+  }
+
+  tensor.mmq_layout_gpu = const_cast<void *>(layout.data);
+  tensor.mmq_layout_quant_type = layout.quant_type;
+  tensor.mmq_layout_rows = layout.rows;
+  tensor.mmq_layout_cols = layout.cols;
+  tensor.mmq_layout_tile_cols = layout.tile_cols;
+  tensor.mmq_layout_bytes = layout.bytes;
+
+  *out = layout;
+  return true;
+}
+
+size_t GGUFModelLoader::GetMmqTransformedLayoutBytes() const {
+  // Serialize against concurrent first-builds (lazy mid-serving build) so
+  // the byte sum and teardown iteration never race a publish.
+  std::lock_guard<std::mutex> lock(mmq_layout_mu_);
+  size_t total = 0;
+  for (const auto &entry : tensors_) {
+    total += entry.second.mmq_layout_bytes;
+  }
+  return total;
+}
 
 void GGUFModelLoader::SetDequantizedCachePolicy(DequantizedCachePolicy policy) {
   dequantized_cache_policy_ = policy;

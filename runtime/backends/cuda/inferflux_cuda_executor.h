@@ -275,6 +275,9 @@ private:
   // Model loading
   std::unique_ptr<SafetensorsLoader> loader_;
   std::unique_ptr<runtime::cuda::native::IModelLoader> model_loader_;
+  // Widest prefill call (tokens) from LlamaBackendConfig::prefill_chunk_tokens;
+  // forwarded to every forward replica for scratch sizing.
+  int prefill_chunk_tokens_{512};
   runtime::cuda::native::ModelInfo model_info_;
   std::filesystem::path loaded_model_path_;
   bool model_loaded_{false};
@@ -423,6 +426,16 @@ private:
   int timing_sample_rate_{0};
   std::atomic<int> timing_batch_counter_{0};
   NativeExecutionPolicy execution_policy_{};
+
+  // KV bounds backstop: the native KV cache indexes device memory by raw
+  // sequence id (slot table + per-slot strides) with no device-side bounds
+  // check. Admission bounds ids in normal operation — the scheduler sizes its
+  // sequence slot manager to the published KV capacity — so a violation here
+  // means a scheduler/backend capacity mismatch; the guard converts it into a
+  // clean per-request failure instead of an out-of-bounds device write.
+  bool SeqIdInKvRange(int seq_id) const;
+  void RecordKvRangeViolation(int seq_id);
+  std::atomic<int> kv_range_violations_{0};
 
   struct NativePerfAccumulator {
     std::atomic<double> prefill_ms{0.0};

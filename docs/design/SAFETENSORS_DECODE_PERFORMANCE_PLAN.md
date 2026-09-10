@@ -221,6 +221,325 @@ BatchForwardDevice o/down/lm_head stay explicit (genuine branching).
 Parity gates per stage: safetensors + GGUF determinism vs pre-change,
 isolation probe count, first-token probe.
 
+## 4d) Coverage + profiling matrix (Sep 7): engines x formats x backends
+
+Coverage (verified this session on the dual-GPU box):
+
+| Engine | GGUF CUDA | GGUF ROCm | ST CUDA | ST ROCm |
+|---|---|---|---|---|
+| inferflux (native) | ✅ 344.6 tok/s c=16 | ✅ 36.3 | ✅ 318.8 | ❌ no HIP bf16 forward |
+| llama.cpp | ✅ 211.9 | ✅ 35.4 | ❌ GGUF-only | ❌ |
+| vLLM | ❌ no GGUF | ❌ CUDA venv | ✅ 720.8 | ❌ CUDA venv |
+| SGLang | ❌ no GGUF | ❌ CUDA venv | ✅ 619.0 | ❌ CUDA venv |
+| Ollama (remote) | ✅ 123.7 | n/a remote | ❌ | ❌ |
+
+InferFlux has the highest coverage: 4 of 6 working combos vs 3 (llama.cpp)
+and 2 (vLLM/SGLang). Notable: **inferflux_cuda now leads llama.cpp on GGUF
+at c>=8** (344.6 vs 211.9 at c=16 = 1.63x; 277.4 vs 247.9 at c=8) — the
+April snapshot had it 0.66-0.83x behind. ROCm GGUF works but at ~17-36
+tok/s (7x slower than CUDA; both inferflux_rocm and llama_cpp_rocm land
+identically — GGUF decode in the ROCm build rides the llama.cpp HIP
+kernels). ST-on-ROCm is blocked: no HIP bf16 forward is built.
+
+**Memory-pressure dimension (same matrix, c=16 GPU peaks):**
+
+| Row | GPU peak | vs baseline |
+|---|---|---|
+| inferflux GGUF CUDA | 7,148 MB | +3,006 MB vs llama.cpp |
+| llama.cpp GGUF CUDA | 4,142 MB | baseline |
+| Ollama GGUF (remote) | 658 MB | own-GPU accounting, not comparable |
+| inferflux ST CUDA | 8,750 MB | — |
+| vLLM ST CUDA | 19,970 MB | 2.28x InferFlux |
+| SGLang ST CUDA | 17,436 MB | 2.0x InferFlux |
+
+The decisive competitive framing falls out of the throughput/memory pair:
+**tokens per second per GB of GPU memory at c=16 is nearly identical between
+InferFlux (36.4) and vLLM (36.1)** — vLLM's 2.26x throughput lead is bought
+entirely with 2.28x more pre-allocated memory. On memory-constrained cards
+the comparison inverts: vLLM's 20 GB pre-allocation cannot serve
+Qwen2.5-3B on a 12 GB card at all in this configuration, while InferFlux
+serves it in 8.75 GB with headroom. GGUF quantized serving shrinks this
+further (7.1 GB for Q4_K_M with native kernels leading llama.cpp at
+c>=8).
+
+**Output-accuracy verification (the throughput table is meaningful):**
+all working combos were validated for response correctness, not just speed:
+- GGUF CUDA: harness semantic similarity HIGH for all engine pairs at all
+  concurrency levels (inferflux-vs-llama 0.89-0.94, inferflux-vs-ollama
+  0.89-0.90); 32/32 success every level.
+- ST CUDA: harness reference (llama.cpp) absent, so cross-engine similarity
+  was computed directly from saved responses (160 per engine, MiniLM
+  cosine): inferflux-vs-vLLM 0.923, inferflux-vs-SGLang 0.924, vLLM-vs-
+  SGLang 0.997 (llama.cpp-derived siblings nearly identical, as expected);
+  0 degenerate responses across all 480.
+- ROCm GGUF: both backends produce identical outputs (1.000 mutual) at
+  0.92-0.96 cosine vs the CUDA backend for the same prompts+greedy —
+  correctness on the AMD path confirmed against the CUDA reference.
+The multi-variant GGUF outputs (2-3 coherent variants per load) are
+decode-composition numerics: present with relay and graphs on and off,
+all variants correct — not a regression.
+
+nsys kernel summaries (c=8 wave, 32x64): inferflux GGUF = native MMQ/MMVQ
+kernels (InferfluxMmqQ 326ms top); inferflux ST = cutlass bf16 wmma + FA2
+MMA; llama.cpp GGUF = mul_mat_q stream-k; vLLM = ampere fp16 CUTLASS GEMMs.
+
+**ncu SpeedOfLight finding (overturns the DRAM-streaming assumption):**
+the dominant InferFlux GGUF kernels run at **98-99% L1TEX/SM-memory
+throughput while DRAM sits at 14-15%**. The decode bottleneck is the
+L1/shared-memory pipeline (transaction density), not DRAM streaming —
+weight tiles are L2-resident across the small 3B model. Future kernel
+work should target L1TEX pressure (wider vector loads, fewer
+transactions, register tiling), not more aggressive DRAM prefetch. This
+also explains why the deep-MLP DRAM-focused redesign plateaued at the
+same ceiling as cuBLAS.
+
+**Occupancy lever falsified (Sep 7):** ncu showed the MMA-tier kernels
+(`InferfluxMmqQ4KMma/Q6KMma`, 117-121 regs/thread,
+`__launch_bounds__(256, 1)`, 33% occupancy, L1TEX 45-54%) as
+under-saturated vs the 90-95% grouped-FFN kernels. The classic fix —
+`__launch_bounds__(256, 2)` to target 2 blocks/SM — measured **20-25%
+WORSE** (263-369 vs 413-429 tok/s on the same driver/config): the
+register budget IS the accumulator working set; forcing 2-block
+occupancy spills it. The 54% L1TEX reading reflects genuine pipe
+saturation for this kernel's mix, not fixable idleness. Kernel-level
+follow-up would need SASS analysis (smem bank pattern / ldmatrix
+scheduling), not occupancy tuning.
+
+## 4e) Memory-overhead investigation (Sep 7): root cause found
+
+Question: GGUF q4_k_m peaks at 7,148 MB vs llama.cpp 4,142 MB (+3.0 GB).
+Weights are identical. Where does the +3 GB go?
+
+Method: fresh nsys capture with `--cuda-memory-usage=true` (GGUF config,
+c=16 load), sqlite export, `CUDA_GPU_MEMORY_USAGE_EVENTS` bucketed by exact
+allocation size and netted allocation-vs-free by address (an earlier cut
+double-counted freed generations — the numbers below are the netted, live-set
+corrected ones and sum exactly to the measured live total). Every family
+factors exactly against Qwen2.5-3B shapes (hidden=2048, ffn=11008,
+vocab=151,936, 36 layers, kv_heads=2, head_dim=128). One load generation:
+weights/KV allocate once and free at shutdown; live bytes go 5,848 MB after
+startup, +543 MB at first decode, 6,391 MB steady at c=16.
+
+The whale: **three live full-model copies of the transformed down-proj MMQ
+weight layouts — 1,683 MB live, 1,122 MB redundant.**
+`FusedQuantGemm::BuildDownProjMmqLayout` (fused_quant_gemm.cu:1913)
+re-lays-out every layer's down_proj weight for the mma.sync MMQ path
+(Q4_K 12,681,216 B / Q6_K 18,493,440 B per tensor; q4_k_m uses Q6_K
+down-proj on 18 of 36 layers -> 18+18 per pass, 561 MB per pass). The
+layout is cached per-layer inside each `QuantizedWeightMap`
+(quantized_weight_map.cpp:437), and there are three maps per model
+(primary executor:1847 + decode lane :1386 + prefill lane :1387 — GGUF
+lanes own private maps because the map holds mutable scratch state;
+safetensors lanes share one map and have no MMQ path at all). Two passes
+build at load, one lazily at first decode (+543 MB measured; one ~18 MB
+Q6_K tensor of that pass builds during load, which is why the measured
+delta is 543 rather than the full 561 MB pass). All stay live until
+shutdown. llama.cpp needs zero such copies — its MMQ kernels read the
+native layout.
+
+Full steady-state decomposition (GGUF q4_k_m, live at c=16, sums to the
+measured 6,391 MB):
+
+| Block | Size | Verdict |
+|---|---|---|
+| Native quantized weight buffer (single cudaMalloc, file-sized) | 2,099 MB | optimal |
+| Transformed down-proj MMQ layouts, 3 passes x 561 MB | 1,683 MB | 1 pass needed; loader-level shared cache saves 1,122 MB |
+| KV cache (16 batch x 2048 seq worst case, 36 layers) | 1,208 MB | worst-case reservation vs llama.cpp demand-grown pool; batch-aware planner + admission guards are correctness prerequisites |
+| token_embd fp16 dequant (retained by policy) | 622 MB | needed by the embed path; row-gather kernel would remove it (out of scope) |
+| 3 forward replicas: rows-scaled scratch ~616 MB + logits/samplers | ~700 MB | prefill/decode overlap cost; rows right-sizing saves ~460 MB |
+| Slot tables, cublas workspaces, events, misc | ~79 MB | legit |
+
+Corrections vs the first cut of this section (caught in adversarial review):
+there are exactly 3 `QuantizedWeightMap` instances per model, not 6 (the 6
+layout passes in the raw trace were cumulative allocation events, not a live
+set — netting frees by address shows a single load generation); the second
+622 MB vocab-sized buffer is a load-time TRANSIENT (dequanted output.weight
+freed by the post-warm-batch dequant-cache cleanup at t=1.77s), not a
+permanent tie-unaware double — steady state holds one 622 MB token_embd
+dequant; replica scratch is ~616 MB rows-scaled (not ~400 MB); the
+"gate+up transform" and "dequant spill" families resolve to per-replica
+activation staging and the batch-scoped dequant churn.
+
+Efficiency summary vs llama.cpp: ~1.1 GB is multiplied weight-layout copies
+(shared per-tensor cache), ~0.6 GB is worst-case KV reservation (bounded by
+admission; planner can shrink batch under budget), ~0.46 GB is scratch
+sized to max-seq instead of chunk+batch. Fixing the first and third plus
+the load transient puts GGUF peak around 5.5 GB vs llama.cpp 4.14 GB; the
+residual is the KV worst-case reserve — the honest cost of pre-allocated
+per-slot KV. The 2.0 GB weight buffer itself is already optimal.
+
+En-route correctness findings (fixed in the follow-up series): KV
+`GetK/GetV`/`Append` and the device slot table are unchecked while the
+scheduler circulates up to 128 slot ids against 16 KV slots (OOB device
+writes whenever >16 sequences are resident), and native-CUDA embeddings
+(NativeEmbed, ephemeral seq ids >=900000) appends KV far out of bounds on
+every call.
+
+### 4e-results: post-fix measurement (Sep 7, all three merged)
+
+With #108 (KV admission guards + batch-aware planner), #109 (shared MMQ
+layout cache), and #110 (scratch right-sizing + direct-Generate chunking)
+merged, the same nsys `--cuda-memory-usage=true` capture on the same GGUF
+config + c=16 load measures:
+
+- **Netted steady-state live: 6,391 -> 4,762 MB (-1,629 MB)**. Books close
+  within rounding (~6 MB residual): -1,122 MB (three MMQ layout passes ->
+  one) and -501 MB measured (scratch rows 2048 -> 512 across three
+  replicas; the §4e estimate was ~460). Mid-serving ledger: weights
+  domain 2,660 MB = 2,099 weight buffer + one 561 MB shared layout pass
+  (`weights.mmq_layouts` item); three blocks >= 50 MB account for 3,929 MB
+  (weights, KV, retained token_embd dequant).
+- **Throughput: 422 and 456 tok/s at c=16** (two runs) vs 384 pre-series
+  baseline — no regression, possibly scratch-locality improvement (harness
+  variance ~30%; treat as parity-or-better).
+- Greedy determinism clean (1 distinct output of 8 concurrent identical
+  prompts), long-prompt (954/999-token) prefills through both unified and
+  direct paths coherent, zero guard violations, zero CUDA errors.
+- GGUF nvidia-smi-equivalent peak is now dominated by the load-time
+  transient churn (~600 MB dequant + lane warm) on top of a ~4.8 GB
+  steady state; the remaining gap to llama.cpp's 4,142 MB is dominated by
+  the 1,208 MB worst-case KV reserve plus the retained token_embd dequant
+  (a qualitative comparison — llama.cpp's footprint also includes its own
+  demand-grown KV, so the two peaks are not an additive decomposition).
+
+En-route fixes that the series carries: the KV seq-id OOB (unguarded
+device writes whenever >16 sequences were resident — now admission-bounded
+and backstopped), native-CUDA embeddings writing K/V out of bounds on
+every call (fail-closed; proper KV-free path in #111), the direct
+Generate path issuing whole-prompt single calls (now chunked), and the
+phased-prefill path bypassing chunked_prefill_tokens.
+
+### 4f) Profiling vs stock llama-server (Sep 8, corrected): where the GGUF decode time goes
+
+Setting: identical decode battery (48 requests x 256 tokens at c=16, all
+generating the full 12,288 tokens — llama-server with `-c 16384` so its
+256-token-per-sequence default does not truncate generations — Qwen2.5-3B
+q4_k_m, FA on both). nsys `--trace=cuda --cuda-graph-trace=node` captures
+of both engines; ncu SpeedOfLight+Occupancy on the attention kernels.
+
+End-to-end: stock `llama-server` 884 tok/s vs `inferflux_cuda` 574 tok/s
+(1.54x) on this battery.
+
+**Methodology trap worth remembering**: with nsys's default
+`--cuda-graph-trace=graph`, per-kernel records exclude graph-replayed
+kernels — 88-94% of real GPU busy time is invisible and any per-kernel
+analysis of that capture describes only the non-graphed sliver. Decode on
+both engines runs inside CUDA graphs, so per-kernel profiling requires
+`--cuda-graph-trace=node`. An earlier cut of this section made exactly
+that mistake; the table below is from node-level captures (859k/1,009k
+kernel records).
+
+**True GPU busy time per generated token** (kernel intervals merged):
+
+| Family | inferflux_cuda | llama-server | ratio |
+|---|---|---|---|
+| matmul (MMQ + MMVQ) | 1,151.9 us/tok (72.3%) | 619.6 us/tok (86.5%) | 1.86x |
+| attention | 387.6 us/tok (24.4%) | 53.2 us/tok (7.4%) | 7.3x |
+| elementwise/quant | 36.2 us/tok | 27.5 us/tok | 1.3x |
+| standalone dequant | 11.1 us/tok | — | — |
+| sampling | 7.4 us/tok | — | — |
+| other | 8.4 us/tok | 26.5 us/tok | — |
+| **TOTAL busy** | **1,591.0 us/tok** | **716.4 us/tok** | **2.22x** |
+| duty cycle (busy/wall) | 91% | 63% | — |
+
+(Family rows are raw per-kernel sums and overlap slightly; the TOTAL row
+is the merged-interval union, so rows sum to a little more than TOTAL.)
+
+(The earlier 4.6x/17x figures in a first cut of this section came from
+summing the non-graphed sliver and a token-count asymmetry — both engines
+here generated the full 12,288 tokens, verified from response usage.)
+
+**Findings:**
+
+1. **Matmul is the largest absolute gap**: 1.86x per token on a 72% share
+   = ~530 us/token excess. inferflux's Q4_K/Q6_K mma kernels need a
+   per-kernel ncu pass (achieved bandwidth/occupancy vs llama.cpp's
+   mul_mat_q) before code changes.
+2. **Attention is the largest relative gap**: 7.3x per token and 24.4% of
+   inferflux's busy time vs 7.4%. ncu on `FlashAttention2MMAGQAKernel`
+   shows the structural problem: grid (16,2,1) = 32 blocks (one per
+   sequence x kv-head), theoretical occupancy 8.33% limited by shared
+   memory (1 block/SM), 0.67 waves, SM 11.6% — latency-bound. ncu's
+   printed rule estimates a 91.67% local speedup from occupancy alone.
+   llama.cpp's `flash_attn_ext_f16` covers batch + KV splits across 96
+   blocks (stream-K decomposition + fixup). Per-launch costs are shape
+   dependent (inferflux's observed grids ranged (2,2,1) ~179-205 us (median/mean) to
+   (16,2,1) ~2.7 ms), so the fix is structural: whole-batch launches with
+   KV-split decomposition and less shared memory per block.
+3. **Sampling and standalone dequant are NOT priorities**: 0.5% and 0.7%
+   of busy time. (An earlier cut called them out from the sliver data.)
+
+**Bridge attempt — first measurement falsified, corrected positive
+(Sep 8)**: the warp-per-head-pair packed decode attention kernel
+(in-register shuffle dots, half K/V tiles, 32 KB smem = 3 blocks/SM,
+one sync/tile) first measured 303 tok/s vs 574 baseline — but a
+post-merge review caught that its K/V tiles were missing `__shared__`
+(spilling ~32 KB/thread to local memory), so the measurement ran a
+local-memory-spilling kernel, not the designed one. With
+`__shared__` restored: 532/651 tok/s (2 runs, avg 591) vs 574/496
+baseline — **avg +10%**, determinism 1-distinct-of-8, outputs coherent.
+Shipped default-on behind `INFERFLUX_CUDA_ATTN_PACKED_DECODE=0` kill
+switch.
+   **Second attempt also falsified (Sep 9)**: staging the block-cooperative
+   split decode kernel's K/V tiles as the cache dtype instead of FP32
+   (lossless, 75.8 -> ~43 KB smem, 2 blocks/SM) measured 440-465 tok/s vs
+   the 496-574 baseline band — bit-identical outputs but neutral-to-
+   negative. The kernel is per-element ALU/latency bound, not smem-
+   occupancy bound; tile dtype alone does not move it. The remaining ~4x attention gap vs llama.cpp still needs the
+tensor-core tile design (mma.m16n8k16 + ldmatrix + GQA packing +
+cp.async, as in flash_attn_ext_f16). Lesson recorded: kernel variables
+indexed by runtime values must be explicitly `__shared__`; a missing
+qualifier is silent (nvcc accepts automatic arrays) and only visible as
+a throughput collapse.
+4. **Duty cycle**: inferflux keeps the GPU 91% busy while llama-server
+   sits at 63% — inferflux loses less time to gaps, but spends what it
+   keeps inefficiently.
+5. **Launch amplification was an artifact** of graph-level tracing: at
+   node level llama-server launches MORE, smaller kernels per token (82.1
+   vs 69.9). Kernel count is not the problem; kernel efficiency is.
+
+**Why vLLM/SGLang still beat llama.cpp** (general, not measured here):
+paged/radix KV gives token-level batching with tensor-core attention
+kernels (FlashAttention/FlashInfer) and eliminates fragmentation; chunked
+prefill mixes prompt tokens into the running decode batch so the GPU
+never stalls on a prompt phase; automatic prefix caching reuses tokens
+across requests; whole decode steps run under CUDA graphs with fused
+norms/RoPE. llama.cpp optimizes for small-batch latency and GGUF quant
+breadth; its slots are sequence-bound, so prefill phases stall decode. At
+c=16 the stock server's kernels already beat inferflux's (this section);
+the serving architecture is the ceiling vLLM/SGLang design around.
+
+### 4g) Throughput + memory campaign outcome (Sep 8)
+
+Campaign per the throughput+memory plan: #117 wrapper knobs, #120 rig,
+#121 launch structure, #122 packed-attention smem fix, #124 KV default +
+append bounds. Results on the 48x256 c=16 battery (2-run averages,
+Qwen2.5-3B q4_k_m):
+
+- **Memory: 5.4 GB -> 4.8 GB loaded (-~600 MB)** via the KV default
+  right-sizing (16 x 1,024 = 604 MB, user-approved); KV ledger verifies
+  603,979,776 B. PR-5 row-gather (-622 MB) is the remaining memory item
+  to reach the <= 4.2 GB stretch.
+- **Throughput: variance-bound on this battery** — post-campaign runs
+  458-651 tok/s vs pre-campaign 496-574. The per-kernel fixes (attention
+  smem, launch structure) landed as modest wins individually; the
+  battery's 30% variance swamps them. The decode-heavy llamaserver-style
+  comparison (1,066 vs 468 tok/s at the time of 4f) remains the
+  sharper benchmark for the attention gap.
+- **Correctness**: decode-append bounds closed at every entry (prefill
+  guards, decode-assembly guards both paths, greedy-burst clamp, burst
+  preflight); 1,100-token prompts fail cleanly instead of silently
+  corrupting the neighboring slot's KV; determinism 1-distinct-of-8;
+  0 violations on the standard battery.
+- **Falsified**: warp-per-head-pair packed attention WITHOUT __shared__
+  (measured 303 tok/s — local-memory spill; with __shared__ it is a
+  modest +7% average, shipped default-on with kill switch).
+
+Remaining (ranked): #113 token_embd row-gather (memory), the
+tensor-core attention tile rewrite (throughput, the real 7.3x fix),
+#125 UX surfacing, #126 GPU-gated guard test, #123 FFN partials sizing
+hazard.
+
 ## 5) Open follow-up: the decode relay fingerprint is provably inert (and a naive fix was falsified)
 
 The executor arms a per-step device relay after each decode step (sampled

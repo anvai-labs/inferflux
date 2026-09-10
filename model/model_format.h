@@ -40,6 +40,13 @@ std::string ResolveMlxLoadPath(const std::string &path,
 std::string ResolveLlamaLoadPath(const std::string &path,
                                  const std::string &resolved_format);
 
+// Resolve a concrete GGUF artifact for gguf-format inputs: returns the path
+// itself when it is a *.gguf file, the best-scoring *.gguf inside it when it
+// is a directory, and empty otherwise. Model format auto-detection can hand
+// routers a mixed directory (safetensors + GGUF sidecar); single-file loaders
+// need the file.
+std::string ResolveGgufArtifactPath(const std::string &path);
+
 // True when the current llama.cpp-backed loader can consume the format.
 bool IsLoadableByLlamaBackend(const std::string &resolved_format);
 

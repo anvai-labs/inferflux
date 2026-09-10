@@ -46,6 +46,7 @@ struct MmqWeightInfo {
   int rows{0};      // Logical output rows / columns in the destination matrix
   int cols{0};      // Logical K dimension
   int tile_cols{0}; // Number of output rows packed per layout tile
+  size_t bytes{0};  // Device bytes held by the transformed layout
 };
 
 /**
@@ -80,6 +81,14 @@ public:
 
   // --- Global accessors ---
   virtual const T *EmbedTokens() const { return embed_tokens_; }
+
+  /// Raw quantized embedding table for row-gather lookup (PR-5). Returns
+  /// false for non-quantized tables (safetensors weights are already
+  /// full precision; no gain from gather).
+  virtual bool EmbedTokensRaw(QuantizedWeightInfo &out) const {
+    (void)out;
+    return false;
+  }
   virtual const T *FinalNorm() const { return final_norm_; }
   virtual const T *LmHead() const { return lm_head_; }
 

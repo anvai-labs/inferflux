@@ -15,6 +15,9 @@ public:
   auto &pending_decode() { return s_.pending_decode_; }
   auto &queue_mutex() { return s_.queue_mutex_; }
 
+  auto &slot_manager() { return s_.slot_manager_; }
+  int max_batch_size() const { return s_.config_.max_batch_size; }
+
   auto BuildBatchLocked() { return s_.BuildBatchLocked(); }
 
   void ProcessBatch(Scheduler::BatchSelection selection) {

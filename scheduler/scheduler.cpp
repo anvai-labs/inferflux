@@ -248,7 +248,8 @@ struct PrefillStepState {
 bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
                               const InferenceRequest &inference,
                               const PrefillStepState &state,
-                              PrefillResult *result) {
+                              PrefillResult *result,
+                              int chunk_token_cap = 2048) {
   const int sequence_id = state.sequence_id;
   const int n_past_start = state.n_past_start;
   if (!backend || !result || sequence_id < 0) {
@@ -271,7 +272,9 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
     backend->FreeSequence(sequence_id);
   }
 
-  const int token_cap = std::max(1, backend->UnifiedBatchTokenCapacity());
+  const int token_cap =
+      std::min(std::max(1, backend->UnifiedBatchTokenCapacity()),
+               std::max(1, chunk_token_cap));
   int chunk_start = bounded_start;
   UnifiedBatchOutput final_output{};
   while (chunk_start < static_cast<int>(prompt_tokens.size())) {
@@ -584,6 +587,27 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
       model_selection_options_(model_selection_options) {
   batch_policy_ = CreateBatchSelectionPolicy(config_.batch_policy);
 
+  // Native CUDA backends publish their KV slot capacity via metrics before the
+  // scheduler is constructed (router model load runs first). Sequence ids
+  // handed to the backend come from the slot manager, so the slot manager —
+  // not just the batch width — must be bounded by that capacity: retained and
+  // retiring leases keep high slot ids circulating, and the native KV cache
+  // indexes device memory by raw sequence id. Backends that publish no
+  // capacity (metric 0) keep the historical defaults.
+  size_t slot_capacity = kMaxSequenceSlots;
+  if (const int kv_capacity = metrics_->GetInferfluxCudaKvMaxSequences();
+      kv_capacity > 0) {
+    if (config_.max_batch_size > kv_capacity) {
+      log::Info("scheduler", "Clamping scheduler max_batch_size " +
+                                 std::to_string(config_.max_batch_size) +
+                                 " to native KV slot capacity " +
+                                 std::to_string(kv_capacity));
+      config_.max_batch_size = kv_capacity;
+    }
+    slot_capacity =
+        std::min<size_t>(kMaxSequenceSlots, static_cast<size_t>(kv_capacity));
+  }
+
   BatchExecutor::UnifiedBatchTuning tuning;
   tuning.decode_burst_tokens = config_.decode_burst_tokens;
   tuning.chunked_prefill_tokens = config_.chunked_prefill_tokens;
@@ -594,7 +618,7 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
 
   // Initialize sequence slot manager for universal KV cache tracking.
   slot_manager_ =
-      std::make_unique<scheduler::SequenceSlotManager>(kMaxSequenceSlots);
+      std::make_unique<scheduler::SequenceSlotManager>(slot_capacity);
 
   // Enable decode worker pool when a positive pool size is configured.
   // With use_decode_workers_=true, ProcessBatch only runs Prefill and
@@ -1977,6 +2001,34 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // PagedAttention Block Allocation: calculate additional blocks needed.
         std::size_t prompt_len = inf.bpe_prompt_tokens.size();
 
+        // Context-overflow rejection (PR #124 follow-up / issue #125):
+        // fail before compute AND before paged-block reservation when
+        // prompt + generation cannot fit one slot's KV extent (kv max_seq
+        // = tokens per slot, NOT the slot count). Published only by the
+        // inferflux_cuda executor; other backends context-shift instead.
+        if (pending->resolved_backend &&
+            pending->resolved_backend->Name() == "inferflux_cuda" &&
+            metrics_->GetInferfluxCudaKvMaxSeq() > 0) {
+          const int kv_max_seq = metrics_->GetInferfluxCudaKvMaxSeq();
+          if (kv_max_seq > 0 &&
+              static_cast<long long>(inf.bpe_prompt_tokens.size()) +
+                      inf.max_tokens >
+                  kv_max_seq) {
+            InferenceResult overflow;
+            overflow.no_backend = true;
+            overflow.completion =
+                "context_overflow: prompt " +
+                std::to_string(inf.bpe_prompt_tokens.size()) +
+                " + max_tokens " + std::to_string(inf.max_tokens) +
+                " exceeds the per-slot context of " +
+                std::to_string(kv_max_seq) +
+                " tokens (raise INFERFLUX_CUDA_KV_MAX_SEQ for long-context "
+                "workloads, or reduce max_tokens)";
+            pending->promise.set_value(std::move(overflow));
+            continue;
+          }
+        }
+
         // Logical blocks already covered by the cached prefix.
         std::size_t warm_blocks = cached_blocks.size();
         std::size_t total_blocks_needed =
@@ -2134,8 +2186,14 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
 
             bool prefill_ok = ExecutePhasedPrefillStep(
                 pending->resolved_backend.get(), inf,
-                {seq_id, prefill_start, seq_generation}, &pr);
+                {seq_id, prefill_start, seq_generation}, &pr,
+                /*chunk_token_cap=*/config_.chunked_prefill_tokens);
             if (!prefill_ok) {
+              log::Warn("scheduler",
+                        "Phased prefill failed for request " +
+                            std::to_string(inf.id) + " (prompt_tokens=" +
+                            std::to_string(inf.bpe_prompt_tokens.size()) +
+                            "); falling back to full-prompt prefill");
               if (copied_prefix) {
                 pr = pending->resolved_backend->PrefillPartial(
                     inf.prompt, seq_id, prefill_start);
