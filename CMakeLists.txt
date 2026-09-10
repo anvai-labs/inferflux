@@ -606,6 +606,11 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
   target_include_directories(benchmark_q4k_mmq_rig PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_link_libraries(benchmark_q4k_mmq_rig PRIVATE inferflux_core inferflux_cuda_kernels)
+  add_executable(benchmark_fa_decode_rig tests/unit/benchmark_fa_decode_rig.cu
+                 runtime/backends/cuda/kernels/flash_attention.cu)
+  target_include_directories(benchmark_fa_decode_rig PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(benchmark_fa_decode_rig PRIVATE CUDA::cudart)
   target_include_directories(benchmark_q6k_kernels PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/external)
   target_include_directories(benchmark_downproj_q81 PRIVATE
