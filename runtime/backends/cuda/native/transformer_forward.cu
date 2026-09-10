@@ -3419,9 +3419,22 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
         // GQA-packed decode (PR-1): warp-per-head-pair, half K/V tiles,
         // in-register dot reduction. Requires the contiguous-cache decode
         // shape head_dim 128 / GQA 8; everything else falls through.
-        if (kv_contiguous && policy.enable_attn_packed_decode &&
+        if (kv_contiguous && policy.enable_attn_mma_decode &&
             head_dim_ == 128 && num_kv_heads_ > 0 &&
             num_heads_ == num_kv_heads_ * 8) {
+          // Tensor-core mma decode (fa-decode rig): GQA heads packed into
+          // the mma N dimension; measured 1.4-3x over the packed kernel
+          // at kv 128-1024. bf16 and non-128 dims fall back internally.
+          err = cuda_kernel::FlashDecodeMmaGqa<T>(
+              d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_, d_batch_kv_lens_,
+              layer, B, num_heads_, num_kv_heads_, head_dim_,
+              kv_cache_->SlotStride(), kv_cache_->LayerStride(),
+              kv_cache_->KvStride(), attn_scale, stream_,
+              d_attn_split_workspace_, attn_split_workspace_bytes_,
+              max_seq_len_);
+        } else if (kv_contiguous && policy.enable_attn_packed_decode &&
+                   head_dim_ == 128 && num_kv_heads_ > 0 &&
+                   num_heads_ == num_kv_heads_ * 8) {
           err = cuda_kernel::FlashDecodePacked<T>(
               d_q_, kv_buffer, d_attn_out_, d_batch_seq_ids_, d_batch_kv_lens_,
               layer, B, num_heads_, num_kv_heads_, head_dim_,
