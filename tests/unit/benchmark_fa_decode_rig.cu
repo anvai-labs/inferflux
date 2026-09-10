@@ -17,6 +17,11 @@
 //   - Q rows must be indexed by (b, kvh*kGqa + n); a missing kvh offset
 //     only shows up in kv-head-1 blocks.
 //
+// Known accuracy margin: the candidate's max_rel_err (0.001-0.011) sits
+// 10-20x above the fp32-accumulator kernels purely from the f16 PV
+// accumulator — the design point under test — leaving ~3-4x margin under
+// the 5e-2 gate; tighten the gate only alongside a f32-PV variant.
+//
 // Build: standalone target benchmark_fa_decode_rig (see CMakeLists.txt).
 // Run:   ./build-cuda/benchmark_fa_decode_rig
 
@@ -81,10 +86,12 @@ __device__ __forceinline__ void MmaPv(int (&d)[2], const int (&a)[4],
       : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
 }
 
-// Flush rescale factors below 2^-20 (llama.cpp SOFTMAX_FTZ_THRESHOLD) so
-// the fp16 accumulator never enters the denormal range.
-__device__ __forceinline__ float Ftz(float x) {
-  return x < 9.53674316e-7f ? 0.f : x;
+// Online-softmax rescale with llama.cpp's FTZ semantics: flush when the
+// logit gap exceeds 20 nats (SOFTMAX_FTZ_THRESHOLD = -20 applied to the
+// exponent difference) so the fp16 accumulator never denormals. Note the
+// threshold applies pre-exp, not to the scale itself.
+__device__ __forceinline__ float Rescale(float diff) {
+  return diff < -20.f ? 0.f : __expf(diff);
 }
 
 // K A-fragment: [16 rows x 16 dims] of the padded K tile (row-major).
@@ -248,7 +255,7 @@ __global__ void FlashDecodeMmaGqaKernel(
     float rsc[2];
 #pragma unroll
     for (int e = 0; e < 2; ++e) {
-      rsc[e] = Ftz(__expf(m_run[e] - new_m[e]));
+      rsc[e] = Rescale(m_run[e] - new_m[e]);
       m_run[e] = new_m[e];
       l_run[e] *= rsc[e];
     }
@@ -375,7 +382,7 @@ __global__ void FlashDecodeMmaGqaKernel(
       float bl = 0.f;
 #pragma unroll
       for (int w = 0; w < 4; ++w) {
-        const float f = Ftz(__expf(mg_m[w * 8 + h] - bm));
+        const float f = Rescale(mg_m[w * 8 + h] - bm);
         mg_rf[w * 8 + h] = f;
         bl += mg_l[w * 8 + h] * f;
       }
@@ -432,6 +439,7 @@ __global__ void CombinePartialsKernel(const float *__restrict__ partial_O,
 __global__ void RefAttentionKernel(const half *__restrict__ Q,
                                    const half *__restrict__ kv_buffer,
                                    half *__restrict__ O,
+                                   const int *__restrict__ seq_ids,
                                    const int *__restrict__ kv_lens,
                                    size_t slot_stride, size_t kv_stride,
                                    float scale) {
@@ -441,8 +449,8 @@ __global__ void RefAttentionKernel(const half *__restrict__ Q,
   const int kvh = h / kGqa;
   const int kv_len = kv_lens[b];
   const half *qp = Q + (b * kH + h) * kD;
-  const size_t kbase =
-      static_cast<size_t>(b) * slot_stride + static_cast<size_t>(kvh) * kD;
+  const size_t kbase = static_cast<size_t>(seq_ids[b]) * slot_stride +
+                       static_cast<size_t>(kvh) * kD;
   const size_t vbase = kbase + kv_stride;
   const size_t row_stride = static_cast<size_t>(kKVH) * kD;
   float m = -INFINITY;
@@ -513,7 +521,8 @@ int RigMain() {
   printf("FA decode rig - %s (%d SMs)\n", prop.name, prop.multiProcessorCount);
   printf("geometry: B=%d H=%d KVH=%d D=%d GQA=%d\n\n", kB, kH, kKVH, kD, kGqa);
 
-  const int kvlens[] = {128, 256, 512, 1024, -1}; // -1 = staggered lens
+  // -1 = staggered; tiny lens exercise sub-slice/empty-split paths
+  const int kvlens[] = {1, 7, 56, 128, 256, 512, 1024, -1};
   const size_t max_seq = 1024;
   const size_t kv_dim = kKVH * kD;
   const size_t kv_stride = max_seq * kv_dim; // per K or V plane
@@ -573,7 +582,7 @@ int RigMain() {
     // lengths span the full window rather than matching exactly.
     std::vector<int> h_lens(kB), h_ids(kB);
     for (int b = 0; b < kB; ++b) {
-      h_ids[b] = b;
+      h_ids[b] = (b * 7 + 3) % kB; // permuted slot mapping
       h_lens[b] =
           (kv_len > 0) ? kv_len : (128 + (b * 113 + 7) % (max_seq - 128));
     }
@@ -586,8 +595,8 @@ int RigMain() {
 
     {
       dim3 grid(kB, kH);
-      RefAttentionKernel<<<grid, kD>>>(d_q, d_kv, d_ref, d_lens, slot_stride,
-                                       kv_stride, scale);
+      RefAttentionKernel<<<grid, kD>>>(d_q, d_kv, d_ref, d_ids, d_lens,
+                                       slot_stride, kv_stride, scale);
       CudaChecked(cudaGetLastError(), "ref");
       CudaChecked(cudaDeviceSynchronize(), "ref sync");
     }
@@ -604,10 +613,20 @@ int RigMain() {
           cudaMemcpy(ref.data(), d_ref, q_bytes, cudaMemcpyDeviceToHost),
           "d2h");
       double worst = 0.0;
+      int bad_printed = 0;
       for (size_t i = 0; i < got.size(); ++i) {
         const double gv = __half2float(got[i]);
         const double rv = __half2float(ref[i]);
-        worst = fmax(worst, fabs(gv - rv) / fmax(fabs(rv), 0.05));
+        const double rel = fabs(gv - rv) / fmax(fabs(rv), 0.05);
+        if (rel > worst) {
+          worst = rel;
+        }
+        if (rel > 5e-2 && bad_printed < 3) {
+          const int b = i / (kH * kD), h = (i / kD) % kH, d = i % kD;
+          printf("  mismatch b%d h%d d%d: got=%.6f ref=%.6f\n", b, h, d, gv,
+                 rv);
+          ++bad_printed;
+        }
       }
       const float cold_us = TimeKernel(launch, true, d_evict, evict_bytes);
       const float warm_us = TimeKernel(launch, false, nullptr, 0);
