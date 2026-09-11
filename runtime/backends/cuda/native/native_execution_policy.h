@@ -172,8 +172,8 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_CUDA_ATTN_MMA_DECODE", false);
     policy.mmq_mma_force_split_fat =
         ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA_FORCE_SPLIT_FAT", true);
-    policy.mmq_mma_split_min_segment = ParseIntEnv(
-        "INFERFLUX_CUDA_MMQ_MMA_SPLIT_MIN_SEGMENT", 0, 0, 1 << 20);
+    policy.mmq_mma_split_min_segment =
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_SPLIT_MIN_SEGMENT", 0, 0, 1 << 20);
     policy.attn_split_chunk =
         ParseIntEnv("INFERFLUX_CUDA_ATTN_SPLIT_CHUNK", 512, 64, 8192);
     policy.attn_split_qsplit_override =
