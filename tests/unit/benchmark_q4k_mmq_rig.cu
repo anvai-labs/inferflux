@@ -14,6 +14,8 @@
 // Decision table (plan file): MMA >=1.3x slower than llama mul_mat_q
 // per-kernel -> stream-K rework (PR-3); parity but in-server family gap ->
 // launch structure (PR-2); dp4a within 10% of MMA at M=16 -> tier sweep.
+#include <nvtx3/nvToolsExt.h>
+
 #include "runtime/backends/cuda/native/gguf_util.h"
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/kernels/mmq_mma.cuh"
@@ -162,8 +164,12 @@ int main() {
                cudaMemcpyDeviceToHost);
 
     printf("\n=== shape %s: N=%d K=%d ===\n", sh.name, N, K);
+    const int shape_idx = static_cast<int>(&sh - kShapes);
 
     for (int M : kM) {
+      char nvtx_name[24];
+      snprintf(nvtx_name, sizeof(nvtx_name), "M%d_s%d", M, shape_idx);
+      nvtxRangePushA(nvtx_name);
       auto acts = MakeActs(M, K, 3);
       half *d_in;
       cudaMalloc(&d_in, acts.size() * sizeof(half));
@@ -400,6 +406,7 @@ int main() {
 
       cudaFree(d_in);
       cudaFree(d_out);
+      nvtxRangePop();
     }
 
     cudaFree(d_w);
