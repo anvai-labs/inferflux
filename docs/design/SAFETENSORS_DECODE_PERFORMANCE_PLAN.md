@@ -726,6 +726,13 @@ Top kernels by time (ours vs llama):
   the 4f 7.3x per-token gap; the packed/mma kernels and splits tuned in
   this campaign did that).
 
+**Down-proj split fix (Sep 11, landed with this section):** the
+down-proj launchers' underfill branch now floors the split count at
+`downproj_mmq_min_splits` (default 6, the sweep knee) — measured
+in-server at c=16: grid (16,1,3) 176 us -> (16,1,6) **128 us (-27%
+per launch)**, battery 48/48. The Q4_K/Gemv launchers keep the
+1-wave heuristic (their curves confirmed it near-optimal).
+
 **Q6_K correction + split (Sep 11, sqlite grid analysis of the 4i
 capture):** the 22.8k `InferfluxMmqQ6KMma` launches behind the "240 us
 avg" are TWO populations:

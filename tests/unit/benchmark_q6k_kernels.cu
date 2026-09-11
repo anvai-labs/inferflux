@@ -535,7 +535,7 @@ int main() {
                            cudaFuncAttributeMaxDynamicSharedMemorySize,
                            (int)smem);
       const dim3 mma_block(32, native::kMmqMmaWarps, 1);
-      for (int ks : {1, 2, 3, 4, 6}) {
+      for (int ks : {1, 2, 3, 4, 6, 8, 12}) {
         if (ks > 1) {
           if (!d_part)
             cudaMalloc(&d_part, 6 * mn * sizeof(float));

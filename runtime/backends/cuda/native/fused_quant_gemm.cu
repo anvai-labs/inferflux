@@ -2376,7 +2376,11 @@ bool FusedQuantGemm::DownProjMmqMmaQ4K(
   const int total_ctas = n_tiles * ((M + 15) / 16);
   int splits = 1;
   if (total_ctas < sm_count) {
-    splits = std::min((sm_count + total_ctas - 1) / total_ctas,
+    // 4h/4i sweep (benchmark_q6k_kernels + q4k rig, down shape): the
+    // utilization knee is at ~2 waves (96 blocks on 48 SMs), well past
+    // the 1-wave target - s=6 measured 1.6x over ceil(SM/tiles)=3.
+    splits = std::min(std::max((sm_count + total_ctas - 1) / total_ctas,
+                               p.downproj_mmq_min_splits),
                       static_cast<int>(kMmqMmaMaxSplits));
   }
   // 4h: splitting short K-segments defeats memory-level parallelism —
@@ -2468,7 +2472,11 @@ bool FusedQuantGemm::DownProjMmqMma(
   const int total_ctas = n_tiles * ((M + 15) / 16);
   int splits = 1;
   if (total_ctas < sm_count) {
-    splits = std::min((sm_count + total_ctas - 1) / total_ctas,
+    // 4h/4i sweep (benchmark_q6k_kernels + q4k rig, down shape): the
+    // utilization knee is at ~2 waves (96 blocks on 48 SMs), well past
+    // the 1-wave target - s=6 measured 1.6x over ceil(SM/tiles)=3.
+    splits = std::min(std::max((sm_count + total_ctas - 1) / total_ctas,
+                               p.downproj_mmq_min_splits),
                       static_cast<int>(kMmqMmaMaxSplits));
   }
   // 4h: splitting short K-segments defeats memory-level parallelism —

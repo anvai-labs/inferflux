@@ -95,6 +95,11 @@ struct NativeExecutionPolicy {
   bool enable_experimental_q81_grouped_rowquad_m4{false};
   bool enable_experimental_q81_grouped_mmq3{true};
   bool enable_downproj_mmq{false};
+  // 4h/4i sweep: the down-proj MMA utilization knee sits at ~2 waves
+  // (s=6 on 48 SMs for the 16-tile grid), 1.6x over the 1-wave split
+  // count. Used as the floor when the grid under-fills the device;
+  // -1 uses the measured default (6).
+  int downproj_mmq_min_splits{6};
   int downproj_mmq_min_batch_override{-1};
   // mma.sync int8 tensor-core MMQ family (S7/S8): Q4_K gate/up+QKV+o
   // and Q6_K down-proj at M >= 2. Default ON — interleaved 3-round c16
