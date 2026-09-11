@@ -663,6 +663,43 @@ numbers end-to-end at c=8/16 with the dispatch trace confirming engagement.
 Also note: the reduce kernel after 8-split down-proj runs at 67% MEM —
 the partials round-trip is real traffic, not free.
 
+### 4i) Fresh family re-profile at HEAD (Sep 11): the gap persists, and it is launch-structure
+
+Re-ran the 4f battery (48 x 256 tokens, c = 16, q4_k_m) at current HEAD
+under node-level nsys on all three engines (llama-server `-np 16 -c 16384
+-fa on`; ours shipped-default = packed attention; ours with
+INFERFLUX_CUDA_ATTN_MMA_DECODE=1). Same 12,288 tokens each, 48/48 complete.
+
+| engine | profiled e2e | busy-kernel sum | us/tok |
+|---|---|---|---|
+| llama-server | 622 tok/s | 14.5 s | 1,184 |
+| ours (packed) | 273 tok/s | 41.7 s | 3,390 |
+| ours (mma attn) | **296 tok/s (+8.5% paired)** | 38.3 s (**-8% busy**) | 3,121 |
+
+(kernel-sum, not merged-interval — overlapped kernels double-count, so
+absolute us/tok runs higher than 4f's union method; the within-method
+ratios are the signal. The paired +8.5% e2e for the mma path is the
+first clean e2e confirmation of the rig prediction.)
+
+Top kernels by time (ours vs llama):
+
+- **Q4_K MMA: 17.3 s / 352k launches vs llama `mul_mat_q` 7.2 s / 166k** —
+  same avg duration (~43-49 us), TWICE the instance count. Launch-
+  structure gap, not per-kernel gap: llama fuses gate+up into one
+  mul_mat_q and runs qkv as one; we launch q, k, v, gate, up separately
+  (k/v are N=256 launches with 8 splits each — the (2,1,8) rows in 4h).
+- **Q6_K MMA (vocab/head): 5.5-5.9 s at 240 us avg vs llama's Q6_K 2.6 s
+  at 92 us** — 2.6x per launch on the largest single projection.
+- Attention is no longer the story: 1.7-2.3 s vs llama 0.8 s (down from
+  the 4f 7.3x per-token gap; the packed/mma kernels and splits tuned in
+  this campaign did that).
+
+Next targets, in order: (1) projection launch fusion (gate+up as one
+[2N, K] launch; fold k/v into the q launch or at least share their
+split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
+llama's type-14 mul_mat_q), (3) the mma default-on flip once (1)+(2)
+land (the paired +8.5% already justifies it at c=16 decode-heavy).
+
 ## 5) Measurement protocol (keep using it)
 
 - nsys captures without env instrumentation; treat
