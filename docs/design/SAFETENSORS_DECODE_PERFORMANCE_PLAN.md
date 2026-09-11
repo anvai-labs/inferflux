@@ -664,6 +664,21 @@ numbers end-to-end at c=8/16 with the dispatch trace confirming engagement.
 Also note: the reduce kernel after 8-split down-proj runs at 67% MEM —
 the partials round-trip is real traffic, not free.
 
+**Segment-length gate falsified (Sep 11):** the direct test of (b) — capping
+splits so K/splits >= 4096 (folded down-proj to 1 split, qkv/o to 1) — made
+both WORSE: down-proj 11.7% -> 1.9% MEM (8.1 -> 50.3 us), qkv/o 32.6% ->
+13.7% (21.5 -> 51.0 us). Causal correction: the narrow-N shapes are CTA-STARVED, not split-degraded — splits were raising CTA count (down: 2 CTAs
+unsplit -> 16 at 8 splits, a 6x utilization gain) and the real problem is
+the low N-parallelism (gate/up reaches 57% because 86 N-tiles exist, not
+because it is unsplit). The knob ships default-off
+(`INFERFLUX_CUDA_MMQ_MMA_SPLIT_MIN_SEGMENT`, 0) as the measurement
+instrument. Revised fix candidates: (a') reduce the MMA N-tile width
+(kMmqY 1024) on narrow-N shapes to raise CTA count at full K — kernel-side
+but tiling-only; (b') raise `kMmqMmaMaxSplits` (8) for down-proj with the
+reduce kernel verified at 67% MEM; both need a rig splits-sweep
+(splits {1,2,4,8,16,32} x N-tile variants at M {8,16}) to map the tradeoff
+before touching dispatch.
+
 ## 5) Measurement protocol (keep using it)
 
 - nsys captures without env instrumentation; treat
