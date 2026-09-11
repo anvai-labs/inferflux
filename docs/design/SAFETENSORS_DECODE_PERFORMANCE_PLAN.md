@@ -726,6 +726,21 @@ Top kernels by time (ours vs llama):
   the 4f 7.3x per-token gap; the packed/mma kernels and splits tuned in
   this campaign did that).
 
+**Q6_K correction + split (Sep 11, sqlite grid analysis of the 4i
+capture):** the 22.8k `InferfluxMmqQ6KMma` launches behind the "240 us
+avg" are TWO populations:
+
+- **grid (1187,1,1) = the vocab head** (token_embd Q6_K, N=151936 ->
+  1187 tiles): 1,201 launches at **1,391 us each (1.67 s total)**. The
+  bandwidth floor for [16, 2048] x [2048, 151936] is ~325 us (~187 MB
+  at ~576 GB/s), so the head runs ~4.3x above the floor — the largest
+  single-kernel headroom on the board.
+- **grid (16,1,3) = the down-proj** (ffn_down Q6_K, N=2048, 3 splits):
+  21,621 launches at **176 us avg (3.81 s total)** — ~3x the q6k rig's
+  kernel time (51-62 us) on the same shape. Suspect: the split count
+  (3) or the Q6_K split efficiency; needs the same rig splits-sweep as
+  the Q4_K kernel (benchmark_q6k_kernels extension).
+
 Next targets, in order: (1) projection launch fusion (gate+up as one
 [2N, K] launch; fold k/v into the q launch or at least share their
 split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
