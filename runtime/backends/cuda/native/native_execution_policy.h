@@ -108,6 +108,14 @@ struct NativeExecutionPolicy {
   // (62us vs 102us, 48us vs 190us warm; MMA sits at the ~51us bandwidth
   // floor at s=6). A/B at c8 decode: +15% tok/s. Below M=4 the row-quad
   // family stays competitive with MMA's fixed launch/quantize overhead.
+  // 4h: minimum K-segment length per split CTA for the MMA tier.
+  // FALSIFIED as a default (Sep 11): folding splits starves the narrow-N
+  // shapes they were compensating for — down-proj N=2048 fell 11.7% -> 1.9%
+  // MEM and qkv/o 32.6% -> 13.7% (fewer CTAs, not more, is the problem
+  // there; gate/up only reaches 57% because 86 N-tiles provide parallelism).
+  // Kept at 0 (off) as the measurement instrument for the splits-sweep
+  // follow-up; raising it re-enables the gate.
+  int mmq_mma_split_min_segment{0};
   int mmq_mma_min_batch{4};
   int mmq_mma_max_batch{16};
   // Prefill M ceiling for the MMA family (S12): prefill chunks (default
@@ -164,6 +172,8 @@ struct NativeExecutionPolicy {
         ParseBoolEnv("INFERFLUX_CUDA_ATTN_MMA_DECODE", false);
     policy.mmq_mma_force_split_fat =
         ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA_FORCE_SPLIT_FAT", true);
+    policy.mmq_mma_split_min_segment = ParseIntEnv(
+        "INFERFLUX_CUDA_MMQ_MMA_SPLIT_MIN_SEGMENT", 0, 0, 1 << 20);
     policy.attn_split_chunk =
         ParseIntEnv("INFERFLUX_CUDA_ATTN_SPLIT_CHUNK", 512, 64, 8192);
     policy.attn_split_qsplit_override =
