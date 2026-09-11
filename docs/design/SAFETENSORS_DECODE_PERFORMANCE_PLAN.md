@@ -748,6 +748,24 @@ avg" are TWO populations:
   (3) or the Q6_K split efficiency; needs the same rig splits-sweep as
   the Q4_K kernel (benchmark_q6k_kernels extension).
 
+**Down-proj and vocab vs llama at matched shape (Sep 11, llama-side
+sqlite analysis of the same 4i battery):**
+
+- **Down-proj Q6_K: llama 64 us vs our 128 us (post-fix)** — llama's
+  grid is (48,1,1): 16 N-tiles x 3 K-chunks FLATTENED into grid.x,
+  stream-K style, combined by `mul_mat_q_stream_k_fixup` (221k fixup
+  launches per battery — their whole matmul family works this way). No
+  partials gmem round-trip. Our (16,1,6) + ReduceMmqKSplit does the
+  same work with a partials write/read. The measured 2x justifies
+  porting stream-K split handling (fold splits into grid.x + fixup
+  kernel) to the Mmq tier — the split-policy knobs then become
+  unnecessary for these shapes.
+- **Vocab head: llama 1,169 us ~= ours 1,391 us** — a SHARED
+  inefficiency (both ~4x over the ~325 us bandwidth floor at this
+  shape). A bandwidth-optimal vocab kernel (pure streaming, no mma
+  tile machinery) would leapfrog llama by ~1 s of battery busy time
+  rather than match it.
+
 Next targets, in order: (1) projection launch fusion (gate+up as one
 [2N, K] launch; fold k/v into the q launch or at least share their
 split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
