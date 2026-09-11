@@ -57,7 +57,7 @@ models:
 # Runtime configuration
 runtime:
   # Backend selection
-  backend_priority: "inferflux_cuda,llama_cpp_cuda,cpu"
+  backend_priority: [inferflux_cuda, llama_cpp_cuda, cpu]
   capability_routing:
     enabled: true
 

@@ -339,6 +339,17 @@ int main(int argc, char **argv) {
               backend_priority.push_back(ToLower(hint.as<std::string>()));
             }
           }
+        } else if (config["runtime"]["backend_priority"] &&
+                   config["runtime"]["backend_priority"].IsScalar()) {
+          // Comma-separated string form — same syntax as
+          // INFERFLUX_BACKEND_PRIORITY. Ignoring it here silently dropped
+          // configs using this form to the built-in default priority
+          // (cpu for CUDA-less builds, cuda otherwise).
+          auto parsed_priority = ParseBackendPriorityList(
+              config["runtime"]["backend_priority"].as<std::string>());
+          if (!parsed_priority.empty()) {
+            backend_priority = std::move(parsed_priority);
+          }
         }
         if (config["runtime"]["mps_layers"])
           mps_layers = config["runtime"]["mps_layers"].as<int>();

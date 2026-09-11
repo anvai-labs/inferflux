@@ -187,6 +187,11 @@ When strict mode is enabled, unsupported explicit native requests fail with `422
 For `backend: cuda` requests, runtime fallback order is:
 `inferflux_cuda` -> `llama_cpp_cuda` -> `rocm` (if compiled) -> `mlx` (if compiled) -> `mps` (if compiled) -> `cpu`.
 
+`runtime.backend_priority` accepts two forms: a YAML sequence
+(`[inferflux_cuda, llama_cpp_cuda, cpu]`) or a scalar comma-separated string
+(`"inferflux_cuda,llama_cpp_cuda,cpu"`) — the same syntax as the
+`INFERFLUX_BACKEND_PRIORITY` environment variable, which overrides both.
+
 ## 7) Runtime Tuning Cheat Sheet
 
 ### Scheduler
@@ -344,6 +349,7 @@ Scope contract:
 | `INFERFLUX_LLAMA_KV_CACHE_TYPE` | llama.cpp wrapper KV element type for both K and V: `f16` (default) / `q8_0` / `q4_0` (aliases `q8`/`q4`). **Requires FlashAttention** — with FA disabled (CPU/Vulkan/OpenCL targets, Grok arch) the value is normalized back to `f16` with a warning at load. `q8_0` saves ~66 MB on a 3B model but measured 15-20% slower — memory-constrained deployments only. Unknown values silently mean `f16` |
 | `INFERFLUX_CUDA_EMBED_ROW_GATHER` | gather embedding rows directly from the raw Q4_K/Q6_K token_embd table (saves the 622 MB full-precision copy on a 3B model). **Experimental, default off**: with tied weights the aliased lm_head cache goes stale after batch cleanup — enable only after #113 lands |
 | `INFERFLUX_CUDA_MMQ_MMA_FORCE_SPLIT_FAT` | force K-split >= 2 for decode-MMA projections with M > 8 even when the launch grid already fills the SM array (default on; disabling drops the partial writes + reduce launch on large-N shapes) |
+| `INFERFLUX_CUDA_ATTN_PACKED_DECODE` | GQA-packed decode attention for head_dim 128 / GQA 8 (warp-owned Q-head pairs, in-register reductions, K/V tiles staged in the cache dtype). Default on (measured +7-10% decode at c=16 vs the fp32-tile split kernel, clean determinism); `0` restores the split-KV kernel. On this shape it takes precedence over `INFERFLUX_CUDA_ATTN_SPLIT_KV`. Distinct from `INFERFLUX_CUDA_ATTN_WPH`, a recorded negative result that stays off |
 | `INFERFLUX_CUDA_ATTN_MMA_DECODE` | tensor-core (`mma.m16n8k16`) decode attention for head_dim 128 / GQA 8 / fp16: all GQA heads packed into the mma N dimension, per-warp online softmax over 32-row KV slices, f16 PV accumulation. **Experimental, default off** — kernel-vs-kernel rig (`benchmark_fa_decode_rig`, B=16) measures warm-L2 1.24-1.65x over the packed kernel (win grows with kv length; cold-L2 parity at kv <= 256) and 4-12x over the fp32-tile split family; `1` enables. Falls back to the packed kernel for bf16 or other shapes |
 | `INFERFLUX_CUDA_QKV_SHARED_QUANT` | quantize the normalized QKV input once and run three Prequantized MMAs instead of one DS quantizer per projection (default on; `0` restores per-call quantize) |
 | `INFERFLUX_DISABLE_SHARED_MMQ_LAYOUT` | share transformed down-proj MMQ layouts across weight-map replicas via the loader's per-tensor cache instead of building one copy per replica (primary + overlap lanes). Set `1` to restore per-replica layouts |
