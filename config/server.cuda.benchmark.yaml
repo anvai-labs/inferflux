@@ -20,7 +20,7 @@ models:
     default: true
 
 runtime:
-  backend_priority: "cuda,llama_cpp_cuda,cpu"
+  backend_priority: [cuda, llama_cpp_cuda, cpu]
   capability_routing:
     enabled: true
 
