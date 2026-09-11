@@ -675,11 +675,11 @@ because it is unsplit). The knob ships default-off
 instrument. Revised fix candidates: (a') reduce the MMA N-tile width
 (kMmqY 1024) on narrow-N shapes to raise CTA count at full K — kernel-side
 but tiling-only; (b') raise `kMmqMmaMaxSplits` (8) for down-proj with the
-reduce kernel verified at 67% MEM; both need a rig splits-sweep
+reduce kernel verified at 67% MEM.
 
 **Splits-sweep (Sep 11, rig `MMA splits=N` rows, cold-L2, M=16):** the
 tradeoff curves show the #121 policy choices are already near-optimal per
-shape — the §4h "policy is the problem" hypothesis is REFINED:
+shape — the 4h "policy is the problem" hypothesis is REFINED:
 
 - qkv/o (16 CTAs at splits=1): optimum at splits 4-8 (16.8-17.2 us, ~148
   GB/s); splits=1 is 2.3x worse (38.5 us). Policy picks 3 — near-optimal.
@@ -693,11 +693,44 @@ Implications: (1) the low qkv/o utilization (~148 GB/s, 26% of peak even
 at optimal splits) is the K=2048 short-stream shape limit, not dispatch;
 (2) gate/up dominates absolute MMA time and is near the wall; (3) the
 1.86x matmul family gap in 4f was measured against the OLD kernel mix —
-the decisive check is a fresh node-level family re-profile of both
-engines at current HEAD (packed/mma attention + tuned splits), which
-supersedes further per-kernel matmul work if the gap has closed.
-(splits {1,2,4,8,16,32} x N-tile variants at M {8,16}) to map the tradeoff
-before touching dispatch.
+re-profiled fresh at HEAD below (4i).
+
+### 4i) Fresh family re-profile at HEAD (Sep 11): the gap persists, and it is launch-structure
+
+Re-ran the 4f battery (48 x 256 tokens, c = 16, q4_k_m) at current HEAD
+under node-level nsys on all three engines (llama-server `-np 16 -c 16384
+-fa on`; ours shipped-default = packed attention; ours with
+INFERFLUX_CUDA_ATTN_MMA_DECODE=1). Same 12,288 tokens each, 48/48 complete.
+
+| engine | profiled e2e | busy-kernel sum | us/tok |
+|---|---|---|---|
+| llama-server | 622 tok/s | 14.5 s | 1,184 |
+| ours (packed) | 273 tok/s | 41.7 s | 3,390 |
+| ours (mma attn) | **296 tok/s (+8.5% paired)** | 38.3 s (**-8% busy**) | 3,121 |
+
+(kernel-sum, not merged-interval — overlapped kernels double-count, so
+absolute us/tok runs higher than 4f's union method; the within-method
+ratios are the signal. The paired +8.5% e2e for the mma path is the
+first clean e2e confirmation of the rig prediction.)
+
+Top kernels by time (ours vs llama):
+
+- **Q4_K MMA: 17.3 s / 352k launches vs llama `mul_mat_q` 7.2 s / 166k** —
+  same avg duration (~43-49 us), TWICE the instance count. Launch-
+  structure gap, not per-kernel gap: llama fuses gate+up into one
+  mul_mat_q and runs qkv as one; we launch q, k, v, gate, up separately
+  (k/v are N=256 launches with 8 splits each — the (2,1,8) rows in 4h).
+- **Q6_K MMA (vocab/head): 5.5-5.9 s at 240 us avg vs llama's Q6_K 2.6 s
+  at 92 us** — 2.6x per launch on the largest single projection.
+- Attention is no longer the story: 1.7-2.3 s vs llama 0.8 s (down from
+  the 4f 7.3x per-token gap; the packed/mma kernels and splits tuned in
+  this campaign did that).
+
+Next targets, in order: (1) projection launch fusion (gate+up as one
+[2N, K] launch; fold k/v into the q launch or at least share their
+split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
+llama's type-14 mul_mat_q), (3) the mma default-on flip once (1)+(2)
+land (the paired +8.5% already justifies it at c=16 decode-heavy).
 
 ## 5) Measurement protocol (keep using it)
 
