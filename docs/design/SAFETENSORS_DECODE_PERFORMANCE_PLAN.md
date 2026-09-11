@@ -633,6 +633,36 @@ Findings (decision-grade):
 4. Caveats: ncu windows are partial slices (launch-count capped), ours ran
    eager (no graphs); per-kernel SOL means, not end-to-end.
 
+**Split-geometry correlation (Sep 11, decisive):** grouping in-server mma
+launches by grid (x = N-tiles, y = M-tiles, z = splits), B = 6 decode,
+eager mode — the split count explains the collapse:
+
+| grid (x,y,z) | projection | M bucket | us | SM% | MEM% |
+|---|---|---|---|---|---|
+| (86,1,1) | gate/up 11008x2048 | <= 16 (decode) | 65.1 | 20.2 | **57.3** |
+| (16,1,3) | qkv/o 2048x2048 | <= 16 (decode) | 21.5 | 11.3 | **32.6** |
+| (2,1,8) | down 2048x11008 | <= 16 (decode) | 8.1 | 3.9 | **11.7** |
+| (86,2,1) | gate/up (prefill M 17-32) | 17-32 | 100.1 | 26.9 | 37.3 |
+| (2,2,8) | down (prefill), 8 splits | 17-32 | 8.2 | 7.9 | 13.1 |
+| (16,2,2) | qkv/o (prefill), 2 splits | 17-32 | 27.8 | 17.3 | 25.6 |
+
+The same kernel hits 57% of DRAM peak unsplit (matching the rig) and
+collapses monotonically with the split count: 3 splits -> 33%, 8 splits ->
+12%. The #121 forced-split gate ("split only when total_ctas < sm_count")
+is the mechanism: it fires exactly on the narrow-N projections (down-proj
+N=2048 -> 2 x-tiles, qkv/o -> 16), where each split CTA then streams a
+short K-segment (K/8 = 1376 for down-proj) with poor memory-level
+parallelism, plus partials+reduce traffic on top. The rig never sees this
+because it launches unsplit.
+
+Fix candidates (policy, not kernel): (a) prefer more N-tiles (128 -> 64)
+over K-splits on narrow-N shapes; (b) gate splits on the per-CTA K-segment
+length (K/splits >= ~4096) instead of CTA count alone; (c) measure
+splits-off for the down-proj in-server. Any fix must beat the CURRENT
+numbers end-to-end at c=8/16 with the dispatch trace confirming engagement.
+Also note: the reduce kernel after 8-split down-proj runs at 67% MEM —
+the partials round-trip is real traffic, not free.
+
 ## 5) Measurement protocol (keep using it)
 
 - nsys captures without env instrumentation; treat
