@@ -42,9 +42,10 @@ struct NativeExecutionPolicy {
   // accumulation. head_dim 128 / GQA 8 / fp16 only. Kernel-vs-kernel rig
   // (benchmark_fa_decode_rig, B=16): warm-L2 1.24-1.65x vs the packed
   // kernel (win grows with kv; cold-L2 parity at kv <= 256), 4-12x vs the
-  // fp32-tile split family. Default off pending in-server A/B;
-  // INFERFLUX_CUDA_ATTN_MMA_DECODE=1 enables.
-  bool enable_attn_mma_decode{false};
+  // fp32-tile split family. Paired in-server A/B at c=16 (4i): +8.5% e2e
+  // (296 vs 273 tok/s) and -8% busy-kernel time. Default on;
+  // INFERFLUX_CUDA_ATTN_MMA_DECODE=0 is the kill switch.
+  bool enable_attn_mma_decode{true};
   // Force K-split >= 2 for decode-MMA projections with M > 8 even when the
   // grid already fills the SM array (large-N shapes pay partial writes +
   // a reduce launch for it). Disable to let the occupancy heuristic decide.
@@ -169,7 +170,7 @@ struct NativeExecutionPolicy {
     policy.enable_attn_packed_decode =
         ParseBoolEnv("INFERFLUX_CUDA_ATTN_PACKED_DECODE", true);
     policy.enable_attn_mma_decode =
-        ParseBoolEnv("INFERFLUX_CUDA_ATTN_MMA_DECODE", false);
+        ParseBoolEnv("INFERFLUX_CUDA_ATTN_MMA_DECODE", true);
     policy.mmq_mma_force_split_fat =
         ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA_FORCE_SPLIT_FAT", true);
     policy.mmq_mma_split_min_segment =
