@@ -772,6 +772,31 @@ split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
 llama's type-14 mul_mat_q), (3) the mma default-on flip once (1)+(2)
 land (the paired +8.5% already justifies it at c=16 decode-heavy).
 
+### 4j) SUSTAINED-LOAD CLOCKS: the rig-vs-server multiplier explained (Sep 11)
+
+Clock sampling during the 48 x 256 c=16 battery: SM clocks sit at
+**1,425-1,485 MHz** for the whole run — under half the 3,105 MHz max
+boost — while power is only ~60 W of the 130 W cap and die temp 34-36 C.
+No throttle reason flags active (not power, not thermal): DVFS simply
+does not hold boost clocks under sustained load in this (WSL2)
+environment. Short rig bursts (~5 ms) sample near boost.
+
+This one multiplier explains every "in-server kernel runs 1.5-2.3x its
+rig time" observation in 4h/4i (gate/up 57% rig vs 32% server; down-proj
+52-62 us rig vs 128 us server). DRAM bandwidth is clock-independent, so
+pure-bandwidth headroom claims survive; compute-latency-bound headroom
+claims must be halved at sustained clocks.
+
+Ops lever (needs one sudo command per boot, untested):
+`sudo nvidia-smi -lgc 2100` — holding ~2.1 GHz would be worth ~+45%
+e2e for free if the workload is clock-bound at sustained load.
+
+Also recorded: shipped-default HEAD (mma attention default-on +
+gate/up fusion + down-proj split floor) measured **457 tok/s
+unprofiled** on this battery, up from the 4i shipped-default band
+(273-330 profiled / ~330-458 unprofiled). The campaign's e2e gains
+survived contact with the real clock environment.
+
 ## 5) Measurement protocol (keep using it)
 
 - nsys captures without env instrumentation; treat
