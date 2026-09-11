@@ -12,8 +12,8 @@
 
 #include "runtime/backends/cuda/native/fused_quant_gemm.h"
 #include "runtime/backends/cuda/native/kernels/dequantization.cuh"
-#include "runtime/backends/cuda/native/kernels/mmvq.cuh"
 #include "runtime/backends/cuda/native/kernels/mmq_mma.cuh"
+#include "runtime/backends/cuda/native/kernels/mmvq.cuh"
 #include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 
 #include <cuda_fp16.h>
@@ -72,18 +72,18 @@ float Q4KValue(const block_q4_k &b, int e) {
 int main() {
   using namespace inferflux;
   using namespace inferflux::runtime::cuda::native;
+  using inferflux::runtime::cuda::native::block_q8_1;
   using inferflux::runtime::cuda::native::BlockQ8_1MmqDs;
   using inferflux::runtime::cuda::native::InferfluxMmqQ4KMma;
   using inferflux::runtime::cuda::native::QuantizeRowQ8_1MmqDsKernel;
-  using inferflux::runtime::cuda::native::block_q8_1;
   constexpr int kWideWarps = 4; // incumbent launch: (128,1,1) blocks
   cudaFree(0);
 
   cudaDeviceProp prop{};
   cudaGetDeviceProperties(&prop, 0);
   const double bw_gbs = 360.0; // RTX 4000 Ada effective (measured floor)
-  printf("device: %s  SMs=%d  ~%.0f GB/s\n", prop.name, prop.multiProcessorCount,
-         bw_gbs);
+  printf("device: %s  SMs=%d  ~%.0f GB/s\n", prop.name,
+         prop.multiProcessorCount, bw_gbs);
 
   uint32_t seed = 4242;
   const int blocks_per_row = kK / 256;
@@ -99,9 +99,9 @@ int main() {
     for (int i = 0; i < K_SCALE_SIZE; ++i)
       b.scales[i] = 0;
     for (int j = 0; j < 4; ++j) {
-      b.scales[j] = 1 + (Lcg(seed) % 60);      // sc0-3, top 2 bits 0
-      b.scales[j + 4] = Lcg(seed) % 60;        // m0-3
-      b.scales[j + 8] = 1 + (Lcg(seed) % 15);  // sc4-7 low nibbles
+      b.scales[j] = 1 + (Lcg(seed) % 60);     // sc0-3, top 2 bits 0
+      b.scales[j + 4] = Lcg(seed) % 60;       // m0-3
+      b.scales[j + 8] = 1 + (Lcg(seed) % 15); // sc4-7 low nibbles
     }
     const half d = __float2half(0.002f);
     const half dmin = __float2half(0.001f);
@@ -117,7 +117,8 @@ int main() {
   cudaMemcpy(d_up, host_w.data() + host_w.size() / 2,
              host_w.size() / 2 * sizeof(block_q4_k), cudaMemcpyHostToDevice);
 
-  QuantizedWeightInfo gate_info{d_gate, static_cast<int>(GGUF::TensorType::Q4_K),
+  QuantizedWeightInfo gate_info{d_gate,
+                                static_cast<int>(GGUF::TensorType::Q4_K),
                                 static_cast<int64_t>(kN) * kK};
   QuantizedWeightInfo up_info{d_up, static_cast<int>(GGUF::TensorType::Q4_K),
                               static_cast<int64_t>(kN) * kK};
@@ -128,10 +129,11 @@ int main() {
   cudaStream_t s;
   cudaStreamCreate(&s);
 
-  const double floor_us = 2.0 * kN * blocks_per_row * sizeof(block_q4_k) /
-                          (bw_gbs * 1e3);
+  const double floor_us =
+      2.0 * kN * blocks_per_row * sizeof(block_q4_k) / (bw_gbs * 1e3);
   printf("geometry: N=%d K=%d  weights=%.1f MB  floor=%.1f us (both mats)\n\n",
-         kN, kK, 2.0 * kN * blocks_per_row * sizeof(block_q4_k) / 1e6, floor_us);
+         kN, kK, 2.0 * kN * blocks_per_row * sizeof(block_q4_k) / 1e6,
+         floor_us);
 
   for (int M : {1, 4, 8, 16}) {
     std::vector<half> acts(static_cast<size_t>(M) * kK);
@@ -171,32 +173,28 @@ int main() {
       const dim3 block(kWideWarps * 32);
       auto run_wide = [&] {
         if (M <= 1) {
-          inferflux_mmvq_q4k_fused_gate_up_silu_wide<1>
-              <<<grid, block, 0, s>>>(
-                  static_cast<const block_q4_k *>(gate_info.data),
-                  static_cast<const block_q4_k *>(up_info.data),
-                  static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
+          inferflux_mmvq_q4k_fused_gate_up_silu_wide<1><<<grid, block, 0, s>>>(
+              static_cast<const block_q4_k *>(gate_info.data),
+              static_cast<const block_q4_k *>(up_info.data),
+              static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
         } else if (M <= 2) {
           const dim3 g2(kN, (M + 1) / 2);
-          inferflux_mmvq_q4k_fused_gate_up_silu_wide<2>
-              <<<g2, block, 0, s>>>(
-                  static_cast<const block_q4_k *>(gate_info.data),
-                  static_cast<const block_q4_k *>(up_info.data),
-                  static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
+          inferflux_mmvq_q4k_fused_gate_up_silu_wide<2><<<g2, block, 0, s>>>(
+              static_cast<const block_q4_k *>(gate_info.data),
+              static_cast<const block_q4_k *>(up_info.data),
+              static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
         } else if (M <= 4) {
           const dim3 g4(kN, (M + 3) / 4);
-          inferflux_mmvq_q4k_fused_gate_up_silu_wide<4>
-              <<<g4, block, 0, s>>>(
-                  static_cast<const block_q4_k *>(gate_info.data),
-                  static_cast<const block_q4_k *>(up_info.data),
-                  static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
+          inferflux_mmvq_q4k_fused_gate_up_silu_wide<4><<<g4, block, 0, s>>>(
+              static_cast<const block_q4_k *>(gate_info.data),
+              static_cast<const block_q4_k *>(up_info.data),
+              static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
         } else {
           const dim3 g8(kN, (M + 7) / 8);
-          inferflux_mmvq_q4k_fused_gate_up_silu_wide<8>
-              <<<g8, block, 0, s>>>(
-                  static_cast<const block_q4_k *>(gate_info.data),
-                  static_cast<const block_q4_k *>(up_info.data),
-                  static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
+          inferflux_mmvq_q4k_fused_gate_up_silu_wide<8><<<g8, block, 0, s>>>(
+              static_cast<const block_q4_k *>(gate_info.data),
+              static_cast<const block_q4_k *>(up_info.data),
+              static_cast<const block_q8_1 *>(d_act_q8), d_out, kN, kK, M);
         }
       };
       if (M <= 8) {
@@ -207,9 +205,11 @@ int main() {
         cudaDeviceSynchronize();
         cudaMemcpy(ref.data(), d_out, ref.size() * sizeof(half),
                    cudaMemcpyDeviceToHost);
-        for (int i = 0; i < kWarmup; ++i) run_wide();
+        for (int i = 0; i < kWarmup; ++i)
+          run_wide();
         cudaEventRecord(start, s);
-        for (int i = 0; i < kIters; ++i) run_wide();
+        for (int i = 0; i < kIters; ++i)
+          run_wide();
         cudaEventRecord(stop, s);
         cudaDeviceSynchronize();
         const double wide_ms = BenchMs(start, stop);
@@ -228,8 +228,8 @@ int main() {
           if (rel > 1e-2) {
             ++bad;
             if (shown++ < 6)
-              printf("  wide mismatch out[%zu]: ref=%.3f wide=%.3f\n", i2,
-                     r, g);
+              printf("  wide mismatch out[%zu]: ref=%.3f wide=%.3f\n", i2, r,
+                     g);
           }
         }
         printf("  wide vs incumbent: %d/%zu bad, max_rel=%.3e\n", bad,
@@ -241,8 +241,7 @@ int main() {
     double max_rel = 0;
     if (M == 1) {
       std::vector<half> out(kN);
-      cudaMemcpy(out.data(), d_out, kN * sizeof(half),
-                 cudaMemcpyDeviceToHost);
+      cudaMemcpy(out.data(), d_out, kN * sizeof(half), cudaMemcpyDeviceToHost);
       // Q8_1 reference activations: quantize on host (mirrors kernel input).
       std::vector<block_q8_1> q8(kK / 32);
       cudaMemcpy(q8.data(), d_act_q8, q8.size() * sizeof(block_q8_1),
@@ -260,8 +259,8 @@ int main() {
           const block_q4_k &gb =
               host_w[static_cast<size_t>(col) * blocks_per_row + k / 256];
           const block_q4_k &ub =
-              host_w[host_w.size() / 2 + static_cast<size_t>(col) *
-                                                blocks_per_row + k / 256];
+              host_w[host_w.size() / 2 +
+                     static_cast<size_t>(col) * blocks_per_row + k / 256];
           g += Q4KValue(gb, k % 256) * act_val(k);
           u += Q4KValue(ub, k % 256) * act_val(k);
         }
@@ -295,23 +294,27 @@ int main() {
             const char *w = mat ? reinterpret_cast<const char *>(d_up)
                                 : reinterpret_cast<const char *>(d_gate);
             dim3 grid(n_tiles, (M + 15) / 16, ks);
-            InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, s>>>(
-                w, d_act_ds, d_out + mat * gate_out, kN, kK, M, d_part, ks);
+            InferfluxMmqQ4KMma<16>
+                <<<grid, dim3(32, kMmqMmaWarps, 1), smem, s>>>(
+                    w, d_act_ds, d_out + mat * gate_out, kN, kK, M, d_part, ks,
+                    w, d_out + mat * gate_out, 0);
             if (ks > 1) {
               const int rt = 256;
               const size_t mn = static_cast<size_t>(M) * kN;
-              ReduceMmqKSplit<<<(mn + rt - 1) / rt, rt, 0, s>>>(d_part,
-                  d_out + mat * gate_out, ks, mn);
+              ReduceMmqKSplit<<<(mn + rt - 1) / rt, rt, 0, s>>>(
+                  d_part, d_out + mat * gate_out, ks, mn);
             }
           }
         };
-        for (int i = 0; i < kWarmup; ++i) run();
+        for (int i = 0; i < kWarmup; ++i)
+          run();
         cudaEventRecord(start, s);
-        for (int i = 0; i < kIters; ++i) run();
+        for (int i = 0; i < kIters; ++i)
+          run();
         cudaEventRecord(stop, s);
         const double mma_ms = BenchMs(start, stop);
-        printf("M=%-2d  mma gate+up s=%d   : %7.1f us   (%.2fx floor)\n", M,
-               ks, mma_ms * 1000, mma_ms * 1000 / floor_us);
+        printf("M=%-2d  mma gate+up s=%d   : %7.1f us   (%.2fx floor)\n", M, ks,
+               mma_ms * 1000, mma_ms * 1000 / floor_us);
         cudaFree(d_part);
       }
       cudaFree(d_act_ds);

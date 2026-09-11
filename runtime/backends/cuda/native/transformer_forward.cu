@@ -2246,6 +2246,34 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                       }
                     }
                     const half *mma_in = static_cast<const half *>(d_norm_out_);
+                    // 4i launch fusion: quantize the shared FFN input once,
+                    // then gate+up in ONE dual-pointer mma launch (splits=1,
+                    // optimal for the 2N-tile grid). Falls back to the
+                    // per-projection path when the dual declines.
+                    static const bool dual_ok_b = [] {
+                      const char *e = getenv("INFERFLUX_CUDA_MMQ_GATE_UP_DUAL");
+                      return !e || e[0] != '0';
+                    }();
+                    if (dual_ok_b &&
+                        FusedQuantGemm::QuantizeForMmqMma(
+                            mma_in,
+                            static_cast<runtime::cuda::native::BlockQ8_1MmqDs
+                                            *>(d_act_q8_1_mmq_),
+                            seq_len, hidden_size_, stream_,
+                            &execution_policy_) &&
+                        FusedQuantGemm::GemvMmqMmaGateUpDualPrequantized(
+                            gate_raw, up_raw,
+                            static_cast<
+                                const runtime::cuda::native::BlockQ8_1MmqDs *>(
+                                d_act_q8_1_mmq_),
+                            d_ffn_gate_, d_ffn_up_, seq_len, intermediate_size_,
+                            hidden_size_, stream_, &execution_policy_)) {
+                      LogPackedGemmPath("gate_proj",
+                                        "using Q4_K MMA dual launch");
+                      LogPackedGemmPath("up_proj",
+                                        "using Q4_K MMA dual launch");
+                      return true;
+                    }
                     if (TryQ8_1MmaGemv<T>(
                             gate_raw, mma_in, d_ffn_gate_, d_act_q8_1_mmq_,
                             d_mma_partials_, seq_len, intermediate_size_,
@@ -3755,28 +3783,55 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                 static_cast<
                                     runtime::cuda::native::BlockQ8_1MmqDs *>(
                                     d_act_q8_1_mmq_),
-                                B, hidden_size_, stream_, active_policy) &&
-                            FusedQuantGemm::GemvMmqMmaPrequantized(
-                                gate_raw,
-                                static_cast<
-                                    const runtime::cuda::native::BlockQ8_1MmqDs
-                                        *>(d_act_q8_1_mmq_),
-                                d_ffn_gate_, d_mma_partials_, B,
-                                intermediate_size_, hidden_size_, stream_,
-                                active_policy) &&
-                            FusedQuantGemm::GemvMmqMmaPrequantized(
-                                up_raw,
-                                static_cast<
-                                    const runtime::cuda::native::BlockQ8_1MmqDs
-                                        *>(d_act_q8_1_mmq_),
-                                d_ffn_up_, d_mma_partials_, B,
-                                intermediate_size_, hidden_size_, stream_,
-                                active_policy)) {
-                          LogPackedGemmPath("gate_proj",
-                                            "using Q4_K MMA projection");
-                          LogPackedGemmPath("up_proj",
-                                            "using Q4_K MMA projection");
-                          return true;
+                                B, hidden_size_, stream_, active_policy)) {
+                          // 4i launch fusion: gate+up in ONE mma launch
+                          // (dual weight/output pointers selected per
+                          // N-tile; splits=1, optimal for the 2N-tile
+                          // grid). Falls back to the two-launch path when
+                          // the dual declines (quant-type or shape
+                          // mismatch).
+                          static const bool dual_ok_a = [] {
+                            const char *e =
+                                getenv("INFERFLUX_CUDA_MMQ_GATE_UP_DUAL");
+                            return !e || e[0] != '0';
+                          }();
+                          if (dual_ok_a &&
+                              FusedQuantGemm::GemvMmqMmaGateUpDualPrequantized(
+                                  gate_raw, up_raw,
+                                  static_cast<const runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  d_ffn_gate_, d_ffn_up_, B, intermediate_size_,
+                                  hidden_size_, stream_, active_policy)) {
+                            LogPackedGemmPath("gate_proj",
+                                              "using Q4_K MMA dual launch");
+                            LogPackedGemmPath("up_proj",
+                                              "using Q4_K MMA dual launch");
+                            return true;
+                          }
+                          if (FusedQuantGemm::GemvMmqMmaPrequantized(
+                                  gate_raw,
+                                  static_cast<const runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  d_ffn_gate_, d_mma_partials_, B,
+                                  intermediate_size_, hidden_size_, stream_,
+                                  active_policy) &&
+                              FusedQuantGemm::GemvMmqMmaPrequantized(
+                                  up_raw,
+                                  static_cast<const runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  d_ffn_up_, d_mma_partials_, B,
+                                  intermediate_size_, hidden_size_, stream_,
+                                  active_policy)) {
+                            LogPackedGemmPath("gate_proj",
+                                              "using Q4_K MMA projection");
+                            LogPackedGemmPath("up_proj",
+                                              "using Q4_K MMA projection");
+                            return true;
+                          }
+                          return false;
                         }
                       }
                     }

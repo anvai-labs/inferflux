@@ -337,6 +337,17 @@ public:
   /// GemvMmqMma without the input quantization step; requires ds_act to
   /// have been filled by QuantizeForMmqMma with the same M/K on the same
   /// stream.
+  /// Fused gate+up Q4_K MMA: ONE launch covering both weights (dual
+  /// pointers selected per N-tile), outputs to the two separate buffers.
+  /// Splits forced to 1 (the 4h sweep showed splits only hurt the wide
+  /// gate/up shape, whose 2N/128 tiles already exceed the SM count).
+  /// Both weights must be Q4_K with equal N and K.
+  static bool GemvMmqMmaGateUpDualPrequantized(
+      const QuantizedWeightInfo &w1, const QuantizedWeightInfo &w2,
+      const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *out1,
+      half *out2, int M, int N, int K, cudaStream_t stream,
+      const NativeExecutionPolicy *policy);
+
   static bool GemvMmqMmaPrequantized(
       const QuantizedWeightInfo &weight,
       const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *output,
