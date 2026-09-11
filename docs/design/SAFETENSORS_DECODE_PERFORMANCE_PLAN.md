@@ -742,6 +742,15 @@ avg" are TWO populations:
   bandwidth floor for [16, 2048] x [2048, 151936] is ~325 us (~187 MB
   at ~576 GB/s), so the head runs ~4.3x above the floor — the largest
   single-kernel headroom on the board.
+  ISOLATED-KERNEL MEASUREMENT (benchmark_q6k_vocab_probe, Sep 11): the
+  production Q6_K MMA kernel at the vocab shape achieves only **238
+  GB/s** (1,093 us at splits=1, M=16; splits=2 is worse; M-independent)
+  vs 184 GB/s for the down shape at its optimum. So ~40% of the gap to
+  the floor is KERNEL quality (short-K streams through the mma tile
+  machinery at 1187 CTAs), not launch conditions — a bandwidth-optimal
+  streaming kernel (GEMV-style, no mma tiles) targeting 450+ GB/s
+  would save ~0.9 s of battery busy time. This is the justified
+  next kernel build.
 - **grid (16,1,3) = the down-proj** (ffn_down Q6_K, N=2048, 3 splits):
   21,621 launches at **176 us avg (3.81 s total)** — ~3x the q6k rig's
   kernel time (51-62 us) on the same shape. Suspect: the split count
