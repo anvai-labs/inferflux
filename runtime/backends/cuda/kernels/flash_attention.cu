@@ -3,6 +3,7 @@
 #include "runtime/backends/cuda/common/dtype_traits.cuh"
 #include <cmath>
 #include <cuda_runtime.h>
+#include <type_traits>
 
 namespace inferflux {
 namespace cuda_kernel {
@@ -1507,6 +1508,468 @@ __global__ void FlashDecodePackedKernel(
   }
 }
 
+// ============================================================================
+// MMA decode attention (tensor-core rewrite, rig-derived).
+//
+// flash_attn_ext_f16 decode shape: all GQARatio Q-heads packed into the mma
+// N dimension, 4 warps each own 32 of every 128-row KV chunk with per-warp
+// online softmax state merged through smem, QK^T in f32 accumulation, PV in
+// f16 accumulation with a 2^-20 FTZ guard. Same partials layout as
+// FlashDecodeGQASplitKernel (combine via FlashDecodeReduceSplitsKernel).
+// Shape-static (head_dim 128 / GQA 8) and CUDA-graph safe.
+// Kernel-vs-kernel (benchmark_fa_decode_rig, B=16, RTX 4000 Ada):
+// warm-L2 1.24-1.65x vs the packed kernel (win grows with kv; cold-L2
+// parity at kv<=256), 4-12x vs the fp32-tile split family.
+// Fragment geometry reference: tests/unit/benchmark_fa_decode_rig.cu.
+// ============================================================================
+
+namespace {
+
+constexpr int kMmaDecodeGqa = 8;         // heads packed per block
+constexpr int kMmaDecodeDim = 128;       // head dim (shape-static)
+constexpr int kMmaDecodeThreads = 128;   // 4 warps
+constexpr int kMmaDecodeChunk = 128;     // KV rows per chunk per block
+constexpr int kMmaDecodeRowStride = 136; // padded tile row stride (halves)
+constexpr int kMmaDecodePStride = 9;     // P transpose tile row stride
+
+__device__ __forceinline__ uint32_t MmaDecodePackHalfs(float lo, float hi) {
+  __half2 h2 = __floats2half2_rn(lo, hi);
+  return *reinterpret_cast<uint32_t *>(&h2);
+}
+
+__device__ __forceinline__ void MmaDecodeQk(int (&d)[4], const int (&a)[4],
+                                            const int (&b)[2]) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+      "{%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, {%0, %1, %2, %3};"
+      : "+r"(d[0]), "+r"(d[1]), "+r"(d[2]), "+r"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ void MmaDecodePv(int (&d)[2], const int (&a)[4],
+                                            const int (&b)[2]) {
+  asm("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 "
+      "{%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%0, %1};"
+      : "+r"(d[0]), "+r"(d[1])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+// Online-softmax rescale with llama.cpp FTZ semantics: flush when the
+// logit gap exceeds 20 nats (SOFTMAX_FTZ_THRESHOLD applies to the
+// exponent difference) so the fp16 accumulator never denormals.
+__device__ __forceinline__ float MmaDecodeRescale(float diff) {
+  return diff < -20.f ? 0.f : __expf(diff);
+}
+
+// K A-fragment: [16 rows x 16 dims] of the padded K tile (row-major).
+// D-fragment element i sits at row = lane/4 + 8*(i/2),
+// col = 2*(lane%4) + (i%2) — for both the f32 QK^T tile and the f16 PV tile.
+__device__ __forceinline__ void MmaDecodeLoadKFrag(int (&a)[4], const half *s_k,
+                                                   int row0, int k0) {
+  const int lane = threadIdx.x % 32;
+  const int g = lane / 4;
+  const int b = (lane % 4) * 2;
+  a[0] = *reinterpret_cast<const int *>(s_k + (row0 + g) * kMmaDecodeRowStride +
+                                        k0 + b);
+  a[1] = *reinterpret_cast<const int *>(
+      s_k + (row0 + g + 8) * kMmaDecodeRowStride + k0 + b);
+  a[2] = *reinterpret_cast<const int *>(s_k + (row0 + g) * kMmaDecodeRowStride +
+                                        k0 + b + 8);
+  a[3] = *reinterpret_cast<const int *>(
+      s_k + (row0 + g + 8) * kMmaDecodeRowStride + k0 + b + 8);
+}
+
+// A = V^T view: element (r, c) = V[row0 + c, d0 + r]. Eight smem half loads
+// packed into four registers (ldmatrix.trans is the v2 upgrade).
+__device__ __forceinline__ void
+MmaDecodeLoadVTFrag(int (&a)[4], const half *s_v, int row0, int d0) {
+  const int lane = threadIdx.x % 32;
+  const int g = lane / 4;
+  const int b = lane % 4;
+  a[0] = MmaDecodePackHalfs(
+      __half2float(s_v[(row0 + 2 * b) * kMmaDecodeRowStride + d0 + g]),
+      __half2float(s_v[(row0 + 2 * b + 1) * kMmaDecodeRowStride + d0 + g]));
+  a[1] = MmaDecodePackHalfs(
+      __half2float(s_v[(row0 + 2 * b) * kMmaDecodeRowStride + d0 + g + 8]),
+      __half2float(s_v[(row0 + 2 * b + 1) * kMmaDecodeRowStride + d0 + g + 8]));
+  a[2] = MmaDecodePackHalfs(
+      __half2float(s_v[(row0 + 2 * b + 8) * kMmaDecodeRowStride + d0 + g]),
+      __half2float(s_v[(row0 + 2 * b + 9) * kMmaDecodeRowStride + d0 + g]));
+  a[3] = MmaDecodePackHalfs(
+      __half2float(s_v[(row0 + 2 * b + 8) * kMmaDecodeRowStride + d0 + g + 8]),
+      __half2float(s_v[(row0 + 2 * b + 9) * kMmaDecodeRowStride + d0 + g + 8]));
+}
+
+__global__ void FlashDecodeMmaGqaKernel(
+    const half *__restrict__ Q, const half *__restrict__ kv_buffer,
+    float *__restrict__ partial_O, float *__restrict__ partial_max,
+    float *__restrict__ partial_sum, const int *__restrict__ seq_ids,
+    const int *__restrict__ kv_lens, int layer, int num_splits,
+    size_t slot_stride, size_t layer_stride, size_t kv_stride, float scale) {
+  static_assert(kMmaDecodeGqa == 8 && kMmaDecodeDim == 128,
+                "kernel is shape-specialized; see the rig for the general map");
+  const int b = blockIdx.x;
+  const int kvh = blockIdx.y;
+  const int split = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int warp = tid / 32;
+  const int lane = tid % 32;
+
+  const int kv_len = kv_lens[b];
+  const int split_len = (kv_len + num_splits - 1) / num_splits;
+  const int kv_begin = split * split_len;
+  const int kv_end = min(kv_begin + split_len, kv_len);
+
+  extern __shared__ char smem_raw[];
+  half *s_k = reinterpret_cast<half *>(smem_raw);
+  half *s_v = s_k + kMmaDecodeChunk * kMmaDecodeRowStride;
+  half *s_p = s_v + kMmaDecodeChunk * kMmaDecodeRowStride;
+  float *merge = reinterpret_cast<float *>(s_p + 4 * 32 * kMmaDecodePStride);
+
+  if (kv_begin >= kv_end) {
+    if (tid < kMmaDecodeGqa) {
+      const int split_base =
+          ((b * gridDim.y + kvh) * num_splits + split) * kMmaDecodeGqa;
+      partial_max[split_base + tid] = -INFINITY;
+      partial_sum[split_base + tid] = 0.f;
+    }
+    return;
+  }
+
+  const int g = b * gridDim.y * kMmaDecodeGqa + kvh * kMmaDecodeGqa;
+  const size_t kvh_base = static_cast<size_t>(seq_ids[b]) * slot_stride +
+                          static_cast<size_t>(layer) * layer_stride +
+                          static_cast<size_t>(kvh) * kMmaDecodeDim;
+
+  // Q register fragments (B operand of QK^T; invariant over KV).
+  int q_b[8][2];
+  {
+    const int bb = (lane % 4) * 2;
+    const int n = lane / 4;
+#pragma unroll
+    for (int ks = 0; ks < 8; ++ks) {
+      const int k0 = ks * 16 + bb;
+      q_b[ks][0] = MmaDecodePackHalfs(
+          __half2float(Q[(g + n) * kMmaDecodeDim + k0]) * scale,
+          __half2float(Q[(g + n) * kMmaDecodeDim + k0 + 1]) * scale);
+      q_b[ks][1] = MmaDecodePackHalfs(
+          __half2float(Q[(g + n) * kMmaDecodeDim + k0 + 8]) * scale,
+          __half2float(Q[(g + n) * kMmaDecodeDim + k0 + 9]) * scale);
+    }
+  }
+
+  float m_run[2] = {-INFINITY, -INFINITY};
+  float l_run[2] = {0.f, 0.f};
+  int vkq[8][2][2]; // [v_tile][row_group][2 regs of half2]
+#pragma unroll
+  for (int v = 0; v < 8; ++v) {
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+      vkq[v][rg][0] = 0;
+      vkq[v][rg][1] = 0;
+    }
+  }
+
+  for (int chunk = kv_begin; chunk < kv_end; chunk += kMmaDecodeChunk) {
+    const int rows = min(kMmaDecodeChunk, kv_end - chunk);
+    for (int i = tid; i < kMmaDecodeChunk * kMmaDecodeDim;
+         i += kMmaDecodeThreads) {
+      const int r = i / kMmaDecodeDim;
+      const int d = i % kMmaDecodeDim;
+      half kv = __float2half(0.f), vv = __float2half(0.f);
+      if (r < rows) {
+        const size_t off =
+            kvh_base +
+            static_cast<size_t>(chunk + r) * (kMmaDecodeDim * gridDim.y) + d;
+        kv = kv_buffer[off];
+        vv = kv_buffer[off + kv_stride]; // V plane follows the K plane
+      }
+      s_k[r * kMmaDecodeRowStride + d] = kv;
+      s_v[r * kMmaDecodeRowStride + d] = vv;
+    }
+    __syncthreads();
+
+    // ---- QK^T over this warp's 32 rows ----
+    float p[8];
+    float vmax[2] = {-INFINITY, -INFINITY};
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+      int d[4] = {0, 0, 0, 0};
+#pragma unroll
+      for (int ks = 0; ks < 8; ++ks) {
+        int a[4];
+        MmaDecodeLoadKFrag(a, s_k, warp * 32 + rg * 16, ks * 16);
+        MmaDecodeQk(d, a, q_b[ks]);
+      }
+      const float *df = reinterpret_cast<const float *>(d);
+#pragma unroll
+      for (int l = 0; l < 4; ++l) {
+        p[rg * 4 + l] = df[l];
+        vmax[l % 2] = fmaxf(vmax[l % 2], df[l]);
+      }
+    }
+#pragma unroll
+    for (int mask = 4; mask < 32; mask <<= 1) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        vmax[e] = fmaxf(vmax[e], __shfl_xor_sync(0xffffffffu, vmax[e], mask));
+      }
+    }
+
+    const float new_m[2] = {fmaxf(m_run[0], vmax[0]), fmaxf(m_run[1], vmax[1])};
+    float rsc[2];
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      rsc[e] = MmaDecodeRescale(m_run[e] - new_m[e]);
+      m_run[e] = new_m[e];
+      l_run[e] *= rsc[e];
+    }
+    {
+      const __half2 rs = __floats2half2_rn(rsc[0], rsc[1]);
+#pragma unroll
+      for (int v = 0; v < 8; ++v) {
+#pragma unroll
+        for (int rg = 0; rg < 2; ++rg) {
+          __half2 *d2 = reinterpret_cast<__half2 *>(vkq[v][rg]);
+          d2[0] *= rs;
+          d2[1] *= rs;
+        }
+      }
+    }
+
+    // Exponentiated P; zero-padded rows contribute nothing.
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+#pragma unroll
+      for (int l = 0; l < 4; ++l) {
+        const int row = warp * 32 + rg * 16 + lane / 4 + 8 * (l / 2);
+        p[rg * 4 + l] = row < rows ? __expf(p[rg * 4 + l] - new_m[l % 2]) : 0.f;
+      }
+    }
+    float esum[2] = {0.f, 0.f};
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+      esum[0] += p[rg * 4 + 0] + p[rg * 4 + 2];
+      esum[1] += p[rg * 4 + 1] + p[rg * 4 + 3];
+    }
+#pragma unroll
+    for (int mask = 4; mask < 32; mask <<= 1) {
+#pragma unroll
+      for (int e = 0; e < 2; ++e) {
+        esum[e] += __shfl_xor_sync(0xffffffffu, esum[e], mask);
+      }
+    }
+#pragma unroll
+    for (int e = 0; e < 2; ++e) {
+      l_run[e] += esum[e];
+    }
+
+    // Transpose P through this warp's smem tile for the PV B operand.
+    half *pw = s_p + warp * (32 * kMmaDecodePStride);
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int rg = i / 4;
+      const int row = rg * 16 + lane / 4 + 8 * ((i % 4) / 2);
+      const int col = (lane % 4) * 2 + (i % 2);
+      pw[row * kMmaDecodePStride + col] = __float2half(p[i]);
+    }
+    __syncwarp();
+
+    // ---- PV: A = V^T, B = P^T (B[j] packs rows (lane%4)*2 + 8*j, +1) ----
+#pragma unroll
+    for (int rg = 0; rg < 2; ++rg) {
+      const int kb = (lane % 4) * 2;
+      const int n = lane / 4;
+      int bfr[2];
+      bfr[0] = MmaDecodePackHalfs(
+          __half2float(pw[(rg * 16 + kb) * kMmaDecodePStride + n]),
+          __half2float(pw[(rg * 16 + kb + 1) * kMmaDecodePStride + n]));
+      bfr[1] = MmaDecodePackHalfs(
+          __half2float(pw[(rg * 16 + kb + 8) * kMmaDecodePStride + n]),
+          __half2float(pw[(rg * 16 + kb + 9) * kMmaDecodePStride + n]));
+#pragma unroll
+      for (int v = 0; v < 8; ++v) {
+        int a[4];
+        MmaDecodeLoadVTFrag(a, s_v, warp * 32 + rg * 16, v * 16);
+        MmaDecodePv(vkq[v][rg], a, bfr);
+      }
+    }
+    __syncthreads();
+  }
+
+  // ---- Merge the 4 warps through smem ----
+  float *mg_m = merge;
+  float *mg_l = mg_m + 32;
+  float *mg_rf = mg_l + 32;
+  float *mg_o = mg_rf + 32;
+
+  if (lane / 4 == 0) {
+    const int head = (lane % 4) * 2;
+    mg_m[warp * 8 + head] = m_run[0];
+    mg_m[warp * 8 + head + 1] = m_run[1];
+    mg_l[warp * 8 + head] = l_run[0];
+    mg_l[warp * 8 + head + 1] = l_run[1];
+  }
+  // rg0 stores, rg1 adds (each lane addresses the same slot in both).
+#pragma unroll
+  for (int pass = 0; pass < 2; ++pass) {
+#pragma unroll
+    for (int v = 0; v < 8; ++v) {
+      const __half *d2 = reinterpret_cast<const __half *>(vkq[v][pass]);
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        const int vd = v * 16 + lane / 4 + 8 * (i / 2);
+        const int head = (lane % 4) * 2 + (i % 2);
+        float *slot = &mg_o[(warp * 8 + head) * kMmaDecodeDim + vd];
+        if (pass == 0) {
+          *slot = __half2float(d2[i]);
+        } else {
+          *slot += __half2float(d2[i]);
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  const int split_base =
+      ((b * gridDim.y + kvh) * num_splits + split) * kMmaDecodeGqa;
+  if (warp == 0) {
+    for (int h = tid; h < kMmaDecodeGqa; h += 32) {
+      float bm = -INFINITY;
+#pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        bm = fmaxf(bm, mg_m[w * 8 + h]);
+      }
+      float bl = 0.f;
+#pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        const float f = MmaDecodeRescale(mg_m[w * 8 + h] - bm);
+        mg_rf[w * 8 + h] = f;
+        bl += mg_l[w * 8 + h] * f;
+      }
+      partial_max[split_base + h] = bm;
+      partial_sum[split_base + h] = bl;
+    }
+    __syncwarp();
+    for (int i = tid; i < kMmaDecodeGqa * kMmaDecodeDim; i += 32) {
+      const int h = i / kMmaDecodeDim;
+      const int d = i % kMmaDecodeDim;
+      float acc = 0.f;
+#pragma unroll
+      for (int w = 0; w < 4; ++w) {
+        acc += mg_o[(w * 8 + h) * kMmaDecodeDim + d] * mg_rf[w * 8 + h];
+      }
+      partial_O[(split_base + h) * kMmaDecodeDim + d] = acc;
+    }
+  }
+}
+
+} // namespace
+
+template <typename T, int GQARatio, int HEAD_DIM>
+cudaError_t
+LaunchGQADecodeMma(const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,
+                   const int *d_kv_lens, int layer, int batch_size,
+                   int num_heads, int num_kv_heads, size_t slot_stride,
+                   size_t layer_stride, size_t kv_stride, float scale,
+                   cudaStream_t stream, void *split_workspace,
+                   size_t split_workspace_bytes, int max_kv_hint) {
+  const int num_splits = (max_kv_hint > 0 && max_kv_hint <= 256) ? 1 : 4;
+  const size_t partial_O_bytes = static_cast<size_t>(batch_size) *
+                                 num_kv_heads * num_splits * GQARatio *
+                                 HEAD_DIM * sizeof(float);
+  const size_t partial_scalar_bytes = static_cast<size_t>(batch_size) *
+                                      num_kv_heads * num_splits * GQARatio *
+                                      sizeof(float);
+  const size_t total_workspace = partial_O_bytes + 2 * partial_scalar_bytes;
+
+  // The mma path always writes partials and always runs the combine, so
+  // a missing or undersized workspace is fatal here even at one split
+  // (unlike the split family, there is no direct-write kernel to fall
+  // back to inside this launcher).
+  if (!split_workspace || split_workspace_bytes < total_workspace) {
+    return LaunchGQADecode<T, GQARatio>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, HEAD_DIM, slot_stride, layer_stride, kv_stride, scale,
+        stream, split_workspace, split_workspace_bytes, max_kv_hint);
+  }
+
+  float *partial_O = static_cast<float *>(split_workspace);
+  float *partial_max = reinterpret_cast<float *>(
+      reinterpret_cast<char *>(split_workspace) + partial_O_bytes);
+  float *partial_sum =
+      reinterpret_cast<float *>(reinterpret_cast<char *>(split_workspace) +
+                                partial_O_bytes + partial_scalar_bytes);
+
+  constexpr int smem =
+      2 * kMmaDecodeChunk * kMmaDecodeRowStride *
+          static_cast<int>(sizeof(half)) +
+      4 * 32 * kMmaDecodePStride * static_cast<int>(sizeof(half)) +
+      4192 * static_cast<int>(sizeof(float));
+  static bool smem_configured = [] {
+    // 88.7 KB dynamic smem: raise the per-block limit once per process.
+    return cudaFuncSetAttribute(FlashDecodeMmaGqaKernel,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                96 * 1024) == cudaSuccess;
+  }();
+  if (!smem_configured) {
+    return LaunchGQADecode<T, GQARatio>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, HEAD_DIM, slot_stride, layer_stride, kv_stride, scale,
+        stream, split_workspace, split_workspace_bytes, max_kv_hint);
+  }
+
+  dim3 grid(batch_size, num_kv_heads, num_splits);
+  FlashDecodeMmaGqaKernel<<<grid, kMmaDecodeThreads, smem, stream>>>(
+      reinterpret_cast<const half *>(Q),
+      reinterpret_cast<const half *>(kv_buffer), partial_O, partial_max,
+      partial_sum, d_seq_ids, d_kv_lens, layer, num_splits, slot_stride,
+      layer_stride, kv_stride, scale);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return err;
+  }
+
+  int reduce_threads = 1;
+  while (reduce_threads < HEAD_DIM) {
+    reduce_threads <<= 1;
+  }
+  reduce_threads = min(reduce_threads, 1024);
+  dim3 reduce_grid(batch_size, num_heads);
+  FlashDecodeReduceSplitsKernel<T><<<reduce_grid, reduce_threads, 0, stream>>>(
+      partial_O, partial_max, partial_sum, O, num_heads, num_kv_heads, HEAD_DIM,
+      num_splits);
+  return cudaGetLastError();
+}
+
+template <typename T>
+cudaError_t
+FlashDecodeMmaGqa(const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,
+                  const int *d_kv_lens, int layer, int batch_size,
+                  int num_heads, int num_kv_heads, int head_dim,
+                  size_t slot_stride, size_t layer_stride, size_t kv_stride,
+                  float scale, cudaStream_t stream, void *split_workspace,
+                  size_t split_workspace_bytes, int max_kv_hint) {
+  const int gqa_ratio = (num_kv_heads > 0 && num_heads > num_kv_heads)
+                            ? (num_heads / num_kv_heads)
+                            : 1;
+  if constexpr (!std::is_same_v<T, __half>) {
+    return FlashDecodePacked<T>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream, split_workspace, split_workspace_bytes, max_kv_hint);
+  }
+  if (head_dim != kMmaDecodeDim || gqa_ratio != kMmaDecodeGqa) {
+    return FlashDecodePacked<T>(
+        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
+        stream, split_workspace, split_workspace_bytes, max_kv_hint);
+  }
+  return LaunchGQADecodeMma<T, kMmaDecodeGqa, kMmaDecodeDim>(
+      Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
+      num_kv_heads, slot_stride, layer_stride, kv_stride, scale, stream,
+      split_workspace, split_workspace_bytes, max_kv_hint);
+}
+
 template <typename T, int GQARatio, int HEAD_DIM>
 cudaError_t
 LaunchGQADecodePacked(const T *Q, const T *kv_buffer, T *O,
@@ -1595,6 +2058,18 @@ FlashDecodePacked(const T *Q, const T *kv_buffer, T *O, const int *d_seq_ids,
       stream, split_workspace, split_workspace_bytes, max_kv_hint);
 }
 
+template cudaError_t FlashDecodeMmaGqa<half>(
+    const half *Q, const half *kv_buffer, half *O, const int *d_seq_ids,
+    const int *d_kv_lens, int layer, int batch_size, int num_heads,
+    int num_kv_heads, int head_dim, size_t slot_stride, size_t layer_stride,
+    size_t kv_stride, float scale, cudaStream_t stream, void *split_workspace,
+    size_t split_workspace_bytes, int max_kv_hint);
+template cudaError_t FlashDecodeMmaGqa<__nv_bfloat16>(
+    const __nv_bfloat16 *Q, const __nv_bfloat16 *kv_buffer, __nv_bfloat16 *O,
+    const int *d_seq_ids, const int *d_kv_lens, int layer, int batch_size,
+    int num_heads, int num_kv_heads, int head_dim, size_t slot_stride,
+    size_t layer_stride, size_t kv_stride, float scale, cudaStream_t stream,
+    void *split_workspace, size_t split_workspace_bytes, int max_kv_hint);
 template cudaError_t FlashDecodePacked<half>(
     const half *Q, const half *kv_buffer, half *O, const int *d_seq_ids,
     const int *d_kv_lens, int layer, int batch_size, int num_heads,
