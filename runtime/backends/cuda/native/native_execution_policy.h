@@ -26,12 +26,17 @@ struct NativeExecutionPolicy {
   // Split-parallel decode attention (S3): parallelize FlashDecode over
   // Q-heads (short context) and KV chunks (long context). Default off.
   bool enable_attn_split_kv{false};
-  // GQA-packed warp-per-head-pair decode attention (head_dim 128, GQA 8):
-  // FALSIFIED (Sep 8): measured 303 tok/s vs 574 baseline at c=16 — the
-  // per-(KV-row, head) shuffle reductions cost more than the block-
-  // cooperative dots they replace, and half tiles did not compensate.
-  // Kept behind this knob as a recorded negative result; default off.
-  bool enable_attn_packed_decode{false};
+  // GQA-packed block-cooperative decode attention (head_dim 128, GQA 8):
+  // warps own Q-head pairs, K/V tiles staged in the cache dtype, dots
+  // reduced fully in-register (two __syncthreads__ per 64-row tile).
+  // The first build measured 303 tok/s vs 574 baseline, but its smem tiles
+  // were missing __shared__ (silent local-memory spill — PR #122); with the
+  // qualifier restored it measured +7-10% at c=16 with clean determinism.
+  // Default on; INFERFLUX_CUDA_ATTN_PACKED_DECODE=0 is the kill switch.
+  // On this shape it takes precedence over INFERFLUX_CUDA_ATTN_SPLIT_KV.
+  // (Do not confuse with INFERFLUX_CUDA_ATTN_WPH, the recorded
+  // warp-per-head negative result.)
+  bool enable_attn_packed_decode{true};
   // Force K-split >= 2 for decode-MMA projections with M > 8 even when the
   // grid already fills the SM array (large-N shapes pay partial writes +
   // a reduce launch for it). Disable to let the occupancy heuristic decide.
@@ -146,7 +151,7 @@ struct NativeExecutionPolicy {
     policy.enable_attn_split_kv =
         ParseBoolEnv("INFERFLUX_CUDA_ATTN_SPLIT_KV", false);
     policy.enable_attn_packed_decode =
-        ParseBoolEnv("INFERFLUX_CUDA_ATTN_PACKED_DECODE", false);
+        ParseBoolEnv("INFERFLUX_CUDA_ATTN_PACKED_DECODE", true);
     policy.mmq_mma_force_split_fat =
         ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA_FORCE_SPLIT_FAT", true);
     policy.attn_split_chunk =
