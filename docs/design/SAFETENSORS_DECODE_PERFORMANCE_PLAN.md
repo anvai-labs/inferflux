@@ -676,6 +676,26 @@ instrument. Revised fix candidates: (a') reduce the MMA N-tile width
 (kMmqY 1024) on narrow-N shapes to raise CTA count at full K — kernel-side
 but tiling-only; (b') raise `kMmqMmaMaxSplits` (8) for down-proj with the
 reduce kernel verified at 67% MEM; both need a rig splits-sweep
+
+**Splits-sweep (Sep 11, rig `MMA splits=N` rows, cold-L2, M=16):** the
+tradeoff curves show the #121 policy choices are already near-optimal per
+shape — the §4h "policy is the problem" hypothesis is REFINED:
+
+- qkv/o (16 CTAs at splits=1): optimum at splits 4-8 (16.8-17.2 us, ~148
+  GB/s); splits=1 is 2.3x worse (38.5 us). Policy picks 3 — near-optimal.
+- gate/up (86 CTAs): splits=1 optimal (42.6 us, **307 GB/s = 53% of
+  peak**, near the practical streaming wall); every split hurts
+  (splits=32 is 3.5x worse). Policy picks 1 — optimal.
+- down (16 CTAs, K=11008): optimum at splits 4-16 (54-57 us, 229-242
+  GB/s); splits=1 is 3.2x worse. Policy picks 4 — near-optimal.
+
+Implications: (1) the low qkv/o utilization (~148 GB/s, 26% of peak even
+at optimal splits) is the K=2048 short-stream shape limit, not dispatch;
+(2) gate/up dominates absolute MMA time and is near the wall; (3) the
+1.86x matmul family gap in 4f was measured against the OLD kernel mix —
+the decisive check is a fresh node-level family re-profile of both
+engines at current HEAD (packed/mma attention + tuned splits), which
+supersedes further per-kernel matmul work if the gap has closed.
 (splits {1,2,4,8,16,32} x N-tile variants at M {8,16}) to map the tradeoff
 before touching dispatch.
 

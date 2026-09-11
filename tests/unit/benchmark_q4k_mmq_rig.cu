@@ -270,6 +270,90 @@ int main() {
                              static_cast<double>(M) * N * 2;
         printf("  M=%-2d MMA-chain   %8.2f us (min %7.2f)  %8.0f GB/s  maxrel %.2e\n",
                M, us, mn_ms * 1000.f, bytes / (us * 1e3), max_rel);
+        // K-split sweep (4h follow-up): direct launches at explicit split
+        // counts to map the CTA-parallelism vs segment-length tradeoff.
+        // Gate: every variant must reproduce the policy-driven output.
+        {
+          const int kMaxSweepSplits = 32;
+          float *d_part_sw = nullptr;
+          cudaMalloc(&d_part_sw, sizeof(float) * static_cast<size_t>(M) * N *
+                                     kMaxSweepSplits);
+          namespace mmq = inferflux::runtime::cuda::native;
+          const int grid_x = (N + mmq::kMmqY - 1) / mmq::kMmqY;
+          const int grid_y = (M + 15) / 16;
+          const size_t sw_smem = mmq::MmqSmemInts(16) * sizeof(int);
+          static const bool sw_smem_ok = [] {
+            return cudaFuncSetAttribute(
+                       mmq::InferfluxMmqQ4KMma<16>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       mmq::MmqSmemInts(16) * sizeof(int)) == cudaSuccess;
+          }();
+          if (sw_smem_ok) {
+            for (int splits : {1, 2, 4, 8, 16, 32}) {
+              auto run_sw = [&]() {
+                mmq::InferfluxMmqQ4KMma<16><<<dim3(grid_x, grid_y, splits),
+                                              dim3(32, mmq::kMmqMmaWarps, 1),
+                                              sw_smem, s>>>(
+                    reinterpret_cast<const char *>(d_w), d_ds, d_out, N, K,
+                    M, splits > 1 ? d_part_sw : nullptr, splits);
+                if (splits > 1) {
+                  const size_t mn = static_cast<size_t>(M) * N;
+                  mmq::ReduceMmqKSplit<<<static_cast<int>((mn + 255) / 256),
+                                         256, 0, s>>>(d_part_sw, d_out, splits,
+                                                      mn);
+                }
+              };
+              cudaMemset(d_out, 0, static_cast<size_t>(M) * N * sizeof(half));
+              run_sw();
+              cudaStreamSynchronize(s);
+              cudaMemcpy(hout.data(), d_out, hout.size() * sizeof(half),
+                         cudaMemcpyDeviceToHost);
+              double rel_sw = 0.0;
+              for (int m = 0; m < M; ++m)
+                for (int nn = 0; nn < nsample; ++nn) {
+                  const float pol = __half2float(
+                      mma_sample[static_cast<size_t>(m) * nsample + nn]);
+                  const float got = __half2float(
+                      hout[static_cast<size_t>(m) * nsample + nn]);
+                  const float denom = std::max(1.f, std::fabs(pol));
+                  rel_sw = std::max(rel_sw, static_cast<double>(
+                                                std::fabs(got - pol) /
+                                                denom));
+                }
+              for (int i = 0; i < kWarmup; ++i) {
+                cudaMemsetAsync(d_evict, i & 0xFF,
+                                evict_n * sizeof(float) / 4, s);
+                run_sw();
+              }
+              cudaStreamSynchronize(s);
+              float sw_total = 0.f, sw_min = 1e9f;
+              for (int i = 0; i < kIters; ++i) {
+                cudaMemsetAsync(d_evict, i & 0xFF,
+                                evict_n * sizeof(float) / 4, s);
+                cudaEventRecord(beg, s);
+                run_sw();
+                cudaEventRecord(fin, s);
+                cudaEventSynchronize(fin);
+                float ms = 0.f;
+                cudaEventElapsedTime(&ms, beg, fin);
+                sw_total += ms;
+                sw_min = std::min(sw_min, ms);
+              }
+              const float sw_us = sw_total / kIters * 1000.f;
+              printf(
+                  "  M=%-2d MMA splits=%-2d %8.2f us (min %7.2f)  %8.0f GB/s  "
+                  "maxrel-vs-policy %.2e%s\n",
+                  M, splits, sw_us, sw_min * 1000.f, bytes / (sw_us * 1e3),
+                  rel_sw, rel_sw > 5e-2 ? "  <-- FAIL" : "");
+              if (rel_sw > 5e-2) {
+                printf("  MMA splits=%d correctness gate FAILED (%.3e)\n",
+                       splits, rel_sw);
+                return 1;
+              }
+            }
+          }
+          cudaFree(d_part_sw);
+        }
         // max_rel vs the dequant reference is informational on synthetic
         // data (known-broken reference, see header); the kernel-vs-kernel
         // gate in the dp4a block below is the enforced check.
