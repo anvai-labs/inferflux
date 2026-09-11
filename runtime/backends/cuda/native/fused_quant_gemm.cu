@@ -2125,8 +2125,7 @@ bool FusedQuantGemm::GemvMmqMmaPrequantized(
   // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
   // at 8 on the same kernel). 0 disables the gate.
   if (p.mmq_mma_split_min_segment > 0) {
-    splits = std::min(splits,
-                      std::max(1, K / p.mmq_mma_split_min_segment));
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
   }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
@@ -2209,8 +2208,7 @@ bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
   // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
   // at 8 on the same kernel). 0 disables the gate.
   if (p.mmq_mma_split_min_segment > 0) {
-    splits = std::min(splits,
-                      std::max(1, K / p.mmq_mma_split_min_segment));
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
   }
 
   dim3 qgrid((K / 128 + 3) / 4, M);
@@ -2328,8 +2326,7 @@ bool FusedQuantGemm::DownProjMmqMmaQ4K(
   // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
   // at 8 on the same kernel). 0 disables the gate.
   if (p.mmq_mma_split_min_segment > 0) {
-    splits = std::min(splits,
-                      std::max(1, K / p.mmq_mma_split_min_segment));
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
   }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
@@ -2420,8 +2417,7 @@ bool FusedQuantGemm::DownProjMmqMma(
   // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
   // at 8 on the same kernel). 0 disables the gate.
   if (p.mmq_mma_split_min_segment > 0) {
-    splits = std::min(splits,
-                      std::max(1, K / p.mmq_mma_split_min_segment));
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
   }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ6KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
