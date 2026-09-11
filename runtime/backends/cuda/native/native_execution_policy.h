@@ -161,7 +161,8 @@ struct NativeExecutionPolicy {
     policy.enable_attn_packed_decode =
         ParseBoolEnv("INFERFLUX_CUDA_ATTN_PACKED_DECODE", true);
     policy.enable_attn_mma_decode =
-        ParseBoolEnv("INFERFLUX_CUDA_ATTN_MMA_DECODE", false);    policy.mmq_mma_force_split_fat =
+        ParseBoolEnv("INFERFLUX_CUDA_ATTN_MMA_DECODE", false);
+    policy.mmq_mma_force_split_fat =
         ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA_FORCE_SPLIT_FAT", true);
     policy.attn_split_chunk =
         ParseIntEnv("INFERFLUX_CUDA_ATTN_SPLIT_CHUNK", 512, 64, 8192);
