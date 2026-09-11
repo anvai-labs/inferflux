@@ -588,6 +588,51 @@ is microseconds; most of the relay's saving overlaps host work that was
 already hidden by the graphs), so this lands primarily as a
 correctness/observability fix that re-activates dead code.
 
+### 4h) ncu per-launch decision table (Sep 10): where the matmul gap really is
+
+Closes the PR-3 conditional ("per-kernel deficit >= 1.3x vs llama's
+mul_mat_q"). Method: ncu SpeedOfLight sections, kernel-filtered captures of
+stock llama-server (B <= 4, `-fa on`) and inferflux_cuda at matched decode
+conditions (graphs OFF for ours — graph replay hides kernels from the launch
+counter; per-kernel SOL is unaffected). Qwen2.5-3B q4_k_m, ~10-token prompts,
+45-64 generated tokens. 80-100-sample windows; numbers are per-kernel means.
+
+| kernel (tier) | n | us | SM% | MEM% |
+|---|---|---|---|---|
+| llama `mul_mat_vec_q` (decode M <= 4) | 36 | 22.1 | 46.5 | **64.4** |
+| ours `mmvq_q4k_group` (decode M = 3) | 23 | — | 76.0 | **76.0** |
+| ours `mmvq_q4k_accum_wide` (M = 3) | 29 | — | 48.2 | **79.9** |
+| ours `mmvq_q6k_accum_vec` (output head) | 24 | — | 67.0 | **74.3** |
+| ours `InferfluxMmqQ4KMma` (M 4-16 tier) | 26-30 | 27.4-30.2 | 11-12 | **32-34** |
+| llama `flash_attn_ext_f16` (decode B <= 4) | 6 | 8.0 | 2.2 | 32.5 |
+| ours `FlashDecodePackedKernel` (B = 3) | 5 | 4.1 | 11.8 | 11.8 |
+
+Findings (decision-grade):
+
+1. **Decode attention, small batch: we are 2x faster** (4.1 vs 8.0 us at
+   matched B ~= 3). The 7.3x gap in 4f is a LARGE-BATCH phenomenon (B = 16,
+   kv 256-1024); the packed kernel and the mma candidate (#137/#138) are the
+   response on that side.
+2. **The vec (dp4a MMVQ) tier beats llama's per-kernel achieved bandwidth**:
+   74-80% of DRAM peak vs their 64%. The PR-3 gate ("our kernels have a
+   >= 1.3x per-kernel deficit -> port llama's stream-K form") is
+   **FALSIFIED for the vec tier** — there is nothing to port; our kernels
+   are already the more efficient implementation at matched conditions.
+3. **The MMA tier (M 4-16) is the outlier**: 32-34% of MEM peak (11% SM) —
+   half the utilization of our own vec tier and half of llama's. Since
+   decode at c >= 4 routes through this tier, it is the prime suspect for
+   the B = 16 matmul-family gap in 4f — NOT the vec tier and NOT llama's
+   kernel design. Next step: extend `benchmark_q4k_mmq_rig` with ncu SOL at
+   matched M in {4, 8, 16} to isolate why the mma.sync path saturates at a
+   third of peak (occupancy 1 block/SM? smem bank conflicts? Q8_1 activation
+   feeding?) before considering any rewrite. NOTE the rig measured the MMA
+   tier FASTER than vec at M >= 9 kernel-vs-kernel — a kernel can win on
+   time while underutilizing (fewer waves, latency effects), so the rig
+   time-interpretation and the ncu utilization must be reconciled at matched
+   M before acting.
+4. Caveats: ncu windows are partial slices (launch-count capped), ours ran
+   eager (no graphs); per-kernel SOL means, not end-to-end.
+
 ## 5) Measurement protocol (keep using it)
 
 - nsys captures without env instrumentation; treat
