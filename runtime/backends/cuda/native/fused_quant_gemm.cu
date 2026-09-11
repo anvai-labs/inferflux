@@ -2120,6 +2120,13 @@ bool FusedQuantGemm::GemvMmqMmaPrequantized(
       (p.mmq_mma_force_split_fat || total_ctas < sm_count)) {
     splits = std::max(splits, 2);
   }
+  // 4h: splitting short K-segments defeats memory-level parallelism —
+  // in-server utilization falls monotonically with split count once
+  // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
+  // at 8 on the same kernel). 0 disables the gate.
+  if (p.mmq_mma_split_min_segment > 0) {
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
+  }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
       static_cast<const char *>(weight.data), ds_act, output, N, K, M,
@@ -2195,6 +2202,13 @@ bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
     // grid under-fills the SM array; large-N shapes skip the partial
     // writes + reduce launch when the knob is disabled.
     splits = std::max(splits, 2);
+  }
+  // 4h: splitting short K-segments defeats memory-level parallelism —
+  // in-server utilization falls monotonically with split count once
+  // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
+  // at 8 on the same kernel). 0 disables the gate.
+  if (p.mmq_mma_split_min_segment > 0) {
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
   }
 
   dim3 qgrid((K / 128 + 3) / 4, M);
@@ -2307,7 +2321,13 @@ bool FusedQuantGemm::DownProjMmqMmaQ4K(
     splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                       static_cast<int>(kMmqMmaMaxSplits));
   }
-
+  // 4h: splitting short K-segments defeats memory-level parallelism —
+  // in-server utilization falls monotonically with split count once
+  // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
+  // at 8 on the same kernel). 0 disables the gate.
+  if (p.mmq_mma_split_min_segment > 0) {
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
+  }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
       static_cast<const char *>(weight.data), ds_act, output, N, K, M,
@@ -2392,7 +2412,13 @@ bool FusedQuantGemm::DownProjMmqMma(
     splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                       static_cast<int>(kMmqMmaMaxSplits));
   }
-
+  // 4h: splitting short K-segments defeats memory-level parallelism —
+  // in-server utilization falls monotonically with split count once
+  // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
+  // at 8 on the same kernel). 0 disables the gate.
+  if (p.mmq_mma_split_min_segment > 0) {
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
+  }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ6KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
       static_cast<const char *>(weight.data), act_mmq, output, N, K, M,

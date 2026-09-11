@@ -640,18 +640,19 @@ eager mode — the split count explains the collapse:
 | grid (x,y,z) | projection | M bucket | us | SM% | MEM% |
 |---|---|---|---|---|---|
 | (86,1,1) | gate/up 11008x2048 | <= 16 (decode) | 65.1 | 20.2 | **57.3** |
-| (16,1,3) | qkv/o 2048x2048 | <= 16 (decode) | 21.5 | 11.3 | **32.6** |
-| (2,1,8) | down 2048x11008 | <= 16 (decode) | 8.1 | 3.9 | **11.7** |
+| (16,1,3) | q_proj / down 2048xK | <= 16 (decode) | 21.5 | 11.3 | **32.6** |
+| (2,1,8) | k/v_proj 256x2048 | <= 16 (decode) | 8.1 | 3.9 | **11.7** |
 | (86,2,1) | gate/up (prefill M 17-32) | 17-32 | 100.1 | 26.9 | 37.3 |
-| (2,2,8) | down (prefill), 8 splits | 17-32 | 8.2 | 7.9 | 13.1 |
+| (2,2,8) | k/v_proj (prefill), 8 splits | 17-32 | 8.2 | 7.9 | 13.1 |
 | (16,2,2) | qkv/o (prefill), 2 splits | 17-32 | 27.8 | 17.3 | 25.6 |
 
 The same kernel hits 57% of DRAM peak unsplit (matching the rig) and
 collapses monotonically with the split count: 3 splits -> 33%, 8 splits ->
 12%. The #121 forced-split gate ("split only when total_ctas < sm_count")
-is the mechanism: it fires exactly on the narrow-N projections (down-proj
-N=2048 -> 2 x-tiles, qkv/o -> 16), where each split CTA then streams a
-short K-segment (K/8 = 1376 for down-proj) with poor memory-level
+is the mechanism: it fires exactly on the narrow-N projections (k/v_proj
+N=256 -> 2 x-tiles; grid x decodes as N/128, so the (2,1,8) rows are
+k/v_proj, not down-proj — down shares the (16,*) signature with q_proj),
+where each split CTA streams a short K-segment with poor memory-level
 parallelism, plus partials+reduce traffic on top. The rig never sees this
 because it launches unsplit.
 
@@ -662,6 +663,41 @@ splits-off for the down-proj in-server. Any fix must beat the CURRENT
 numbers end-to-end at c=8/16 with the dispatch trace confirming engagement.
 Also note: the reduce kernel after 8-split down-proj runs at 67% MEM —
 the partials round-trip is real traffic, not free.
+
+**Segment-length gate falsified (Sep 11):** the direct test of (b) — capping
+splits so K/splits >= 4096 (folded down-proj to 1 split, qkv/o to 1) — made
+both WORSE: down-proj 11.7% -> 1.9% MEM (8.1 -> 50.3 us), qkv/o 32.6% ->
+13.7% (21.5 -> 51.0 us). Causal correction: the narrow-N shapes are CTA-STARVED, not split-degraded — splits were raising CTA count (down: 2 CTAs
+unsplit -> 16 at 8 splits, a 6x utilization gain) and the real problem is
+the low N-parallelism (gate/up reaches 57% because 86 N-tiles exist, not
+because it is unsplit). The knob ships default-off
+(`INFERFLUX_CUDA_MMQ_MMA_SPLIT_MIN_SEGMENT`, 0) as the measurement
+instrument. Revised fix candidates: (a') reduce the MMA N-tile width
+(kMmqY 1024) on narrow-N shapes to raise CTA count at full K — kernel-side
+but tiling-only; (b') raise `kMmqMmaMaxSplits` (8) for down-proj with the
+reduce kernel verified at 67% MEM; both need a rig splits-sweep
+
+**Splits-sweep (Sep 11, rig `MMA splits=N` rows, cold-L2, M=16):** the
+tradeoff curves show the #121 policy choices are already near-optimal per
+shape — the §4h "policy is the problem" hypothesis is REFINED:
+
+- qkv/o (16 CTAs at splits=1): optimum at splits 4-8 (16.8-17.2 us, ~148
+  GB/s); splits=1 is 2.3x worse (38.5 us). Policy picks 3 — near-optimal.
+- gate/up (86 CTAs): splits=1 optimal (42.6 us, **307 GB/s = 53% of
+  peak**, near the practical streaming wall); every split hurts
+  (splits=32 is 3.5x worse). Policy picks 1 — optimal.
+- down (16 CTAs, K=11008): optimum at splits 4-16 (54-57 us, 229-242
+  GB/s); splits=1 is 3.2x worse. Policy picks 4 — near-optimal.
+
+Implications: (1) the low qkv/o utilization (~148 GB/s, 26% of peak even
+at optimal splits) is the K=2048 short-stream shape limit, not dispatch;
+(2) gate/up dominates absolute MMA time and is near the wall; (3) the
+1.86x matmul family gap in 4f was measured against the OLD kernel mix —
+the decisive check is a fresh node-level family re-profile of both
+engines at current HEAD (packed/mma attention + tuned splits), which
+supersedes further per-kernel matmul work if the gap has closed.
+(splits {1,2,4,8,16,32} x N-tile variants at M {8,16}) to map the tradeoff
+before touching dispatch.
 
 ## 5) Measurement protocol (keep using it)
 
