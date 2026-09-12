@@ -808,7 +808,17 @@ sqlite analysis of the same 4i battery):**
   tile machinery) would leapfrog llama by ~1 s of battery busy time
   rather than match it.
 
-Next targets, in order: (1) projection launch fusion (gate+up as one
+**Stream-K assessment input (Sep 12):** matched-duration comparison of
+the Q6_K down-proj: llama (48,1,1) 64 us vs ours (16,1,6) 128 us — a
+real 2x at ~matched clocks (both engines sustained-throttled during
+the battery). Ours at the rig-optimal s=6 with partials+reduce; theirs
+stream-K flattened with a fixup kernel. The gap decomposes into (a)
+the partials gmem round-trip (~4 us of the 64 — small), and (b) per-CTA
+efficiency: our 96 short-K CTAs vs their 48 full-K CTAs at 1 wave. A
+stream-K port (flattened grid, fixup combine) is the remaining lever;
+ncu SOL comparison on llama-server was impractical (graph-replay
+collection hangs), so the port decision carries nsys-duration evidence
+only. Sizeable kernel project — queued behind higher-value work.
 [2N, K] launch; fold k/v into the q launch or at least share their
 split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
 llama's type-14 mul_mat_q), (3) the mma default-on flip once (1)+(2)
