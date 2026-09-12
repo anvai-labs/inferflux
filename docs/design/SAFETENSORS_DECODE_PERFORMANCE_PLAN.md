@@ -830,6 +830,18 @@ structure. The staging-vectorization experiment in the rig
 gated by L1-sectors + duration) comes BEFORE any stream-K port — if
 staging closes the 2x, stream-K becomes unnecessary; if not, stream-K
 is layered on the faster base.
+
+**Staging comparison result (Sep 12):** our `LoadTilesQ6KMma` is a
+faithful port of llama's current `load_tiles_q6_K` — same loop
+structure, same 4-byte `get_int_b2`-style loads, same nibble unpacking
+(the only delta is llama's `i = min(i, i_max)` clamp vs our
+break/continue, both uniform-loop-safe). No staging divergence exists
+to fix. The 2x down-proj gap lives in the inner pipeline: llama's
+vec_dot/mma scheduling (deeper unroll, different fragment pipelining)
+processes each staged tile faster. Closing it = pipeline-level ncu
+work (instruction-throughput analysis of both kernels at the down
+shape), a deep project with ~5% e2e upside (down-proj Q6_K is 3.8-5.5
+s of busy). Ranked behind anything else on the board at equal effort.
 [2N, K] launch; fold k/v into the q launch or at least share their
 split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
 llama's type-14 mul_mat_q), (3) the mma default-on flip once (1)+(2)
