@@ -762,6 +762,15 @@ avg" are TWO populations:
   vocab launches). Both variants are kept in the probe as the recorded
   negative result (max_rel 0.0000 vs the mma output — correct but
   slow).
+  **ncu root cause for the mma kernel's vocab gap (Sep 11):** per
+  launch, `l1tex` global-load sectors total **48.16M = 1.54 GB — 7.6x
+  the 202 MB of q6_k weight data** — with MEM% at 76.6 and achieved
+  occupancy 32.8% (121 regs/thread, 12.4 waves). The kernel's tile
+  staging re-reads each weight byte ~7.6x (non-vectorized loads at the
+  210-byte q6_k row stride; ql/qh/scales are separate sub-arrays). The
+  fix is vectorized (uint4) tile staging in the Q6_K (and likely Q4_K)
+  mma tile loader — a kernel-internal change with a clean ncu metric
+  to gate it (L1 sectors per launch ~6.3M = 1x the data).
 - **grid (16,1,3) = the down-proj** (ffn_down Q6_K, N=2048, 3 splits):
   21,621 launches at **176 us avg (3.81 s total)** — ~3x the q6k rig's
   kernel time (51-62 us) on the same shape. Suspect: the split count
