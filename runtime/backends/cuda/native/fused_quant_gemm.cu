@@ -2126,9 +2126,9 @@ bool FusedQuantGemm::GemvMmqMmaGateUpDualPrequantized(
 bool FusedQuantGemm::GemvMmqMmaTriplePrequantized(
     const QuantizedWeightInfo &w1, const QuantizedWeightInfo &w2,
     const QuantizedWeightInfo &w3,
-    const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *out1,
-    half *out2, half *out3, float *partials, int M, int N1, int N2, int N3,
-    int K, cudaStream_t stream, const NativeExecutionPolicy *policy) {
+    const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *out1, half *out2,
+    half *out3, float *partials, int M, int N1, int N2, int N3, int K,
+    cudaStream_t stream, const NativeExecutionPolicy *policy) {
   // One launch for three same-K Q4_K projections (q+k+v): grid.x covers
   // N1+N2+N3 rows split across the three weight/output pointer pairs.
   // Split count from the standard underfill heuristic.
@@ -2141,9 +2141,12 @@ bool FusedQuantGemm::GemvMmqMmaTriplePrequantized(
       static_cast<size_t>(N2) * K != static_cast<size_t>(w2.num_elements) ||
       static_cast<size_t>(N3) * K != static_cast<size_t>(w3.num_elements) ||
       w1.quant_type != w2.quant_type || w2.quant_type != w3.quant_type ||
-      static_cast<GGUF::TensorType>(w1.quant_type) !=
-          GGUF::TensorType::Q4_K ||
+      N2 != N1 || N3 != N1 ||
+      static_cast<GGUF::TensorType>(w1.quant_type) != GGUF::TensorType::Q4_K ||
       K % QK_K != 0) {
+    // N2/N3 must equal N1: the per-tile row mapping is only proven for
+    // equal-width segments (the unequal-N case mis-maps rows past the
+    // first per segment — see TestTripleUnequal).
     return false;
   }
   static bool smem_configured = false;
@@ -2200,9 +2203,8 @@ bool FusedQuantGemm::GemvMmqMmaTriplePrequantized(
     const int rthreads = 256;
     const size_t rblocks = (mn + rthreads - 1) / rthreads;
     ReduceMmqKSplitTriple<<<rblocks, rthreads, 0, stream>>>(
-        partials, out1, out2, out3, splits,
-        static_cast<size_t>(M) * N1, static_cast<size_t>(M) * N2,
-        static_cast<size_t>(M) * N3);
+        partials, out1, out2, out3, splits, static_cast<size_t>(M) * N1,
+        static_cast<size_t>(M) * N2, static_cast<size_t>(M) * N3);
     err = cudaGetLastError();
     if (err != cudaSuccess) {
       return false;

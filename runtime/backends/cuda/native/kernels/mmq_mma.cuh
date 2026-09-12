@@ -495,9 +495,14 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
   const bool in_w2 = !in_w3 && n1_tiles > 0 && it >= n1_tiles;
   const char *w_sel = in_w3 ? w3 : (in_w2 ? w2 : w);
   half *out_sel = in_w3 ? out3 : (in_w2 ? out2 : out);
-  const int it_local = in_w3 ? it - n1_tiles - n2_tiles
-                             : (in_w2 ? it - n1_tiles : it);
-  const int tile_x_max_i = N - it_local * kMmqY - 1;
+  const int it_local =
+      in_w3 ? it - n1_tiles - n2_tiles : (in_w2 ? it - n1_tiles : it);
+  // Per-segment row stride: fused segments may have different N
+  // (q+k+v fusion: 2048 / 256 / 256).
+  const int seg_n = in_w3 ? static_cast<int>(gridDim.x) * kMmqY -
+                                (n1_tiles + n2_tiles) * kMmqY
+                          : N;
+  const int tile_x_max_i = seg_n - it_local * kMmqY - 1;
   const int tile_y_max_j = M - jt * mmq_x - 1;
 
   float sum[mmq_x * kMmqY / (kMmqMmaWarps * warp_size)] = {0};
@@ -588,10 +593,11 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
         // clobber rows 0..mmq_x-1 and leave rows mmq_x.. unwritten.
         const int row = jt * mmq_x + j;
         if (ksplits == 1) {
-          out_sel[static_cast<size_t>(row) * N + it_local * kMmqY + i] =
+          out_sel[static_cast<size_t>(row) * seg_n + it_local * kMmqY + i] =
               __float2half(sum[(j0 / TileC::J + n) * TileC::ne + l]);
         } else {
-          partials[(static_cast<size_t>(blockIdx.z) * M + row) * N +
+          partials[(static_cast<size_t>(blockIdx.z) * M + row) *
+                       (gridDim.x * kMmqY) +
                    it * kMmqY + i] = sum[(j0 / TileC::J + n) * TileC::ne + l];
         }
       }
@@ -823,8 +829,8 @@ static __global__ void ReduceMmqKSplitTriple(const float *__restrict__ partials,
                                              half *__restrict__ out1,
                                              half *__restrict__ out2,
                                              half *__restrict__ out3,
-                                             int splits, size_t mn1,
-                                             size_t mn2, size_t mn3) {
+                                             int splits, size_t mn1, size_t mn2,
+                                             size_t mn3) {
   const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   const size_t mn = mn1 + mn2 + mn3;
   if (idx >= mn) {
