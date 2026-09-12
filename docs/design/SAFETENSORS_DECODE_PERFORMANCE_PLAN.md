@@ -842,6 +842,16 @@ processes each staged tile faster. Closing it = pipeline-level ncu
 work (instruction-throughput analysis of both kernels at the down
 shape), a deep project with ~5% e2e upside (down-proj Q6_K is 3.8-5.5
 s of busy). Ranked behind anything else on the board at equal effort.
+Tooling note for the pipeline project (Sep 12): our kernel's
+instruction profile at the down shape is lean (6.84 M inst/launch,
+0.78 M global loads = vectorized, 0.019 inst/MAC) - no low-hanging
+instruction waste. The llama-side instruction comparison remains
+blocked: ncu on llama-server hangs in graph-replay collection, and
+llama.cpp test-backend-ops q6_K perf launches no mul_mat_q-matching
+kernels from its wrapper. The pipeline project needs either a
+graphs-disabled llama build or a custom runner replicating the
+mul_mat_q tile decomposition before the instruction-level
+divergence can be identified.
 [2N, K] launch; fold k/v into the q launch or at least share their
 split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
 llama's type-14 mul_mat_q), (3) the mma default-on flip once (1)+(2)
