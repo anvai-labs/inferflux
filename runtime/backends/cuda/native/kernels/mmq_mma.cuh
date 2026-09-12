@@ -596,8 +596,7 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
           out_sel[static_cast<size_t>(row) * seg_n + it_local * kMmqY + i] =
               __float2half(sum[(j0 / TileC::J + n) * TileC::ne + l]);
         } else {
-          partials[(static_cast<size_t>(blockIdx.z) * M + row) *
-                       (gridDim.x * kMmqY) +
+          partials[(static_cast<size_t>(blockIdx.z) * M + row) * N +
                    it * kMmqY + i] = sum[(j0 / TileC::J + n) * TileC::ne + l];
         }
       }
