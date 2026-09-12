@@ -771,6 +771,19 @@ avg" are TWO populations:
   fix is vectorized (uint4) tile staging in the Q6_K (and likely Q4_K)
   mma tile loader — a kernel-internal change with a clean ncu metric
   to gate it (L1 sectors per launch ~6.3M = 1x the data).
+
+**Deprioritized (Sep 12, down-control comparison + wall analysis):** the
+same ncu capture on the down-shape control shows NO amplification
+(0.65M sectors / 96 CTAs = 217 KB per CTA = exactly the useful data),
+while the vocab shows 6x — but the vocab's isolated throughput (238-254
+GB/s at boost clocks) already sits at the PRACTICAL streaming wall for
+this access pattern established by the bf16 falsification (40-60% of
+peak cold-L2; the "4x over the ideal floor" framing was against an
+unreachable ceiling). Remaining vocab headroom is ~1.3-1.4x (~0.3 s of
+battery busy, ~1% e2e) and would need the heavyweight streaming design
+falsified for the bf16 GEMV. The vocab kernel target is DEPRIORITIZED;
+achieving it would also leapfrog llama (their vocab runs the same
+~1.17 ms).
 - **grid (16,1,3) = the down-proj** (ffn_down Q6_K, N=2048, 3 splits):
   21,621 launches at **176 us avg (3.81 s total)** — ~3x the q6k rig's
   kernel time (51-62 us) on the same shape. Suspect: the split count
