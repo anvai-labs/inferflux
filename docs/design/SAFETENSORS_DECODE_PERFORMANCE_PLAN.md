@@ -751,6 +751,17 @@ avg" are TWO populations:
   streaming kernel (GEMV-style, no mma tiles) targeting 450+ GB/s
   would save ~0.9 s of battery busy time. This is the justified
   next kernel build.
+  **FALSIFIED (Sep 11, probe v1+v2):** two streaming-GEMV variants
+  (warp-per-row scalar dequant; then element-major transposed acts with
+  uint4 vectorized loads) measured 8,857 us and 7,255 us — 7-8x SLOWER
+  than the mma kernel's 1,025 us. Root cause: at M=16 the per-element
+  scalar dequant + 16 FMA arithmetic dominates (~10 G flops/battery on
+  the CUDA cores) — the mma tiles amortize exactly that via tensor
+  cores. The vocab shape is NOT reachable by a simpler kernel; closing
+  its gap requires mma-kernel-level optimization (ncu on the 1187-CTA
+  vocab launches). Both variants are kept in the probe as the recorded
+  negative result (max_rel 0.0000 vs the mma output — correct but
+  slow).
 - **grid (16,1,3) = the down-proj** (ffn_down Q6_K, N=2048, 3 splits):
   21,621 launches at **176 us avg (3.81 s total)** — ~3x the q6k rig's
   kernel time (51-62 us) on the same shape. Suspect: the split count
