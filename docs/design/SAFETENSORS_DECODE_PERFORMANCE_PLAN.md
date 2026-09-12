@@ -801,6 +801,20 @@ split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
 llama's type-14 mul_mat_q), (3) the mma default-on flip once (1)+(2)
 land (the paired +8.5% already justifies it at c=16 decode-heavy).
 
+**Launch-fusion status update (Sep 11):** gate+up dual launch landed
+(#147). The q+k+v triple MMA launch is implemented
+(`GemvMmqMmaTriplePrequantized` + per-tile triple-pointer selection in
+the kernel + a triple-output reduce) and validated, but at DECODE
+widths the live q/k/v path routes through the **Q8_1 grouped GEMV
+family** (`q8_1_mixed` operator — `fused_dequant_gemv_q4k_q8_1_group`
+et al., 2.6 s of 4i busy), not the Q4_K MMA tier: the triple engages
+only at prefill-scale M (<= 16) through the normalized-projection
+sites. The decode q/k/v fusion target is therefore the Q8_1 grouped
+dispatcher (fuse the per-projection grouped launches), which is a
+different, smaller-grained family. The triple wiring ships behind
+INFERFLUX_CUDA_QKV_TRIPLE_LAUNCH (default on) and is exercised at
+prefill; kill switch restores the 3-launch path.
+
 ### 4j) SUSTAINED-LOAD CLOCKS: the rig-vs-server multiplier explained (Sep 11)
 
 Clock sampling during the 48 x 256 c=16 battery: SM clocks sit at

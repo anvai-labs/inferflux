@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -1846,6 +1847,14 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
               },
               [&]() {
                 bool norm_computed = (qkv_norm == nullptr);
+                // 4i launch fusion: set by the q-slot when the fused
+                // q+k+v mma launch covered all three projections.
+                bool qkv_fused = false;
+                static const bool qkv_triple_ok = [] {
+                  const char *e =
+                      getenv("INFERFLUX_CUDA_QKV_TRIPLE_LAUNCH");
+                  return !e || e[0] != '0';
+                }();
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
@@ -1862,9 +1871,43 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
+                          if constexpr (std::is_same_v<T, half>) {
+                          if (qkv_triple_ok && seq_len >= 2 &&
+                              FusedQuantGemm::QuantizeForMmqMma(
+                                  d_norm_out_,
+                                  static_cast<runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  seq_len, hidden_size_, stream_,
+                                  &execution_policy_) &&
+                              FusedQuantGemm::GemvMmqMmaTriplePrequantized(
+                                  q_raw, k_raw, v_raw,
+                                  static_cast<const runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  d_q_, d_k_new_, d_v_new_, d_mma_partials_,
+                                  seq_len, num_heads_ * head_dim_,
+                                  num_kv_heads_ * head_dim_,
+                                  num_kv_heads_ * head_dim_, hidden_size_,
+                                  stream_, &execution_policy_)) {
+                            qkv_fused = true;
+                            LogPackedGemmPath("q_proj",
+                                              "using Q4_K MMA triple launch");
+                            LogPackedGemmPath("k_proj",
+                                              "using Q4_K MMA triple launch");
+                            LogPackedGemmPath("v_proj",
+                                              "using Q4_K MMA triple launch");
+                            return true;
+                          }
                           return TryQuantizedProjection(
                               pctx, q_raw, d_norm_out_, d_q_, seq_len,
                               num_heads_ * head_dim_, hidden_size_, "q_proj");
+                          } else {
+                            return TryQuantizedProjection(
+                                pctx, q_raw, d_norm_out_, d_q_, seq_len,
+                                num_heads_ * head_dim_, hidden_size_,
+                                "q_proj");
+                          }
                         },
                         [&]() {
                           if (!RunDenseProjection(
@@ -1894,6 +1937,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
+                          if (qkv_fused) {
+                            return true;
+                          }
                           return TryQuantizedProjection(
                               pctx, k_raw, d_norm_out_, d_k_new_, seq_len,
                               num_kv_heads_ * head_dim_, hidden_size_,
@@ -1927,6 +1973,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
+                          if (qkv_fused) {
+                            return true;
+                          }
                           return TryQuantizedProjection(
                               pctx, v_raw, d_norm_out_, d_v_new_, seq_len,
                               num_kv_heads_ * head_dim_, hidden_size_,
@@ -3197,6 +3246,37 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                       // quantize when the shared quantize declines.
                       static const bool qkv_shared_quant =
                           ParseBoolEnv("INFERFLUX_CUDA_QKV_SHARED_QUANT", true);
+                      static const bool qkv_triple_ok = [] {
+                        const char *e =
+                            getenv("INFERFLUX_CUDA_QKV_TRIPLE_LAUNCH");
+                        return !e || e[0] != '0';
+                      }();
+                      if (qkv_triple_ok && qkv_shared_quant &&
+                          inferflux::FusedQuantGemm::QuantizeForMmqMma(
+                              mma_input,
+                              static_cast<runtime::cuda::native::BlockQ8_1MmqDs
+                                              *>(d_act_q8_1_mmq_),
+                              B, hidden_size_, stream_, active_policy) &&
+                          inferflux::FusedQuantGemm::
+                              GemvMmqMmaTriplePrequantized(
+                                  q_raw, k_raw, v_raw,
+                                  static_cast<const runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  d_q_, d_k_new_, d_v_new_, d_mma_partials_,
+                                  B, num_heads_ * head_dim_,
+                                  num_kv_heads_ * head_dim_,
+                                  num_kv_heads_ * head_dim_, hidden_size_,
+                                  stream_, active_policy)) {
+                        // 4i launch fusion: q+k+v in one mma launch.
+                        LogPackedGemmPath("q_proj",
+                                          "using Q4_K MMA triple launch");
+                        LogPackedGemmPath("k_proj",
+                                          "using Q4_K MMA triple launch");
+                        LogPackedGemmPath("v_proj",
+                                          "using Q4_K MMA triple launch");
+                        return true;
+                      }
                       if (qkv_shared_quant &&
                           inferflux::FusedQuantGemm::QuantizeForMmqMma(
                               mma_input,
