@@ -815,6 +815,16 @@ different, smaller-grained family. The triple wiring ships behind
 INFERFLUX_CUDA_QKV_TRIPLE_LAUNCH (default on) and is exercised at
 prefill; kill switch restores the 3-launch path.
 
+**Resolved (Sep 12):** the Q8_1 grouped family ALREADY fuses the
+decode q/k/v — `GemvQ8_1Pair` (q+k, Q4_K) + `GemvQ8_1` (v, Q6_K
+in q4_k_m models) = 2 launches for 3 projections, with
+`GemvQ8_1Triple` reserved for all-same-type models. The per-segment
+stride lesson from the Mmq multi-segment work applies there too:
+`GemvQ8_1Pair`/`Triple` handle differing N via per-projection output
+cols in their spec arrays. No further q/k/v fusion work is needed;
+the decode-projection queue narrows to the vocab kernel (4h L1
+amplification) and the stream-K port assessment.
+
 ### 4j) SUSTAINED-LOAD CLOCKS: the rig-vs-server multiplier explained (Sep 11)
 
 Clock sampling during the 48 x 256 c=16 battery: SM clocks sit at
