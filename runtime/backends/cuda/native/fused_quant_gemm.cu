@@ -2183,32 +2183,21 @@ bool FusedQuantGemm::GemvMmqMmaTriplePrequantized(
     splits = std::min((sm_count + total_ctas - 1) / total_ctas,
                       static_cast<int>(kMmqMmaMaxSplits));
   }
-  // partials must hold M * (N1+N2+N3) * splits floats (caller-owned,
-  // same contract as the prequantized single/dual launchers).
-  const size_t mn = static_cast<size_t>(M) * n_tiles * kMmqY;
-  if (splits > 1 && !partials) {
+  // The fused triple has no split-K reduce with a consistent partials
+  // layout (the per-segment row mapping only holds at splits=1).
+  // Decline when the heuristic would split: the caller falls back to
+  // the per-projection chain, which splits correctly.
+  if (splits > 1) {
     return false;
   }
-  dim3 grid(n_tiles, (M + 15) / 16, splits);
+  dim3 grid(n_tiles, (M + 15) / 16, 1); // splits forced to 1 above
   InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
-      static_cast<const char *>(w1.data), ds_act, out1, N1, K, M,
-      splits > 1 ? partials : nullptr, splits,
+      static_cast<const char *>(w1.data), ds_act, out1, N1, K, M, nullptr, 1,
       static_cast<const char *>(w2.data), out2, n1_tiles,
       static_cast<const char *>(w3.data), out3, n2_tiles);
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     return false;
-  }
-  if (splits > 1) {
-    const int rthreads = 256;
-    const size_t rblocks = (mn + rthreads - 1) / rthreads;
-    ReduceMmqKSplitTriple<<<rblocks, rthreads, 0, stream>>>(
-        partials, out1, out2, out3, splits, static_cast<size_t>(M) * N1,
-        static_cast<size_t>(M) * N2, static_cast<size_t>(M) * N3);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-      return false;
-    }
   }
   return true;
 }
