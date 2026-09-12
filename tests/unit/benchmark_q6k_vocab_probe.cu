@@ -32,7 +32,8 @@ constexpr int kBlocksPerRow = kK / 256; // q6_k: 256 elems per block
 // Deterministic weights in a plausible q6_k range; scales/d chosen so no
 // NaN/Inf appears (correctness is not the question here — throughput is).
 using inferflux::runtime::cuda::native::block_q6_k;
-std::vector<block_q6_k> MakeWeights(int rows, uint32_t seed) {
+std::vector<block_q6_k> MakeWeights(int rows, int kK2, uint32_t seed) {
+  const int kBlocksPerRow = kK2 / 256;
   std::vector<block_q6_k> w(static_cast<size_t>(rows) * kBlocksPerRow);
   auto u8 = [&seed](int span) {
     seed ^= seed << 13;
@@ -56,8 +57,8 @@ std::vector<block_q6_k> MakeWeights(int rows, uint32_t seed) {
   return w;
 }
 
-std::vector<half> MakeActs(int m, uint32_t seed) {
-  std::vector<half> a(static_cast<size_t>(m) * kK);
+std::vector<half> MakeActs(int m, int kk2, uint32_t seed) {
+  std::vector<half> a(static_cast<size_t>(m) * kk2);
   for (auto &x : a) {
     seed ^= seed << 13;
     seed ^= seed >> 7;
@@ -67,14 +68,14 @@ std::vector<half> MakeActs(int m, uint32_t seed) {
   return a;
 }
 
-void RunShape(const char *name, int N, int M, int splits) {
-  printf("=== %s: N=%d K=%d M=%d ===\n", name, N, kK, M);
-  auto w = MakeWeights(N, 0xDEADBEEFu);
-  auto acts = MakeActs(M, 0x12345678u);
+void RunShape(const char *name, int N, int KK, int M, int splits) {
+  printf("=== %s: N=%d K=%d M=%d ===\n", name, N, KK, M);
+  auto w = MakeWeights(N, KK, 0xDEADBEEFu);
+  auto acts = MakeActs(M, KK, 0x12345678u);
 
   // Host-quantize activations to the D4 layout (same as the q6k rig).
   std::vector<inferflux::runtime::cuda::native::BlockQ8_1Mmq> hq(
-      static_cast<size_t>(M) * (kK / 128));
+      static_cast<size_t>(M) * (KK / 128));
   {
     auto hq_at =
         [&](int r,
@@ -82,14 +83,14 @@ void RunShape(const char *name, int N, int M, int splits) {
       return hq[static_cast<size_t>(grp) * M + r];
     };
     for (int r = 0; r < M; ++r) {
-      for (int grp = 0; grp < kK / 128; ++grp) {
+      for (int grp = 0; grp < KK / 128; ++grp) {
         auto &g = hq_at(r, grp);
         for (int sub = 0; sub < 4; ++sub) {
           float amax = 0;
           float vals[32];
           for (int i = 0; i < 32; ++i) {
             const float v = __half2float(
-                acts[static_cast<size_t>(r) * kK + grp * 128 + sub * 32 + i]);
+                acts[static_cast<size_t>(r) * KK + grp * 128 + sub * 32 + i]);
             vals[i] = v;
             amax = std::fmax(amax, std::fabs(v));
           }
@@ -137,7 +138,7 @@ void RunShape(const char *name, int N, int M, int splits) {
   auto run = [&]() {
     inferflux::runtime::cuda::native::InferfluxMmqQ6KMma<16>
         <<<grid, block, smem, s>>>(reinterpret_cast<const char *>(d_w), d_a,
-                                   d_out, N, kK, M, d_part, splits);
+                                   d_out, N, KK, M, d_part, splits);
     if (splits > 1) {
       const int rthreads = 256;
       const size_t rblocks = (mn + rthreads - 1) / rthreads;
@@ -167,8 +168,8 @@ void RunShape(const char *name, int N, int M, int splits) {
   }
   const float us = total / iters * 1000.f;
   // Bytes: Q6_K weights N*K*210/256 + fp16 acts + fp16 out.
-  const double bytes = static_cast<double>(N) * kK * 210.0 / 256.0 +
-                       static_cast<double>(M) * kK * 2 +
+  const double bytes = static_cast<double>(N) * KK * 210.0 / 256.0 +
+                       static_cast<double>(M) * KK * 2 +
                        static_cast<double>(M) * N * 2;
   printf("  splits=%-2d grid=(%d,%d,%d)  %8.1f us  %7.1f GB/s\n", splits,
          grid.x, grid.y, grid.z, us, bytes / (us * 1e3));
@@ -278,8 +279,8 @@ __global__ void VocabGemmQ6KKernel(
 } // namespace
 
 int RunStreamingVocab(int N, int M) {
-  auto w = MakeWeights(N, 0xDEADBEEFu);
-  auto acts = MakeActs(M, 0x12345678u);
+  auto w = MakeWeights(N, kK, 0xDEADBEEFu);
+  auto acts = MakeActs(M, kK, 0x12345678u);
   std::vector<inferflux::runtime::cuda::native::BlockQ8_1Mmq> hq(
       static_cast<size_t>(M) * (kK / 128));
   {
@@ -417,12 +418,12 @@ int main() {
   printf("Q6_K vocab-shape probe - %s (%d SMs)\n", prop.name,
          prop.multiProcessorCount);
   // Control: the down-proj shape (kernel quality known-good).
-  RunShape("down (control)", 2048, 16, 6);
+  RunShape("down real (K=11008)", 2048, 11008, 16, 6);
   // The vocab head: splits sweep around the single-wave point.
-  RunShape("vocab", 151936, 16, 1);
-  RunShape("vocab", 151936, 16, 2);
-  RunShape("vocab", 151936, 8, 1);
-  RunShape("vocab", 151936, 1, 1);
+  RunShape("vocab", 151936, kK, 16, 1);
+  RunShape("vocab", 151936, kK, 16, 2);
+  RunShape("vocab", 151936, kK, 8, 1);
+  RunShape("vocab", 151936, kK, 1, 1);
   int fails = RunStreamingVocab(151936, 16);
   return fails;
 }
