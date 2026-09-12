@@ -474,7 +474,9 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
                        half *__restrict__ out, int N, int K, int M,
                        float *__restrict__ partials, int ksplits,
                        const char *__restrict__ w2 = nullptr,
-                       half *__restrict__ out2 = nullptr, int n1_tiles = 0) {
+                       half *__restrict__ out2 = nullptr, int n1_tiles = 0,
+                       const char *__restrict__ w3 = nullptr,
+                       half *__restrict__ out3 = nullptr, int n2_tiles = 0) {
   constexpr int warp_size = 32;
   constexpr int QK = 256;
 
@@ -489,10 +491,12 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
   // Dual-tensor mode (gate+up fusion): tiles [n1_tiles, gridDim.x) read w2
   // and write out2 with local tile indices. Single-tensor launches pass
   // n1_tiles = 0 and w2/out2 alias w/out, so the map is identity.
-  const bool in_w2 = n1_tiles > 0 && it >= n1_tiles;
-  const char *w_sel = in_w2 ? w2 : w;
-  half *out_sel = in_w2 ? out2 : out;
-  const int it_local = in_w2 ? it - n1_tiles : it;
+  const bool in_w3 = n2_tiles > 0 && it >= n1_tiles + n2_tiles;
+  const bool in_w2 = !in_w3 && n1_tiles > 0 && it >= n1_tiles;
+  const char *w_sel = in_w3 ? w3 : (in_w2 ? w2 : w);
+  half *out_sel = in_w3 ? out3 : (in_w2 ? out2 : out);
+  const int it_local = in_w3 ? it - n1_tiles - n2_tiles
+                             : (in_w2 ? it - n1_tiles : it);
   const int tile_x_max_i = N - it_local * kMmqY - 1;
   const int tile_y_max_j = M - jt * mmq_x - 1;
 
@@ -810,6 +814,33 @@ static __global__ void ReduceMmqKSplit(const float *__restrict__ partials,
     acc += partials[static_cast<size_t>(s) * mn + idx];
   }
   out[idx] = __float2half(acc);
+}
+
+// Triple-output variant (q+k+v fused launch): the first mn1 elements of
+// the flat [M*(N1+N2+N3)] output go to out1, the rest split between
+// out2 and out3.
+static __global__ void ReduceMmqKSplitTriple(const float *__restrict__ partials,
+                                             half *__restrict__ out1,
+                                             half *__restrict__ out2,
+                                             half *__restrict__ out3,
+                                             int splits, size_t mn1,
+                                             size_t mn2, size_t mn3) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t mn = mn1 + mn2 + mn3;
+  if (idx >= mn) {
+    return;
+  }
+  float acc = 0.0f;
+  for (int s = 0; s < splits; ++s) {
+    acc += partials[static_cast<size_t>(s) * mn + idx];
+  }
+  if (idx < mn1) {
+    out1[idx] = __float2half(acc);
+  } else if (idx < mn1 + mn2) {
+    out2[idx - mn1] = __float2half(acc);
+  } else {
+    out3[idx - mn1 - mn2] = __float2half(acc);
+  }
 }
 
 template <int mmq_x>

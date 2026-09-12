@@ -348,6 +348,16 @@ public:
       half *out2, int M, int N, int K, cudaStream_t stream,
       const NativeExecutionPolicy *policy);
 
+  /// Fused q+k+v Q4_K MMA: ONE launch covering three weights (per-tile
+  /// pointer selection), outputs to the three separate buffers. All
+  /// three must be Q4_K with K % 256 == 0 and N % 128 == 0.
+  static bool GemvMmqMmaTriplePrequantized(
+      const QuantizedWeightInfo &w1, const QuantizedWeightInfo &w2,
+      const QuantizedWeightInfo &w3,
+      const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *out1,
+      half *out2, half *out3, float *partials, int M, int N1, int N2, int N3,
+      int K, cudaStream_t stream, const NativeExecutionPolicy *policy);
+
   static bool GemvMmqMmaPrequantized(
       const QuantizedWeightInfo &weight,
       const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *output,
