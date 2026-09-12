@@ -819,6 +819,17 @@ stream-K port (flattened grid, fixup combine) is the remaining lever;
 ncu SOL comparison on llama-server was impractical (graph-replay
 collection hangs), so the port decision carries nsys-duration evidence
 only. Sizeable kernel project — queued behind higher-value work.
+
+**Reordering insight (Sep 12):** llama's 48 CTAs at 1 wave process the
+SAME per-CTA K (3,669 elems) as our s=3 config (48 CTAs, 176 us
+in-server) — 2.75x apart. That points at the per-CTA staging
+efficiency (our 4-byte unaligned loads at the 210-byte q6_k stride,
+the same family as the vocab-shape L1 amplification), NOT the wave
+structure. The staging-vectorization experiment in the rig
+(benchmark_q6k_kernels: uint4 ql/qh loads vs LoadPackedInt32Unaligned,
+gated by L1-sectors + duration) comes BEFORE any stream-K port — if
+staging closes the 2x, stream-K becomes unnecessary; if not, stream-K
+is layered on the faster base.
 [2N, K] launch; fold k/v into the q launch or at least share their
 split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
 llama's type-14 mul_mat_q), (3) the mma default-on flip once (1)+(2)
