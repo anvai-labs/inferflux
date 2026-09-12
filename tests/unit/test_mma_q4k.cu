@@ -511,6 +511,103 @@ void TestDualReal() {
 // Triple-launch (q+k+v fusion) with UNEQUAL segment widths: catches
 // per-segment row-stride bugs (all segments must match three single
 // launches bitwise, splits 1 and 2).
+// Regression (release review): single Q4_K launch with N % 128 != 0 at
+// splits > 1 must match its ks=1 output bitwise. The #152 padded
+// partials stride broke exactly this class (v0.1.1 was correct).
+void TestSplitsOddN() {
+  const int N = 320, K = 256, M = 16; // N % 128 = 64
+  const int bpr = K / 256;
+  std::vector<block_q4_k> w(static_cast<size_t>(N) * bpr);
+  uint32_t seed = 4242;
+  for (auto &b : w) {
+    for (int i = 0; i < 128; ++i) {
+      b.qs[i] = Lcg(seed) & 0xFF;
+    }
+    for (int i = 0; i < 12; ++i) {
+      b.scales[i] = Lcg(seed) & 0xFF;
+    }
+    const half d = __float2half(0.003f + 0.002f * (Lcg(seed) % 1000) / 1000.0f);
+    const half dm = __float2half(0.001f);
+    std::memcpy(&b.d, &d, 2);
+    std::memcpy(&b.dmin, &dm, 2);
+  }
+  std::vector<half> acts(static_cast<size_t>(M) * K);
+  for (auto &v : acts) {
+    v = __float2half((static_cast<int>(Lcg(seed) % 2001) - 1000) / 2000.0f);
+  }
+  std::vector<BlockQ8_1MmqDs> hq(static_cast<size_t>(M) * (K / 128));
+  for (int r = 0; r < M; ++r) {
+    QuantizeDsHost(acts, K, hq, r);
+  }
+
+  cudaStream_t s;
+  cudaStreamCreate(&s);
+  const size_t mn = static_cast<size_t>(M) * N;
+  block_q4_k *d_w;
+  BlockQ8_1MmqDs *d_a;
+  half *d_o1, *d_o2;
+  float *d_part;
+  cudaMalloc(&d_w, w.size() * sizeof(block_q4_k));
+  cudaMalloc(&d_a, hq.size() * sizeof(BlockQ8_1MmqDs));
+  cudaMalloc(&d_o1, mn * sizeof(half));
+  cudaMalloc(&d_o2, mn * sizeof(half));
+  cudaMalloc(&d_part, 8 * mn * sizeof(float));
+  cudaMemcpyAsync(d_w, w.data(), w.size() * sizeof(block_q4_k),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_a, hq.data(), hq.size() * sizeof(BlockQ8_1MmqDs),
+                  cudaMemcpyHostToDevice, s);
+  dim3 grid((N + 127) / 128, (M + 15) / 16, 1);
+  const size_t smem = MmqSmemInts(16) * sizeof(int);
+  cudaFuncSetAttribute(InferfluxMmqQ4KMma<16>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(smem));
+
+  auto run_ks = [&](int ks, half *out) {
+    dim3 g(grid.x, grid.y, ks);
+    InferfluxMmqQ4KMma<16><<<g, dim3(32, kMmqMmaWarps, 1), smem, s>>>(
+        reinterpret_cast<const char *>(d_w), d_a, out, N, K, M,
+        ks > 1 ? d_part : nullptr, ks, reinterpret_cast<const char *>(d_w), out,
+        0);
+    if (ks > 1) {
+      ReduceMmqKSplit<<<static_cast<int>((mn + 255) / 256), 256, 0, s>>>(
+          d_part, out, ks, mn);
+    }
+  };
+
+  run_ks(1, d_o1);
+  run_ks(2, d_o2);
+  cudaStreamSynchronize(s);
+  std::vector<half> o1(mn), o2(mn);
+  cudaMemcpyAsync(o1.data(), d_o1, mn * sizeof(half), cudaMemcpyDeviceToHost,
+                  s);
+  cudaMemcpyAsync(o2.data(), d_o2, mn * sizeof(half), cudaMemcpyDeviceToHost,
+                  s);
+  cudaStreamSynchronize(s);
+  int bad = 0;
+  for (size_t i = 0; i < mn; ++i) {
+    uint16_t a, b;
+    std::memcpy(&a, &o1[i], 2);
+    std::memcpy(&b, &o2[i], 2);
+    if (a != b) {
+      ++bad;
+      if (bad < 4)
+        printf("  oddN ks2 o[%zu]=%.4f want %.4f (row %zu)\n", i,
+               __half2float(o2[i]), __half2float(o1[i]), i / N);
+    }
+  }
+  printf("splits odd-N (N=%d M=%d ks=2 vs ks=1): %s", N, M,
+         bad ? "FAIL" : "PASS");
+  if (bad)
+    ++g_fail;
+  printf("\n");
+  cudaFree(d_w);
+  cudaFree(d_a);
+  cudaFree(d_o1);
+  cudaFree(d_o2);
+  cudaFree(d_part);
+  cudaStreamDestroy(s);
+}
+
 void TestTripleUnequal() {
   const int N1 = 512, N2 = 256, N3 = 256, K = 256, M = 16;
   const int bpr = K / 256;
@@ -723,6 +820,7 @@ int main() {
   TestSiluMulQuantizer(4, 11008, 20260855);
   TestSiluMulQuantizer(16, 11008, 20260856);
   TestDualReal();
+  TestSplitsOddN();
   TestTripleUnequal();
   printf("RESULT: %s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
   return g_fail ? 1 : 0;
