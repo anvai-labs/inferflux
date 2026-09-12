@@ -644,6 +644,10 @@ if(ENABLE_CUDA AND CUDAToolkit_FOUND)
     CUDA_STANDARD 17
     CUDA_ARCHITECTURES "${CMAKE_CUDA_ARCHITECTURES}"
   )
+  add_executable(benchmark_q6k_vocab_probe tests/unit/benchmark_q6k_vocab_probe.cu)
+  target_include_directories(benchmark_q6k_vocab_probe PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/external)
+  target_link_libraries(benchmark_q6k_vocab_probe PRIVATE inferflux_core inferflux_cuda_kernels)
   add_executable(test_fa2_prefill tests/unit/test_fa2_prefill.cu
                            runtime/backends/cuda/kernels/flash_attention.cu)
   target_include_directories(test_fa2_prefill PRIVATE

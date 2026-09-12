@@ -199,9 +199,10 @@ __device__ __forceinline__ int UnpackScalesQ45K(const int *scales, int ksc) {
 
 // DS quantizer: half[M, K] -> BlockQ8_1MmqDs[M, K/128], group-major.
 // Same thread mapping as QuantizeRowQ8_1MmqKernel; also emits d*sum(qs).
-static __global__ void QuantizeRowQ8_1MmqDsKernel(
-    const half *__restrict__ x, BlockQ8_1MmqDs *__restrict__ y, int K,
-    int total_rows) {
+static __global__ void
+QuantizeRowQ8_1MmqDsKernel(const half *__restrict__ x,
+                           BlockQ8_1MmqDs *__restrict__ y, int K,
+                           int total_rows) {
   const int row = blockIdx.y;
   if (row >= total_rows)
     return;
@@ -211,17 +212,15 @@ static __global__ void QuantizeRowQ8_1MmqDsKernel(
   if (group >= groups_per_row) {
     return;
   }
-  BlockQ8_1MmqDs &grp =
-      y[static_cast<size_t>(group) * total_rows + row];
+  BlockQ8_1MmqDs &grp = y[static_cast<size_t>(group) * total_rows + row];
   const int lane = t % 32;
 
   const int base = row * K + group * 128 + 4 * lane;
   const half2 h01 = *reinterpret_cast<const half2 *>(&x[base + 0]);
   const half2 h23 = *reinterpret_cast<const half2 *>(&x[base + 2]);
-  const float vals[4] = {__half2float(__low2half(h01)),
-                         __half2float(__high2half(h01)),
-                         __half2float(__low2half(h23)),
-                         __half2float(__high2half(h23))};
+  const float vals[4] = {
+      __half2float(__low2half(h01)), __half2float(__high2half(h01)),
+      __half2float(__low2half(h23)), __half2float(__high2half(h23))};
 
   float amax = fabsf(vals[0]);
   amax = fmaxf(amax, fabsf(vals[1]));
@@ -250,7 +249,8 @@ static __global__ void QuantizeRowQ8_1MmqDsKernel(
     sum32 += __shfl_xor_sync(0xFFFFFFFF, sum32, off);
   }
   if (lane % 8 == 0) {
-    grp.ds[lane / 8] = make_half2(__float2half_rn(d), __float2half_rn(d * sum32));
+    grp.ds[lane / 8] =
+        make_half2(__float2half_rn(d), __float2half_rn(d * sum32));
   }
 }
 
@@ -272,8 +272,7 @@ static __global__ void SiluMulQuantizeQ8_1MmqDsKernel(
   if (group >= groups_per_row) {
     return;
   }
-  BlockQ8_1MmqDs &grp =
-      y[static_cast<size_t>(group) * total_rows + row];
+  BlockQ8_1MmqDs &grp = y[static_cast<size_t>(group) * total_rows + row];
   const int lane = t % 32;
 
   const int base = row * K + group * 128 + 4 * lane;
@@ -324,8 +323,8 @@ static __global__ void SiluMulQuantizeQ8_1MmqDsKernel(
 // Port of load_tiles_q4_K (mmq.cuh:1984-2091), MMA branch.
 template <int mmq_y>
 __device__ __forceinline__ void
-LoadTilesQ4KMma(const char *__restrict__ x, int *__restrict__ x_tile,
-                int kbx0, int i_max, int stride) {
+LoadTilesQ4KMma(const char *__restrict__ x, int *__restrict__ x_tile, int kbx0,
+                int i_max, int stride) {
   constexpr int warp_size = 32;
   int *x_qs = x_tile;
   half2 *x_dm = reinterpret_cast<half2 *>(x_qs + kMmqTileNeK * 2);
@@ -428,8 +427,8 @@ VecDotQ4KQ8_1Mma(const int *__restrict__ x, const int *__restrict__ y,
 #pragma unroll
       for (int k01 = 0; k01 < kMmqTileNeK; k01 += 8) {
         const int k0 = k00 + k01;
-        dm_a[n][l][k01 / 8] = __half22float2(
-            x_dm[i * kMmqMmaTileXKQ81 + k0 / 8]);
+        dm_a[n][l][k01 / 8] =
+            __half22float2(x_dm[i * kMmqMmaTileXKQ81 + k0 / 8]);
       }
     }
   }
@@ -473,7 +472,11 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
     InferfluxMmqQ4KMma(const char *__restrict__ w,
                        const BlockQ8_1MmqDs *__restrict__ act,
                        half *__restrict__ out, int N, int K, int M,
-                       float *__restrict__ partials, int ksplits) {
+                       float *__restrict__ partials, int ksplits,
+                       const char *__restrict__ w2 = nullptr,
+                       half *__restrict__ out2 = nullptr, int n1_tiles = 0,
+                       const char *__restrict__ w3 = nullptr,
+                       half *__restrict__ out3 = nullptr, int n2_tiles = 0) {
   constexpr int warp_size = 32;
   constexpr int QK = 256;
 
@@ -485,13 +488,27 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
   const int blocks_per_row = K / QK;
   const int it = blockIdx.x;
   const int jt = blockIdx.y;
-  const int tile_x_max_i = N - it * kMmqY - 1;
+  // Dual-tensor mode (gate+up fusion): tiles [n1_tiles, gridDim.x) read w2
+  // and write out2 with local tile indices. Single-tensor launches pass
+  // n1_tiles = 0 and w2/out2 alias w/out, so the map is identity.
+  const bool in_w3 = n2_tiles > 0 && it >= n1_tiles + n2_tiles;
+  const bool in_w2 = !in_w3 && n1_tiles > 0 && it >= n1_tiles;
+  const char *w_sel = in_w3 ? w3 : (in_w2 ? w2 : w);
+  half *out_sel = in_w3 ? out3 : (in_w2 ? out2 : out);
+  const int it_local =
+      in_w3 ? it - n1_tiles - n2_tiles : (in_w2 ? it - n1_tiles : it);
+  // Per-segment row stride: fused segments may have different N
+  // (q+k+v fusion: 2048 / 256 / 256).
+  const int seg_n = in_w3 ? static_cast<int>(gridDim.x) * kMmqY -
+                                (n1_tiles + n2_tiles) * kMmqY
+                          : N;
+  const int tile_x_max_i = seg_n - it_local * kMmqY - 1;
   const int tile_y_max_j = M - jt * mmq_x - 1;
 
   float sum[mmq_x * kMmqY / (kMmqMmaWarps * warp_size)] = {0};
 
-  const char *x = w + static_cast<size_t>(it) * kMmqY * blocks_per_row *
-                          sizeof(block_q4_k);
+  const char *x = w_sel + static_cast<size_t>(it_local) * kMmqY *
+                              blocks_per_row * sizeof(block_q4_k);
   constexpr int sz = sizeof(BlockQ8_1MmqDs) / sizeof(int);
   static_assert(sz == kMmqTileYK, "DS row stride must equal tile Y pitch");
   const int *y_base = reinterpret_cast<const int *>(act);
@@ -507,9 +524,9 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
       __syncthreads();
       if (threadIdx.x == 0 && threadIdx.y == 0) {
         // Single-writer dump: rows 0/1/8/16 cols 0..75 + row-0 dm halves.
-        float *dbg = reinterpret_cast<float *>(
-            reinterpret_cast<char *>(out) +
-            static_cast<size_t>(M) * N * sizeof(half));
+        float *dbg = reinterpret_cast<float *>(reinterpret_cast<char *>(out) +
+                                               static_cast<size_t>(M) * N *
+                                                   sizeof(half));
         int k = 0;
         for (int r : {0, 1, 8, 16})
           for (int col = 0; col < 76; ++col)
@@ -528,8 +545,7 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
       {
         const int *src =
             y_base +
-            (static_cast<size_t>(kb0 * QK / 128 + chunk) * M + jt * mmq_x) *
-                sz;
+            (static_cast<size_t>(kb0 * QK / 128 + chunk) * M + jt * mmq_x) * sz;
 #pragma unroll
         for (int l0 = 0; l0 < mmq_x * kMmqTileYK;
              l0 += kMmqMmaWarps * warp_size) {
@@ -545,9 +561,9 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
 #ifdef INFERFLUX_MMA_DEBUG_SUM
       if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0 &&
           threadIdx.y == 0) {
-        float *dbg = reinterpret_cast<float *>(
-            reinterpret_cast<char *>(out) +
-            static_cast<size_t>(M) * N * sizeof(half));
+        float *dbg = reinterpret_cast<float *>(reinterpret_cast<char *>(out) +
+                                               static_cast<size_t>(M) * N *
+                                                   sizeof(half));
         const int base = kb0 * 16 + chunk * 8;
         for (int s2 = 0; s2 < 8; ++s2)
           dbg[base + s2] = sum[s2];
@@ -577,12 +593,12 @@ __global__ void __launch_bounds__(kMmqMmaWarps * 32, 1)
         // clobber rows 0..mmq_x-1 and leave rows mmq_x.. unwritten.
         const int row = jt * mmq_x + j;
         if (ksplits == 1) {
-          out[static_cast<size_t>(row) * N + it * kMmqY + i] =
+          out_sel[static_cast<size_t>(row) * seg_n + it_local * kMmqY + i] =
               __float2half(sum[(j0 / TileC::J + n) * TileC::ne + l]);
         } else {
-          partials[(static_cast<size_t>(blockIdx.z) * M + row) * N +
-                   it * kMmqY + i] =
-              sum[(j0 / TileC::J + n) * TileC::ne + l];
+          partials[(static_cast<size_t>(blockIdx.z) * M + row) *
+                       (gridDim.x * kMmqY) +
+                   it * kMmqY + i] = sum[(j0 / TileC::J + n) * TileC::ne + l];
         }
       }
     }
@@ -804,6 +820,33 @@ static __global__ void ReduceMmqKSplit(const float *__restrict__ partials,
     acc += partials[static_cast<size_t>(s) * mn + idx];
   }
   out[idx] = __float2half(acc);
+}
+
+// Triple-output variant (q+k+v fused launch): the first mn1 elements of
+// the flat [M*(N1+N2+N3)] output go to out1, the rest split between
+// out2 and out3.
+static __global__ void ReduceMmqKSplitTriple(const float *__restrict__ partials,
+                                             half *__restrict__ out1,
+                                             half *__restrict__ out2,
+                                             half *__restrict__ out3,
+                                             int splits, size_t mn1, size_t mn2,
+                                             size_t mn3) {
+  const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t mn = mn1 + mn2 + mn3;
+  if (idx >= mn) {
+    return;
+  }
+  float acc = 0.0f;
+  for (int s = 0; s < splits; ++s) {
+    acc += partials[static_cast<size_t>(s) * mn + idx];
+  }
+  if (idx < mn1) {
+    out1[idx] = __float2half(acc);
+  } else if (idx < mn1 + mn2) {
+    out2[idx - mn1] = __float2half(acc);
+  } else {
+    out3[idx - mn1 - mn2] = __float2half(acc);
+  }
 }
 
 template <int mmq_x>

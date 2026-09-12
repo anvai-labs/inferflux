@@ -42,9 +42,10 @@ struct NativeExecutionPolicy {
   // accumulation. head_dim 128 / GQA 8 / fp16 only. Kernel-vs-kernel rig
   // (benchmark_fa_decode_rig, B=16): warm-L2 1.24-1.65x vs the packed
   // kernel (win grows with kv; cold-L2 parity at kv <= 256), 4-12x vs the
-  // fp32-tile split family. Default off pending in-server A/B;
-  // INFERFLUX_CUDA_ATTN_MMA_DECODE=1 enables.
-  bool enable_attn_mma_decode{false};
+  // fp32-tile split family. Paired in-server A/B at c=16 (4i): +8.5% e2e
+  // (296 vs 273 tok/s) and -8% busy-kernel time. Default on;
+  // INFERFLUX_CUDA_ATTN_MMA_DECODE=0 is the kill switch.
+  bool enable_attn_mma_decode{true};
   // Force K-split >= 2 for decode-MMA projections with M > 8 even when the
   // grid already fills the SM array (large-N shapes pay partial writes +
   // a reduce launch for it). Disable to let the occupancy heuristic decide.
@@ -94,6 +95,11 @@ struct NativeExecutionPolicy {
   bool enable_experimental_q81_grouped_rowquad_m4{false};
   bool enable_experimental_q81_grouped_mmq3{true};
   bool enable_downproj_mmq{false};
+  // 4h/4i sweep: the down-proj MMA utilization knee sits at ~2 waves
+  // (s=6 on 48 SMs for the 16-tile grid), 1.6x over the 1-wave split
+  // count. Used as the floor when the grid under-fills the device;
+  // -1 uses the measured default (6).
+  int downproj_mmq_min_splits{6};
   int downproj_mmq_min_batch_override{-1};
   // mma.sync int8 tensor-core MMQ family (S7/S8): Q4_K gate/up+QKV+o
   // and Q6_K down-proj at M >= 2. Default ON — interleaved 3-round c16
@@ -108,6 +114,14 @@ struct NativeExecutionPolicy {
   // (62us vs 102us, 48us vs 190us warm; MMA sits at the ~51us bandwidth
   // floor at s=6). A/B at c8 decode: +15% tok/s. Below M=4 the row-quad
   // family stays competitive with MMA's fixed launch/quantize overhead.
+  // 4h: minimum K-segment length per split CTA for the MMA tier.
+  // FALSIFIED as a default (Sep 11): folding splits starves the narrow-N
+  // shapes they were compensating for — down-proj N=2048 fell 11.7% -> 1.9%
+  // MEM and qkv/o 32.6% -> 13.7% (fewer CTAs, not more, is the problem
+  // there; gate/up only reaches 57% because 86 N-tiles provide parallelism).
+  // Kept at 0 (off) as the measurement instrument for the splits-sweep
+  // follow-up; raising it re-enables the gate.
+  int mmq_mma_split_min_segment{0};
   int mmq_mma_min_batch{4};
   int mmq_mma_max_batch{16};
   // Prefill M ceiling for the MMA family (S12): prefill chunks (default
@@ -161,9 +175,11 @@ struct NativeExecutionPolicy {
     policy.enable_attn_packed_decode =
         ParseBoolEnv("INFERFLUX_CUDA_ATTN_PACKED_DECODE", true);
     policy.enable_attn_mma_decode =
-        ParseBoolEnv("INFERFLUX_CUDA_ATTN_MMA_DECODE", false);
+        ParseBoolEnv("INFERFLUX_CUDA_ATTN_MMA_DECODE", true);
     policy.mmq_mma_force_split_fat =
         ParseBoolEnv("INFERFLUX_CUDA_MMQ_MMA_FORCE_SPLIT_FAT", true);
+    policy.mmq_mma_split_min_segment =
+        ParseIntEnv("INFERFLUX_CUDA_MMQ_MMA_SPLIT_MIN_SEGMENT", 0, 0, 1 << 20);
     policy.attn_split_chunk =
         ParseIntEnv("INFERFLUX_CUDA_ATTN_SPLIT_CHUNK", 512, 64, 8192);
     policy.attn_split_qsplit_override =

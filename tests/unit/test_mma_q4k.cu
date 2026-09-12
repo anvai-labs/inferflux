@@ -21,18 +21,18 @@
 #include <cstring>
 #include <vector>
 
+using inferflux::runtime::cuda::native::block_q4_k;
 using inferflux::runtime::cuda::native::BlockQ8_1MmqDs;
 using inferflux::runtime::cuda::native::InferfluxMmqQ4KMma;
-using inferflux::runtime::cuda::native::QuantizeRowQ8_1MmqDsKernel;
-using inferflux::runtime::cuda::native::SiluMulQuantizeQ8_1MmqDsKernel;
-using inferflux::runtime::cuda::native::block_q4_k;
 using inferflux::runtime::cuda::native::kMmqMmaTileXKQ81;
 using inferflux::runtime::cuda::native::kMmqMmaWarps;
 using inferflux::runtime::cuda::native::kMmqTileNeK;
 using inferflux::runtime::cuda::native::kMmqTileYK;
 using inferflux::runtime::cuda::native::kMmqY;
 using inferflux::runtime::cuda::native::MmqSmemInts;
+using inferflux::runtime::cuda::native::QuantizeRowQ8_1MmqDsKernel;
 using inferflux::runtime::cuda::native::ReduceMmqKSplit;
+using inferflux::runtime::cuda::native::SiluMulQuantizeQ8_1MmqDsKernel;
 
 namespace {
 
@@ -70,9 +70,10 @@ void QuantizeDsHost(const std::vector<half> &x, int K,
     for (int sub = 0; sub < 4; ++sub) {
       float amax = 0.0f;
       for (int i = 0; i < 32; ++i)
-        amax = fmaxf(amax, fabsf(__half2float(
-                               x[static_cast<size_t>(row) * K + g * 128 +
-                                 sub * 32 + i])));
+        amax = fmaxf(
+            amax,
+            fabsf(__half2float(
+                x[static_cast<size_t>(row) * K + g * 128 + sub * 32 + i])));
       const float d = amax > 0.0f ? amax / 127.0f : 0.0f;
       const float d_inv = amax > 0.0f ? 127.0f / amax : 0.0f;
       float sum32 = 0.0f;
@@ -83,8 +84,7 @@ void QuantizeDsHost(const std::vector<half> &x, int K,
         grp.qs[sub * 32 + i] = static_cast<int8_t>(q);
         sum32 += q;
       }
-      grp.ds[sub] =
-          make_half2(__float2half_rn(d), __float2half_rn(d * sum32));
+      grp.ds[sub] = make_half2(__float2half_rn(d), __float2half_rn(d * sum32));
     }
   }
 }
@@ -119,8 +119,7 @@ void SiluMulQuantizeDsHost(const std::vector<half> &gate,
         grp.qs[sub * 32 + i] = static_cast<int8_t>(q);
         sum32 += q;
       }
-      grp.ds[sub] =
-          make_half2(__float2half_rn(d), __float2half_rn(d * sum32));
+      grp.ds[sub] = make_half2(__float2half_rn(d), __float2half_rn(d * sum32));
     }
   }
 }
@@ -164,8 +163,7 @@ std::vector<half> Run(const std::vector<block_q4_k> &w,
   {
     std::vector<BlockQ8_1MmqDs> dev(gm.size());
     dim3 qgrid((groups + 3) / 4, M);
-    QuantizeRowQ8_1MmqDsKernel<<<qgrid, 128, 0, buf.s>>>(buf.acts, buf.a, K,
-                                                         M);
+    QuantizeRowQ8_1MmqDsKernel<<<qgrid, 128, 0, buf.s>>>(buf.acts, buf.a, K, M);
     cudaMemcpyAsync(dev.data(), buf.a, dev.size() * sizeof(BlockQ8_1MmqDs),
                     cudaMemcpyDeviceToHost, buf.s);
     cudaStreamSynchronize(buf.s);
@@ -185,7 +183,7 @@ std::vector<half> Run(const std::vector<block_q4_k> &w,
                        static_cast<int>(smem));
   InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, buf.s>>>(
       reinterpret_cast<const char *>(buf.w), buf.a, buf.out, N, K, M,
-      buf.partials, ks);
+      buf.partials, ks, reinterpret_cast<const char *>(buf.w), buf.out, 0);
   if (ks > 1) {
     const int rt = 256;
     const size_t rb = (buf.mn + rt - 1) / rt;
@@ -207,14 +205,16 @@ void TestUniform() {
   const int N = 128, K = 256, M = 16;
   std::vector<block_q4_k> w(N);
   for (auto &b : w) {
-    for (int i = 0; i < 128; ++i) b.qs[i] = 0x11; // lo=1, hi=1 nibbles
+    for (int i = 0; i < 128; ++i)
+      b.qs[i] = 0x11; // lo=1, hi=1 nibbles
     // 12-byte k4 scale area: sc0-3 = bytes 0-3 (6-bit); m0-3 = bytes 4-7;
     // sc4-7 low nibbles live in bytes 8-11 (get_scale_min_k4 j>=4 reads
     // q[j+4]). sc=1 everywhere, m=0 everywhere.
-    for (int i = 0; i < 12; ++i) b.scales[i] = 0;
+    for (int i = 0; i < 12; ++i)
+      b.scales[i] = 0;
     for (int j = 0; j < 4; ++j) {
-      b.scales[j] = 1;      // sc0-3 = 1
-      b.scales[j + 8] = 1;  // sc4-7 low nibbles = 1
+      b.scales[j] = 1;     // sc0-3 = 1
+      b.scales[j + 8] = 1; // sc4-7 low nibbles = 1
     }
     const half d = __float2half(1.0f);
     const half dmin = __float2half(0.0f);
@@ -227,9 +227,10 @@ void TestUniform() {
   // ds.y = d * sum(qs) = (1/127) * (32*127) = 32.0 per group.
   for (auto &g : row_major)
     for (int sub = 0; sub < 4; ++sub) {
-      g.ds[sub] = make_half2(__float2half_rn(1.0f / 127.0f),
-                             __float2half_rn(32.0f));
-      for (int i = 0; i < 32; ++i) g.qs[sub * 32 + i] = 127;
+      g.ds[sub] =
+          make_half2(__float2half_rn(1.0f / 127.0f), __float2half_rn(32.0f));
+      for (int i = 0; i < 32; ++i)
+        g.qs[sub * 32 + i] = 127;
     }
   // act value = d*q = 1 for every element -> out = K exactly.
   Buf buf;
@@ -251,7 +252,10 @@ void TestUniform() {
   if (bad)
     ++g_fail;
   printf("\n");
-  cudaFree(buf.w); cudaFree(buf.a); cudaFree(buf.acts); cudaFree(buf.out);
+  cudaFree(buf.w);
+  cudaFree(buf.a);
+  cudaFree(buf.acts);
+  cudaFree(buf.out);
   cudaFree(buf.partials);
 }
 
@@ -259,8 +263,10 @@ void TestShape(int M, int N, int K, int ks, uint32_t seed) {
   const int bpr = K / 256;
   std::vector<block_q4_k> w(static_cast<size_t>(N) * bpr);
   for (auto &b : w) {
-    for (int i = 0; i < 128; ++i) b.qs[i] = Lcg(seed) & 0xFF;
-    for (int i = 0; i < 12; ++i) b.scales[i] = Lcg(seed) & 0xFF;
+    for (int i = 0; i < 128; ++i)
+      b.qs[i] = Lcg(seed) & 0xFF;
+    for (int i = 0; i < 12; ++i)
+      b.scales[i] = Lcg(seed) & 0xFF;
     const half d = __float2half(0.003f + 0.002f * (Lcg(seed) % 1000) / 1000.0f);
     const half dm = __float2half(0.001f);
     std::memcpy(&b.d, &d, 2);
@@ -270,7 +276,8 @@ void TestShape(int M, int N, int K, int ks, uint32_t seed) {
   for (auto &v : acts)
     v = __float2half((static_cast<int>(Lcg(seed) % 2001) - 1000) / 2000.0f);
   std::vector<BlockQ8_1MmqDs> row_major(static_cast<size_t>(M) * K / 128);
-  for (int r = 0; r < M; ++r) QuantizeDsHost(acts, K, row_major, r);
+  for (int r = 0; r < M; ++r)
+    QuantizeDsHost(acts, K, row_major, r);
 
   Buf buf;
   const std::vector<half> out = Run(w, acts, row_major, M, N, K, ks, buf);
@@ -286,13 +293,14 @@ void TestShape(int M, int N, int K, int ks, uint32_t seed) {
           const int k = kb * 256 + e;
           const BlockQ8_1MmqDs &g =
               row_major[static_cast<size_t>(j) * (K / 128) + k / 128];
-          ref += Q4KValue(b, e) *
-                 (__half2float(__low2half(g.ds[(k % 128) / 32])) *
-                  g.qs[k % 128]);
+          ref +=
+              Q4KValue(b, e) *
+              (__half2float(__low2half(g.ds[(k % 128) / 32])) * g.qs[k % 128]);
         }
       }
       const float got = __half2float(out[static_cast<size_t>(j) * N + col]);
-      const double rel = std::fabs((got - ref) / (std::fabs(ref) > 1.0 ? ref : 1.0));
+      const double rel =
+          std::fabs((got - ref) / (std::fabs(ref) > 1.0 ? ref : 1.0));
       max_rel = std::max(max_rel, rel);
     }
 
@@ -304,11 +312,14 @@ void TestShape(int M, int N, int K, int ks, uint32_t seed) {
   // uniform-exact test, not this bound.
   const double tol = K >= 8192 ? 4e-2 : 2e-2;
   const bool ok = max_rel < tol;
-  printf("M=%-2d N=%-6d K=%-5d ks=%d max_rel=%.3e (tol %.0e) %s\n", M, N, K,
-         ks, max_rel, tol, ok ? "PASS" : "FAIL");
+  printf("M=%-2d N=%-6d K=%-5d ks=%d max_rel=%.3e (tol %.0e) %s\n", M, N, K, ks,
+         max_rel, tol, ok ? "PASS" : "FAIL");
   if (!ok)
     ++g_fail;
-  cudaFree(buf.w); cudaFree(buf.a); cudaFree(buf.acts); cudaFree(buf.out);
+  cudaFree(buf.w);
+  cudaFree(buf.a);
+  cudaFree(buf.acts);
+  cudaFree(buf.out);
   cudaFree(buf.partials);
 }
 
@@ -339,8 +350,7 @@ void TestSiluMulQuantizer(int M, int K, uint32_t seed) {
   cudaMalloc(&da, gm.size() * sizeof(BlockQ8_1MmqDs));
   cudaMemcpy(dg, gate.data(), gate.size() * sizeof(half),
              cudaMemcpyHostToDevice);
-  cudaMemcpy(du, up.data(), up.size() * sizeof(half),
-             cudaMemcpyHostToDevice);
+  cudaMemcpy(du, up.data(), up.size() * sizeof(half), cudaMemcpyHostToDevice);
   dim3 qgrid((groups + 3) / 4, M);
   SiluMulQuantizeQ8_1MmqDsKernel<<<qgrid, 128>>>(dg, du, da, K, M);
   std::vector<BlockQ8_1MmqDs> dev(gm.size());
@@ -358,6 +368,312 @@ void TestSiluMulQuantizer(int M, int K, uint32_t seed) {
 }
 
 } // namespace
+
+// Dual-tensor launch (gate+up fusion): tiles [n1_tiles, grid) must read w2
+// and write out2 with local tile indices; the union must match two
+// single-tensor launches exactly.
+void TestDualReal() {
+  const int N = 11008, K = 2048, M = 16; // real gate/up shape
+  const int bpr = K / 256;
+  std::vector<block_q4_k> w1(static_cast<size_t>(N) * bpr);
+  std::vector<block_q4_k> w2(static_cast<size_t>(N) * bpr);
+  uint32_t seed = 12345;
+  auto rnd = [&seed]() {
+    seed ^= seed << 13;
+    seed ^= seed >> 17;
+    seed ^= seed << 5;
+    return static_cast<float>(seed % 2001 - 1000) / 1000.0f;
+  };
+  for (int t = 0; t < 2; ++t) {
+    auto &w = t ? w2 : w1;
+    for (auto &b : w) {
+      for (int i = 0; i < 128; ++i)
+        b.qs[i] = static_cast<unsigned char>(rnd() * 60 + 64);
+      for (int i = 0; i < 12; ++i)
+        b.scales[i] = static_cast<unsigned char>(rnd() * 8);
+      const half d = __float2half(rnd() * 0.5f + 0.5f);
+      const half dmin = __float2half(0.0f);
+      std::memcpy(&b.d, &d, 2);
+      std::memcpy(&b.dmin, &dmin, 2);
+    }
+  }
+  std::vector<half> acts(static_cast<size_t>(M) * K);
+  for (auto &a : acts)
+    a = __float2half(rnd() * 2.0f - 1.0f);
+  // Quantize on device (same kernel the server uses).
+  std::vector<BlockQ8_1MmqDs> row_major(static_cast<size_t>(M) * K / 128);
+  {
+    half *d_in;
+    BlockQ8_1MmqDs *d_q;
+    cudaMalloc(&d_in, acts.size() * sizeof(half));
+    cudaMalloc(&d_q, row_major.size() * sizeof(BlockQ8_1MmqDs));
+    cudaMemcpyAsync(d_in, acts.data(), acts.size() * sizeof(half),
+                    cudaMemcpyHostToDevice);
+    dim3 qgrid((K / 128 + 3) / 4, M);
+    QuantizeRowQ8_1MmqDsKernel<<<qgrid, 128>>>(d_in, d_q, K, M);
+    cudaMemcpy(row_major.data(), d_q, row_major.size() * sizeof(BlockQ8_1MmqDs),
+               cudaMemcpyDeviceToHost);
+    cudaFree(d_in);
+    cudaFree(d_q);
+    cudaGetLastError();
+  }
+
+  cudaStream_t s;
+  cudaStreamCreate(&s);
+  const size_t mn = static_cast<size_t>(M) * N;
+  block_q4_k *d_w1, *d_w2;
+  half *d_acts, *d_out1, *d_out2, *d_ref1, *d_ref2;
+  BlockQ8_1MmqDs *d_ds;
+  float *d_part;
+  cudaMalloc(&d_w1, w1.size() * sizeof(block_q4_k));
+  cudaMalloc(&d_w2, w2.size() * sizeof(block_q4_k));
+  cudaMalloc(&d_acts, acts.size() * sizeof(half));
+  cudaMalloc(&d_ds, row_major.size() * sizeof(BlockQ8_1MmqDs));
+  cudaMalloc(&d_out1, mn * sizeof(half));
+  cudaMalloc(&d_out2, mn * sizeof(half));
+  cudaMalloc(&d_ref1, mn * sizeof(half));
+  cudaMalloc(&d_ref2, mn * sizeof(half));
+  cudaMalloc(&d_part, 8 * mn * sizeof(float));
+  cudaMemcpyAsync(d_w1, w1.data(), w1.size() * sizeof(block_q4_k),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_w2, w2.data(), w2.size() * sizeof(block_q4_k),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_acts, acts.data(), acts.size() * sizeof(half),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_ds, row_major.data(),
+                  row_major.size() * sizeof(BlockQ8_1MmqDs),
+                  cudaMemcpyHostToDevice, s);
+  dim3 grid((N + kMmqY - 1) / kMmqY, (M + 15) / 16, 1);
+  const size_t smem = MmqSmemInts(16) * sizeof(int);
+  cudaFuncSetAttribute(InferfluxMmqQ4KMma<16>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(smem));
+  // Reference: two single-tensor launches.
+  InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, s>>>(
+      reinterpret_cast<const char *>(d_w1), d_ds, d_ref1, N, K, M, nullptr, 1,
+      reinterpret_cast<const char *>(d_w1), d_ref1, 0);
+  InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, s>>>(
+      reinterpret_cast<const char *>(d_w2), d_ds, d_ref2, N, K, M, nullptr, 1,
+      reinterpret_cast<const char *>(d_w2), d_ref2, 0);
+  // Dual: one launch, tiles {0,1} -> w1/out1, tiles {2,3} -> w2/out2.
+  InferfluxMmqQ4KMma<16>
+      <<<dim3(grid.x * 2, grid.y, 1), dim3(32, kMmqMmaWarps, 1), smem, s>>>(
+          reinterpret_cast<const char *>(d_w1), d_ds, d_out1, N, K, M, nullptr,
+          1, reinterpret_cast<const char *>(d_w2), d_out2,
+          (N + kMmqY - 1) / kMmqY);
+  std::vector<half> r1(mn), r2(mn), o1(mn), o2(mn);
+  cudaMemcpyAsync(r1.data(), d_ref1, mn * sizeof(half), cudaMemcpyDeviceToHost,
+                  s);
+  cudaMemcpyAsync(r2.data(), d_ref2, mn * sizeof(half), cudaMemcpyDeviceToHost,
+                  s);
+  cudaMemcpyAsync(o1.data(), d_out1, mn * sizeof(half), cudaMemcpyDeviceToHost,
+                  s);
+  cudaMemcpyAsync(o2.data(), d_out2, mn * sizeof(half), cudaMemcpyDeviceToHost,
+                  s);
+  cudaStreamSynchronize(s);
+  int bad = 0;
+  for (size_t i = 0; i < mn; ++i) {
+    uint16_t b1, b2, r1b, r2b;
+    std::memcpy(&b1, &o1[i], 2);
+    std::memcpy(&b2, &o2[i], 2);
+    std::memcpy(&r1b, &r1[i], 2);
+    std::memcpy(&r2b, &r2[i], 2);
+    if (b1 != r1b) {
+      ++bad;
+      if (bad < 4)
+        printf("  dual out1[%zu]=%.4f want %.4f\n", i, __half2float(o1[i]),
+               __half2float(r1[i]));
+    }
+    if (b2 != r2b) {
+      ++bad;
+      if (bad < 8)
+        printf("  dual out2[%zu]=%.4f want %.4f\n", i, __half2float(o2[i]),
+               __half2float(r2[i]));
+    }
+  }
+  printf("dual tile mapping (N=%d K=%d M=%d): %s", N, K, M,
+         bad ? "FAIL" : "PASS");
+  if (bad)
+    ++g_fail;
+  printf("\n");
+  cudaFree(d_w1);
+  cudaFree(d_w2);
+  cudaFree(d_acts);
+  cudaFree(d_ds);
+  cudaFree(d_out1);
+  cudaFree(d_out2);
+  cudaFree(d_ref1);
+  cudaFree(d_ref2);
+  cudaFree(d_part);
+  cudaStreamDestroy(s);
+}
+
+// Triple-launch (q+k+v fusion) with UNEQUAL segment widths: catches
+// per-segment row-stride bugs (all segments must match three single
+// launches bitwise, splits 1 and 2).
+void TestTripleUnequal() {
+  const int N1 = 512, N2 = 256, N3 = 256, K = 256, M = 16;
+  const int bpr = K / 256;
+  std::vector<block_q4_k> w1(static_cast<size_t>(N1) * bpr);
+  std::vector<block_q4_k> w2(static_cast<size_t>(N2) * bpr);
+  std::vector<block_q4_k> w3(static_cast<size_t>(N3) * bpr);
+  uint32_t seed = 777;
+  for (auto *wp : {&w1, &w2, &w3}) {
+    for (auto &b : *wp) {
+      for (int i = 0; i < 128; ++i) {
+        b.qs[i] = Lcg(seed) & 0xFF;
+      }
+      for (int i = 0; i < 12; ++i) {
+        b.scales[i] = Lcg(seed) & 0xFF;
+      }
+      const half d =
+          __float2half(0.003f + 0.002f * (Lcg(seed) % 1000) / 1000.0f);
+      const half dm = __float2half(0.001f);
+      std::memcpy(&b.d, &d, 2);
+      std::memcpy(&b.dmin, &dm, 2);
+    }
+  }
+  std::vector<half> acts(static_cast<size_t>(M) * K);
+  for (auto &v : acts) {
+    v = __float2half((static_cast<int>(Lcg(seed) % 2001) - 1000) / 2000.0f);
+  }
+  std::vector<BlockQ8_1MmqDs> hq(static_cast<size_t>(M) * (K / 128));
+  for (int r = 0; r < M; ++r) {
+    QuantizeDsHost(acts, K, hq, r);
+  }
+  cudaStream_t s;
+  cudaStreamCreate(&s);
+  const size_t mn1 = static_cast<size_t>(M) * N1;
+  const size_t mn2 = static_cast<size_t>(M) * N2;
+  const size_t mn3 = static_cast<size_t>(M) * N3;
+  block_q4_k *d_w1, *d_w2, *d_w3;
+  inferflux::runtime::cuda::native::BlockQ8_1MmqDs *d_a;
+  half *d_o1, *d_o2, *d_o3, *d_r1, *d_r2, *d_r3;
+  float *d_part;
+  cudaMalloc(&d_w1, w1.size() * sizeof(block_q4_k));
+  cudaMalloc(&d_w2, w2.size() * sizeof(block_q4_k));
+  cudaMalloc(&d_w3, w3.size() * sizeof(block_q4_k));
+  cudaMalloc(&d_a,
+             hq.size() *
+                 sizeof(inferflux::runtime::cuda::native::BlockQ8_1MmqDs));
+  cudaMalloc(&d_o1, mn1 * sizeof(half));
+  cudaMalloc(&d_o2, mn2 * sizeof(half));
+  cudaMalloc(&d_o3, mn3 * sizeof(half));
+  cudaMalloc(&d_r1, mn1 * sizeof(half));
+  cudaMalloc(&d_r2, mn2 * sizeof(half));
+  cudaMalloc(&d_r3, mn3 * sizeof(half));
+  cudaMalloc(&d_part, 8 * (mn1 + mn2 + mn3) * sizeof(float));
+  cudaMemcpyAsync(d_w1, w1.data(), w1.size() * sizeof(block_q4_k),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_w2, w2.data(), w2.size() * sizeof(block_q4_k),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_w3, w3.data(), w3.size() * sizeof(block_q4_k),
+                  cudaMemcpyHostToDevice, s);
+  cudaMemcpyAsync(d_a, hq.data(),
+                  hq.size() *
+                      sizeof(inferflux::runtime::cuda::native::BlockQ8_1MmqDs),
+                  cudaMemcpyHostToDevice, s);
+  const size_t smem =
+      inferflux::runtime::cuda::native::MmqSmemInts(16) * sizeof(int);
+  cudaFuncSetAttribute(inferflux::runtime::cuda::native::InferfluxMmqQ4KMma<16>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize,
+                       static_cast<int>(smem));
+  const dim3 block(32, inferflux::runtime::cuda::native::kMmqMmaWarps, 1);
+
+  int bad = 0;
+  // ks=1 only: the shipped k/v dual forces splits=1, and the single q
+  // launch's own splits path is self-reducing inside its launcher.
+  {
+    dim3 g1((N1 + 127) / 128, (M + 15) / 16, 1);
+    dim3 g2((N2 + 127) / 128, (M + 15) / 16, 1);
+    dim3 g3((N3 + 127) / 128, (M + 15) / 16, 1);
+    inferflux::runtime::cuda::native::InferfluxMmqQ4KMma<16>
+        <<<g1, block, smem, s>>>(reinterpret_cast<const char *>(d_w1), d_a,
+                                 d_r1, N1, K, M, nullptr, 1,
+                                 reinterpret_cast<const char *>(d_w1), d_r1, 0);
+    inferflux::runtime::cuda::native::InferfluxMmqQ4KMma<16>
+        <<<g2, block, smem, s>>>(reinterpret_cast<const char *>(d_w2), d_a,
+                                 d_r2, N2, K, M, nullptr, 1,
+                                 reinterpret_cast<const char *>(d_w2), d_r2, 0);
+    inferflux::runtime::cuda::native::InferfluxMmqQ4KMma<16>
+        <<<g3, block, smem, s>>>(reinterpret_cast<const char *>(d_w3), d_a,
+                                 d_r3, N3, K, M, nullptr, 1,
+                                 reinterpret_cast<const char *>(d_w3), d_r3, 0);
+    // Shipped combination: single q launch + equal-N k/v dual launch.
+    dim3 gq((N1 + 127) / 128, (M + 15) / 16, 1);
+    dim3 gd((N2 + N3 + 127) / 128, (M + 15) / 16, 1);
+    inferflux::runtime::cuda::native::InferfluxMmqQ4KMma<16>
+        <<<gq, block, smem, s>>>(reinterpret_cast<const char *>(d_w1), d_a,
+                                 d_o1, N1, K, M, nullptr, 1,
+                                 reinterpret_cast<const char *>(d_w1), d_o1, 0);
+    inferflux::runtime::cuda::native::InferfluxMmqQ4KMma<16>
+        <<<gd, block, smem, s>>>(
+            reinterpret_cast<const char *>(d_w2), d_a, d_o2, N2, K, M, nullptr,
+            1, reinterpret_cast<const char *>(d_w3), d_o3, N2 / 128);
+    cudaStreamSynchronize(s);
+    std::vector<half> o1(mn1), o2(mn2), o3(mn3), r1(mn1), r2(mn2), r3(mn3);
+    cudaMemcpyAsync(o1.data(), d_o1, mn1 * sizeof(half), cudaMemcpyDeviceToHost,
+                    s);
+    cudaMemcpyAsync(o2.data(), d_o2, mn2 * sizeof(half), cudaMemcpyDeviceToHost,
+                    s);
+    cudaMemcpyAsync(o3.data(), d_o3, mn3 * sizeof(half), cudaMemcpyDeviceToHost,
+                    s);
+    cudaMemcpyAsync(r1.data(), d_r1, mn1 * sizeof(half), cudaMemcpyDeviceToHost,
+                    s);
+    cudaMemcpyAsync(r2.data(), d_r2, mn2 * sizeof(half), cudaMemcpyDeviceToHost,
+                    s);
+    cudaMemcpyAsync(r3.data(), d_r3, mn3 * sizeof(half), cudaMemcpyDeviceToHost,
+                    s);
+    cudaStreamSynchronize(s);
+    for (size_t i = 0; i < mn1; ++i) {
+      uint16_t a, b;
+      std::memcpy(&a, &o1[i], 2);
+      std::memcpy(&b, &r1[i], 2);
+      if (a != b) {
+        ++bad;
+        if (bad < 4)
+          printf("  q o1[%zu] mismatch\n", i);
+      }
+    }
+    for (size_t i = 0; i < mn2; ++i) {
+      uint16_t a, b;
+      std::memcpy(&a, &o2[i], 2);
+      std::memcpy(&b, &r2[i], 2);
+      if (a != b) {
+        ++bad;
+        if (bad < 8)
+          printf("  kv o2[%zu] mismatch (row %zu)\n", i, i / N2);
+      }
+    }
+    for (size_t i = 0; i < mn3; ++i) {
+      uint16_t a, b;
+      std::memcpy(&a, &o3[i], 2);
+      std::memcpy(&b, &r3[i], 2);
+      if (a != b) {
+        ++bad;
+        if (bad < 12)
+          printf("  kv o3[%zu] mismatch (row %zu)\n", i, i / N3);
+      }
+    }
+  }
+  printf("triple unequal-N (N=%d/%d/%d M=%d ks 1+2): %s", N1, N2, N3, M,
+         bad ? "FAIL" : "PASS");
+  if (bad)
+    ++g_fail;
+  printf("\n");
+  cudaFree(d_w1);
+  cudaFree(d_w2);
+  cudaFree(d_w3);
+  cudaFree(d_a);
+  cudaFree(d_o1);
+  cudaFree(d_o2);
+  cudaFree(d_o3);
+  cudaFree(d_r1);
+  cudaFree(d_r2);
+  cudaFree(d_r3);
+  cudaFree(d_part);
+  cudaStreamDestroy(s);
+}
 
 int main() {
   cudaFree(0);
@@ -406,6 +722,8 @@ int main() {
   printf("== silu-mul DS quantizer ==\n");
   TestSiluMulQuantizer(4, 11008, 20260855);
   TestSiluMulQuantizer(16, 11008, 20260856);
+  TestDualReal();
+  TestTripleUnequal();
   printf("RESULT: %s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail);
   return g_fail ? 1 : 0;
 }

@@ -588,6 +588,324 @@ is microseconds; most of the relay's saving overlaps host work that was
 already hidden by the graphs), so this lands primarily as a
 correctness/observability fix that re-activates dead code.
 
+### 4h) ncu per-launch decision table (Sep 10): where the matmul gap really is
+
+Closes the PR-3 conditional ("per-kernel deficit >= 1.3x vs llama's
+mul_mat_q"). Method: ncu SpeedOfLight sections, kernel-filtered captures of
+stock llama-server (B <= 4, `-fa on`) and inferflux_cuda at matched decode
+conditions (graphs OFF for ours — graph replay hides kernels from the launch
+counter; per-kernel SOL is unaffected). Qwen2.5-3B q4_k_m, ~10-token prompts,
+45-64 generated tokens. 80-100-sample windows; numbers are per-kernel means.
+
+| kernel (tier) | n | us | SM% | MEM% |
+|---|---|---|---|---|
+| llama `mul_mat_vec_q` (decode M <= 4) | 36 | 22.1 | 46.5 | **64.4** |
+| ours `mmvq_q4k_group` (decode M = 3) | 23 | — | 76.0 | **76.0** |
+| ours `mmvq_q4k_accum_wide` (M = 3) | 29 | — | 48.2 | **79.9** |
+| ours `mmvq_q6k_accum_vec` (output head) | 24 | — | 67.0 | **74.3** |
+| ours `InferfluxMmqQ4KMma` (M 4-16 tier) | 26-30 | 27.4-30.2 | 11-12 | **32-34** |
+| llama `flash_attn_ext_f16` (decode B <= 4) | 6 | 8.0 | 2.2 | 32.5 |
+| ours `FlashDecodePackedKernel` (B = 3) | 5 | 4.1 | 11.8 | 11.8 |
+
+Findings (decision-grade):
+
+1. **Decode attention, small batch: we are 2x faster** (4.1 vs 8.0 us at
+   matched B ~= 3). The 7.3x gap in 4f is a LARGE-BATCH phenomenon (B = 16,
+   kv 256-1024); the packed kernel and the mma candidate (#137/#138) are the
+   response on that side.
+2. **The vec (dp4a MMVQ) tier beats llama's per-kernel achieved bandwidth**:
+   74-80% of DRAM peak vs their 64%. The PR-3 gate ("our kernels have a
+   >= 1.3x per-kernel deficit -> port llama's stream-K form") is
+   **FALSIFIED for the vec tier** — there is nothing to port; our kernels
+   are already the more efficient implementation at matched conditions.
+3. **The MMA tier (M 4-16) is the outlier**: 32-34% of MEM peak (11% SM) —
+   half the utilization of our own vec tier and half of llama's. Since
+   decode at c >= 4 routes through this tier, it is the prime suspect for
+   the B = 16 matmul-family gap in 4f — NOT the vec tier and NOT llama's
+   kernel design. Next step: extend `benchmark_q4k_mmq_rig` with ncu SOL at
+   matched M in {4, 8, 16} to isolate why the mma.sync path saturates at a
+   third of peak (occupancy 1 block/SM? smem bank conflicts? Q8_1 activation
+   feeding?) before considering any rewrite. NOTE the rig measured the MMA
+   tier FASTER than vec at M >= 9 kernel-vs-kernel — a kernel can win on
+   time while underutilizing (fewer waves, latency effects), so the rig
+   time-interpretation and the ncu utilization must be reconciled at matched
+   M before acting.
+4. Caveats: ncu windows are partial slices (launch-count capped), ours ran
+   eager (no graphs); per-kernel SOL means, not end-to-end.
+
+**Split-geometry correlation (Sep 11, decisive):** grouping in-server mma
+launches by grid (x = N-tiles, y = M-tiles, z = splits), B = 6 decode,
+eager mode — the split count explains the collapse:
+
+| grid (x,y,z) | projection | M bucket | us | SM% | MEM% |
+|---|---|---|---|---|---|
+| (86,1,1) | gate/up 11008x2048 | <= 16 (decode) | 65.1 | 20.2 | **57.3** |
+| (16,1,3) | q_proj / down 2048xK | <= 16 (decode) | 21.5 | 11.3 | **32.6** |
+| (2,1,8) | k/v_proj 256x2048 | <= 16 (decode) | 8.1 | 3.9 | **11.7** |
+| (86,2,1) | gate/up (prefill M 17-32) | 17-32 | 100.1 | 26.9 | 37.3 |
+| (2,2,8) | k/v_proj (prefill), 8 splits | 17-32 | 8.2 | 7.9 | 13.1 |
+| (16,2,2) | qkv/o (prefill), 2 splits | 17-32 | 27.8 | 17.3 | 25.6 |
+
+The same kernel hits 57% of DRAM peak unsplit (matching the rig) and
+collapses monotonically with the split count: 3 splits -> 33%, 8 splits ->
+12%. The #121 forced-split gate ("split only when total_ctas < sm_count")
+is the mechanism: it fires exactly on the narrow-N projections (k/v_proj
+N=256 -> 2 x-tiles; grid x decodes as N/128, so the (2,1,8) rows are
+k/v_proj, not down-proj — down shares the (16,*) signature with q_proj),
+where each split CTA streams a short K-segment with poor memory-level
+parallelism, plus partials+reduce traffic on top. The rig never sees this
+because it launches unsplit.
+
+Fix candidates (policy, not kernel): (a) prefer more N-tiles (128 -> 64)
+over K-splits on narrow-N shapes; (b) gate splits on the per-CTA K-segment
+length (K/splits >= ~4096) instead of CTA count alone; (c) measure
+splits-off for the down-proj in-server. Any fix must beat the CURRENT
+numbers end-to-end at c=8/16 with the dispatch trace confirming engagement.
+Also note: the reduce kernel after 8-split down-proj runs at 67% MEM —
+the partials round-trip is real traffic, not free.
+
+**Segment-length gate falsified (Sep 11):** the direct test of (b) — capping
+splits so K/splits >= 4096 (folded down-proj to 1 split, qkv/o to 1) — made
+both WORSE: down-proj 11.7% -> 1.9% MEM (8.1 -> 50.3 us), qkv/o 32.6% ->
+13.7% (21.5 -> 51.0 us). Causal correction: the narrow-N shapes are CTA-STARVED, not split-degraded — splits were raising CTA count (down: 2 CTAs
+unsplit -> 16 at 8 splits, a 6x utilization gain) and the real problem is
+the low N-parallelism (gate/up reaches 57% because 86 N-tiles exist, not
+because it is unsplit). The knob ships default-off
+(`INFERFLUX_CUDA_MMQ_MMA_SPLIT_MIN_SEGMENT`, 0) as the measurement
+instrument. Revised fix candidates: (a') reduce the MMA N-tile width
+(kMmqY 1024) on narrow-N shapes to raise CTA count at full K — kernel-side
+but tiling-only; (b') raise `kMmqMmaMaxSplits` (8) for down-proj with the
+reduce kernel verified at 67% MEM.
+
+**Splits-sweep (Sep 11, rig `MMA splits=N` rows, cold-L2, M=16):** the
+tradeoff curves show the #121 policy choices are already near-optimal per
+shape — the 4h "policy is the problem" hypothesis is REFINED:
+
+- qkv/o (16 CTAs at splits=1): optimum at splits 4-8 (16.8-17.2 us, ~148
+  GB/s); splits=1 is 2.3x worse (38.5 us). Policy picks 3 — near-optimal.
+- gate/up (86 CTAs): splits=1 optimal (42.6 us, **307 GB/s = 53% of
+  peak**, near the practical streaming wall); every split hurts
+  (splits=32 is 3.5x worse). Policy picks 1 — optimal.
+- down (16 CTAs, K=11008): optimum at splits 4-16 (54-57 us, 229-242
+  GB/s); splits=1 is 3.2x worse. Policy picks 4 — near-optimal.
+
+Implications: (1) the low qkv/o utilization (~148 GB/s, 26% of peak even
+at optimal splits) is the K=2048 short-stream shape limit, not dispatch;
+(2) gate/up dominates absolute MMA time and is near the wall; (3) the
+1.86x matmul family gap in 4f was measured against the OLD kernel mix —
+re-profiled fresh at HEAD below (4i).
+
+### 4i) Fresh family re-profile at HEAD (Sep 11): the gap persists, and it is launch-structure
+
+Re-ran the 4f battery (48 x 256 tokens, c = 16, q4_k_m) at current HEAD
+under node-level nsys on all three engines (llama-server `-np 16 -c 16384
+-fa on`; ours shipped-default = packed attention; ours with
+INFERFLUX_CUDA_ATTN_MMA_DECODE=1). Same 12,288 tokens each, 48/48 complete.
+
+| engine | profiled e2e | busy-kernel sum | us/tok |
+|---|---|---|---|
+| llama-server | 622 tok/s | 14.5 s | 1,184 |
+| ours (packed) | 273 tok/s | 41.7 s | 3,390 |
+| ours (mma attn) | **296 tok/s (+8.5% paired)** | 38.3 s (**-8% busy**) | 3,121 |
+
+(kernel-sum, not merged-interval — overlapped kernels double-count, so
+absolute us/tok runs higher than 4f's union method; the within-method
+ratios are the signal. The paired +8.5% e2e for the mma path is the
+first clean e2e confirmation of the rig prediction.)
+
+Top kernels by time (ours vs llama):
+
+- **Q4_K MMA: 17.3 s / 352k launches vs llama `mul_mat_q` 7.2 s / 166k** —
+  same avg duration (~43-49 us), TWICE the instance count. Launch-
+  structure gap, not per-kernel gap: llama fuses gate+up into one
+  mul_mat_q and runs qkv as one; we launch q, k, v, gate, up separately
+  (k/v are N=256 launches with 8 splits each — the (2,1,8) rows in 4h).
+- **Q6_K MMA (vocab/head): 5.5-5.9 s at 240 us avg vs llama's Q6_K 2.6 s
+  at 92 us** — 2.6x per launch on the largest single projection.
+- Attention is no longer the story: 1.7-2.3 s vs llama 0.8 s (down from
+  the 4f 7.3x per-token gap; the packed/mma kernels and splits tuned in
+  this campaign did that).
+
+**Down-proj split fix (Sep 11, landed with this section):** the
+down-proj launchers' underfill branch now floors the split count at
+`downproj_mmq_min_splits` (default 6, the sweep knee) — measured
+in-server at c=16: grid (16,1,3) 176 us -> (16,1,6) **128 us (-27%
+per launch)**, battery 48/48. The Q4_K/Gemv launchers keep the
+1-wave heuristic (their curves confirmed it near-optimal).
+
+**Q6_K correction + split (Sep 11, sqlite grid analysis of the 4i
+capture):** the 22.8k `InferfluxMmqQ6KMma` launches behind the "240 us
+avg" are TWO populations:
+
+- **grid (1187,1,1) = the vocab head** (token_embd Q6_K, N=151936 ->
+  1187 tiles): 1,201 launches at **1,391 us each (1.67 s total)**. The
+  bandwidth floor for [16, 2048] x [2048, 151936] is ~325 us (~187 MB
+  at ~576 GB/s), so the head runs ~4.3x above the floor — the largest
+  single-kernel headroom on the board.
+  ISOLATED-KERNEL MEASUREMENT (benchmark_q6k_vocab_probe, Sep 11): the
+  production Q6_K MMA kernel at the vocab shape achieves only **238
+  GB/s** (1,093 us at splits=1, M=16; splits=2 is worse; M-independent)
+  vs 184 GB/s for the down shape at its optimum. So ~40% of the gap to
+  the floor is KERNEL quality (short-K streams through the mma tile
+  machinery at 1187 CTAs), not launch conditions — a bandwidth-optimal
+  streaming kernel (GEMV-style, no mma tiles) targeting 450+ GB/s
+  would save ~0.9 s of battery busy time. This is the justified
+  next kernel build.
+  **FALSIFIED (Sep 11, probe v1+v2):** two streaming-GEMV variants
+  (warp-per-row scalar dequant; then element-major transposed acts with
+  uint4 vectorized loads) measured 8,857 us and 7,255 us — 7-8x SLOWER
+  than the mma kernel's 1,025 us. Root cause: at M=16 the per-element
+  scalar dequant + 16 FMA arithmetic dominates (~10 G flops/battery on
+  the CUDA cores) — the mma tiles amortize exactly that via tensor
+  cores. The vocab shape is NOT reachable by a simpler kernel; closing
+  its gap requires mma-kernel-level optimization (ncu on the 1187-CTA
+  vocab launches). Both variants are kept in the probe as the recorded
+  negative result (max_rel 0.0000 vs the mma output — correct but
+  slow).
+  **ncu root cause for the mma kernel's vocab gap (Sep 11):** per
+  launch, `l1tex` global-load sectors total **48.16M = 1.54 GB — 7.6x
+  the 202 MB of q6_k weight data** — with MEM% at 76.6 and achieved
+  occupancy 32.8% (121 regs/thread, 12.4 waves). The kernel's tile
+  staging re-reads each weight byte ~7.6x (non-vectorized loads at the
+  210-byte q6_k row stride; ql/qh/scales are separate sub-arrays). The
+  fix is vectorized (uint4) tile staging in the Q6_K (and likely Q4_K)
+  mma tile loader — a kernel-internal change with a clean ncu metric
+  to gate it (L1 sectors per launch ~6.3M = 1x the data).
+
+**Deprioritized (Sep 12, down-control comparison + wall analysis):** the
+same ncu capture on the down-shape control shows NO amplification
+(0.65M sectors / 96 CTAs = 217 KB per CTA = exactly the useful data),
+while the vocab shows 6x — but the vocab's isolated throughput (238-254
+GB/s at boost clocks) already sits at the PRACTICAL streaming wall for
+this access pattern established by the bf16 falsification (40-60% of
+peak cold-L2; the "4x over the ideal floor" framing was against an
+unreachable ceiling). Remaining vocab headroom is ~1.3-1.4x (~0.3 s of
+battery busy, ~1% e2e) and would need the heavyweight streaming design
+falsified for the bf16 GEMV. The vocab kernel target is DEPRIORITIZED;
+achieving it would also leapfrog llama (their vocab runs the same
+~1.17 ms).
+- **grid (16,1,3) = the down-proj** (ffn_down Q6_K, N=2048, 3 splits):
+  21,621 launches at **176 us avg (3.81 s total)** — ~3x the q6k rig's
+  kernel time (51-62 us) on the same shape. Suspect: the split count
+  (3) or the Q6_K split efficiency; needs the same rig splits-sweep as
+  the Q4_K kernel (benchmark_q6k_kernels extension).
+
+**Down-proj and vocab vs llama at matched shape (Sep 11, llama-side
+sqlite analysis of the same 4i battery):**
+
+- **Down-proj Q6_K: llama 64 us vs our 128 us (post-fix)** — llama's
+  grid is (48,1,1): 16 N-tiles x 3 K-chunks FLATTENED into grid.x,
+  stream-K style, combined by `mul_mat_q_stream_k_fixup` (221k fixup
+  launches per battery — their whole matmul family works this way). No
+  partials gmem round-trip. Our (16,1,6) + ReduceMmqKSplit does the
+  same work with a partials write/read. The measured 2x justifies
+  porting stream-K split handling (fold splits into grid.x + fixup
+  kernel) to the Mmq tier — the split-policy knobs then become
+  unnecessary for these shapes.
+- **Vocab head: llama 1,169 us ~= ours 1,391 us** — a SHARED
+  inefficiency (both ~4x over the ~325 us bandwidth floor at this
+  shape). A bandwidth-optimal vocab kernel (pure streaming, no mma
+  tile machinery) would leapfrog llama by ~1 s of battery busy time
+  rather than match it.
+
+**Stream-K assessment input (Sep 12):** matched-duration comparison of
+the Q6_K down-proj: llama (48,1,1) 64 us vs ours (16,1,6) 128 us — a
+real 2x at ~matched clocks (both engines sustained-throttled during
+the battery). Ours at the rig-optimal s=6 with partials+reduce; theirs
+stream-K flattened with a fixup kernel. The gap decomposes into (a)
+the partials gmem round-trip (~4 us of the 64 — small), and (b) per-CTA
+efficiency: our 96 short-K CTAs vs their 48 full-K CTAs at 1 wave. A
+stream-K port (flattened grid, fixup combine) is the remaining lever;
+ncu SOL comparison on llama-server was impractical (graph-replay
+collection hangs), so the port decision carries nsys-duration evidence
+only. Sizeable kernel project — queued behind higher-value work.
+
+**Reordering insight (Sep 12):** llama's 48 CTAs at 1 wave process the
+SAME per-CTA K (3,669 elems) as our s=3 config (48 CTAs, 176 us
+in-server) — 2.75x apart. That points at the per-CTA staging
+efficiency (our 4-byte unaligned loads at the 210-byte q6_k stride,
+the same family as the vocab-shape L1 amplification), NOT the wave
+structure. The staging-vectorization experiment in the rig
+(benchmark_q6k_kernels: uint4 ql/qh loads vs LoadPackedInt32Unaligned,
+gated by L1-sectors + duration) comes BEFORE any stream-K port — if
+staging closes the 2x, stream-K becomes unnecessary; if not, stream-K
+is layered on the faster base.
+
+**Staging comparison result (Sep 12):** our `LoadTilesQ6KMma` is a
+faithful port of llama's current `load_tiles_q6_K` — same loop
+structure, same 4-byte `get_int_b2`-style loads, same nibble unpacking
+(the only delta is llama's `i = min(i, i_max)` clamp vs our
+break/continue, both uniform-loop-safe). No staging divergence exists
+to fix. The 2x down-proj gap lives in the inner pipeline: llama's
+vec_dot/mma scheduling (deeper unroll, different fragment pipelining)
+processes each staged tile faster. Closing it = pipeline-level ncu
+work (instruction-throughput analysis of both kernels at the down
+shape), a deep project with ~5% e2e upside (down-proj Q6_K is 3.8-5.5
+s of busy). Ranked behind anything else on the board at equal effort.
+Tooling note for the pipeline project (Sep 12): our kernel's
+instruction profile at the down shape is lean (6.84 M inst/launch,
+0.78 M global loads = vectorized, 0.019 inst/MAC) - no low-hanging
+instruction waste. The llama-side instruction comparison remains
+blocked: ncu on llama-server hangs in graph-replay collection, and
+llama.cpp test-backend-ops q6_K perf launches no mul_mat_q-matching
+kernels from its wrapper. The pipeline project needs either a
+graphs-disabled llama build or a custom runner replicating the
+mul_mat_q tile decomposition before the instruction-level
+divergence can be identified.
+[2N, K] launch; fold k/v into the q launch or at least share their
+split geometry), (2) Q6_K vocab-matmul efficiency (ncu per-launch vs
+llama's type-14 mul_mat_q), (3) the mma default-on flip once (1)+(2)
+land (the paired +8.5% already justifies it at c=16 decode-heavy).
+
+**Launch-fusion status update (Sep 11):** gate+up dual launch landed
+(#147). The q+k+v triple MMA launch is implemented
+(`GemvMmqMmaTriplePrequantized` + per-tile triple-pointer selection in
+the kernel + a triple-output reduce) and validated, but at DECODE
+widths the live q/k/v path routes through the **Q8_1 grouped GEMV
+family** (`q8_1_mixed` operator — `fused_dequant_gemv_q4k_q8_1_group`
+et al., 2.6 s of 4i busy), not the Q4_K MMA tier: the triple engages
+only at prefill-scale M (<= 16) through the normalized-projection
+sites. The decode q/k/v fusion target is therefore the Q8_1 grouped
+dispatcher (fuse the per-projection grouped launches), which is a
+different, smaller-grained family. The triple wiring ships behind
+INFERFLUX_CUDA_QKV_TRIPLE_LAUNCH (default on) and is exercised at
+prefill; kill switch restores the 3-launch path.
+
+**Resolved (Sep 12):** the Q8_1 grouped family ALREADY fuses the
+decode q/k/v — `GemvQ8_1Pair` (q+k, Q4_K) + `GemvQ8_1` (v, Q6_K
+in q4_k_m models) = 2 launches for 3 projections, with
+`GemvQ8_1Triple` reserved for all-same-type models. The per-segment
+stride lesson from the Mmq multi-segment work applies there too:
+`GemvQ8_1Pair`/`Triple` handle differing N via per-projection output
+cols in their spec arrays. No further q/k/v fusion work is needed;
+the decode-projection queue narrows to the vocab kernel (4h L1
+amplification) and the stream-K port assessment.
+
+### 4j) SUSTAINED-LOAD CLOCKS: the rig-vs-server multiplier explained (Sep 11)
+
+Clock sampling during the 48 x 256 c=16 battery: SM clocks sit at
+**1,425-1,485 MHz** for the whole run — under half the 3,105 MHz max
+boost — while power is only ~60 W of the 130 W cap and die temp 34-36 C.
+No throttle reason flags active (not power, not thermal): DVFS simply
+does not hold boost clocks under sustained load in this (WSL2)
+environment. Short rig bursts (~5 ms) sample near boost.
+
+This one multiplier explains every "in-server kernel runs 1.5-2.3x its
+rig time" observation in 4h/4i (gate/up 57% rig vs 32% server; down-proj
+52-62 us rig vs 128 us server). DRAM bandwidth is clock-independent, so
+pure-bandwidth headroom claims survive; compute-latency-bound headroom
+claims must be halved at sustained clocks.
+
+Ops lever (needs one sudo command per boot, untested):
+`sudo nvidia-smi -lgc 2100` — holding ~2.1 GHz would be worth ~+45%
+e2e for free if the workload is clock-bound at sustained load.
+
+Also recorded: shipped-default HEAD (mma attention default-on +
+gate/up fusion + down-proj split floor) measured **457 tok/s
+unprofiled** on this battery, up from the 4i shipped-default band
+(273-330 profiled / ~330-458 unprofiled). The campaign's e2e gains
+survived contact with the real clock environment.
+
 ## 5) Measurement protocol (keep using it)
 
 - nsys captures without env instrumentation; treat

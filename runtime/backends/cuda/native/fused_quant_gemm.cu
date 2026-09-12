@@ -12,6 +12,7 @@
 #include "server/logging/logger.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
 #include <cstdint>
@@ -2067,6 +2068,151 @@ bool FusedQuantGemm::QuantizeForMmqMma(
   return cudaPeekAtLastError() == cudaSuccess;
 }
 
+bool FusedQuantGemm::GemvMmqMmaGateUpDualPrequantized(
+    const QuantizedWeightInfo &w1, const QuantizedWeightInfo &w2,
+    const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *out1, half *out2,
+    int M, int N, int K, cudaStream_t stream,
+    const NativeExecutionPolicy *policy) {
+  // One launch for both gate and up: grid.x covers 2N rows split across
+  // the two weight pointers (tiles [0, N/128) -> w1/out1, the rest ->
+  // w2/out2). Splits are forced to 1: the 4h sweep measured splits=1
+  // optimal for the wide gate/up shape (86+ tiles > SM count) and the
+  // dual-output reduce would need a second kernel variant.
+  using namespace runtime::cuda::native;
+  const auto &p = ResolveExecutionPolicy(policy);
+  if (!p.enable_mmq_mma || !w1.data || !w2.data || !ds_act || !out1 || !out2 ||
+      M < 2 || N <= 0 || K <= 0 ||
+      static_cast<size_t>(N) * K != static_cast<size_t>(w1.num_elements) ||
+      static_cast<size_t>(N) * K != static_cast<size_t>(w2.num_elements) ||
+      w1.quant_type != w2.quant_type ||
+      static_cast<GGUF::TensorType>(w1.quant_type) != GGUF::TensorType::Q4_K ||
+      K % QK_K != 0) {
+    return false;
+  }
+  static bool smem_configured = false;
+  static size_t configured_smem = 0;
+  const size_t smem = MmqSmemInts(16) * sizeof(int);
+  if (!smem_configured || configured_smem != smem) {
+    if (cudaFuncSetAttribute(InferfluxMmqQ4KMma<16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(smem)) != cudaSuccess) {
+      return false;
+    }
+    smem_configured = true;
+    configured_smem = smem;
+  }
+  static int sm_count = [] {
+    cudaDeviceProp prop{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+      return 0;
+    }
+    return prop.multiProcessorCount;
+  }();
+  if (sm_count <= 0) {
+    return false;
+  }
+  (void)p;
+  const int n1_tiles = (N + kMmqY - 1) / kMmqY;
+  const int n_tiles = n1_tiles * 2;
+  dim3 grid(n_tiles, (M + 15) / 16, 1);
+  InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
+      static_cast<const char *>(w1.data), ds_act, out1, N, K, M, nullptr, 1,
+      static_cast<const char *>(w2.data), out2, n1_tiles);
+  return cudaPeekAtLastError() == cudaSuccess;
+}
+
+bool FusedQuantGemm::GemvMmqMmaTriplePrequantized(
+    const QuantizedWeightInfo &w1, const QuantizedWeightInfo &w2,
+    const QuantizedWeightInfo &w3,
+    const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *out1, half *out2,
+    half *out3, float *partials, int M, int N1, int N2, int N3, int K,
+    cudaStream_t stream, const NativeExecutionPolicy *policy) {
+  // One launch for three same-K Q4_K projections (q+k+v): grid.x covers
+  // N1+N2+N3 rows split across the three weight/output pointer pairs.
+  // Split count from the standard underfill heuristic.
+  using namespace runtime::cuda::native;
+  const auto &p = ResolveExecutionPolicy(policy);
+  if (!p.enable_mmq_mma || !w1.data || !w2.data || !w3.data || !ds_act ||
+      !out1 || !out2 || !out3 || M < 2 || N1 <= 0 || N2 <= 0 || N3 <= 0 ||
+      K <= 0 || N1 % kMmqY != 0 || N2 % kMmqY != 0 || N3 % kMmqY != 0 ||
+      static_cast<size_t>(N1) * K != static_cast<size_t>(w1.num_elements) ||
+      static_cast<size_t>(N2) * K != static_cast<size_t>(w2.num_elements) ||
+      static_cast<size_t>(N3) * K != static_cast<size_t>(w3.num_elements) ||
+      w1.quant_type != w2.quant_type || w2.quant_type != w3.quant_type ||
+      N2 != N1 || N3 != N1 ||
+      static_cast<GGUF::TensorType>(w1.quant_type) != GGUF::TensorType::Q4_K ||
+      K % QK_K != 0) {
+    // N2/N3 must equal N1: the per-tile row mapping is only proven for
+    // equal-width segments (the unequal-N case mis-maps rows past the
+    // first per segment — see TestTripleUnequal).
+    return false;
+  }
+  static bool smem_configured = false;
+  static size_t configured_smem = 0;
+  const size_t smem = MmqSmemInts(16) * sizeof(int);
+  if (!smem_configured || configured_smem != smem) {
+    if (cudaFuncSetAttribute(InferfluxMmqQ4KMma<16>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(smem)) != cudaSuccess) {
+      return false;
+    }
+    smem_configured = true;
+    configured_smem = smem;
+  }
+  static int sm_count = [] {
+    cudaDeviceProp prop{};
+    int dev = 0;
+    if (cudaGetDevice(&dev) != cudaSuccess ||
+        cudaGetDeviceProperties(&prop, dev) != cudaSuccess) {
+      return 0;
+    }
+    return prop.multiProcessorCount;
+  }();
+  if (sm_count <= 0) {
+    return false;
+  }
+  const int n1_tiles = N1 / kMmqY;
+  const int n2_tiles = N2 / kMmqY;
+  const int n3_tiles = N3 / kMmqY;
+  const int n_tiles = n1_tiles + n2_tiles + n3_tiles;
+  const int total_ctas = n_tiles * ((M + 15) / 16);
+  int splits = 1;
+  if (total_ctas < sm_count) {
+    splits = std::min((sm_count + total_ctas - 1) / total_ctas,
+                      static_cast<int>(kMmqMmaMaxSplits));
+  }
+  // partials must hold M * (N1+N2+N3) * splits floats (caller-owned,
+  // same contract as the prequantized single/dual launchers).
+  const size_t mn = static_cast<size_t>(M) * n_tiles * kMmqY;
+  if (splits > 1 && !partials) {
+    return false;
+  }
+  dim3 grid(n_tiles, (M + 15) / 16, splits);
+  InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
+      static_cast<const char *>(w1.data), ds_act, out1, N1, K, M,
+      splits > 1 ? partials : nullptr, splits,
+      static_cast<const char *>(w2.data), out2, n1_tiles,
+      static_cast<const char *>(w3.data), out3, n2_tiles);
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+    return false;
+  }
+  if (splits > 1) {
+    const int rthreads = 256;
+    const size_t rblocks = (mn + rthreads - 1) / rthreads;
+    ReduceMmqKSplitTriple<<<rblocks, rthreads, 0, stream>>>(
+        partials, out1, out2, out3, splits, static_cast<size_t>(M) * N1,
+        static_cast<size_t>(M) * N2, static_cast<size_t>(M) * N3);
+    err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      return false;
+    }
+  }
+  return true;
+}
+
 bool FusedQuantGemm::GemvMmqMmaPrequantized(
     const QuantizedWeightInfo &weight,
     const runtime::cuda::native::BlockQ8_1MmqDs *ds_act, half *output,
@@ -2120,10 +2266,18 @@ bool FusedQuantGemm::GemvMmqMmaPrequantized(
       (p.mmq_mma_force_split_fat || total_ctas < sm_count)) {
     splits = std::max(splits, 2);
   }
+  // 4h: splitting short K-segments defeats memory-level parallelism —
+  // in-server utilization falls monotonically with split count once
+  // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
+  // at 8 on the same kernel). 0 disables the gate.
+  if (p.mmq_mma_split_min_segment > 0) {
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
+  }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
       static_cast<const char *>(weight.data), ds_act, output, N, K, M,
-      splits > 1 ? partials : nullptr, splits);
+      splits > 1 ? partials : nullptr, splits,
+      static_cast<const char *>(weight.data), output, 0);
   if (splits > 1) {
     const size_t mn = static_cast<size_t>(M) * N;
     const int rthreads = 256;
@@ -2196,6 +2350,13 @@ bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
     // writes + reduce launch when the knob is disabled.
     splits = std::max(splits, 2);
   }
+  // 4h: splitting short K-segments defeats memory-level parallelism —
+  // in-server utilization falls monotonically with split count once
+  // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
+  // at 8 on the same kernel). 0 disables the gate.
+  if (p.mmq_mma_split_min_segment > 0) {
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
+  }
 
   dim3 qgrid((K / 128 + 3) / 4, M);
   QuantizeRowQ8_1MmqDsKernel<<<qgrid, 128, 0, stream>>>(input, ds_act, K, M);
@@ -2203,7 +2364,8 @@ bool FusedQuantGemm::GemvMmqMma(const QuantizedWeightInfo &weight,
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
       static_cast<const char *>(weight.data), ds_act, output, N, K, M,
-      splits > 1 ? partials : nullptr, splits);
+      splits > 1 ? partials : nullptr, splits,
+      static_cast<const char *>(weight.data), output, 0);
   if (splits > 1) {
     const size_t mn = static_cast<size_t>(M) * N;
     const int rthreads = 256;
@@ -2304,14 +2466,25 @@ bool FusedQuantGemm::DownProjMmqMmaQ4K(
   const int total_ctas = n_tiles * ((M + 15) / 16);
   int splits = 1;
   if (total_ctas < sm_count) {
-    splits = std::min((sm_count + total_ctas - 1) / total_ctas,
+    // 4h/4i sweep (benchmark_q6k_kernels + q4k rig, down shape): the
+    // utilization knee is at ~2 waves (96 blocks on 48 SMs), well past
+    // the 1-wave target - s=6 measured 1.6x over ceil(SM/tiles)=3.
+    splits = std::min(std::max((sm_count + total_ctas - 1) / total_ctas,
+                               p.downproj_mmq_min_splits),
                       static_cast<int>(kMmqMmaMaxSplits));
   }
-
+  // 4h: splitting short K-segments defeats memory-level parallelism —
+  // in-server utilization falls monotonically with split count once
+  // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
+  // at 8 on the same kernel). 0 disables the gate.
+  if (p.mmq_mma_split_min_segment > 0) {
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
+  }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ4KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
       static_cast<const char *>(weight.data), ds_act, output, N, K, M,
-      splits > 1 ? partials : nullptr, splits);
+      splits > 1 ? partials : nullptr, splits,
+      static_cast<const char *>(weight.data), output, 0);
   if (splits > 1) {
     const size_t mn = static_cast<size_t>(M) * N;
     const int rthreads = 256;
@@ -2389,10 +2562,20 @@ bool FusedQuantGemm::DownProjMmqMma(
   const int total_ctas = n_tiles * ((M + 15) / 16);
   int splits = 1;
   if (total_ctas < sm_count) {
-    splits = std::min((sm_count + total_ctas - 1) / total_ctas,
+    // 4h/4i sweep (benchmark_q6k_kernels + q4k rig, down shape): the
+    // utilization knee is at ~2 waves (96 blocks on 48 SMs), well past
+    // the 1-wave target - s=6 measured 1.6x over ceil(SM/tiles)=3.
+    splits = std::min(std::max((sm_count + total_ctas - 1) / total_ctas,
+                               p.downproj_mmq_min_splits),
                       static_cast<int>(kMmqMmaMaxSplits));
   }
-
+  // 4h: splitting short K-segments defeats memory-level parallelism —
+  // in-server utilization falls monotonically with split count once
+  // K/splits drops below ~4K (measured 57% unsplit, 33% at 3 splits, 12%
+  // at 8 on the same kernel). 0 disables the gate.
+  if (p.mmq_mma_split_min_segment > 0) {
+    splits = std::min(splits, std::max(1, K / p.mmq_mma_split_min_segment));
+  }
   dim3 grid(n_tiles, (M + 15) / 16, splits);
   InferfluxMmqQ6KMma<16><<<grid, dim3(32, kMmqMmaWarps, 1), smem, stream>>>(
       static_cast<const char *>(weight.data), act_mmq, output, N, K, M,

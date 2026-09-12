@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
@@ -1846,6 +1847,13 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
               },
               [&]() {
                 bool norm_computed = (qkv_norm == nullptr);
+                // 4i launch fusion: set by the q-slot when the fused
+                // q+k+v mma launch covered all three projections.
+                bool qkv_fused = false;
+                static const bool qkv_triple_ok = [] {
+                  const char *e = getenv("INFERFLUX_CUDA_QKV_TRIPLE_LAUNCH");
+                  return !e || e[0] != '0';
+                }();
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
@@ -1862,6 +1870,50 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
+                          if constexpr (std::is_same_v<T, half>) {
+                            static const bool qkv_fused_ok = [] {
+                              const char *e =
+                                  getenv("INFERFLUX_CUDA_QKV_FUSED_LAUNCH");
+                              return !e || e[0] != '0';
+                            }();
+                            // 4i launch fusion: one quantize feeds q (single
+                            // mma) and k+v (the proven equal-N dual launch,
+                            // one more) — 2 launches instead of 3.
+                            if (qkv_fused_ok && seq_len >= 2 &&
+                                FusedQuantGemm::QuantizeForMmqMma(
+                                    d_norm_out_,
+                                    static_cast<
+                                        runtime::cuda::native::BlockQ8_1MmqDs
+                                            *>(d_act_q8_1_mmq_),
+                                    seq_len, hidden_size_, stream_,
+                                    &execution_policy_) &&
+                                FusedQuantGemm::GemvMmqMmaPrequantized(
+                                    q_raw,
+                                    static_cast<const runtime::cuda::native::
+                                                    BlockQ8_1MmqDs *>(
+                                        d_act_q8_1_mmq_),
+                                    d_q_, d_mma_partials_, seq_len,
+                                    num_heads_ * head_dim_, hidden_size_,
+                                    stream_, &execution_policy_) &&
+                                FusedQuantGemm::
+                                    GemvMmqMmaGateUpDualPrequantized(
+                                        k_raw, v_raw,
+                                        static_cast<const runtime::cuda::
+                                                        native::BlockQ8_1MmqDs
+                                                            *>(d_act_q8_1_mmq_),
+                                        d_k_new_, d_v_new_, seq_len,
+                                        num_kv_heads_ * head_dim_, hidden_size_,
+                                        stream_, &execution_policy_)) {
+                              qkv_fused = true;
+                              LogPackedGemmPath("q_proj",
+                                                "using Q4_K MMA projection");
+                              LogPackedGemmPath(
+                                  "k_proj", "using Q4_K MMA k/v dual launch");
+                              LogPackedGemmPath(
+                                  "v_proj", "using Q4_K MMA k/v dual launch");
+                              return true;
+                            }
+                          }
                           return TryQuantizedProjection(
                               pctx, q_raw, d_norm_out_, d_q_, seq_len,
                               num_heads_ * head_dim_, hidden_size_, "q_proj");
@@ -1894,6 +1946,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
+                          if (qkv_fused) {
+                            return true;
+                          }
                           return TryQuantizedProjection(
                               pctx, k_raw, d_norm_out_, d_k_new_, seq_len,
                               num_kv_heads_ * head_dim_, hidden_size_,
@@ -1927,6 +1982,9 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                           return true;
                         },
                         [&]() {
+                          if (qkv_fused) {
+                            return true;
+                          }
                           return TryQuantizedProjection(
                               pctx, v_raw, d_norm_out_, d_v_new_, seq_len,
                               num_kv_heads_ * head_dim_, hidden_size_,
@@ -2246,6 +2304,34 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                       }
                     }
                     const half *mma_in = static_cast<const half *>(d_norm_out_);
+                    // 4i launch fusion: quantize the shared FFN input once,
+                    // then gate+up in ONE dual-pointer mma launch (splits=1,
+                    // optimal for the 2N-tile grid). Falls back to the
+                    // per-projection path when the dual declines.
+                    static const bool dual_ok_b = [] {
+                      const char *e = getenv("INFERFLUX_CUDA_MMQ_GATE_UP_DUAL");
+                      return !e || e[0] != '0';
+                    }();
+                    if (dual_ok_b &&
+                        FusedQuantGemm::QuantizeForMmqMma(
+                            mma_in,
+                            static_cast<runtime::cuda::native::BlockQ8_1MmqDs
+                                            *>(d_act_q8_1_mmq_),
+                            seq_len, hidden_size_, stream_,
+                            &execution_policy_) &&
+                        FusedQuantGemm::GemvMmqMmaGateUpDualPrequantized(
+                            gate_raw, up_raw,
+                            static_cast<
+                                const runtime::cuda::native::BlockQ8_1MmqDs *>(
+                                d_act_q8_1_mmq_),
+                            d_ffn_gate_, d_ffn_up_, seq_len, intermediate_size_,
+                            hidden_size_, stream_, &execution_policy_)) {
+                      LogPackedGemmPath("gate_proj",
+                                        "using Q4_K MMA dual launch");
+                      LogPackedGemmPath("up_proj",
+                                        "using Q4_K MMA dual launch");
+                      return true;
+                    }
                     if (TryQ8_1MmaGemv<T>(
                             gate_raw, mma_in, d_ffn_gate_, d_act_q8_1_mmq_,
                             d_mma_partials_, seq_len, intermediate_size_,
@@ -3169,6 +3255,37 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                       // quantize when the shared quantize declines.
                       static const bool qkv_shared_quant =
                           ParseBoolEnv("INFERFLUX_CUDA_QKV_SHARED_QUANT", true);
+                      static const bool qkv_triple_ok = [] {
+                        const char *e =
+                            getenv("INFERFLUX_CUDA_QKV_TRIPLE_LAUNCH");
+                        return !e || e[0] != '0';
+                      }();
+                      if (qkv_triple_ok && qkv_shared_quant &&
+                          inferflux::FusedQuantGemm::QuantizeForMmqMma(
+                              mma_input,
+                              static_cast<runtime::cuda::native::BlockQ8_1MmqDs
+                                              *>(d_act_q8_1_mmq_),
+                              B, hidden_size_, stream_, active_policy) &&
+                          inferflux::FusedQuantGemm::
+                              GemvMmqMmaTriplePrequantized(
+                                  q_raw, k_raw, v_raw,
+                                  static_cast<const runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  d_q_, d_k_new_, d_v_new_, d_mma_partials_, B,
+                                  num_heads_ * head_dim_,
+                                  num_kv_heads_ * head_dim_,
+                                  num_kv_heads_ * head_dim_, hidden_size_,
+                                  stream_, active_policy)) {
+                        // 4i launch fusion: q+k+v in one mma launch.
+                        LogPackedGemmPath("q_proj",
+                                          "using Q4_K MMA triple launch");
+                        LogPackedGemmPath("k_proj",
+                                          "using Q4_K MMA triple launch");
+                        LogPackedGemmPath("v_proj",
+                                          "using Q4_K MMA triple launch");
+                        return true;
+                      }
                       if (qkv_shared_quant &&
                           inferflux::FusedQuantGemm::QuantizeForMmqMma(
                               mma_input,
@@ -3755,28 +3872,55 @@ bool LlamaForwardTyped<T>::BatchForwardDevice(int batch_size, float *d_logits) {
                                 static_cast<
                                     runtime::cuda::native::BlockQ8_1MmqDs *>(
                                     d_act_q8_1_mmq_),
-                                B, hidden_size_, stream_, active_policy) &&
-                            FusedQuantGemm::GemvMmqMmaPrequantized(
-                                gate_raw,
-                                static_cast<
-                                    const runtime::cuda::native::BlockQ8_1MmqDs
-                                        *>(d_act_q8_1_mmq_),
-                                d_ffn_gate_, d_mma_partials_, B,
-                                intermediate_size_, hidden_size_, stream_,
-                                active_policy) &&
-                            FusedQuantGemm::GemvMmqMmaPrequantized(
-                                up_raw,
-                                static_cast<
-                                    const runtime::cuda::native::BlockQ8_1MmqDs
-                                        *>(d_act_q8_1_mmq_),
-                                d_ffn_up_, d_mma_partials_, B,
-                                intermediate_size_, hidden_size_, stream_,
-                                active_policy)) {
-                          LogPackedGemmPath("gate_proj",
-                                            "using Q4_K MMA projection");
-                          LogPackedGemmPath("up_proj",
-                                            "using Q4_K MMA projection");
-                          return true;
+                                B, hidden_size_, stream_, active_policy)) {
+                          // 4i launch fusion: gate+up in ONE mma launch
+                          // (dual weight/output pointers selected per
+                          // N-tile; splits=1, optimal for the 2N-tile
+                          // grid). Falls back to the two-launch path when
+                          // the dual declines (quant-type or shape
+                          // mismatch).
+                          static const bool dual_ok_a = [] {
+                            const char *e =
+                                getenv("INFERFLUX_CUDA_MMQ_GATE_UP_DUAL");
+                            return !e || e[0] != '0';
+                          }();
+                          if (dual_ok_a &&
+                              FusedQuantGemm::GemvMmqMmaGateUpDualPrequantized(
+                                  gate_raw, up_raw,
+                                  static_cast<const runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  d_ffn_gate_, d_ffn_up_, B, intermediate_size_,
+                                  hidden_size_, stream_, active_policy)) {
+                            LogPackedGemmPath("gate_proj",
+                                              "using Q4_K MMA dual launch");
+                            LogPackedGemmPath("up_proj",
+                                              "using Q4_K MMA dual launch");
+                            return true;
+                          }
+                          if (FusedQuantGemm::GemvMmqMmaPrequantized(
+                                  gate_raw,
+                                  static_cast<const runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  d_ffn_gate_, d_mma_partials_, B,
+                                  intermediate_size_, hidden_size_, stream_,
+                                  active_policy) &&
+                              FusedQuantGemm::GemvMmqMmaPrequantized(
+                                  up_raw,
+                                  static_cast<const runtime::cuda::native::
+                                                  BlockQ8_1MmqDs *>(
+                                      d_act_q8_1_mmq_),
+                                  d_ffn_up_, d_mma_partials_, B,
+                                  intermediate_size_, hidden_size_, stream_,
+                                  active_policy)) {
+                            LogPackedGemmPath("gate_proj",
+                                              "using Q4_K MMA projection");
+                            LogPackedGemmPath("up_proj",
+                                              "using Q4_K MMA projection");
+                            return true;
+                          }
+                          return false;
                         }
                       }
                     }
