@@ -701,7 +701,10 @@ std::string LlamaCppBackend::Generate(
     // token would exceed n_ctx.  We discard the oldest half of the KV cache
     // and shift the remaining positions so generation can continue.
     {
-      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx(context_));
+      // Per-sequence capacity is n_ctx_seq (llama_n_ctx is the KV pool total
+      // across all slot sequences); overflowing n_ctx_seq is what makes
+      // llama_decode fail.
+      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx_seq(context_));
       if (position >= n_ctx - 1 && n_ctx > 1) {
         llama_pos keep = n_ctx / 2;
         llama_pos discard = position - keep + 1;
@@ -1147,7 +1150,10 @@ std::string LlamaCppBackend::Decode(
     // Context-window management: sliding-window KV eviction (same as
     // Generate(), but scoped to the sequence slot for phased decode).
     {
-      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx(context_));
+      // Per-sequence capacity is n_ctx_seq (llama_n_ctx is the KV pool total
+      // across all slot sequences); overflowing n_ctx_seq is what makes
+      // llama_decode fail.
+      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx_seq(context_));
       if (position >= n_ctx - 1 && n_ctx > 1) {
         llama_pos keep = n_ctx / 2;
         llama_pos discard = position - keep + 1;
@@ -1197,7 +1203,10 @@ LlamaCppBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
   for (int i = 0; i < n; ++i) {
     auto &inp = inputs[i];
     // Per-sequence context-window eviction (mirrors the logic in Decode()).
-    llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx(context_));
+    // Per-sequence capacity is n_ctx_seq (llama_n_ctx is the KV pool total
+    // across all slot sequences); overflowing n_ctx_seq is what makes
+    // llama_decode fail.
+    llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx_seq(context_));
     if (inp.n_past >= static_cast<int>(n_ctx) - 1 && n_ctx > 1) {
       llama_pos keep = n_ctx / 2;
       llama_pos discard = static_cast<llama_pos>(inp.n_past) - keep + 1;
