@@ -36,8 +36,10 @@ runtime:
   scheduler:
     max_batch_size: 16
     max_batch_tokens: 16384
-    min_batch_size: 1
-    batch_accumulation_ms: 2
+    # Gather a full decode wave before launching a run-to-completion phased
+    # call (see server.rocm.yaml for the measured rationale on the R9700).
+    min_batch_size: 16
+    batch_accumulation_ms: 100
 
   tensor_parallel: 1
   mps_layers: 0

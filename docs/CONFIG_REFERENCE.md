@@ -200,8 +200,8 @@ For `backend: cuda` requests, runtime fallback order is:
 |---|---|---|
 | `runtime.scheduler.max_batch_size` | 4-16 | raise for throughput if latency budget allows |
 | `runtime.scheduler.max_batch_tokens` | 8192 | cap per-batch token memory pressure |
-| `runtime.scheduler.min_batch_size` | 1 | keep low for responsiveness |
-| `runtime.scheduler.batch_accumulation_ms` | 0-5 | small wait to form better batches |
+| `runtime.scheduler.min_batch_size` | 1 | keep low for responsiveness; **raise to ≈ `max_batch_size` for GPU concurrent serving** — phased calls run to completion, so a below-wave selection runs solo for a whole generation while later arrivals wait |
+| `runtime.scheduler.batch_accumulation_ms` | 0-5 | small wait to form better batches; **GPU concurrent serving: 50-100 ms** so a gathering wave can arrive (measured on the R9700: `min_batch_size=16, batch_accumulation_ms=100` took the 48×256 c=16 battery from 741 to 1067 tok/s, +44%, vs 992 for stock llama-server on the same hardware; cost is up to the window in first-token latency for a lone request — measured TTFT ~170 ms). Single-stream latency-sensitive deployments keep the low defaults |
 | `runtime.scheduler.policy` | `priority_age` | queue ranking policy (`priority_age`, `lpm_priority`, `throughput_balanced`) |
 | `runtime.scheduler.decode_burst_tokens` | `0` | decode burst cap per executor pass (`0` disables burst slicing) |
 | `runtime.scheduler.decode_pool_size` | `1` | dedicated decode lane count (0 = inline on worker loop, 1+ = decode threads; 1 is default/arch recommendation) |
