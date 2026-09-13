@@ -1176,8 +1176,10 @@ int main(int argc, char **argv) {
       (cuda_enabled && cuda_flash_attention_enabled) ||
       rocm_flash_attention_enabled;
   if (const char *env_fa = std::getenv("INFERFLUX_LLAMA_FLASH_ATTENTION")) {
+    const std::string env_fa_lower = ToLower(env_fa);
     llama_wrapper_flash_attention =
-        std::string(env_fa) == "true" || std::string(env_fa) == "1";
+        env_fa_lower == "true" || env_fa_lower == "1" ||
+        env_fa_lower == "yes" || env_fa_lower == "on";
   }
   primary_cfg.use_flash_attention = llama_wrapper_flash_attention;
   primary_cfg.flash_attention_tile = cuda_flash_attention_tile;
@@ -1300,7 +1302,17 @@ int main(int argc, char **argv) {
 #endif
 
   // Sync primary_cfg with effective post-guard FA state; record Prometheus
-  // gauge (§2.7).
+  // gauge (§2.7). Recompute from the guarded flags — the guards above may
+  // have disabled CUDA FA on builds/runtimes without CUDA support — then
+  // re-apply the env override (case-insensitive).
+  llama_wrapper_flash_attention =
+      cuda_flash_attention_enabled || rocm_flash_attention_enabled;
+  if (const char *env_fa = std::getenv("INFERFLUX_LLAMA_FLASH_ATTENTION")) {
+    const std::string env_fa_lower = ToLower(env_fa);
+    llama_wrapper_flash_attention =
+        env_fa_lower == "true" || env_fa_lower == "1" ||
+        env_fa_lower == "yes" || env_fa_lower == "on";
+  }
   primary_cfg.use_flash_attention = llama_wrapper_flash_attention;
   primary_cfg.cuda_phase_overlap_scaffold = cuda_phase_overlap_scaffold;
   primary_cfg.cuda_phase_overlap_prefill_replica =
