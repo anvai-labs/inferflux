@@ -25,6 +25,14 @@
 
 namespace inferflux {
 
+// True when sampling is exactly argmax over the raw logits row: temperature
+// <= 0 with nothing that mutates logits (penalties, logit_bias). top_k /
+// top_p / min_p / seed are irrelevant here — truncation filters keep the
+// global maximum, so a greedy chain picks the same token either way. Used by
+// the unified-batch path to skip llama_sampler_sample's full-vocab
+// token_data materialization on the hot decode path.
+bool CanSampleGreedyArgmax(const SamplingParams &sp);
+
 class LlamaCppBackend : public BackendInterface {
 public:
   LlamaCppBackend();

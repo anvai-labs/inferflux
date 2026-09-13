@@ -387,3 +387,64 @@ TEST_CASE("TokenLogprob bytes field matches UTF-8 encoding",
   REQUIRE(tlp.bytes[0] == 0xC3);
   REQUIRE(tlp.bytes[1] == 0xB1);
 }
+
+// ---------------------------------------------------------------------------
+// Unified-batch greedy argmax fast path predicate
+// ---------------------------------------------------------------------------
+
+TEST_CASE("CanSampleGreedyArgmax matches greedy-without-logit-mutators",
+          "[sampling]") {
+  SECTION("default greedy parameters qualify") {
+    SamplingParams sp;
+    sp.temperature = 0.0f;
+    REQUIRE(CanSampleGreedyArgmax(sp));
+  }
+
+  SECTION("negative temperature qualifies") {
+    SamplingParams sp;
+    sp.temperature = -1.0f;
+    REQUIRE(CanSampleGreedyArgmax(sp));
+  }
+
+  SECTION("truncation filters do not disqualify at greedy temperature") {
+    // Truncation filters keep the global maximum, so a greedy chain picks
+    // the same token the raw argmax does regardless of top_k/top_p/min_p.
+    SamplingParams sp;
+    sp.temperature = 0.0f;
+    sp.top_k = 40;
+    sp.top_p = 0.9f;
+    sp.min_p = 0.05f;
+    sp.seed = 7;
+    REQUIRE(CanSampleGreedyArgmax(sp));
+  }
+
+  SECTION("positive temperature disqualifies") {
+    SamplingParams sp;
+    sp.temperature = 0.7f;
+    REQUIRE_FALSE(CanSampleGreedyArgmax(sp));
+  }
+
+  SECTION("penalties disqualify") {
+    SamplingParams sp;
+    sp.temperature = 0.0f;
+    sp.frequency_penalty = 0.5f;
+    REQUIRE_FALSE(CanSampleGreedyArgmax(sp));
+
+    SamplingParams sp2;
+    sp2.temperature = 0.0f;
+    sp2.presence_penalty = 0.5f;
+    REQUIRE_FALSE(CanSampleGreedyArgmax(sp2));
+
+    SamplingParams sp3;
+    sp3.temperature = 0.0f;
+    sp3.repetition_penalty = 1.15f;
+    REQUIRE_FALSE(CanSampleGreedyArgmax(sp3));
+  }
+
+  SECTION("logit_bias disqualifies") {
+    SamplingParams sp;
+    sp.temperature = 0.0f;
+    sp.logit_bias[42] = -100.0f;
+    REQUIRE_FALSE(CanSampleGreedyArgmax(sp));
+  }
+}

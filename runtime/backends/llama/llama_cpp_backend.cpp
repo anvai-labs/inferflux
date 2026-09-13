@@ -103,6 +103,12 @@ ggml_type KvCacheGgmlType(const std::string &name) {
 
 } // namespace
 
+bool CanSampleGreedyArgmax(const SamplingParams &sp) {
+  return sp.temperature <= 0.0f && sp.frequency_penalty == 0.0f &&
+         sp.presence_penalty == 0.0f && sp.repetition_penalty == 1.0f &&
+         sp.logit_bias.empty();
+}
+
 namespace {
 std::mutex g_llama_init_mutex;
 int g_llama_init_refcount = 0;
@@ -153,6 +159,19 @@ bool ConsumeTokenTraceBudget() {
 bool LogitsDebugEnabled() {
   static const bool enabled = std::getenv("INFERFLUX_DEBUG_LOGITS") != nullptr;
   return enabled;
+}
+
+// Kill switch for the unified-batch greedy argmax fast path. The fast path is
+// bit-identical to llama's greedy chain (first max over the logits row); this
+// exists only to restore the llama_sampler_sample path for validation.
+bool GreedyArgmaxDisabled() {
+  static const bool disabled = [] {
+    if (const char *env = std::getenv("INFERFLUX_DISABLE_GREEDY_ARGMAX")) {
+      return std::string_view(env) != "0" && std::string_view(env) != "false";
+    }
+    return false;
+  }();
+  return disabled;
 }
 
 bool ConsumeLogitsDebugBudget() {
@@ -1406,6 +1425,36 @@ LlamaCppBackend::ExecuteUnifiedBatch(
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     if (logit_indices[i] >= 0) {
       const auto &inp = inputs[i];
+
+      // Greedy fast path: when sampling is exactly argmax over the raw
+      // logits row, skip llama_sampler_sample's full-vocab token_data
+      // materialization (3.6 MB on a 152k vocab) per request per step.
+      // First-max over the float row selects the identical token.
+      if (!GreedyArgmaxDisabled() && CanSampleGreedyArgmax(inp.sampling)) {
+        const float *logits = llama_get_logits_ith(context_, logit_indices[i]);
+        LogTopLogits("unified_batch", logits, n_vocab_, inp.request_id,
+                     inp.client_request_id, inp.sequence_id,
+                     inp.sequence_generation,
+                     inp.n_past + static_cast<int>(inp.tokens.size()) - 1);
+        if (logits) {
+          const int tok = static_cast<int>(std::distance(
+              logits, std::max_element(logits, logits + n_vocab_)));
+          results[i].ok = true;
+          if (IsTerminalGeneratedToken(tok)) {
+            results[i].token = -1;
+          } else {
+            results[i].token = tok;
+            results[i].piece = TokenToString(tok);
+            LogTokenTrace("unified_batch", inp.request_id, inp.sequence_id,
+                          inp.client_request_id, inp.sequence_generation,
+                          inp.n_past + static_cast<int>(inp.tokens.size()), tok,
+                          results[i].piece);
+          }
+        } else {
+          results[i].ok = false;
+        }
+        continue;
+      }
 
       // Correctness Fix (§P1b): Use per-request sampling parameters.
       // We leverage SetupSampler to prepare the backend's active_sampler_
