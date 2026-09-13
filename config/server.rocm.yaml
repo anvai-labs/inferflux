@@ -41,8 +41,14 @@ runtime:
   scheduler:
     max_batch_size: 16
     max_batch_tokens: 16384
-    min_batch_size: 1
-    batch_accumulation_ms: 2
+    # Gather a full decode wave before launching a run-to-completion phased
+    # call: measured +44% aggregate throughput at c=16 on the R9700
+    # (741 -> 1067 tok/s, Qwen2.5-3B Q4_K_M) vs min_batch_size=1 /
+    # batch_accumulation_ms=2, which launched solo 256-step calls whenever a
+    # single request beat its wave to the queue. Cost: up to 100 ms added
+    # latency for a lone request's first token (measured TTFT stays ~170 ms).
+    min_batch_size: 16
+    batch_accumulation_ms: 100
 
   tensor_parallel: 1
   mps_layers: 0
