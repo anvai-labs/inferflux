@@ -162,4 +162,4 @@ docker compose -f docker/docker-compose.yaml up
 - [API Surface](API_SURFACE.md)
 - [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 - [Admin Guide](AdminGuide.md)
-- [FP16_STATUS](FP16_STATUS.md)
+- [benchmarks](benchmarks.md) (FP16 guidance)

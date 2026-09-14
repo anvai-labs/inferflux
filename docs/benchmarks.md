@@ -34,6 +34,23 @@ safetensors backends (`inferflux_cuda`, LM Studio, vLLM, SGLang) in Stage 2.
 See [benchmark_multi_backend_steps](benchmark_multi_backend_steps.md#9-full-backend-coverage-in-two-stages)
 for the exact two-stage recipe.
 
+## FP16 / memory-precision guidance
+
+| Decision | Guidance |
+|---|---|
+| Default production throughput | Prefer quantized GGUF (`q4_k_m`/`q5_k_m`) for concurrency and memory economy |
+| FP16 deployment | Reserve for quality-critical workloads; right-size concurrency to the VRAM budget |
+| Capacity controls | StartupAdvisor recommendations + conservative `max_parallel_sequences` + monitored memory pressure |
+| Validation gate | Run throughput/contract checks before rollout; treat archived FP16 data as snapshot evidence, not guaranteed ceilings |
+
+`707138b` landed FP16 OOM handling: pre-flight admission check, graceful
+degradation, quantization-detection wiring, and a model-path override fix.
+The March 2026 caution paths (20 GB FP16 instability, universal-backend
+heap corruption) were falsified by the Sep 2026 campaign — native FP16 on
+the 20 GB Ada served c=16 at 338 tok/s with an 8.3-8.7 GB peak and zero
+classified failures (see Stage 2 below). Historical FP16 evidence snapshots
+are cataloged in [ARCHIVE_INDEX](ARCHIVE_INDEX.md).
+
 ## Stage 1 — GGUF Quantized (Sep 4 2026, 2-run average)
 
 RTX 4000 Ada 20GB · Qwen2.5-3B Q4_K_M · 32 requests × 64 tokens per concurrency level

@@ -57,7 +57,7 @@ graph TD
 | Technical-debt register | [technical-debt/README](technical-debt/README.md) |
 | Competitive positioning | [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md) |
 | GGUF runtime contract | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md) |
-| FP16 status | [FP16_STATUS](FP16_STATUS.md) |
+| FP16 / precision guidance | [benchmarks](benchmarks.md) |
 
 ## 3) Operator Runbooks
 

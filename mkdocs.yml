@@ -128,7 +128,6 @@ nav:
       - Developer Guide: DeveloperGuide.md
       - Docs Style Guide: DOCS_STYLE_GUIDE.md
       - GPU CI Bootstrap: GPU_CI_BOOTSTRAP.md
-      - FP16 Status: FP16_STATUS.md
       - ADRs: adr/README.md
       - Feature Specs: features/README.md
       - Technical-Debt Register: technical-debt/README.md
