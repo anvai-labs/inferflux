@@ -136,5 +136,4 @@ nav:
       - GGUF Smoke Test Guide: GGUF_SMOKE_TEST_GUIDE.md
   - Archive:
       - ARCHIVE_INDEX.md
-      - Modernization Audit: MODERNIZATION_AUDIT.md
       - Bench Archive: benchmarks/q6k-vectorized-sm89-2026-08-30.md
