@@ -31,7 +31,7 @@ Full backend coverage takes two harness invocations because no single model
 format serves all five compared engines — GGUF quantized backends
 (`inferflux_cuda`, `llama_cpp_cuda`, Ollama) in Stage 1, full-precision
 safetensors backends (`inferflux_cuda`, LM Studio, vLLM, SGLang) in Stage 2.
-See [benchmark_multi_backend_steps](benchmark_multi_backend_steps.md#9-full-backend-coverage-in-two-stages)
+See [benchmark_multi_backend_steps](benchmark_multi_backend_steps.md#8-full-backend-coverage-in-two-stages)
 for the exact two-stage recipe.
 
 ## FP16 / memory-precision guidance

@@ -38,56 +38,24 @@ Open: width-1 decode tail during closed-loop EOS stagger (workload-
 
 ## 2) Competitive Benchmark
 
-### Safetensors (full precision) — Sep 7 2026, RTX 4000 Ada, Qwen2.5-3B
+The authoritative numbers now live in [benchmarks](benchmarks.md) and
+[COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md); this section keeps
+only the state summary and deltas.
 
-2-run average per cell (multi-backend harness; 0 classified failures):
-
-```
-Backend           c=1    c=4    c=8    c=16   scale    GPU peak
-────────────────  ────   ────   ────   ─────  ──────   ─────────
-inferflux_cuda    47.7   143.8  206.2  338.2  ~7.1x    8.3-8.7 GB
-llama.cpp (f16¹)  44.7   82.5   143.8   93.0  ~2.1x    ~8.0 GB
-vLLM              36.9   160.2  336.0  675.3  ~18.3x   ~20.1 GB
-SGLang            38.1   156.9  307.0  515.3  ~13.5x   18.2-20.1 GB
-LM Studio         115.8  75.2   73.0   71.5   ~0.6x    2.9-3.1 GB
-```
-
-¹ llama.cpp cannot read safetensors directly: its cell runs an f16 GGUF
-sidecar of the same weights (highest-precision llama.cpp serving), so it
-measures a different quantization than the q4_k_m GGUF row.
-
-- Gap to vLLM/SGLang narrowed to **1.52-2.00x at c=16** (was 2.37-2.70x on
-  Sep 4-6), while serving at 2.3-2.4x less GPU memory. The post-#110 scratch
-  right-sizing likely contributed to the inferflux gain (338 vs 298-311).
-- SGLang on this host requires `TVM_FFI_GPU_BACKEND=cuda`: with the ROCm
-  toolchain installed system-wide, its JIT misdetects HIP and fails to build
-  kernels (`/usr/bin/hipcc` shadows the CUDA path).
-
-### GGUF (Q4_K_M) — Sep 7 2026 (post memory campaign), RTX 4000 Ada
-
-2-run average per cell (multi-backend harness; 0 classified failures;
-gguf-compare harness confirms the memory and c=1/4/8 ordering):
-
-```
-Backend          c=1    c=4    c=8    c=16   scale   GPU peak
-───────────────  ────   ────   ────   ─────  ─────   ─────────────
-inferflux_cuda   103.4  163.8  265.8  332.7  3.22x   5.5 GB (ledger)
-llama_cpp_cuda   119.8  198.7  284.0  231.4  1.93x   4.1 GB (same harness)
-Ollama (local)   121.3  124.1  124.2  123.1  ~1.0x   ~1.0 GB
-LM Studio        115.4  71.7   76.2   75.0   ~0.65x  ~2.9 GB
-```
-
-- `inferflux_cuda` leads llama.cpp at c=16 on the same harness (1.44x, both
-  runs agree) after the memory campaign; llama.cpp stays ahead at c=1-4 and
-  c=8 is contested (runs split around parity).
-- GGUF memory overhead vs llama.cpp is now **+1,392 MB** on the identical
-  workload (was +3,006 MB pre-campaign, +1,268-1,294 MB in the Apr/Aug
-  readings) — see performance plan §4e-results.
-- ROCm cells (inferflux_rocm / llama_cpp_rocm, GGUF and safetensors): the
-  R9700 dropped out of WSL passthrough mid-session (`/dev/kfd` absent).
-  Last spot measurements from Sep 7 morning: inferflux_rocm ~17-36 tok/s at
-  c=1-8 on GGUF; ST-on-ROCm remains unbuilt (no HIP bf16 forward).
-  Re-run when the host restores the device.
+- **Safetensors (RTX 4000 Ada, Sep 7):** the decode gap to vLLM/SGLang
+  narrowed to 1.52-2.00x at c=16 (was 2.37-2.70x on Sep 4-6) while serving
+  at 2.3-2.4x less GPU memory. Root-cause decomposition (batch-width
+  collapse ~2.3x, GEMM roofline ~parity, sync overheads) lives in
+  [design/SAFETENSORS_DECODE_PERFORMANCE_PLAN](design/SAFETENSORS_DECODE_PERFORMANCE_PLAN.md).
+- **GGUF (RTX 4000 Ada, Sep 7):** `inferflux_cuda` leads the wrapper 1.44x
+  at c=16 on the same harness; GGUF memory overhead vs llama.cpp is
+  +1,392 MB (was +3,006 MB pre-campaign).
+- **ROCm (R9700, Sep 13):** the "dropped out of WSL passthrough" note and
+  the ~17-36 tok/s spot readings below were a misrouted-CPU-backend
+  artifact, not device throughput. The restored-device sweep shows the
+  wrapper meets or beats stock llama.cpp on every tested architecture
+  (dense parity to +51% MoE; 11,054/11,054 backend ops) — see
+  [benchmarks](benchmarks.md) §ROCm and [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md) §R.
 
 ## 3) Debt Register
 

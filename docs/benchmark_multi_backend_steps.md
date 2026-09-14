@@ -6,7 +6,7 @@ This doc captures the repeatable steps and instrumentation that keep `run_gguf_c
 * `INFERFLUX_ENABLE_EXPERIMENTAL_Q8_1_GROUPED_ROWPAIR_W4` now defaults to `false` in `NativeExecutionPolicy`. Keep it opt-in for controlled experiments only; exact-shape isolated benchmarking on Ada RTX 4000 showed the `M=2,N=11008,K=2048` row-pair FFN kernel was numerically clean but slower than the generic grouped path.
 * Keep `INFERFLUX_ENABLE_BATCHED_DECODE=1` in the benchmark so multi-row decode batches naturally occur and exercise the row-pair operator per the metrics below.
 * `INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT=1` is an experimental scheduler knob only. Keep default benchmarking on `wait=0`; use `wait=1` only as an A/B comparison because the effect is workload-sensitive and not stable enough for default serving policy.
-* `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS` is the active singleton native decode tuning knob for the current stepwise-path burst implementation.
+* `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS` is a legacy tuning knob for the CUDA-singleton stepwise burst path only; the serving guidance for GPU concurrency is the unified batch path with wave-gathering admission (see CONFIG_REFERENCE).
   * `2`: favors lower-concurrency interactive serving (`c=2`/`c=4`)
   * `4`: current balanced default for WSL2/native CUDA benchmarking
   * `8`: only use for explicit high-concurrency probes; it regressed lower-concurrency runs in March 27 long-sweep data
@@ -75,80 +75,13 @@ If you ever replicate the benchmark manually, follow the same order: stop native
   * `memory_snapshot.inferflux_cuda_kv`
   * `memory_snapshot.paged_kv`
 * The multi-backend CSV export now carries the key memory fields alongside throughput so concurrency runs can be compared on both tok/s and memory state.
-* The decode-worker sticky-merge counters (`inferflux_scheduler_decode_worker_sticky_merge_total`, `inferflux_scheduler_decode_worker_sticky_merged_requests_total`) are the intended validation signal for `INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT`, but benchmark-side metric capture still needs follow-up because those lines are visible in direct `/metrics` scrapes yet have not been reliable in the saved benchmark snapshots.
+* The decode-worker sticky-merge counters (`inferflux_scheduler_decode_worker_sticky_merge_total`, `inferflux_scheduler_decode_worker_sticky_merged_requests_total`) are the intended validation signal for `INFERFLUX_ENABLE_STICKY_DECODE_ACCUMULATION_WAIT`, but benchmark-side metric capture remains a known limitation: those lines are visible in direct `/metrics` scrapes yet have not been reliable in saved benchmark snapshots.
 
 ## 5. Accuracy safeguards
 * The similarity report is now per concurrency (`similarity_c*.json`). Treat the whole sweep as invalid if only one concurrency level produces similarity output; that indicates the harness wiped earlier response artifacts.
 * Keep `INFERFLUX_DEBUG_OPERATOR_SELECTION=0`/`INFERFLUX_DEBUG_LOGITS=0` for normal benchmarks; enable them only for debugging because they add logging noise.
 
-## 6. Experimental sticky wait status
-Prompt-heavy Qwen2.5-3B Q4_K_M benchmark matrix on Ada RTX 4000 (`16` requests, `64` max tokens, `1/4/8` concurrency):
-
-* `wait=0`
-  * `c=1`: native `81.6 tok/s`, llama.cpp `111.6 tok/s` (`0.73x`)
-  * `c=4`: native `139.9 tok/s`, llama.cpp `208.2 tok/s` (`0.67x`)
-  * `c=8`: native `158.7 tok/s`, llama.cpp `312.0 tok/s` (`0.51x`)
-* `wait=1`
-  * `c=1`: native `81.9 tok/s`, llama.cpp `108.6 tok/s` (`0.75x`)
-  * `c=4`: native `142.6 tok/s`, llama.cpp `203.1 tok/s` (`0.70x`)
-  * `c=8`: native `163.2 tok/s`, llama.cpp `305.0 tok/s` (`0.54x`)
-
-Interpretation:
-
-* `wait=1` is not universally regressive, but the gain is modest and workload-specific.
-* Keep it available for benchmark matrices.
-* Do not treat it as the recommended default scheduler policy.
-
-## 6.1 March 27 native burst sweep
-
-Long WSL2/native CUDA sweep (`32` requests, `32` max tokens, `1/2/4/8/16` concurrency):
-
-* `chunk=2`
-  * `c=1`: `64.8 tok/s`
-  * `c=2`: `78.8 tok/s`
-  * `c=4`: `103.8 tok/s`
-  * `c=8`: `107.9 tok/s`
-  * `c=16`: `111.3 tok/s`
-* `chunk=4`
-  * `c=1`: `64.1 tok/s`
-  * `c=2`: `73.4 tok/s`
-  * `c=4`: `99.5 tok/s`
-  * `c=8`: `109.8 tok/s`
-  * `c=16`: `123.9 tok/s`
-* `chunk=8`
-  * `c=1`: `65.2 tok/s`
-  * `c=2`: `68.0 tok/s`
-  * `c=4`: `98.6 tok/s`
-  * `c=8`: `114.8 tok/s`
-  * `c=16`: `122.2 tok/s`
-
-Interpretation:
-
-* `chunk=4` is the best balanced benchmark default.
-* `chunk=2` is the better low-latency / low-concurrency tuning point.
-* `chunk=8` is a high-concurrency experiment only.
-Matching long-run `llama_cpp_cuda` run under the same harness after the startup-timeout fix:
-
-* `c=1`: `111.2 tok/s`
-* `c=2`: `110.5 tok/s`
-* `c=4`: `144.2 tok/s`
-* `c=8`: `148.8 tok/s`
-* `c=16`: `293.7 tok/s`
-
-InferFlux `chunk=4` competitive ratios:
-
-* `c=1`: `0.58x`
-* `c=2`: `0.66x`
-* `c=4`: `0.69x`
-* `c=8`: `0.74x`
-* `c=16`: `0.42x`
-
-Interpretation:
-
-* The singleton burst work materially improved native concurrent behavior, especially through `c=8`.
-* The remaining competitive problem is now concentrated in higher sustained concurrency and memory efficiency, not in “burst path unreachable” control-flow debt.
-
-## 7. Release-note checklist
+## 6. Release-note checklist
 When promoting the row-pair flag for release:
 * Update client-facing docs (this file) and point to the new metric so operators can verify row-pair usage.
 * Mention that `llama_cpp_cuda` now runs against a clean GPU thanks to the reset hook—this avoids the sporadic `socket: Operation not permitted` issues that plagued earlier runs.
@@ -159,7 +92,7 @@ Current release posture:
 * Prefer `q8_1_group_mmq3` for Q4_K `M>=2`; the exact live `M=2,N=11008,K=2048` benchmark now beats fused gate/up and has a dedicated row-pair parity test.
 * Retain `q8_1_group_row_pair_w4` as the M=2 fallback when MMQ3 is disabled.
 
-## 8. Local vLLM / SGLang safetensors runs
+## 7. Local vLLM / SGLang safetensors runs
 
 `benchmark_multi_backend_comparison.sh` can now auto-launch local `vllm` and `sglang` servers one at a time so their VRAM is released before the next backend starts.
 
@@ -208,7 +141,7 @@ these:**
    dirs and set `CUDA_HOME` explicitly if `nvcc` isn't at the path the cache
    expects).
 
-## 9. Full backend coverage in two stages
+## 8. Full backend coverage in two stages
 
 No single model file exercises all five backends, so getting a complete
 `inferflux_cuda` / `llama_cpp_cuda` / `ollama` / `vllm` / `sglang` picture

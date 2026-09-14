@@ -27,7 +27,7 @@ flowchart LR
 |---|---|
 | Strong today | API/admin/CLI contracts, backend/provider identity, policy-visible fallback, prefix/KV reuse, admin pools visibility, and operator observability |
 | Foundation now | Native loader detection, memory-first GGUF dequant policy, KV auto-tune planning/metrics, optional session leases, distributed ticket lifecycle, timeout debt, optional fail-closed generation admission, and stepwise native burst decode on the live phased path |
-| **Leadership achieved** | Apr 9 verified: c=1 73.3, c=4 133.6, c=8 159.9 tok/s (16/16 OK, 100% accuracy). At parity with llama.cpp at c=8 (1.02x), 1.87x faster than Ollama, 2.23x faster than LM Studio. Chat template auto-detection (ChatML/Llama/Mistral/Gemma), repetition penalty kernel, KV cache clearing. 0% degenerate responses. Architecture: RAII, DIP, strategy pattern, 43 unit tests. |
+| **Concurrency leadership (Sep 13)** | On the R9700 the wrapper meets or beats stock llama.cpp on every tested architecture (dense parity to +51% MoE at c=16); native CUDA leads the wrapper at c=16 on GGUF short completions (1.56x). Chat template auto-detection, repetition penalty, radix prefix cache, wave-gathering admission, greedy argmax fast path. Architecture: RAII, DIP, strategy pattern; full CPU test suite green. |
 
 ## 3) Modern Serving Posture
 
@@ -53,11 +53,9 @@ flowchart LR
 
 ## 5) Grade Stance
 
-| Area | Reading |
-|---|---|
-| Overall | `B-` |
-| Why not lower | Control-plane, identity, observability, and memory-policy foundations are real and tested |
-| Why not higher | MMQ accumulate kernels and lane overlap fixes (0ccbad3) closed the decode down-proj bottleneck and improved concurrent stability. CUDA graphs re-enabled on primary forward. March 31 baseline shows progress (c=1 65.6, c=4 148.3, c=8 174.6 tok/s) but residual c=8 instability (~75% pass rate) and distributed ownership semantics are not yet release-enforced |
+Current grades and the evidence behind them live in
+[TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md);
+next moves live in [Roadmap](Roadmap.md).
 
 ## 6) Canonical Source Map
 
