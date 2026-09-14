@@ -743,6 +743,7 @@ add_executable(inferflux_tests
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_startup_advisor.cpp
+  tests/unit/test_quantization_detector.cpp
   tests/unit/test_result.cpp
   tests/integration/test_http_generation_admission.cpp
   external/catch2/catch_amalgamated.cpp

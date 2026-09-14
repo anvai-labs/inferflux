@@ -49,10 +49,23 @@ public:
       return QuantizationType::kUnknown;
     }
 
-    // Skip header (already parsed)
+    // Skip header (already parsed) and the KV metadata section — tensor
+    // infos start only after all key-value pairs (issue: every GGUF with
+    // KV metadata previously failed here with "Tensor name too long"
+    // because the KV bytes were misparsed as tensor infos).
     static constexpr long kGgufHeaderOffset =
         24; // magic + version + tensor_count + kv_count
     fseek(file.get(), kGgufHeaderOffset, SEEK_SET);
+
+    std::string kv_key;
+    runtime::core::gguf::GgufValueType kv_type;
+    for (int64_t kv = 0; kv < header.kv_count; ++kv) {
+      if (!parser->ReadKeyValue(file.get(), &kv_key, &kv_type) ||
+          !parser->SkipValue(file.get(), kv_type)) {
+        log::Error("cpu_quant_detector", "Failed to skip GGUF KV metadata");
+        return QuantizationType::kUnknown;
+      }
+    }
 
     // Count tensor types
     std::map<runtime::core::gguf::GgufTensorType, size_t> type_counts;
