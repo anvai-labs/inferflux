@@ -11,9 +11,9 @@ flowchart TD
     B -->|Yes| D{Auth/scope issue?}
     D -->|Yes| E[Verify API key and required scope]
     D -->|No| F{Model/routing issue?}
-    F -->|Yes| G[Check /v1/models and admin routing]
+    F -->|Yes| G["Check /v1/models and admin routing"]
     F -->|No| H{Throughput/latency issue?}
-    H -->|Yes| I[Inspect /metrics batching and backend counters]
+    H -->|Yes| I["Inspect /metrics batching and backend counters"]
     H -->|No| J[Check platform-specific section below]
 ```
 

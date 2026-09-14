@@ -5,7 +5,7 @@
 ```mermaid
 flowchart LR
     A[OpenAI-compatible APIs] --> B[Operator-grade control plane]
-    B --> C[Portable runtime across CPU/CUDA/ROCm/MPS/MLX]
+    B --> C["Portable runtime across CPU/CUDA/ROCm/MPS/MLX"]
     C --> D[Native memory-efficient execution]
     D --> E[Deterministic distributed contracts]
 ```

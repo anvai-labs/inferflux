@@ -6,10 +6,10 @@
 
 ```mermaid
 flowchart LR
-    A[Start inferfluxd] --> B[Run first completion/chat]
-    B --> C[Inspect /v1/models]
+    A[Start inferfluxd] --> B["Run first completion/chat"]
+    B --> C["Inspect /v1/models"]
     C --> D[Use admin controls]
-    D --> E[Watch /metrics and /readyz]
+    D --> E["Watch /metrics and /readyz"]
 ```
 
 ## 2) Task Matrix
