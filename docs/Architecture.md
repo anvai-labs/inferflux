@@ -90,22 +90,33 @@ sequenceDiagram
 
 This contract is reflected in `/v1/models`, `/v1/models/{id}`, and `inferctl models`.
 
-## 6.1) Two-CUDA-Backend Value Matrix
+## 6.1) Backend Value Matrix
 
 ```mermaid
 flowchart LR
     A[cuda request] --> B{inferflux ready + policy allows?}
     B -->|yes| C[inferflux_cuda]
     B -->|no| D[llama_cpp_cuda]
+    E[rocm request] --> F[llama.cpp HIP behind the scheduler]
+    G[mlx request] --> H{MLX build available?}
+    H -->|yes| I[MLX-native loader + engine]
+    H -->|no| J[llama.cpp compatibility fallback]
 ```
 
-| Axis | `inferflux_cuda` provider | `llama_cpp_cuda` provider |
-|---|---|---|
-| Primary value | Throughput/control path owned by InferFlux | Stable compatibility baseline and deterministic fallback |
-| Runtime core | `InferfluxCudaRuntime` + InferFlux CUDA loaders + metrics | llama.cpp runtime behind InferFlux control plane |
-| Strong today | Native safetensors path, GGUF loader detection, memory-first dequant policy, KV auto-tune metrics, explicit provider identity | Mature GGUF behavior, lower operational risk, broad compatibility |
-| Current limits | Async unified batch intentionally off; quantized GGUF throughput and native-owned parity are still maturing | Lower headroom for first-party kernel/runtime innovation |
-| Operational role | Preferred when native is ready and policy allows | Compatibility/safety net when policy permits fallback |
+| Axis | `inferflux_cuda` provider | `llama_cpp_cuda` provider | `rocm` (llama.cpp HIP) | `mlx` |
+|---|---|---|---|---|
+| Primary value | Throughput/control path owned by InferFlux | Stable compatibility baseline and deterministic fallback | AMD GPU serving behind the InferFlux scheduler | Apple Silicon / Metal-aligned hardware breadth |
+| Runtime core | `InferfluxCudaRuntime` + InferFlux CUDA loaders + metrics | llama.cpp runtime behind InferFlux control plane | llama.cpp GGML_HIP runtime behind InferFlux control plane | `MlxWeightLoader` + `MlxExecutionEngine`; GGUF delegates to the llama.cpp base |
+| Strong today | Native safetensors path, GGUF decode leading the wrapper at c≥8 (1.56x at c=16, Sep 4-8), memory-first dequant policy, KV auto-tune metrics, explicit provider identity | Mature GGUF behavior, lower operational risk, broad compatibility | Meets or beats stock llama.cpp on every tested architecture (dense parity to +51% MoE, Sep 13 R9700 sweep); radix prefix cache + wave-gathering admission | Real backend with factory selection and capability-guarded tests |
+| Current limits | Async unified batch intentionally off (sync batched execution is faster); safetensors decode trails vLLM/SGLang — tracked as the open target | Lower headroom for first-party kernel/runtime innovation | Performance tuning is newer than the CUDA path | Not the current optimization focus; perf maturity behind CUDA |
+| Operational role | Preferred when native is ready and policy allows | Compatibility/safety net when policy permits fallback | Primary AMD serving path | Hardware-breadth path |
+
+Backend parity principles (from the retired Backend Parity design note):
+
+1. Single control-plane path — scheduler, executor, and router do not branch on backend internals.
+2. Sharded backend policy modules — backend selection and tuning live outside concrete backend implementations.
+3. Hardware optimization stays local — CUDA/MLX/ROCm optimization hooks remain inside their backend classes.
+4. Capability-first evolution — new backend features surface via traits/capabilities, not hard-coded checks.
 
 ## 6.2) Memory and State Lifecycle Contract
 

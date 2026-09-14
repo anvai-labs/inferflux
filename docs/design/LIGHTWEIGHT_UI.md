@@ -7,12 +7,23 @@
 
 Ship a lightweight, self-contained web UI bundled with `inferfluxd` for model serving management, backend monitoring, and multi-GPU orchestration. Zero external dependencies — single binary distribution.
 
+## Current Reality (from the retired ui_launcher note)
+
+| Area | Current state |
+|---|---|
+| Build flag | `ENABLE_WEBUI` exists in CMake |
+| Server route | `/ui` is served when the feature is compiled in |
+| Renderer | embedded HTML/CSS/JS render through the litehtml-based UI renderer |
+| `--ui` flag | accepted for compatibility; currently a runtime no-op, not a native desktop window |
+| Not shipped | native desktop launcher window, full operator console, installer-grade packaging |
+
 ## Design Principles
 
 1. **Embedded** — Static assets compiled into `inferfluxd` binary (no separate frontend deploy)
 2. **Zero-config** — Enabled by default on `/ui`, disabled via `ui.enabled: false`
 3. **Read-heavy** — Dashboard and monitoring are primary; mutation operations require confirmation
 4. **Multi-GPU native** — First-class support for heterogeneous GPU setups (AMD + NVIDIA)
+5. **Thin layer** — `/ui` stays a thin layer over the authenticated API; no control-plane forks or hidden server-only semantics
 
 ## Pages
 

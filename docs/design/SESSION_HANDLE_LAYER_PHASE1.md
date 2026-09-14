@@ -66,6 +66,6 @@ Environment overrides:
 
 ## 6) Related Docs
 
-- [SEQUENCE_SLOT_MANAGER_PLAN](SEQUENCE_SLOT_MANAGER_PLAN.md)
+- Slot manager implementation: `runtime/scheduler/sequence_slot_manager.*` (the plan retired as shipped; lifecycle fix in #162)
 - [../Architecture](../Architecture.md)
 - [../ARCHIVE_INDEX](../ARCHIVE_INDEX.md) (MODERNIZATION_AUDIT removed)

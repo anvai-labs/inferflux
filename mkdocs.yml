@@ -112,7 +112,6 @@ nav:
       - GGUF Native Runtime: GGUF_NATIVE_KERNEL_IMPLEMENTATION.md
       - GEMV Kernels: GEMV_KERNEL_ARCHITECTURE.md
       - Design Deep Dives:
-          - design/Backend_Parity_LlamaCpp_CUDA_MLX.md
           - design/FUSED_KERNEL_REDESIGN_SPEC.md
           - design/KV_CACHE_ARCHITECTURE_DEEP_DIVE_2026_03_04.md
           - design/LIGHTWEIGHT_UI.md

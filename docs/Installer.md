@@ -74,4 +74,4 @@ cpack --config build/CPackConfig.cmake -G WIX
 |---|---|---|
 | NVIDIA CUDA | use CUDA profile and throughput gate for behavior checks | [MONITORING](MONITORING.md) |
 | AMD ROCm | WSL2 has hard limitations; native Linux or cloud is preferred | [ROCM_INSTALLATION_GUIDE_WSL](ROCM_INSTALLATION_GUIDE_WSL.md) |
-| Apple Silicon | enable MPS/MLX build flags as needed | [CONFIG_REFERENCE](CONFIG_REFERENCE.md), [design/mlx_backend](design/mlx_backend.md) |
+| Apple Silicon | enable MPS/MLX build flags as needed | [CONFIG_REFERENCE](CONFIG_REFERENCE.md), [Architecture](Architecture.md) |

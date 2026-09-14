@@ -276,6 +276,32 @@ BackendCapabilities ReportCapabilities() const override {
 
 The router uses these capabilities to decide request routing. Backends that report `false` for a capability will not receive requests requiring it (requests are routed to a capable backend or rejected with a clear error).
 
+## Common Backend Types and Incremental Refactoring
+
+Shared backend infrastructure lives in `runtime/backends/common/`:
+`backend_types.h` (request/result/identity types), `backend_interface.h`
+(the canonical base all backends implement), and `batching_utils.h` (shared
+batch helpers). `LlamaCppBackend` implements the common interface, and the
+factory + router stay backend-agnostic.
+
+Residual coupling (some runtime/execution paths still reference
+`LlamaCppBackend` types directly) is a known, deferred gap — untangling it
+is broad churn with limited near-term throughput value, and compatibility
+aliases come out only after batch execution and backend contracts settle.
+
+Guidance:
+
+1. Reuse the common backend types for new behavior.
+2. Avoid large inheritance/interface rewrites unless they remove active
+   duplication in code you are already touching.
+3. Prefer incremental extraction over architectural rewrites that compete
+   with throughput work.
+
+This refactor is only worth finishing when it delivers one of: less
+duplicated batching/runtime logic across active backends, clearer
+native-runtime ownership boundaries, or lower regression risk for new
+backend features.
+
 ## Grammar and Structured Output Delegation
 
 Grammar-constrained generation (JSON schema, regex, CFG) is the **one capability that still requires llama.cpp's sampler chain** (`llama_sampler_init_grammar`). This section documents how the architecture handles it without leaking the dependency into the interface.
