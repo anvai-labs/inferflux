@@ -1004,16 +1004,16 @@ LlamaCppBackend::Prefill(const std::string &prompt, int sequence_id) {
   return result;
 }
 
-void LlamaCppBackend::CopySequencePrefix(int src_seq, int dst_seq,
+bool LlamaCppBackend::CopySequencePrefix(int src_seq, int dst_seq,
                                          int n_tokens) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_)
-    return;
+    return false;
   // Clear dst slot first so no stale KV cells survive from a previous request.
   llama_memory_seq_rm(llama_get_memory(context_),
                       static_cast<llama_seq_id>(dst_seq), -1, -1);
   if (n_tokens <= 0) {
-    return;
+    return true;
   }
   // Partial seq_cp can assert on cross-stream KV layouts; copy full source KV
   // state first, then trim the destination to [0, n_tokens) via seq_rm.
@@ -1021,9 +1021,21 @@ void LlamaCppBackend::CopySequencePrefix(int src_seq, int dst_seq,
                       static_cast<llama_seq_id>(src_seq),
                       static_cast<llama_seq_id>(dst_seq),
                       static_cast<llama_pos>(0), static_cast<llama_pos>(-1));
-  llama_memory_seq_rm(
-      llama_get_memory(context_), static_cast<llama_seq_id>(dst_seq),
-      static_cast<llama_pos>(n_tokens), static_cast<llama_pos>(-1));
+  // Hybrid/recurrent memory cannot partially erase a suffix that includes its
+  // final cell: the trim can fail, leaving the stale source tail resident.
+  // Full-clear and report so the caller falls back to a full prefill.
+  if (!llama_memory_seq_rm(
+          llama_get_memory(context_), static_cast<llama_seq_id>(dst_seq),
+          static_cast<llama_pos>(n_tokens), static_cast<llama_pos>(-1))) {
+    log::Warn("llama_backend",
+              "CopySequencePrefix trim failed (hybrid memory); seq " +
+                  std::to_string(dst_seq) +
+                  " cleared for full-prefill fallback");
+    llama_memory_seq_rm(llama_get_memory(context_),
+                        static_cast<llama_seq_id>(dst_seq), -1, -1);
+    return false;
+  }
+  return true;
 }
 
 // Legacy API shape retained for backend compatibility.
@@ -1531,12 +1543,39 @@ LlamaCppBackend::ExecuteUnifiedBatch(
   return results;
 }
 
+// Full-range seq_rm cannot fail on recurrent/hybrid memory (only partial
+// erases that include the final cell can), so the void return is correct.
 void LlamaCppBackend::FreeSequence(int sequence_id) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_)
     return;
   llama_memory_seq_rm(llama_get_memory(context_),
                       static_cast<llama_seq_id>(sequence_id), -1, -1);
+}
+
+bool LlamaCppBackend::TruncateSequence(int sequence_id, int keep_from) {
+  BackendStateLock lock(backend_state_mutex_);
+  if (!context_)
+    return false;
+  auto *mem = llama_get_memory(context_);
+  const auto seq = static_cast<llama_seq_id>(sequence_id);
+  if (keep_from <= 0) {
+    llama_memory_seq_rm(mem, seq, -1, -1);
+    return true;
+  }
+  if (llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(keep_from),
+                          static_cast<llama_pos>(-1))) {
+    return true;
+  }
+  // Hybrid/conv/recurrent memory cannot partially erase a suffix that
+  // includes its final cell. Full-clear and tell the caller to prefill
+  // from position 0.
+  log::Warn("llama_backend", "TruncateSequence partial trim failed (hybrid "
+                             "memory); seq " +
+                                 std::to_string(sequence_id) +
+                                 " cleared for full-prefill fallback");
+  llama_memory_seq_rm(mem, seq, -1, -1);
+  return false;
 }
 
 LlamaCppBackend::SequenceReleaseFence

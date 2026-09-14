@@ -113,7 +113,8 @@ public:
          std::vector<TokenLogprob> *out_logprobs = nullptr,
          int first_token = -1,
          const std::vector<std::string> &stop_seqs = {}) override;
-  void CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) override;
+  bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) override;
+  bool TruncateSequence(int sequence_id, int keep_from) override;
   PrefillResult PrefillPartial(const std::string &prompt, int sequence_id,
                                int n_past_start) override;
   void FreeSequence(int sequence_id) override;

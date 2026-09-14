@@ -321,12 +321,13 @@ PrefillResult NativeGpuBackend::PrefillPartial(const std::string &prompt,
   return backend->PrefillPartial(prompt, sequence_id, n_past_start);
 }
 
-void NativeGpuBackend::CopySequencePrefix(int src_seq, int dst_seq,
+bool NativeGpuBackend::CopySequencePrefix(int src_seq, int dst_seq,
                                           int n_tokens) {
   std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
   if (runtime_) {
-    runtime_->NativeCopySequencePrefix(src_seq, dst_seq, n_tokens);
+    return runtime_->NativeCopySequencePrefix(src_seq, dst_seq, n_tokens);
   }
+  return false;
 }
 
 void NativeGpuBackend::FreeSequence(int sequence_id) {

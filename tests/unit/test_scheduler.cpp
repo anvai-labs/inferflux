@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -701,7 +702,8 @@ TEST_CASE("on_token callback fires on prefix cache hit", "[scheduler]") {
   auto cache = std::make_shared<PagedKVCache>(
       4, 1024, PagedKVCache::EvictionPolicy::kLRU);
   auto prefix_cache = std::make_shared<RadixPrefixCache>(
-      cache, [](int) {}, RadixPrefixCacheLimits{1024, 12});
+      cache, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{1024, 12});
 
   const std::string prompt = "cached prompt";
   auto prompt_tokens = tokenizer.Encode(prompt);
@@ -736,7 +738,8 @@ TEST_CASE("Scheduler reports radix prefix hits as cached prompt tokens",
   auto cache = std::make_shared<PagedKVCache>(
       4, 1024, PagedKVCache::EvictionPolicy::kLRU);
   auto prefix_cache = std::make_shared<RadixPrefixCache>(
-      cache, [](int) {}, RadixPrefixCacheLimits{1024, 12});
+      cache, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{1024, 12});
   auto router = std::make_shared<SingleModelRouter>();
   auto backend = std::make_shared<ReadyStubBackend>("ok");
 
@@ -2320,7 +2323,8 @@ TEST_CASE("Scheduler lpm policy prioritizes prefix-affinity request",
       8, 1024, PagedKVCache::EvictionPolicy::kLRU);
   auto router = std::make_shared<SingleModelRouter>();
   auto prefix_cache = std::make_shared<RadixPrefixCache>(
-      cache, [](int) {}, RadixPrefixCacheLimits{1024, 32});
+      cache, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{1024, 32});
 
   auto cold_backend = std::make_shared<AsyncLaneStubBackend>("cold");
   auto hot_backend = std::make_shared<AsyncLaneStubBackend>("hot");
@@ -2465,4 +2469,188 @@ TEST_CASE("Scheduler keeps default admission without a native KV capacity",
   SchedulerTestAccess access(scheduler);
   REQUIRE(access.slot_manager()->GetMaxSlots() == 128);
   REQUIRE(access.max_batch_size() == 32);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #161: sequence-position consistency across slot reuse
+// ---------------------------------------------------------------------------
+
+// Simulates llama.cpp's batch-init position check: a chunk submitted at
+// n_past is only valid when the sequence's resident KV ends exactly at
+// n_past - 1. Records violations instead of failing so the invariant can be
+// asserted. Optionally models hybrid (conv/recurrent) memory whose partial
+// trims fail, mirroring LFM2.5-8B-A1B.
+class PositionCheckingBackend : public LlamaCppBackend {
+public:
+  std::map<int, int> pos_max; // seq -> last resident position (-1 = empty)
+  bool hybrid_trim_fails = false;
+  int position_violations = 0;
+  int unified_calls = 0;
+  int generate_calls = 0;
+
+  std::string Name() const override { return "position_checking"; }
+  bool LoadModel(const std::filesystem::path &,
+                 const LlamaBackendConfig &) override {
+    return true;
+  }
+  bool IsReady() const override { return true; }
+  int TokenCount(const std::string &) const override { return 5; }
+  std::vector<int> TokenizeForCache(const std::string &) const override {
+    return {1, 2, 3};
+  }
+  int UnifiedBatchTokenCapacity() const override { return 512; }
+
+  bool CopySequencePrefix(int, int dst_seq, int n_tokens) override {
+    if (hybrid_trim_fails) {
+      // Hybrid memory: full clear succeeds, the partial trim cannot.
+      pos_max[dst_seq] = -1;
+      return false;
+    }
+    pos_max[dst_seq] = n_tokens - 1;
+    return true;
+  }
+
+  bool TruncateSequence(int sequence_id, int keep_from) override {
+    if (keep_from > 0 && hybrid_trim_fails) {
+      pos_max[sequence_id] = -1;
+      return false;
+    }
+    pos_max[sequence_id] = keep_from - 1;
+    return true;
+  }
+
+  void FreeSequence(int sequence_id) override { pos_max[sequence_id] = -1; }
+
+  std::vector<UnifiedBatchOutput>
+  ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override {
+    ++unified_calls;
+    std::vector<UnifiedBatchOutput> outputs;
+    for (const auto &in : inputs) {
+      const int xmax =
+          pos_max.count(in.sequence_id) ? pos_max[in.sequence_id] : -1;
+      if (in.n_past != xmax + 1) {
+        // llama-batch.cpp would reject: "inconsistent sequence positions".
+        ++position_violations;
+        return {};
+      }
+      pos_max[in.sequence_id] =
+          in.n_past + static_cast<int>(in.tokens.size()) - 1;
+      UnifiedBatchOutput out;
+      out.ok = true;
+      if (in.request_logits) {
+        out.token = 42;
+        out.piece = "x";
+      }
+      outputs.push_back(out);
+    }
+    return outputs;
+  }
+
+  std::string
+  Generate(const std::string &, int,
+           const std::function<bool(const std::string &, const TokenLogprob *)>
+               &on_chunk,
+           const std::function<bool()> &, int, std::vector<TokenLogprob> *,
+           const std::vector<std::string> &) override {
+    ++generate_calls;
+    if (on_chunk && !on_chunk("x", nullptr)) {
+      return {};
+    }
+    return "x";
+  }
+};
+
+TEST_CASE("Scheduler keeps sequence positions consistent across radix "
+          "donation and eviction (issue #161)",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<PositionCheckingBackend>();
+
+  ModelInfo info;
+  info.id = "position-model";
+  info.path = "/tmp/position.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  auto prefix_cache = std::make_shared<RadixPrefixCache>(
+      cache,
+      [&](int seq_id, std::shared_ptr<BackendInterface> be) {
+        if (auto *llama_be = dynamic_cast<LlamaCppBackend *>(be.get())) {
+          llama_be->FreeSequence(seq_id);
+        }
+      },
+      RadixPrefixCacheLimits{1024, 12});
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, prefix_cache);
+
+  // Prime the trie the way a completed request would (same tokens the stub
+  // tokenizes), then drive two same-prompt requests: the first donates its
+  // KV, eviction recycles it, and the second must never see stale positions.
+  prefix_cache->Insert(backend->TokenizeForCache("seed"), {100}, 0, backend);
+
+  InferenceRequest first;
+  first.prompt = "prefix cached prompt";
+  first.max_tokens = 2;
+  auto resp1 = scheduler.Generate(std::move(first)).get();
+  REQUIRE_FALSE(resp1.no_backend);
+  REQUIRE(resp1.completion_tokens > 0);
+
+  // Evict the donated entry: with the fix the callback carries the backend
+  // so the backend KV is cleared before the slot is reusable.
+  prefix_cache->EvictOneSequence();
+  REQUIRE(backend->pos_max.at(0) == -1);
+
+  InferenceRequest second;
+  second.prompt = "prefix cached prompt";
+  second.max_tokens = 2;
+  auto resp2 = scheduler.Generate(std::move(second)).get();
+  REQUIRE_FALSE(resp2.no_backend);
+  REQUIRE(resp2.completion_tokens > 0);
+
+  REQUIRE(backend->position_violations == 0);
+  REQUIRE(backend->generate_calls == 0);
+}
+
+TEST_CASE("Scheduler falls back to full phased prefill when the hybrid prefix "
+          "trim fails (issue #161)",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<PositionCheckingBackend>();
+  backend->hybrid_trim_fails = true; // LFM2.5-style hybrid memory
+
+  ModelInfo info;
+  info.id = "hybrid-model";
+  info.path = "/tmp/hybrid.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  auto prefix_cache = std::make_shared<RadixPrefixCache>(
+      cache, [](int, std::shared_ptr<BackendInterface>) {},
+      RadixPrefixCacheLimits{1024, 12});
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, prefix_cache);
+
+  prefix_cache->Insert(backend->TokenizeForCache("seed"), {100}, 0, backend);
+
+  InferenceRequest req;
+  req.prompt = "prefix cached prompt";
+  req.max_tokens = 2;
+  auto resp = scheduler.Generate(std::move(req)).get();
+
+  // The prefix copy reports failure, the slot is cleared, and the whole
+  // prompt is re-prefilled inside the phased step — no stale positions, no
+  // sequential degradation.
+  REQUIRE_FALSE(resp.no_backend);
+  REQUIRE(resp.completion_tokens > 0);
+  REQUIRE(backend->position_violations == 0);
+  REQUIRE(backend->generate_calls == 0);
+  REQUIRE(backend->unified_calls > 0);
 }

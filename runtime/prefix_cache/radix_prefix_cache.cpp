@@ -172,11 +172,11 @@ void RadixPrefixCache::SplitEdge(RadixNode *parent, const SplitEdgeSpec &spec) {
   size_++;
 }
 
-void RadixPrefixCache::Insert(
+bool RadixPrefixCache::Insert(
     const std::vector<int> &tokens, const std::vector<int> &block_table,
     int sequence_id, const std::shared_ptr<BackendInterface> &backend) {
   if (capacity_ == 0 || tokens.empty() || block_table.empty()) {
-    return;
+    return false;
   }
 
   std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -219,7 +219,7 @@ void RadixPrefixCache::Insert(
       while (size_ > capacity_) {
         EvictOne();
       }
-      return;
+      return true;
     }
 
     RadixNode *child = it->second.get();
@@ -257,6 +257,7 @@ void RadixPrefixCache::Insert(
   node->backend = backend;
   node->last_used.store(clock_.fetch_add(1, std::memory_order_relaxed) + 1,
                         std::memory_order_relaxed);
+  return true;
 }
 
 void RadixPrefixCache::CollectNodes(
@@ -289,11 +290,12 @@ void RadixPrefixCache::EvictOne() {
 
   RadixNode *victim = victim_it->second;
   if (victim->sequence_id >= 0) {
-    if (auto locked_be = victim->backend.lock()) {
+    auto locked_be = victim->backend.lock();
+    if (locked_be) {
       locked_be->FreeSequence(victim->sequence_id);
     }
     if (on_evict_seq_) {
-      on_evict_seq_(victim->sequence_id);
+      on_evict_seq_(victim->sequence_id, locked_be);
     }
     live_sequences_--;
   }
@@ -322,11 +324,12 @@ void RadixPrefixCache::EvictOneSequence() {
       [](const auto &a, const auto &b) { return a.first < b.first; });
 
   RadixNode *victim = victim_it->second;
-  if (auto locked_be = victim->backend.lock()) {
+  auto locked_be = victim->backend.lock();
+  if (locked_be) {
     locked_be->FreeSequence(victim->sequence_id);
   }
   if (on_evict_seq_) {
-    on_evict_seq_(victim->sequence_id);
+    on_evict_seq_(victim->sequence_id, locked_be);
   }
 
   // Correctness Fix (§ Item 2): release block references back to the cache!

@@ -96,12 +96,13 @@ public:
     return true;
   }
 
-  virtual void NativeCopySequencePrefix(int src_seq, int dst_seq,
+  virtual bool NativeCopySequencePrefix(int src_seq, int dst_seq,
                                         int n_tokens) {
     auto backend = BackendHandle();
     if (backend) {
-      backend->CopySequencePrefix(src_seq, dst_seq, n_tokens);
+      return backend->CopySequencePrefix(src_seq, dst_seq, n_tokens);
     }
+    return false;
   }
 
   virtual std::vector<uint8_t> NativeSerializeSequence(int sequence_id) const {

@@ -379,12 +379,20 @@ void MlxBackend::FreeSequence(int sequence_id) {
   LlamaCppBackend::FreeSequence(sequence_id);
 }
 
-void MlxBackend::CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) {
+bool MlxBackend::TruncateSequence(int sequence_id, int keep_from) {
+  // The MLX engine keeps its own KV state that the llama-context trim cannot
+  // reach; always fall back to a full clear plus full prefill.
+  FreeSequence(sequence_id);
+  (void)keep_from;
+  return false;
+}
+
+bool MlxBackend::CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) {
   if (engine_ready_) {
     engine_.CopySlotPrefix(src_seq, dst_seq, n_tokens);
-    return;
+    return true;
   }
-  LlamaCppBackend::CopySequencePrefix(src_seq, dst_seq, n_tokens);
+  return LlamaCppBackend::CopySequencePrefix(src_seq, dst_seq, n_tokens);
 }
 
 std::vector<LlamaCppBackend::UnifiedBatchOutput>

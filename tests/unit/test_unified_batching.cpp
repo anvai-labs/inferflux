@@ -317,7 +317,8 @@ TEST_CASE("BatchExecutor: Unified Batching & Chunked Prefill",
   auto cache = std::make_shared<PagedKVCache>(
       10, 1024, PagedKVCache::EvictionPolicy::kLRU);
   auto prefix_cache = std::make_shared<RadixPrefixCache>(
-      cache, [](int) {}, RadixPrefixCacheLimits{1024, 12});
+      cache, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{1024, 12});
   auto router = std::make_shared<SingleModelRouter>();
   auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
                                                   router, nullptr);

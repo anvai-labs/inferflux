@@ -26,7 +26,9 @@ TEST_CASE("PrefixCache hit after insert", "[prefix_cache]") {
 }
 
 TEST_CASE("RadixPrefixCache LRU eviction", "[prefix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{4, 12});
+  RadixPrefixCache cache(
+      nullptr, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{4, 12});
   // Fill capacity.
   cache.Insert({1}, {10}, 1, nullptr);
   cache.Insert({2}, {11}, 2, nullptr);
