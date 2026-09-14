@@ -23,6 +23,8 @@ copyright: Copyright &copy; 2026 Vijaykumar Singh
 # kept in-repo but are not part of the published site.
 exclude_docs: |
   /README.md
+  # Deliberately unpublished: links into repository source files, which
+  # mkdocs --strict cannot validate.
   /design/memory_accounting_strategy.md
 
 theme:
