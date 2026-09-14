@@ -140,7 +140,7 @@ by the current state of the canonical docs and code they investigated.
 
 ## Canonical Sources of Truth
 
-- [README](../README.md)
+- [README](index.md)
 - [INDEX](INDEX.md)
 - [Quickstart](Quickstart.md)
 - [API Surface](API_SURFACE.md)

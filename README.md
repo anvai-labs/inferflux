@@ -1,9 +1,11 @@
 # InferFlux
 
 > High-throughput inference server for edge and on-premise AI workloads.
-> OpenAI-compatible APIs · Native CUDA kernels · 1.87x faster than Ollama at concurrency
+> OpenAI-compatible APIs · Native CUDA kernels + llama.cpp · Meets or beats stock llama.cpp on AMD and NVIDIA
 
-**Why InferFlux?** Small, quantized models (3B-8B GGUF) running on a single GPU can power dozens of concurrent AI tasks — but only if the serving layer doesn't bottleneck. Ollama and LM Studio degrade under concurrent load because of Go/Node.js overhead. InferFlux's C++ unified batching serves 8+ concurrent sequences in a single GPU kernel launch, achieving **2.2x scaling** while competitors plateau or degrade.
+**Documentation: https://anvai-labs.github.io/inferflux/**
+
+**Why InferFlux?** Small, quantized models (3B-30B) running on a single GPU can power dozens of concurrent AI tasks — but only if the serving layer doesn't bottleneck. InferFlux's C++ scheduler keeps decode batches full with wave-gathering admission and continuous batching. On an AMD Radeon AI PRO R9700 it serves every tested architecture at or above stock llama.cpp — **+51% on Qwen3-30B-A3B (MoE), +26% on LFM2.5-8B-A1B, +19% on gpt-oss-20b** at 16-way concurrency — while adding auth, policy, fairness, prefix caching, and Prometheus metrics that raw model servers don't have. Measured comparisons and methodology: [docs/COMPETITIVE_POSITIONING.md](docs/COMPETITIVE_POSITIONING.md).
 
 **Use cases:**
 - **Parallel email/document analysis** — 8 agents processing inboxes simultaneously on one RTX 4000
@@ -14,9 +16,9 @@
 - **Task orchestration** — multiple AI agents making independent decisions in parallel
 
 **Integration:** Drop-in replacement for any OpenAI-compatible client. Point `OPENAI_BASE_URL` at InferFlux and existing code works unchanged:
-- **[Victor](https://github.com/vjsingh1984/victor)** — agentic AI framework with 24 providers. InferFlux replaces Ollama/LM Studio as the local provider with 1.87x higher throughput for parallel agent workloads
+- **[Victor](https://github.com/anvai-labs/victor)** — agentic AI framework with 24 providers. InferFlux as the local provider — measured at or above stock llama.cpp on every tested model class
 - **LangChain / LlamaIndex / openai-python** — use InferFlux as any OpenAI-compatible endpoint
-- **NVIDIA RTX 4000 Ada** — optimized for professional workstation GPUs running 3B-8B quantized models at high concurrency
+- **NVIDIA RTX 4000 Ada** — workstation GPUs serving quantized models from 3B dense to 30B MoE at high concurrency
 
 ```mermaid
 graph LR
@@ -33,36 +35,28 @@ graph LR
     style F fill:#90be6d
 ```
 
-## Benchmark (Verified Apr 14 2026)
+## Benchmarks (verified Sep 13 2026)
 
-RTX 4000 Ada 20GB · Qwen2.5-3B Q4_K_M · 16 requests × 64 tokens
+AMD Radeon AI PRO R9700 (32 GB, ROCm 7.2) · Qwen2.5-3B Q4_K_M · 48 requests × 256 tokens, greedy, 16 concurrent · vs a stock llama.cpp server built from the same pinned source:
 
-| Backend | c=1 | c=4 | c=8 | Scale | GPU | Quality |
-|---|---|---|---|---|---|---|
-| llama_cpp_cuda | 113 tok/s | 206 tok/s | 282 tok/s | 2.5x | 5.4 GB | 16/16 ✓ |
-| **inferflux_cuda** | **66 tok/s** | **134 tok/s** | **131 tok/s** | **2.0x** | 6.0 GB | ⚠️ partial¹ |
-| Ollama² | 98 tok/s | 111 tok/s | 113 tok/s | 1.2x | 5.4 GB | 16/16 ✓ |
-| LM Studio² | 109 tok/s | 81 tok/s | 70 tok/s | 0.6x | 7.9 GB | 16/16 ✓ |
+| Model | Stock llama.cpp c=16 | InferFlux c=16 | Δ |
+|---|---:|---:|---|
+| Qwen2.5-3B (dense) | 992 tok/s | **1067 tok/s** | +8% |
+| LFM2.5-8B-A1B (hybrid MoE) | 861 tok/s | **1089 tok/s** | +26% |
+| gpt-oss-20b MXFP4 (MoE) | 598 tok/s | **710 tok/s** | +19% |
+| Qwen3-30B-A3B (MoE) | 498 tok/s | **750 tok/s** | +51% |
+| Qwen3-14B (dense) | 391 tok/s | 388 tok/s | parity |
 
-> ¹ inferflux_cuda: correct tokenization and chat template rendering verified; native CUDA kernel numerical precision causes ~60% of responses to diverge from reference. Accuracy parity is the [top priority](https://github.com/vjsingh1984/inferflux/issues/18).
-> ² Both use llama.cpp under the hood (confirmed: ±12 MB memory, 0.87-0.96 cosine).
+Kernel-level correctness on the AMD GPU: 11,054/11,054 llama.cpp backend ops passed. NVIDIA RTX 4000 Ada CUDA numbers (native first-party kernels vs the llama.cpp wrapper, dated Sep 4-8 2026) and the safetensors comparison against vLLM/SGLang: [docs/benchmarks.md](docs/benchmarks.md) and [docs/COMPETITIVE_POSITIONING.md](docs/COMPETITIVE_POSITIONING.md).
 
-**Key results:**
-- `inferflux_cuda` **1.16x faster than Ollama** and **1.88x faster than LM Studio** at c=8
-- **Best scaling vs external tools**: 2.0x from c=1→c=8 (Ollama 1.2x, LM Studio 0.6x — degrades)
-- `llama_cpp_cuda` remains 2.2x faster than `inferflux_cuda` at c=8 — [closing the gap is the top priority](https://github.com/vjsingh1984/inferflux/issues/18)
-- `llama_cpp_cuda` achieves **100% accuracy** — recommended production backend
+### Why InferFlux stays fast at concurrency
 
-### Why InferFlux Scales Better
-
-| | InferFlux | Ollama | LM Studio |
-|---|---|---|---|
-| **Language** | C++17, zero-copy | Go + CGo boundary | Electron + Node.js |
-| **Batching** | Unified batch: one GPU kernel serves all concurrent sequences | Sequential per-request dispatch | Single-threaded JS event loop |
-| **Weight sharing** | Single GPU context, shared across all requests | Per-process model instance | llama.cpp server subprocess |
-| **Overhead at c=8** | ~0 (batch kernel) | CGo call overhead × 8 + GC pauses | Event loop serialization |
-
-Details: [docs/TechDebt_and_Competitive_Roadmap.md](docs/TechDebt_and_Competitive_Roadmap.md)
+| | InferFlux | Typical per-request servers |
+|---|---|---|
+| **Batching** | Continuous batching with wave-gathering admission — decode batches stay full as requests arrive | Rosters launch per arrival wave; solo requests hold the worker |
+| **Scheduling** | Priority/age, LPM, throughput-balanced selection, chunked prefill, fairness yield/resume | First-come-first-served |
+| **Reuse** | Radix prefix cache with backend-verified KV consistency | Per-request prefill |
+| **Surface** | Auth, policy/guardrails, fairness, Prometheus metrics, audit log around the same llama.cpp library | Raw model serving |
 
 ## OSS Release Snapshot
 
@@ -79,20 +73,19 @@ Details: [docs/TechDebt_and_Competitive_Roadmap.md](docs/TechDebt_and_Competitiv
 
 | State | Reading |
 |---|---|
-| Strong today | API/admin/CLI contracts, backend identity, chat template rendering (ChatML/Llama/Mistral/Gemma), GGUF metadata API |
-| Proven advantage | `llama_cpp_cuda` 2.5x faster than Ollama, 4x faster than LM Studio at c=8. `inferflux_cuda` 1.16x faster than Ollama, 1.88x faster than LM Studio |
-| Native CUDA | `inferflux_cuda` functional with correct tokenization and chat templates. 50+ fused GEMV kernels, FlashAttention-2, repetition penalty. Accuracy parity with llama.cpp is the top priority |
-| Architecture | RAII, DIP (registry-based backend factory), strategy pattern (batch selection), MetricsRegistry DI, InferenceRequest decomposed |
-| Still open | GPU memory overhead, native structured output, speculative decoding integration |
+| Proven (ROCm, Sep 13) | Meets or beats stock llama.cpp on every tested architecture (dense parity, MoE +19-51%); hybrid-attention models fully supported |
+| Proven (CUDA) | 50+ fused GEMV kernels, FlashAttention-2, MMA decode; native `inferflux_cuda` leads the wrapper up to 1.56× at c=16 on short-completion workloads |
+| Strong today | API/admin/CLI contracts, backend identity, chat template rendering, GGUF metadata API, fairness, prefix cache |
+| Still open | Safetensors decode gap vs vLLM/SGLang (measured, profiled — see docs/benchmarks.md), native structured output |
 
 ## Design Principles
 
 | Principle | Reading |
 |---|---|
-| Throughput | Unified batching: one GPU kernel serves all concurrent sequences |
-| Quality | Chat template auto-detected from GGUF metadata; repetition penalty prevents degenerate loops |
-| Memory | Quantized GGUF stays quantized; scratch buffer aliasing; KV budget auto-tuned |
-| Backend selection | `inferflux_cuda` is the recommended backend; `llama_cpp_cuda` available as fallback |
+| Throughput | Continuous batching with wave-gathering admission keeps decode batches full |
+| Quality | Chat template auto-detected from GGUF metadata; greedy determinism verified; per-request sampling |
+| Memory | Quantized GGUF stays quantized; KV budgets sized per slot; honest slot lifecycle |
+| Backend selection | `llama_cpp_*` for the broadest model coverage; native `inferflux_cuda` for first-party kernel work |
 
 ## 3-Minute Bring-Up
 
