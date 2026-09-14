@@ -99,9 +99,14 @@ public:
   // Evict the sequence-holding node with the smallest last_used timestamp (§
   // Item 1). Clears backend KV via the eviction callback and releases the
   // slot — used as the admission pressure valve when all slots are warm.
-  void EvictOneSequence();
+  // Takes the cache lock. Returns true when a sequence was evicted.
+  bool EvictOneSequence();
 
 private:
+  // Locking variant: callers must hold mutex_ exclusively (Insert uses this
+  // under its unique_lock).
+  bool EvictOneSequenceLocked();
+
   // DFS: collect nodes matching a criteria.
   void CollectNodes(RadixNode *node,
                     const std::function<bool(const RadixNode *)> &criteria,

@@ -2496,7 +2496,9 @@ public:
   bool IsReady() const override { return true; }
   int TokenCount(const std::string &) const override { return 5; }
   std::vector<int> TokenizeForCache(const std::string &) const override {
-    return {1, 2, 3};
+    // 40 tokens: above kMinPrefixTokens (32) so radix donation genuinely
+    // happens in the scheduler flow.
+    return std::vector<int>(40, 7);
   }
   int UnifiedBatchTokenCapacity() const override { return 512; }
 
@@ -2599,10 +2601,17 @@ TEST_CASE("Scheduler keeps sequence positions consistent across radix "
   REQUIRE_FALSE(resp1.no_backend);
   REQUIRE(resp1.completion_tokens > 0);
 
+  // The 40-token prompt clears kMinPrefixTokens: the completed request must
+  // have donated its KV — the trie owns the sequence and the slot stays
+  // occupied with KV resident.
+  REQUIRE(prefix_cache->LiveSequences() == 1);
+  REQUIRE(backend->pos_max.at(0) != -1);
+
   // Evict the donated entry: with the fix the callback carries the backend
   // so the backend KV is cleared before the slot is reusable.
-  prefix_cache->EvictOneSequence();
+  REQUIRE(prefix_cache->EvictOneSequence());
   REQUIRE(backend->pos_max.at(0) == -1);
+  REQUIRE_FALSE(prefix_cache->EvictOneSequence()); // nothing left to evict
 
   InferenceRequest second;
   second.prompt = "prefix cached prompt";

@@ -214,7 +214,7 @@ bool RadixPrefixCache::Insert(
       size_++;
 
       while (live_sequences_ > max_sequences_) {
-        EvictOneSequence();
+        EvictOneSequenceLocked();
       }
       while (size_ > capacity_) {
         EvictOne();
@@ -235,8 +235,8 @@ bool RadixPrefixCache::Insert(
     node = child;
   }
 
-  if (node->sequence_id < 0 && sequence_id >= 0)
-    live_sequences_++;
+  // Live-sequence accounting for the (re)donation happens at the assignment
+  // below, together with old-donor cleanup.
 
   // Update the block table for this node only (prefix blocks are owned by
   // ancestor nodes and are concatenated during lookup).
@@ -253,8 +253,27 @@ bool RadixPrefixCache::Insert(
   }
   node->block_table = std::move(node_blocks);
 
+  // Re-donation overwrites the previous donor's claim on this node. Free the
+  // old donor's backend KV and release its slot first — otherwise the old
+  // slot parks occupied forever, referenced by no trie node (issue #161
+  // review, blocker 2).
+  const int old_donor = node->sequence_id;
+  if (old_donor >= 0 && old_donor != sequence_id) {
+    auto old_be = node->backend.lock();
+    if (old_be) {
+      old_be->FreeSequence(old_donor);
+    }
+    if (on_evict_seq_) {
+      on_evict_seq_(old_donor, old_be);
+    }
+    live_sequences_--;
+  }
+
   node->sequence_id = sequence_id;
   node->backend = backend;
+  if (sequence_id >= 0 && sequence_id != old_donor) {
+    live_sequences_++;
+  }
   node->last_used.store(clock_.fetch_add(1, std::memory_order_relaxed) + 1,
                         std::memory_order_relaxed);
   return true;
@@ -310,14 +329,20 @@ void RadixPrefixCache::EvictOne() {
   size_--;
 }
 
-void RadixPrefixCache::EvictOneSequence() {
+bool RadixPrefixCache::EvictOneSequence() {
+  std::unique_lock<std::shared_mutex> lock(mutex_);
+  return EvictOneSequenceLocked();
+}
+
+// Must hold mutex_ exclusively.
+bool RadixPrefixCache::EvictOneSequenceLocked() {
   std::vector<std::pair<uint64_t, RadixNode *>> seq_nodes;
   CollectNodes(
       root_.get(), [](const RadixNode *n) { return n->sequence_id >= 0; },
       seq_nodes);
 
   if (seq_nodes.empty())
-    return;
+    return false;
 
   auto victim_it = std::min_element(
       seq_nodes.begin(), seq_nodes.end(),
@@ -340,6 +365,16 @@ void RadixPrefixCache::EvictOneSequence() {
 
   victim->sequence_id = -1;
   live_sequences_--;
+
+  // Prune childless husks so Lookup does not walk (and overclaim matched
+  // tokens across) evicted edges. Internal nodes stay: their edges route to
+  // live descendants.
+  if (victim->children.empty() && victim->parent != nullptr) {
+    int first_token = victim->edge[0];
+    victim->parent->children.erase(first_token);
+    size_--;
+  }
+  return true;
 }
 
 } // namespace inferflux

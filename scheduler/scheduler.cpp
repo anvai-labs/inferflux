@@ -2801,10 +2801,9 @@ int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out) {
     // LRU donated sequence (the eviction callback clears its backend KV and
     // releases the slot) and retry, so admission cannot starve on warm
     // prefixes now that AcquireLease no longer silently evicts occupied
-    // slots (issue #161).
-    const std::size_t max_attempts = kMaxSequenceSlots;
-    for (std::size_t attempt = 0; attempt < max_attempts && !lease; ++attempt) {
-      prefix_cache_->EvictOneSequence();
+    // slots (issue #161). EvictOneSequence returns false once the trie has
+    // no more sequences to give up.
+    while (!lease && prefix_cache_->EvictOneSequence()) {
       lease = slot_manager_->AcquireLease(request_id);
     }
   }
