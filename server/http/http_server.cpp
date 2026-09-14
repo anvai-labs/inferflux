@@ -10,6 +10,7 @@
 #include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/string_utils.h"
+#include "runtime/text/reasoning_splitter.h"
 #include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
@@ -58,6 +59,18 @@ using json = nlohmann::json;
 namespace inferflux {
 
 namespace {
+
+// Kill switch for reasoning separation: when enabled, <think> blocks stay in
+// content verbatim (legacy behavior for A/B validation).
+bool ReasoningSplitDisabled() {
+  static const bool disabled = [] {
+    if (const char *env = std::getenv("INFERFLUX_DISABLE_REASONING_SPLIT")) {
+      return std::string_view(env) != "0" && std::string_view(env) != "false";
+    }
+    return false;
+  }();
+  return disabled;
+}
 
 int ParseNonNegativeEnvInt(const char *name, int default_value) {
   const char *raw = std::getenv(name);
@@ -671,6 +684,7 @@ static json BuildLogprobsJson(const InferenceResult &result, bool chat_mode) {
 
 // Build one choice object for a single result.
 static json BuildChoice(int idx, const InferenceResult &result,
+                        const std::string &reasoning_content,
                         const ToolCallResult &tool_call, bool chat_mode) {
   json logprobs_json = BuildLogprobsJson(result, chat_mode);
   if (chat_mode) {
@@ -690,11 +704,15 @@ static json BuildChoice(int idx, const InferenceResult &result,
               {"finish_reason", "tool_calls"}};
     } else {
       const std::string fr = result.finish_reason_length ? "length" : "stop";
-      return {
-          {"index", idx},
-          {"message", {{"role", "assistant"}, {"content", result.completion}}},
-          {"logprobs", logprobs_json},
-          {"finish_reason", fr}};
+      return {{"index", idx},
+              {"message",
+               reasoning_content.empty()
+                   ? json{{"role", "assistant"}, {"content", result.completion}}
+                   : json{{"role", "assistant"},
+                          {"content", result.completion},
+                          {"reasoning_content", reasoning_content}}},
+              {"logprobs", logprobs_json},
+              {"finish_reason", fr}};
     }
   } else {
     const std::string fr = result.finish_reason_length ? "length" : "stop";
@@ -712,7 +730,9 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
                                 int total_completion_tokens,
                                 const CompletionRequestPayload &request,
                                 bool chat_mode,
-                                const std::vector<ToolCallResult> &tool_calls) {
+                                const std::vector<ToolCallResult> &tool_calls,
+                                const std::string &reasoning_content = {},
+                                int reasoning_tokens = 0) {
   auto now = std::chrono::system_clock::now();
   auto ts =
       std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch())
@@ -762,6 +782,10 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
     ttft_ms = results[0].time_to_first_token_ms;
   }
   j["usage"]["prompt_tokens_details"] = {{"cached_tokens", cached_toks}};
+  if (reasoning_tokens > 0) {
+    j["usage"]["completion_tokens_details"] = {
+        {"reasoning_tokens", reasoning_tokens}};
+  }
   if (duration_ms >= 0.0) {
     j["usage"]["duration_ms"] = duration_ms;
   }
@@ -769,25 +793,62 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
     j["usage"]["time_to_first_token_ms"] = ttft_ms;
   }
 
+  // Reasoning separation: split <think> blocks out of each result's
+  // completion so the user-facing content is clean and the reasoning rides
+  // in its own response field. No-op when the model emits no <think> tag.
+  int reasoning_tokens_total = 0;
+
   json choices = json::array();
   for (int i = 0; i < static_cast<int>(results.size()); ++i) {
-    const ToolCallResult &tc = (i < static_cast<int>(tool_calls.size()))
-                                   ? tool_calls[i]
-                                   : ToolCallResult{};
-    choices.push_back(BuildChoice(i, results[i], tc, chat_mode));
+    std::string per_result_content = results[i].completion;
+    std::string per_result_reasoning;
+    if (!ReasoningSplitDisabled()) {
+      auto parts = ReasoningSplitter::Split(results[i].completion);
+      per_result_content = std::move(parts.content);
+      per_result_reasoning = std::move(parts.reasoning);
+      reasoning_tokens_total +=
+          static_cast<int>(per_result_reasoning.size() > 0 ? 1 : 0);
+    }
+    auto choice = json::array();
+    (void)choice;
+    json choice_json;
+    if (chat_mode) {
+      const ToolCallResult &tc = (i < static_cast<int>(tool_calls.size()))
+                                     ? tool_calls[i]
+                                     : ToolCallResult{};
+      const std::string fr =
+          results[i].finish_reason_length ? "length" : "stop";
+      choice_json = {
+          {"index", i},
+          {"message",
+           per_result_reasoning.empty()
+               ? json{{"role", "assistant"}, {"content", per_result_content}}
+               : json{{"role", "assistant"},
+                      {"content", per_result_content},
+                      {"reasoning_content", per_result_reasoning}}},
+          {"logprobs", json::object()},
+          {"finish_reason", fr}};
+    } else {
+      choice_json = {{"index", i},
+                     {"text", per_result_content},
+                     {"finish_reason",
+                      results[i].finish_reason_length ? "length" : "stop"}};
+    }
+    choices.push_back(std::move(choice_json));
   }
   j["choices"] = choices;
   return SerializeJsonUtf8Safe(j);
 }
 
 // Single-result overload: preserves the original call sites unchanged.
-std::string
-BuildCompletionBody(const InferenceResult &result,
-                    const CompletionRequestPayload &request, bool chat_mode,
-                    const ToolCallResult &tool_call = ToolCallResult{}) {
+std::string BuildCompletionBody(
+    const InferenceResult &result, const CompletionRequestPayload &request,
+    bool chat_mode, const ToolCallResult &tool_call = ToolCallResult{},
+    const std::string &reasoning_content = {}, int reasoning_tokens = 0) {
   return BuildCompletionBody(std::vector<InferenceResult>{result},
                              result.completion_tokens, request, chat_mode,
-                             std::vector<ToolCallResult>{tool_call});
+                             std::vector<ToolCallResult>{tool_call},
+                             reasoning_content, reasoning_tokens);
 }
 
 std::string BuildErrorBody(const std::string &error) {
@@ -3072,6 +3133,23 @@ void HttpServer::HandleClient(ClientSession &session) {
         }
       }
 
+      // Reasoning separation (#W1): strip <think> blocks from the visible
+      // completion; the extracted reasoning rides in its own response field
+      // and the token count in usage details. No-op when the output has no
+      // <think> block.
+      int reasoning_tokens = 0;
+      std::string reasoning_content;
+      if (!ReasoningSplitDisabled()) {
+        for (auto &r : all_results) {
+          auto parts = inferflux::ReasoningSplitter::Split(r.completion);
+          if (!parts.reasoning.empty()) {
+            reasoning_content = parts.reasoning;
+            reasoning_tokens += static_cast<int>(parts.reasoning.size());
+            r.completion = std::move(parts.content);
+          }
+        }
+      }
+
       // Detect tool calls per choice.
       std::vector<ToolCallResult> tool_calls;
       tool_calls.reserve(all_results.size());
@@ -3119,7 +3197,8 @@ void HttpServer::HandleClient(ClientSession &session) {
 
       SendAll(session, BuildResponse(BuildCompletionBody(
                                          all_results, total_completion_tokens,
-                                         parsed, chat_mode, tool_calls),
+                                         parsed, chat_mode, tool_calls,
+                                         reasoning_content, reasoning_tokens),
                                      200, "OK", mc_trace_hdr));
       return;
     }
@@ -3424,9 +3503,20 @@ void HttpServer::HandleClient(ClientSession &session) {
         stream_active->store(false);
         return;
       } else {
+        // Reasoning separation (#W1): strip <think> blocks from the visible
+        // completion; extracted reasoning rides in its own response field.
+        if (!ReasoningSplitDisabled()) {
+          auto parts = inferflux::ReasoningSplitter::Split(result.completion);
+          if (!parts.reasoning.empty()) {
+            result.reasoning_content = std::move(parts.reasoning);
+            result.completion = std::move(parts.content);
+          }
+        }
         auto payload = BuildResponse(
-            BuildCompletionBody(result, parsed, chat_mode, tool_call), 200,
-            "OK", trace_response_header);
+            BuildCompletionBody(result, parsed, chat_mode, tool_call,
+                                result.reasoning_content,
+                                result.reasoning_tokens),
+            200, "OK", trace_response_header);
         SendAll(session, payload);
       }
     } catch (const std::exception &ex) {
