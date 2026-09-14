@@ -1563,9 +1563,15 @@ int main(int argc, char **argv) {
       static_cast<std::size_t>(prefix_cache_capacity);
   auto prefix_cache = std::make_shared<inferflux::RadixPrefixCache>(
       cache,
-      [&sched_ptr](int seq_id) {
-        if (sched_ptr)
-          sched_ptr->FreeSeqSlot(seq_id);
+      [&sched_ptr](int seq_id,
+                   std::shared_ptr<inferflux::BackendInterface> backend) {
+        if (sched_ptr) {
+          // Carry the backend so eviction clears the backend KV, not just
+          // the slot-manager state (issue #161).
+          sched_ptr->FreeSeqSlot(
+              seq_id, 0,
+              std::dynamic_pointer_cast<inferflux::LlamaCppBackend>(backend));
+        }
       },
       prefix_cache_limits);
   std::shared_ptr<inferflux::disaggregated::IKVTransport> kv_transport;

@@ -92,7 +92,11 @@ SequenceSlotManager::AcquireLease(int64_t request_id) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
 
   ReapRetiredSlotsLocked(std::chrono::steady_clock::now());
-  EvictIdleSlotsLocked(idle_timeout_);
+  // NOTE: no idle-slot eviction here. Flipping an occupied slot to kEvicted
+  // without deterministic backend-KV cleanup handed out slots whose sequences
+  // still held a previous request's positions (issue #161). Admission applies
+  // LRU pressure through the prefix cache's EvictOneSequence instead, which
+  // clears backend KV before releasing the slot.
 
   auto slot = FindFreeSlot();
   if (!slot) {

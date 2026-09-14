@@ -236,3 +236,23 @@ TEST_CASE("SequenceSlotManager slot status", "[slot_manager]") {
 
 } // namespace scheduler
 } // namespace inferflux
+
+TEST_CASE("SequenceSlotManager AcquireLease never evicts occupied slots "
+          "(issue #161)",
+          "[slot_manager]") {
+  inferflux::scheduler::SequenceSlotManager manager(16);
+  manager.SetIdleTimeout(std::chrono::milliseconds(0));
+
+  auto first = manager.AcquireSlot(1);
+  REQUIRE(first.has_value());
+  manager.MarkProcessing(*first);
+  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+  // Pre-#161, AcquireLease internally evicted stale kDecoding slots and could
+  // hand the same slot to a second request while its KV was still resident.
+  auto second = manager.AcquireSlot(2);
+  REQUIRE(second.has_value());
+  REQUIRE(*second != *first);
+  REQUIRE(manager.IsLiveLease({*first, 1, 1}));
+  REQUIRE(manager.GetUsedSlotCount() == 2);
+}

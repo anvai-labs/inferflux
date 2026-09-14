@@ -34,9 +34,9 @@ struct PerfSnapshot {
 /// Snapshot of intermediate attention tensors for debugging/profiling.
 struct AttentionTensorSnapshot {
   int layer_idx{-1};
-  std::string operation;  // "qkv_projection", "rope", "attention_scores", etc.
-  std::vector<float> data;  // Flattened tensor data (on host)
-  std::vector<int> shape;   // Tensor shape [batch, seq, heads, dim]
+  std::string operation;   // "qkv_projection", "rope", "attention_scores", etc.
+  std::vector<float> data; // Flattened tensor data (on host)
+  std::vector<int> shape;  // Tensor shape [batch, seq, heads, dim]
 };
 
 /// Container for attention tensor snapshots across all layers.
@@ -175,10 +175,27 @@ public:
     return true;
   }
 
-  virtual void CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) {
+  // Ensure the sequence's KV holds exactly positions [0, keep_from).
+  // Returns true when that state is guaranteed. Returns false AFTER fully
+  // clearing the sequence (hybrid/recurrent memory cannot trim a suffix that
+  // includes its final cell) — the caller must then prefill from position 0.
+  // The default (unknown capability) reports failure so callers fall back to
+  // a full prefill, which is always safe.
+  virtual bool TruncateSequence(int sequence_id, int keep_from) {
+    (void)sequence_id;
+    (void)keep_from;
+    return false;
+  }
+
+  // Copy the first n_tokens positions of src_seq into dst_seq (dst is fully
+  // cleared first). Returns false when the copy could not be completed (e.g.
+  // the post-copy trim failed on hybrid memory); dst is fully cleared on
+  // failure, so the caller must fall back to a full prefill.
+  virtual bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) {
     (void)src_seq;
     (void)dst_seq;
     (void)n_tokens;
+    return false;
   }
 
   virtual std::vector<uint8_t> SerializeSequence(int sequence_id) {

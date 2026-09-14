@@ -36,9 +36,10 @@ public:
 
   // Release KV cache slots for the given sequence_id.
   void FreeSequence(int sequence_id) override;
+  bool TruncateSequence(int sequence_id, int keep_from) override;
 
   // Copy KV cache entries for positions [0, n_tokens) from src_seq to dst_seq.
-  void CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) override;
+  bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) override;
 
   // Execute a mixed batch of prefill and decode sequences.
   std::vector<UnifiedBatchOutput>

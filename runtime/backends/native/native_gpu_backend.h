@@ -59,7 +59,7 @@ public:
   PrefillResult Prefill(const std::string &prompt, int sequence_id) override;
   PrefillResult PrefillPartial(const std::string &prompt, int sequence_id,
                                int n_past_start) override;
-  void CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) override;
+  bool CopySequencePrefix(int src_seq, int dst_seq, int n_tokens) override;
   void FreeSequence(int sequence_id) override;
   SequenceReleaseFence BeginFreeSequence(int sequence_id) override;
   bool PollFreeSequence(const SequenceReleaseFence &fence) override;
