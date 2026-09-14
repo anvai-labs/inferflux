@@ -147,55 +147,55 @@ class StubIntegrationTests(unittest.TestCase):
         resp, body = self._post("/v1/embeddings", {"input": "hello"})
         self.assertEqual(resp.status, 503, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "no_backend")
+        self.assertEqual((payload.get("error") or {}).get("code"), "no_backend")
 
     def test_embeddings_explicit_model_not_found(self):
         resp, body = self._post("/v1/embeddings", {"model": "explicit-model", "input": "hello"})
         self.assertEqual(resp.status, 404, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "model_not_found")
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
 
     def test_completion_explicit_model_not_found(self):
         resp, body = self._post("/v1/completions", {"model": "explicit-model", "prompt": "hi"})
         self.assertEqual(resp.status, 404, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "model_not_found")
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
 
     def test_models_get_by_id_not_found(self):
         resp, body = self._get("/v1/models/explicit-model")
         self.assertEqual(resp.status, 404, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "model_not_found")
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
 
     def test_admin_models_load_requires_path(self):
         resp, body = self._post("/v1/admin/models", {"id": "explicit-model"})
         self.assertEqual(resp.status, 400, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "path is required")
+        self.assertEqual((payload.get("error") or {}).get("code"), "path is required")
 
     def test_admin_models_unload_requires_id(self):
         resp, body = self._delete("/v1/admin/models", {})
         self.assertEqual(resp.status, 400, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "id is required")
+        self.assertEqual((payload.get("error") or {}).get("code"), "id is required")
 
     def test_admin_models_unload_not_found(self):
         resp, body = self._delete("/v1/admin/models", {"id": "explicit-model"})
         self.assertEqual(resp.status, 404, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "model_not_found")
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
 
     def test_admin_models_set_default_requires_id(self):
         resp, body = self._put("/v1/admin/models/default", {})
         self.assertEqual(resp.status, 400, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "id is required")
+        self.assertEqual((payload.get("error") or {}).get("code"), "id is required")
 
     def test_admin_models_set_default_not_found(self):
         resp, body = self._put("/v1/admin/models/default", {"id": "explicit-model"})
         self.assertEqual(resp.status, 404, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "model_not_found")
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
 
     def test_inferctl_admin_models_unload_not_found(self):
         result = self._run_inferctl(["admin", "models", "--unload", "explicit-model"])
@@ -205,7 +205,7 @@ class StubIntegrationTests(unittest.TestCase):
             msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
         )
         payload = json.loads(result.stdout)
-        self.assertEqual(payload.get("error"), "model_not_found")
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
 
     def test_inferctl_admin_models_set_default_not_found(self):
         result = self._run_inferctl(
@@ -217,7 +217,7 @@ class StubIntegrationTests(unittest.TestCase):
             msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
         )
         payload = json.loads(result.stdout)
-        self.assertEqual(payload.get("error"), "model_not_found")
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
 
     def test_inferctl_models_json(self):
         result = self._run_inferctl(["models", "--json"])
@@ -245,7 +245,7 @@ class StubIntegrationTests(unittest.TestCase):
             msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
         )
         payload = json.loads(result.stdout)
-        self.assertEqual(payload.get("error"), "model_not_found")
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
 
     def test_inferctl_models_id_not_found_default_output(self):
         result = self._run_inferctl(["models", "--id", "explicit-model"])
@@ -255,7 +255,7 @@ class StubIntegrationTests(unittest.TestCase):
             msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
         )
         payload = json.loads(result.stdout)
-        self.assertEqual(payload.get("error"), "model_not_found")
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
 
     def test_inferctl_models_id_requires_value(self):
         result = self._run_inferctl(["models", "--id"])
@@ -928,7 +928,7 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
         resp, body = self._put("/v1/admin/routing", {"fallback_scope": "same_path_only"})
         self.assertEqual(resp.status, 500, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "policy_persist_failed")
+        self.assertEqual((payload.get("error") or {}).get("code"), "policy_persist_failed")
 
         resp, body = self._get("/v1/admin/routing")
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
@@ -943,7 +943,7 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
         resp, body = self._put("/v1/admin/guardrails", {"blocklist": ["only-new-value"]})
         self.assertEqual(resp.status, 500, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "policy_persist_failed")
+        self.assertEqual((payload.get("error") or {}).get("code"), "policy_persist_failed")
 
         resp, body = self._get("/v1/admin/guardrails")
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
@@ -958,7 +958,7 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
         resp, body = self._put("/v1/admin/rate_limit", {"tokens_per_minute": 999})
         self.assertEqual(resp.status, 500, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "policy_persist_failed")
+        self.assertEqual((payload.get("error") or {}).get("code"), "policy_persist_failed")
 
         resp, body = self._get("/v1/admin/rate_limit")
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
@@ -971,7 +971,7 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
         resp, body = self._post("/v1/admin/api_keys", {"key": key, "scopes": ["admin"]})
         self.assertEqual(resp.status, 500, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "policy_persist_failed")
+        self.assertEqual((payload.get("error") or {}).get("code"), "policy_persist_failed")
 
         # Ensure key was not left active in memory.
         resp, body = self._get_with_key("/v1/admin/rate_limit", key)
@@ -982,7 +982,7 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
         resp, body = self._delete("/v1/admin/api_keys", {"key": "dev-key-123"})
         self.assertEqual(resp.status, 500, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "policy_persist_failed")
+        self.assertEqual((payload.get("error") or {}).get("code"), "policy_persist_failed")
 
         resp, body = self._get("/v1/admin/rate_limit")
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
@@ -1054,7 +1054,7 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
         )
         self.assertEqual(resp.status, 422, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
-        self.assertEqual(payload.get("error"), "backend_policy_violation")
+        self.assertEqual(payload["error"]["code"], "backend_policy_violation")
         reason = payload.get("reason", "")
         self.assertIn("strict_inferflux_request", reason)
 

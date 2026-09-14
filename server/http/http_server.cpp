@@ -132,8 +132,7 @@ constexpr std::size_t kMaxResponseFormatBytes =
 // are defined in server/http/model_json.h/.cpp.
 
 std::string BuildModelNotFoundResponse() {
-  return BuildResponse(json({{"error", "model_not_found"}}).dump(), 404,
-                       "Not Found");
+  return BuildResponse(BuildErrorBody("model_not_found"), 404, "Not Found");
 }
 
 bool HasPrefix(const std::string &value, const std::string &prefix) {
@@ -721,11 +720,32 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
   std::string id_prefix = chat_mode ? "chatcmpl-" : "cmpl-";
   int prompt_toks = results.empty() ? 0 : results[0].prompt_tokens;
 
+  // Unique per call: epoch-ms alone collides for concurrent requests, so a
+  // process-wide monotonic counter disambiguates (and survives same-ms
+  // bursts). Restart repeats are acceptable — ids are correlation handles,
+  // not durable keys.
+  static std::atomic<uint64_t> completion_seq{0};
+  const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          now.time_since_epoch())
+                          .count();
+
   json j;
-  j["id"] = id_prefix + std::to_string(ts);
+  j["id"] = id_prefix + std::to_string(now_ms) + "-" +
+            std::to_string(completion_seq.fetch_add(1) + 1);
   j["object"] = chat_mode ? "chat.completion" : "text_completion";
   j["created"] = ts;
-  j["model"] = request.model;
+  // Resolved model: report what actually served (capability fallback can
+  // change it); fall back to the request string when unavailable.
+  if (!results.empty() && !results[0].model_id.empty()) {
+    j["model"] = results[0].model_id;
+  } else {
+    j["model"] = request.model;
+  }
+  if (!request.client_request_id.empty()) {
+    // Echo the caller's correlation id (header x-inferflux-client-request-id)
+    // so gateways can join request and response without guessing.
+    j["client_request_id"] = request.client_request_id;
+  }
   j["usage"] = {{"prompt_tokens", prompt_toks},
                 {"completion_tokens", total_completion_tokens},
                 {"total_tokens", prompt_toks + total_completion_tokens}};
@@ -771,7 +791,14 @@ BuildCompletionBody(const InferenceResult &result,
 }
 
 std::string BuildErrorBody(const std::string &error) {
-  return json({{"error", error}}).dump();
+  // OpenAI-style error envelope: SDK clients expect
+  // error.message/type/code; the specific code doubles as the legacy
+  // machine-readable tag (e.g. "rate_limited", "policy_persist_failed").
+  return json({{"error",
+                {{"message", error},
+                 {"type", "inferflux_error"},
+                 {"code", error}}}})
+      .dump();
 }
 
 std::vector<std::string> SplitForStreaming(const std::string &text) {
@@ -1697,7 +1724,9 @@ void HttpServer::HandleClient(ClientSession &session) {
         "HTTP/1.1 204 No Content\r\n"
         "Access-Control-Allow-Origin: *\r\n"
         "Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n"
-        "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+        "Access-Control-Allow-Headers: Content-Type, Authorization, "
+        "x-inferflux-session-id, x-inferflux-client-request-id, "
+        "traceparent\r\n"
         "Access-Control-Max-Age: 86400\r\n"
         "Content-Length: 0\r\n\r\n";
     SendAll(session, cors_headers);
@@ -1717,8 +1746,10 @@ void HttpServer::HandleClient(ClientSession &session) {
   }
   if (rate_limiter_ && rate_limiter_->Enabled() &&
       !rate_limiter_->Allow(auth_ctx.subject)) {
-    auto response =
-        BuildResponse(BuildErrorBody("rate_limited"), 429, "Too Many Requests");
+    auto response = BuildResponse(
+        BuildErrorBody("rate_limited"), 429, "Too Many Requests",
+        "Retry-After: 1\r\nX-RateLimit-Limit: per-minute bucket\r\n"
+        "X-RateLimit-Remaining: 0\r\n");
     SendAll(session, response);
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "rate_limited",
@@ -2157,7 +2188,10 @@ void HttpServer::HandleClient(ClientSession &session) {
         const std::string reason =
             StripPrefix(load_error, "backend_policy_violation:");
         json payload{
-            {"error", "backend_policy_violation"},
+            {"error",
+             {{"message", "backend_policy_violation"},
+              {"type", "inferflux_error"},
+              {"code", "backend_policy_violation"}}},
             {"reason",
              reason.empty() ? "backend policy rejected model load" : reason},
         };
@@ -3101,6 +3135,10 @@ void HttpServer::HandleClient(ClientSession &session) {
       trace_response_header =
           "traceparent: " + request_ctx.ToTraceparent() + "\r\n";
     }
+    if (!parsed.client_request_id.empty()) {
+      trace_response_header +=
+          "x-inferflux-client-request-id: " + parsed.client_request_id + "\r\n";
+    }
     if (is_legacy_completions) {
       trace_response_header +=
           "Deprecation: true\r\n"
@@ -3235,6 +3273,23 @@ void HttpServer::HandleClient(ClientSession &session) {
                                        result.completion, false));
               SendAll(session, BuildStreamChunk(stream_id, parsed.model,
                                                 stream_ts, "", true));
+            }
+            if (parsed.stream_include_usage) {
+              // Terminal usage frame on every path — gateways key billing on
+              // it, so the stub path must not be the lone omission.
+              json usage_frame = {
+                  {"id", stream_id},
+                  {"object", "chat.completion.chunk"},
+                  {"created", stream_ts},
+                  {"model", parsed.model},
+                  {"choices", json::array()},
+                  {"usage",
+                   {{"prompt_tokens", result.prompt_tokens},
+                    {"completion_tokens", result.completion_tokens},
+                    {"total_tokens",
+                     result.prompt_tokens + result.completion_tokens}}}};
+              SendAll(session,
+                      "data: " + SerializeJsonUtf8Safe(usage_frame) + "\n\n");
             }
             SendAll(session, "data: [DONE]\n\n");
           }
