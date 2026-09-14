@@ -46,7 +46,8 @@ void ReasoningSplitter::Feed(std::string_view piece) {
       std::size_t keep = 0;
       for (std::size_t k = kCloseTag.size() - 1; k >= 1; --k) {
         if (pending_.size() >= k &&
-            pending_.compare(pending_.size() - k, k, kCloseTag.data(), k) == 0) {
+            pending_.compare(pending_.size() - k, k, kCloseTag.data(), k) ==
+                0) {
           keep = k;
           break;
         }
@@ -78,7 +79,8 @@ void ReasoningSplitter::Feed(std::string_view piece) {
       if (pending_.size() >= k) {
         const std::string_view tail =
             std::string_view(pending_).substr(pending_.size() - k);
-        if (MaybePartialTag(tail, kOpenTag) || MaybePartialTag(tail, kCloseTag)) {
+        if (MaybePartialTag(tail, kOpenTag) ||
+            MaybePartialTag(tail, kCloseTag)) {
           hold = k;
           break;
         }
