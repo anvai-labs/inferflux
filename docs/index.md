@@ -24,7 +24,7 @@ flowchart LR
 
 All numbers are greedy decode throughput measured on the hardware listed,
 same model file and battery per comparison. Reproduce with the
-[multi-backend harness](benchmark_multi_backend_steps.md); methodology and
+[multi-backend harness](benchmarks.md#multi-backend-harness-reference); methodology and
 run-to-run variance notes in [benchmarks](benchmarks.md).
 
 ### AMD Radeon AI PRO R9700 (gfx1201, 32 GB, ROCm 7.2) — Sep 13 2026

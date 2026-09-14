@@ -182,9 +182,8 @@ This doc is the runtime contract, not the benchmark log. Historical perf snapsho
 
 ## 12) Related Docs
 
-- [VISION](VISION.md)
-- [PRD](PRD.md)
+- [PRODUCT](PRODUCT.md) (vision + product envelope)
 - [Roadmap](Roadmap.md)
 - [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
 - [MONITORING](MONITORING.md)
-- [design/SAFETENSORS_DECODE_PERFORMANCE_PLAN](design/SAFETENSORS_DECODE_PERFORMANCE_PLAN.md)
+- Historical safetensors performance plan: [ARCHIVE_INDEX](ARCHIVE_INDEX.md) (deleted; findings in [benchmarks](benchmarks.md))

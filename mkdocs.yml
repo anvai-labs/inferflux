@@ -23,9 +23,6 @@ copyright: Copyright &copy; 2026 Vijaykumar Singh
 # kept in-repo but are not part of the published site.
 exclude_docs: |
   /README.md
-  # Deliberately unpublished: links into repository source files, which
-  # mkdocs --strict cannot validate.
-  /design/memory_accounting_strategy.md
 
 theme:
   name: material
@@ -91,8 +88,6 @@ nav:
   - Getting Started:
       - Quickstart: Quickstart.md
       - User Guide: UserGuide.md
-      - Installer: Installer.md
-      - Hardware Setup: HARDWARE_SETUP.md
       - ROCm on WSL2: ROCM_INSTALLATION_GUIDE_WSL.md
       - Troubleshooting: Troubleshooting.md
   - Operations:
@@ -105,30 +100,24 @@ nav:
   - Benchmarks:
       - benchmarks.md
       - Competitive Positioning: COMPETITIVE_POSITIONING.md
-      - Multi-Backend Harness: benchmark_multi_backend_steps.md
   - Architecture:
       - Architecture.md
       - Backend Development: BACKEND_DEVELOPMENT.md
       - GGUF Native Runtime: GGUF_NATIVE_KERNEL_IMPLEMENTATION.md
       - GEMV Kernels: GEMV_KERNEL_ARCHITECTURE.md
       - Design Deep Dives:
-          - design/LIGHTWEIGHT_UI.md
           - design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md
   - Project:
       - Docs Index: INDEX.md
-      - Vision: VISION.md
-      - Product Requirements: PRD.md
+      - Product Vision & Requirements: PRODUCT.md
       - Roadmap: Roadmap.md
       - Technical Debt & Competitive Roadmap: TechDebt_and_Competitive_Roadmap.md
-      - Policy: Policy.md
       - Developer Guide: DeveloperGuide.md
       - Docs Style Guide: DOCS_STYLE_GUIDE.md
       - GPU CI Bootstrap: GPU_CI_BOOTSTRAP.md
       - ADRs: adr/README.md
       - Feature Specs: features/README.md
       - Technical-Debt Register: technical-debt/README.md
-      - Planning: planning/PRINCIPLES_AND_PRIORITIZATION.md
-      - GGUF Smoke Test Guide: GGUF_SMOKE_TEST_GUIDE.md
   - Archive:
       - ARCHIVE_INDEX.md
       - Bench Archive: benchmarks/q6k-vectorized-sm89-2026-08-30.md

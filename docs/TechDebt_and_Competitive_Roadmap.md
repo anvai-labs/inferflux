@@ -46,7 +46,7 @@ only the state summary and deltas.
   narrowed to 1.52-2.00x at c=16 (was 2.37-2.70x on Sep 4-6) while serving
   at 2.3-2.4x less GPU memory. Root-cause decomposition (batch-width
   collapse ~2.3x, GEMM roofline ~parity, sync overheads) lives in
-  [design/SAFETENSORS_DECODE_PERFORMANCE_PLAN](design/SAFETENSORS_DECODE_PERFORMANCE_PLAN.md).
+  [benchmarks](benchmarks.md) (nsys decomposition section).
 - **GGUF (RTX 4000 Ada, Sep 7):** `inferflux_cuda` leads the wrapper 1.44x
   at c=16 on the same harness; GGUF memory overhead vs llama.cpp is
   +1,392 MB (was +3,006 MB pre-campaign).

@@ -148,7 +148,7 @@ Minimum for doc-related PRs:
 | Backend value matrix + parity principles | [Architecture](Architecture.md) |
 | KV/slot lifecycle (radix cache, #162 slot fix) | [Architecture](Architecture.md), `runtime/scheduler/sequence_slot_manager.*` |
 | Common backend types + refactor guidance | [BACKEND_DEVELOPMENT](BACKEND_DEVELOPMENT.md) |
-| EP/TP scaling plan | [design_ep_tp](design/design_ep_tp.md) |
+| EP/TP scaling | [features/README](features/README.md) (FTR-005 distributed lifecycle) |
 
 ## 10) Related Docs
 
