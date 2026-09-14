@@ -1,8 +1,53 @@
 # Competitive Positioning
 
-**Snapshot date:** September 7, 2026 (2-run average per cell, RTX 4000 Ada,
-Qwen2.5-3B; multi-backend harness with response classification — see
-[benchmarks](benchmarks.md) for the methodology note on run-to-run variance)
+**Snapshot date:** September 13, 2026 (adds the AMD R9700 / ROCm sweep;
+CUDA tables below remain the Sep 7-8 2026 RTX 4000 Ada measurements —
+2-run average per cell, Qwen2.5-3B; multi-backend harness with response
+classification — see [benchmarks](benchmarks.md) for the methodology note
+on run-to-run variance)
+
+## R) AMD R9700 / ROCm — four-model sweep vs stock llama.cpp (Sep 13 2026)
+
+InferFlux's `rocm` backend wraps llama.cpp's HIP backend; the comparison
+baseline is a **stock llama.cpp server built from the same pinned source**
+(`-c 32768 -np 16 -ngl 99 -fa on --jinja`), same GPU, same greedy 48×256-token
+battery, 16 concurrent. Wrapper config: `server.rocm.yaml` (wave-gathering:
+`min_batch_size=16`, `batch_accumulation_ms=100`) plus `INFERFLUX_LLAMA_CTX_SIZE=65536`.
+
+| Model (all Q4_K_M-class) | Stock llama.cpp c=1 | Stock c=16 | InferFlux c=1 | InferFlux c=16 | Δ c=16 |
+|---|---:|---:|---:|---:|---|
+| Qwen2.5-3B (dense) | — | 992 | 140-147 | **1067** | +8% |
+| LFM2.5-8B-A1B (hybrid conv MoE) | 241 | 861 | 218 | **1089** | +26% |
+| gpt-oss-20b MXFP4 (MoE) | 135 | 598 | 128 | **710** | +19% |
+| Qwen3-30B-A3B-Instruct-2507 (MoE) | — | 498 | 110 | **750** | +51% |
+| Qwen3-14B (dense) | — | 391 | 47 | 388 | parity |
+
+Reading:
+
+- **InferFlux meets or beats stock llama.cpp on every architecture tested**,
+  with the margin growing on sparse MoE models (+19% to +51%) because
+  wave-gathering admission keeps decode batches full (llama.cpp's own slots
+  drain and refill per request).
+- LFM2.5 required the #162 fix (stale-KV slot reuse broke hybrid memory via
+  position-inconsistent batches — 237.6 tok/s serialized before the fix);
+  dense models are bandwidth-saturated per step, hence parity.
+- Earlier "17-36 tok/s on ROCm" readings in older snapshots were a
+  misrouted-CPU-backend measurement artifact (the config loaded the HIP
+  candidate while requests were served by the CPU backend), not device
+  throughput; treat any pre-Sep-13 ROCm number in older documents as
+  invalid.
+- Single-request streaming TTFT under the production config: ~170 ms (the
+  100 ms wave-gathering window is the trade; set
+  `runtime.scheduler.min_batch_size: 1` / `batch_accumulation_ms: 2` to
+  trade back).
+
+## R2) Platform notes (Sep 13)
+
+- R9700 device bandwidth measured directly: 612 GB/s D2D copy, 635 GB/s
+  streaming read — WSL2 GPU paravirtualization costs nothing measurable.
+- llama.cpp `test-backend-ops` on gfx1201: 11,054/11,054 passed.
+- Kernel-level correctness for the pinned llama.cpp HIP build is fully
+  green; the scheduling layer is where InferFlux's advantage comes from.
 
 ```
 InferFlux Positioning (Sep 7 2026, 2-run avg, tok/s):
@@ -32,15 +77,15 @@ InferFlux Positioning (Sep 7 2026, 2-run avg, tok/s):
 
 | Engine | GGUF / CUDA | Safetensors / CUDA | GGUF / ROCm | Safetensors / ROCm |
 |---|---|---|---|---|
-| `inferflux_cuda` / `inferflux_rocm` | ✓ | ✓ | ✓ (last measured Sep 7 morning: ~17-36 tok/s c=1-8; GPU passthrough currently absent on the bench host) | ✗ no HIP bf16 forward built |
-| llama.cpp (`llama_cpp_cuda` / `llama_cpp_rocm`) | ✓ | ✓ via f16 GGUF sidecar (harness-enabled; the router resolves a `*.gguf` sidecar in the model dir) | ✓ (blocked with host) | via sidecar; blocked with host |
+| `inferflux_cuda` / `inferflux_rocm` | ✓ | ✓ | ✓ (Sep 13 sweep above: meets/beats stock llama.cpp on 4 architectures; MoE +19-51%) | ✗ no HIP bf16 forward built |
+| llama.cpp (`llama_cpp_cuda` / `llama_cpp_rocm`) | ✓ | ✓ via f16 GGUF sidecar (harness-enabled; the router resolves a `*.gguf` sidecar in the model dir) | ✓ (Sep 13 sweep above) | via sidecar |
 | vLLM | ✗ (GGUF unsupported in this venv) | ✓ | ✗ not installed for ROCm | ✗ |
 | SGLang | ✗ | ✓ (requires `TVM_FFI_GPU_BACKEND=cuda` when ROCm toolchain is on PATH — its JIT otherwise misdetects HIP) | ✗ not installed | ✗ |
-| Ollama / LM Studio | ✓ (local Ollama plateaus ~123 tok/s flat) | LM Studio only | — | — |
+| Ollama / LM Studio | ✓ (local Ollama plateaus ~123 tok/s flat; ollama retired from the bench host Sep 13 — numbers retained as dated history) | LM Studio only | — | — |
 
-Note: the AMD R9700 dropped out of WSL passthrough mid-session (`/dev/kfd`
-absent); ROCm cells retain the Sep 7 morning spot measurements and should be
-re-run when the host restores the device.
+Note: the earlier "R9700 dropped out of WSL passthrough" caveat is resolved —
+the device is served through WSL2 GPU paravirtualization and the Sep 13 sweep
+was measured on it.
 
 ### 0b) Stock llama.cpp server — the missing baseline (Sep 8)
 

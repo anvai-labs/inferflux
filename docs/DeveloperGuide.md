@@ -118,7 +118,7 @@ When changing request handling or CLI flags:
 3. Update canonical docs:
 - [API Surface](API_SURFACE.md)
 - [Quickstart](Quickstart.md)
-- [README](../README.md)
+- [README](index.md)
 - [INDEX](INDEX.md)
 
 ## 7) Documentation Discipline

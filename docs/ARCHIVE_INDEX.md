@@ -20,6 +20,14 @@ flowchart LR
 > what existed and where its canonical replacement lives. Names are no
 > longer links.
 
+## 0) Removed Point-in-Time Documents (Sep 14 2026 prune)
+
+| Document | Label | Notes |
+|---|---|---|
+| MAINTENANCE_REVIEW | Reference-Evidence | Mar 2026 maintenance simplification audit; superseded by the current doc map |
+| MODERNIZATION_AUDIT | Reference-Evidence | Mar 2026 modernization migration guide; migrations complete |
+| docs/issues/ (April 2026 import snapshots) | Reference-Evidence | P0/P1 GitHub issue-import tickets; all shipped (native CUDA identity contract, strict request policy, continuous batching, KV page allocator/prefix reuse, behavioral CI gate, FlashAttention path, quantized forward, scheduler lock partitioning, resource metrics, coverage gates) |
+
 ## 1) Performance and Benchmark Evidence
 
 | Document | Label | Notes |
@@ -140,7 +148,7 @@ by the current state of the canonical docs and code they investigated.
 
 ## Canonical Sources of Truth
 
-- [README](../README.md)
+- [README](index.md)
 - [INDEX](INDEX.md)
 - [Quickstart](Quickstart.md)
 - [API Surface](API_SURFACE.md)

@@ -66,7 +66,7 @@ flowchart LR
 | Runtime contract | [Architecture](Architecture.md) |
 | Grade and next moves | [Roadmap](Roadmap.md) |
 | Debt and migration order | [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
-| Modernization table | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
+| Modernization table | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) (MODERNIZATION_AUDIT removed as a point-in-time audit) |
 | Product envelope | [PRD](PRD.md) |
 
 Archived long-form narratives stay under [ARCHIVE_INDEX](ARCHIVE_INDEX.md).

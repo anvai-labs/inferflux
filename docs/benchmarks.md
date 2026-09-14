@@ -1,8 +1,31 @@
 # InferFlux Benchmarks and Performance Analysis
 
 **Status:** Current
-**Snapshot date:** September 4, 2026
-**Primary hardware:** NVIDIA RTX 4000 Ada (20 GB)
+**Snapshot date:** September 13, 2026 (adds the AMD R9700 ROCm sweep; CUDA
+tables below remain the Sep 4-8 2026 RTX 4000 Ada measurements)
+**Primary hardware:** NVIDIA RTX 4000 Ada (20 GB), AMD Radeon AI PRO R9700
+(32 GB)
+
+## ROCm — AMD R9700 (Sep 13 2026)
+
+InferFlux `rocm` backend (llama.cpp HIP wrapped by the InferFlux scheduler)
+vs a stock llama.cpp server built from the same pinned source. Qwen2.5-3B
+Q4_K_M plus four production-class models, 48×256-token greedy battery, 16
+concurrent. Full table, config, and reading:
+[Competitive Positioning §R](COMPETITIVE_POSITIONING.md).
+
+| Model | Stock llama.cpp c=16 | InferFlux c=16 |
+|---|---:|---:|
+| Qwen2.5-3B (dense) | 992 | **1067** |
+| LFM2.5-8B-A1B (hybrid MoE) | 861 | **1089** |
+| gpt-oss-20b MXFP4 (MoE) | 598 | **710** |
+| Qwen3-30B-A3B (MoE) | 498 | **750** |
+| Qwen3-14B (dense) | 391 | 388 (parity) |
+
+Platform sanity: device bandwidth 612 GB/s D2D / 635 GB/s streaming read;
+llama.cpp `test-backend-ops` on gfx1201 11,054/11,054 passed. Any
+pre-Sep-13 "ROCm throughput" number in older documents (17-36 tok/s claims)
+was a misrouted-CPU-backend artifact, not device throughput.
 
 Full backend coverage takes two harness invocations because no single model
 format serves all five compared engines — GGUF quantized backends

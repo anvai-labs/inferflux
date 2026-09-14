@@ -98,4 +98,4 @@ gantt
 - [Architecture decisions](adr/README.md)
 - [Feature specifications](features/README.md)
 - [Technical-debt register](technical-debt/README.md)
-- [Issue import snapshots](issues/README.md)
+- Issue import snapshots removed (April 2026 tickets shipped; see [ARCHIVE_INDEX](ARCHIVE_INDEX.md))

@@ -231,10 +231,7 @@ void PrintNextSteps() {
 void PrintLearningResources() {
   std::cout << "=== Learning Resources ===" << std::endl;
   std::cout << "Documentation:" << std::endl;
-  std::cout << "  • docs/FLASHATTENTION_QUICKSTART.md     - Quick start guide"
-            << std::endl;
-  std::cout << "  • docs/FLASHATTENTION_IMPLEMENTATION_GUIDE.md - Full "
-               "implementation guide"
+  std::cout << "  • docs/FP16_STATUS.md - current FP16 backend status"
             << std::endl;
   std::cout << std::endl;
   std::cout << "Source code to study:" << std::endl;

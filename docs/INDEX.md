@@ -25,7 +25,6 @@ graph TD
     D --> D2[Troubleshooting]
     D --> D3[Monitoring]
 
-    F --> F1[docs/issues]
     F --> F2[ARCHIVE_INDEX]
 ```
 
@@ -56,8 +55,6 @@ graph TD
 | Architecture decisions | [adr/README](adr/README.md) |
 | Feature specifications | [features/README](features/README.md) |
 | Technical-debt register | [technical-debt/README](technical-debt/README.md) |
-| Modernization migration guide | [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md) |
-| Maintenance simplification review | [MAINTENANCE_REVIEW](MAINTENANCE_REVIEW.md) |
 | Competitive positioning | [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md) |
 | GGUF runtime contract | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md) |
 | FP16 status | [FP16_STATUS](FP16_STATUS.md) |
@@ -92,7 +89,6 @@ graph TD
 
 | Need | Doc |
 |---|---|
-| Issue-ready tickets | [docs/issues/README](issues/README.md) |
 | Archived snapshots/benchmarks | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) |
 
 ## 6) Grade Table Source
@@ -102,6 +98,6 @@ Use these two docs for current scoring and grade movement rationale:
 - [Roadmap](Roadmap.md)
 - [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
 
-Use this doc for old-practice -> modern-practice migration guidance:
-
-- [MODERNIZATION_AUDIT](MODERNIZATION_AUDIT.md)
+Historical old-practice -> modern-practice migration guidance lives in the
+[ARCHIVE_INDEX](ARCHIVE_INDEX.md) catalog (MODERNIZATION_AUDIT and
+MAINTENANCE_REVIEW were removed as point-in-time audits).

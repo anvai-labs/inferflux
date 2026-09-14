@@ -1,0 +1,139 @@
+# MkDocs configuration for the InferFlux documentation site
+# (published to GitHub Pages at https://anvai-labs.github.io/inferflux/).
+#
+# The nine canonical docs pinned by scripts/check_docs_contract.py
+# (docs/INDEX.md, Quickstart.md, API_SURFACE.md, UserGuide.md, AdminGuide.md,
+# DeveloperGuide.md, DOCS_STYLE_GUIDE.md, ARCHIVE_INDEX.md) stay at their
+# contract-fixed paths; this nav organizes them and the surrounding deep
+# dives without moving files.
+
+site_name: InferFlux
+site_description: >-
+  Open-source C++17 inference server serving an OpenAI-compatible REST API
+  across CUDA, ROCm, Metal, Vulkan, and CPU backends — first-party kernels
+  plus llama.cpp via one scheduler.
+site_author: Vijaykumar Singh
+site_url: https://anvai-labs.github.io/inferflux/
+repo_url: https://github.com/anvai-labs/inferflux
+repo_name: anvai-labs/inferflux
+copyright: Copyright &copy; 2026 Vijaykumar Singh
+
+# README.md is the repository index; docs/index.md is the published home page.
+# Internal audits and design notes that link into repository source files are
+# kept in-repo but are not part of the published site.
+exclude_docs: |
+  /README.md
+  /MAINTENANCE_REVIEW.md
+  /design/native_kv_device_addressing.md
+  /design/memory_accounting_strategy.md
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.indexes
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - toc.follow
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  icon:
+    repo: fontawesome/brands/github
+    edit: material/pencil
+    view: material/eye
+
+plugins:
+  - search
+  - git-revision-date-localized:
+      enable_creation_date: true
+      fallback_to_build_date: true
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.details
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - Quickstart: Quickstart.md
+      - User Guide: UserGuide.md
+      - Installer: Installer.md
+      - Hardware Setup: HARDWARE_SETUP.md
+      - ROCm on WSL2: ROCM_INSTALLATION_GUIDE_WSL.md
+      - Troubleshooting: Troubleshooting.md
+  - Operations:
+      - Admin Guide: AdminGuide.md
+      - API Surface: API_SURFACE.md
+      - Configuration Reference: CONFIG_REFERENCE.md
+      - Monitoring: MONITORING.md
+      - Startup Advisor: STARTUP_ADVISOR.md
+      - Release Process: ReleaseProcess.md
+  - Benchmarks:
+      - benchmarks.md
+      - Competitive Positioning: COMPETITIVE_POSITIONING.md
+      - Multi-Backend Harness: benchmark_multi_backend_steps.md
+  - Architecture:
+      - Architecture.md
+      - Backend Development: BACKEND_DEVELOPMENT.md
+      - GGUF Native Runtime: GGUF_NATIVE_KERNEL_IMPLEMENTATION.md
+      - GEMV Kernels: GEMV_KERNEL_ARCHITECTURE.md
+      - Design Deep Dives:
+          - design/Backend_Parity_LlamaCpp_CUDA_MLX.md
+          - design/FUSED_KERNEL_REDESIGN_SPEC.md
+          - design/KV_CACHE_ARCHITECTURE_DEEP_DIVE_2026_03_04.md
+          - design/LIGHTWEIGHT_UI.md
+          - design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md
+          - design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md
+  - Project:
+      - Docs Index: INDEX.md
+      - Vision: VISION.md
+      - Product Requirements: PRD.md
+      - Roadmap: Roadmap.md
+      - Technical Debt & Competitive Roadmap: TechDebt_and_Competitive_Roadmap.md
+      - Policy: Policy.md
+      - Developer Guide: DeveloperGuide.md
+      - Docs Style Guide: DOCS_STYLE_GUIDE.md
+      - GPU CI Bootstrap: GPU_CI_BOOTSTRAP.md
+      - FP16 Status: FP16_STATUS.md
+      - ADRs: adr/README.md
+      - Feature Specs: features/README.md
+      - Technical-Debt Register: technical-debt/README.md
+      - Planning: planning/PRINCIPLES_AND_PRIORITIZATION.md
+      - GGUF Smoke Test Guide: GGUF_SMOKE_TEST_GUIDE.md
+  - Archive:
+      - ARCHIVE_INDEX.md
+      - Bench Archive: benchmarks/q6k-vectorized-sm89-2026-08-30.md
