@@ -1720,10 +1720,9 @@ std::string MetricsRegistry::RenderPrometheus() const {
   }
   out << "inferflux_time_to_first_token_ms_bucket{backend=\"" << backend
       << "\",le=\"+Inf\"} "
-      << ttft_latency_.counts[LatencyHistogram::kBuckets.size()].load()
-      << "\n";
-  out << "inferflux_time_to_first_token_ms_sum{backend=\"" << backend
-      << "\"} " << ttft_latency_.sum_ms.load() << "\n";
+      << ttft_latency_.counts[LatencyHistogram::kBuckets.size()].load() << "\n";
+  out << "inferflux_time_to_first_token_ms_sum{backend=\"" << backend << "\"} "
+      << ttft_latency_.sum_ms.load() << "\n";
   out << "inferflux_time_to_first_token_ms_count{backend=\"" << backend
       << "\"} " << ttft_latency_.total.load() << "\n";
 

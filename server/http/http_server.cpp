@@ -132,8 +132,7 @@ constexpr std::size_t kMaxResponseFormatBytes =
 // are defined in server/http/model_json.h/.cpp.
 
 std::string BuildModelNotFoundResponse() {
-  return BuildResponse(BuildErrorBody("model_not_found"), 404,
-                       "Not Found");
+  return BuildResponse(BuildErrorBody("model_not_found"), 404, "Not Found");
 }
 
 bool HasPrefix(const std::string &value, const std::string &prefix) {
@@ -3137,8 +3136,8 @@ void HttpServer::HandleClient(ClientSession &session) {
           "traceparent: " + request_ctx.ToTraceparent() + "\r\n";
     }
     if (!parsed.client_request_id.empty()) {
-      trace_response_header += "x-inferflux-client-request-id: " +
-                               parsed.client_request_id + "\r\n";
+      trace_response_header +=
+          "x-inferflux-client-request-id: " + parsed.client_request_id + "\r\n";
     }
     if (is_legacy_completions) {
       trace_response_header +=
