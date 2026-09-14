@@ -4,12 +4,12 @@
 
 This project, named **InferFlux**, is a high-performance inference server written in C++. It is designed to be a drop-in replacement for services like LM Studio and Ollama, with a strong focus on enterprise-grade features and performance.
 
-The server is built with a modular architecture, supporting multiple backends for different hardware targets, including CPU, CUDA, ROCm, and Apple Metal (MPS). It can load models in GGUF and safetensors formats, either from local storage or from Hugging Face.
+The server is built with a modular architecture, supporting multiple backends for different hardware targets, including CPU, CUDA, ROCm, Apple Metal (MPS), Vulkan, and an experimental MLX path. It can load models in GGUF and safetensors formats, either from local storage or from Hugging Face.
 
 Key features of InferFlux include:
 
 *   **Continuous Batching:** A paged KV cache and a sophisticated scheduler enable efficient handling of multiple concurrent requests.
-*   **Speculative Decoding:** The server can use a smaller, faster "draft" model to generate candidate tokens, which are then verified by the primary model, potentially speeding up inference.
+*   **Speculative Decoding:** A draft-and-verify decoding path is wired in; it is registered as partial and not yet production-validated (see the technical-debt register).
 *   **OpenAI-Compatible API:** The server exposes an HTTP/1.1 REST API (with SSE streaming) compatible with the OpenAI API format, making it easy to integrate with existing tools and applications.
 *   **Enterprise-Grade Security and Observability:**
     *   **Authentication:** Supports API keys and OIDC for secure access.

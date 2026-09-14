@@ -196,6 +196,6 @@ variance on this cell is the highest measured (c=16: 87.9-98.0).
 ## 6) References
 
 - [Benchmark details](benchmarks.md)
-- [Multi-backend benchmark harness checklist](benchmark_multi_backend_steps.md)
+- [Multi-backend harness reference](benchmarks.md#multi-backend-harness-reference)
 - [Tech Debt & Roadmap](TechDebt_and_Competitive_Roadmap.md)
 - [Backend Development Guide](BACKEND_DEVELOPMENT.md)

@@ -276,6 +276,57 @@ BackendCapabilities ReportCapabilities() const override {
 
 The router uses these capabilities to decide request routing. Backends that report `false` for a capability will not receive requests requiring it (requests are routed to a capable backend or rejected with a clear error).
 
+## Common Backend Types and Incremental Refactoring
+
+Shared backend infrastructure lives in `runtime/backends/common/`:
+`backend_types.h` (request/result/identity types), `backend_interface.h`
+(the canonical base all backends implement), and `batching_utils.h` (shared
+batch helpers). `LlamaCppBackend` implements the common interface, and the
+factory + router stay backend-agnostic.
+
+Residual coupling (some runtime/execution paths still reference
+`LlamaCppBackend` types directly) is a known, deferred gap — untangling it
+is broad churn with limited near-term throughput value, and compatibility
+aliases come out only after batch execution and backend contracts settle.
+
+Guidance:
+
+1. Reuse the common backend types for new behavior.
+2. Avoid large inheritance/interface rewrites unless they remove active
+   duplication in code you are already touching.
+3. Prefer incremental extraction over architectural rewrites that compete
+   with throughput work.
+
+This refactor is only worth finishing when it delivers one of: less
+duplicated batching/runtime logic across active backends, clearer
+native-runtime ownership boundaries, or lower regression risk for new
+backend features.
+
+## Backend Naming Reference
+
+Two-axis model: `engine` (who executes the runtime) x `platform` (where it
+runs). Canonical concrete backend ids use `<engine>_<platform>`.
+
+Routing aliases normalize to canonical ids:
+
+- `cuda_native`, `native_cuda`, `cuda_llama_cpp` -> `inferflux_cuda` / `llama_cpp_cuda`
+- Planned future: `rocm_native`/`native_rocm` -> `inferflux_rocm`
+
+Canonical user-facing ids: `inferflux_cuda`, `llama_cpp_cuda`,
+`inferflux_rocm` (implemented, `runtime/backends/backend_factory.cpp`),
+`llama_cpp_rocm`, `mps`, `vulkan`, `opencl`, `mlx`, `cpu`.
+`inferflux_mlx` remains future naming.
+
+Class and type naming: backend classes follow
+`Inferflux<Platform>Backend` / `LlamaCpp<Platform>Backend`
+(`InferfluxCudaBackend`, `LlamaCppRocmBackend`, ...). New descriptors
+normalize around `BackendEngine` (kInferflux, kLlamaCpp) x
+`BackendPlatform` (kCpu, kCuda, kRocm, kMps, kVulkan) in a
+`BackendDescriptor{engine, platform}` pair.
+
+Compatibility policy: no permanent support for old backend-exposure or
+config key names — aliases normalize at the routing boundary.
+
 ## Grammar and Structured Output Delegation
 
 Grammar-constrained generation (JSON schema, regex, CFG) is the **one capability that still requires llama.cpp's sampler chain** (`llama_sampler_init_grammar`). This section documents how the architecture handles it without leaking the dependency into the interface.

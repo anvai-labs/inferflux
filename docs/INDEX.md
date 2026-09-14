@@ -17,9 +17,9 @@ graph TD
     C --> C1[Architecture]
     C --> C2[Config Reference]
     C --> C3[Developer Guide]
-    C --> C4[Vision + PRD + Product Roadmap]
+    C --> C4[Product Vision + Roadmap]
     C --> C6[ADRs + Features + Technical Debt]
-    C --> C5[Modernization Audit]
+    C --> C5[Planning Artifacts]
 
     D --> D1[User Guide]
     D --> D2[Troubleshooting]
@@ -40,24 +40,24 @@ graph TD
 
 | Domain | Doc |
 |---|---|
-| Vision and product direction | [VISION](VISION.md), [PRD](PRD.md) |
+| Vision and product envelope | [PRODUCT](PRODUCT.md) |
 | Runtime architecture | [Architecture](Architecture.md) |
 | API surface | [API_SURFACE](API_SURFACE.md) |
 | Configuration | [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
 | Benchmark results and current CUDA reading | [benchmarks](benchmarks.md) |
-| Multi-backend benchmark harness checklist | [benchmark_multi_backend_steps](benchmark_multi_backend_steps.md) |
+| Multi-backend harness reference | [benchmarks](benchmarks.md) (harness appendix) |
 | Monitoring and tuning | [MONITORING](MONITORING.md) |
 | Archived throughput investigations | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) |
 | Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |
 | Trusted CUDA + ROCm runner setup | [GPU_CI_BOOTSTRAP](GPU_CI_BOOTSTRAP.md) |
 | Grades and execution plan | [Roadmap](Roadmap.md), [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
-| Dependency-ordered product/design plan | [Roadmap](Roadmap.md), [planning/PRINCIPLES_AND_PRIORITIZATION](planning/PRINCIPLES_AND_PRIORITIZATION.md) |
+| Dependency-ordered product/design plan | [Roadmap](Roadmap.md), [Roadmap — Planning Principles](Roadmap.md#planning-principles-and-prioritization) |
 | Architecture decisions | [adr/README](adr/README.md) |
 | Feature specifications | [features/README](features/README.md) |
 | Technical-debt register | [technical-debt/README](technical-debt/README.md) |
 | Competitive positioning | [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md) |
 | GGUF runtime contract | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md) |
-| FP16 status | [FP16_STATUS](FP16_STATUS.md) |
+| FP16 / precision guidance | [benchmarks](benchmarks.md) |
 
 ## 3) Operator Runbooks
 
@@ -66,24 +66,20 @@ graph TD
 | User workflows | [UserGuide](UserGuide.md) |
 | Incident triage | [Troubleshooting](Troubleshooting.md) |
 | Release process | [ReleaseProcess](ReleaseProcess.md) |
-| Installer/package flow | [Installer](Installer.md) |
+| Installer/package flow | [Quickstart](Quickstart.md) |
 | Startup sizing recommendations | [STARTUP_ADVISOR](STARTUP_ADVISOR.md) |
-| GGUF smoke validation | [GGUF_SMOKE_TEST_GUIDE](GGUF_SMOKE_TEST_GUIDE.md) |
+| GGUF smoke validation | `scripts/README.md` (GGUF native smoke) |
 | ROCm on WSL install | [ROCM_INSTALLATION_GUIDE_WSL](ROCM_INSTALLATION_GUIDE_WSL.md) |
-| Dev hardware reference | [HARDWARE_SETUP](HARDWARE_SETUP.md) |
+| Dev hardware + CI runner | [GPU_CI_BOOTSTRAP](GPU_CI_BOOTSTRAP.md) |
 
 ## 4) Contributor Deep Dives
 
 | Topic | Doc |
 |---|---|
 | Backend implementation | [BACKEND_DEVELOPMENT](BACKEND_DEVELOPMENT.md) |
-| Policy surface | [Policy](Policy.md) |
-| Backend parity design | [design/Backend_Parity_LlamaCpp_CUDA_MLX](design/Backend_Parity_LlamaCpp_CUDA_MLX.md) |
+| Policy surface | [AdminGuide](AdminGuide.md) |
+| Backend value matrix + parity principles | [Architecture](Architecture.md) |
 | Native GGUF quantized runtime design | [design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE](design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md) |
-| InferFlux CUDA + distributed uplift plan | [design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN](design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md) |
-| Session handle layer (Phase 1) | [design/SESSION_HANDLE_LAYER_PHASE1](design/SESSION_HANDLE_LAYER_PHASE1.md) |
-| Safetensors decode performance plan | [design/SAFETENSORS_DECODE_PERFORMANCE_PLAN](design/SAFETENSORS_DECODE_PERFORMANCE_PLAN.md) |
-| EP/TP scaling design | [design_ep_tp](design/design_ep_tp.md) |
 
 ## 5) Backlog and Evidence
 

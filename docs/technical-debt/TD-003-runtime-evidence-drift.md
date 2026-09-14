@@ -3,7 +3,7 @@
 Status: Proposed
 Priority: P0
 Owners: Runtime Performance, Product, Documentation
-Dependencies: TD-001, ADR-0001
+Dependencies: ADR-0001
 
 ## Liability
 

@@ -231,7 +231,7 @@ void PrintNextSteps() {
 void PrintLearningResources() {
   std::cout << "=== Learning Resources ===" << std::endl;
   std::cout << "Documentation:" << std::endl;
-  std::cout << "  • docs/FP16_STATUS.md - current FP16 backend status"
+  std::cout << "  • docs/benchmarks.md - current FP16 backend status"
             << std::endl;
   std::cout << std::endl;
   std::cout << "Source code to study:" << std::endl;
