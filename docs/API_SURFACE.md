@@ -100,6 +100,25 @@ graph TD
 | `prompt_tokens_details.cached_tokens` | Prompt tokens served from the radix prefix cache / session KV reuse. Always present — an explicit `0` on a miss. `prompt_tokens` stays inclusive; fresh input = `prompt_tokens − cached_tokens`. |
 | `duration_ms` | Request accept → last token, server-measured. |
 | `time_to_first_token_ms` | Request accept → first token; streaming requests only. |
+| `client_request_id` | Echoed when the caller supplies `client_request_id` (body) or `x-inferflux-client-request-id` (header); also echoed as a response header. |
+
+Completion `id`s are unique per call (`<prefix><epoch-ms>-<counter>`); they are
+correlation handles, not durable keys. The response `model` field reports the
+**resolved** model id (the model that actually served, after capability
+fallback), matching `GET /v1/models/{id}`; the requested string remains
+visible in `system`-side metadata and metrics.
+
+Errors use the OpenAI envelope:
+
+```json
+{"error": {"message": "model_not_found", "type": "inferflux_error", "code": "model_not_found"}}
+```
+
+`code` carries the legacy machine-readable tag (`rate_limited`,
+`model_not_found`, `backend_policy_violation`, ...). Rate-limited responses
+(429) add `Retry-After` and `X-RateLimit-Remaining: 0` headers. CORS
+preflight permits `x-inferflux-session-id`, `x-inferflux-client-request-id`,
+and `traceparent` alongside `Content-Type`/`Authorization`.
 
 `GET /v1/admin/pools` returns three top-level objects for automation symmetry:
 

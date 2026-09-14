@@ -156,6 +156,7 @@ public:
 
   // Latency recording — call with full request duration in milliseconds.
   void RecordLatency(double request_ms);
+  void RecordTimeToFirstToken(double ms);
 
   // Per-phase latency recording (OBS-2).
   // prefill_ms: time from tokenization start to first token produced.
@@ -392,6 +393,7 @@ private:
 
   // Latency histograms.
   LatencyHistogram request_latency_;
+  LatencyHistogram ttft_latency_; // OBS: time to first token (streams)
   LatencyHistogram queue_latency_;
   LatencyHistogram batch_exec_latency_;
   LatencyHistogram scheduler_sequence_retirement_latency_;

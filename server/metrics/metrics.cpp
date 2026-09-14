@@ -597,6 +597,10 @@ void MetricsRegistry::RecordLatency(double request_ms) {
   request_latency_.Record(request_ms);
 }
 
+void MetricsRegistry::RecordTimeToFirstToken(double ms) {
+  ttft_latency_.Record(ms);
+}
+
 void MetricsRegistry::RecordPrefillDuration(double prefill_ms) {
   prefill_latency_.Record(prefill_ms);
 }
@@ -1703,6 +1707,25 @@ std::string MetricsRegistry::RenderPrometheus() const {
       << request_latency_.sum_ms.load() << "\n";
   out << "inferflux_request_duration_ms_count{backend=\"" << backend << "\"} "
       << request_latency_.total.load() << "\n";
+
+  // --- OBS: time-to-first-token histogram (streaming) ---
+  out << "# HELP inferflux_time_to_first_token_ms Time to first token for "
+         "streaming completions\n";
+  out << "# TYPE inferflux_time_to_first_token_ms histogram\n";
+  for (std::size_t i = 0; i < LatencyHistogram::kBuckets.size(); ++i) {
+    out << "inferflux_time_to_first_token_ms_bucket{backend=\"" << backend
+        << "\",le=\"" << std::fixed << std::setprecision(0)
+        << LatencyHistogram::kBuckets[i] << "\"} "
+        << ttft_latency_.counts[i].load() << "\n";
+  }
+  out << "inferflux_time_to_first_token_ms_bucket{backend=\"" << backend
+      << "\",le=\"+Inf\"} "
+      << ttft_latency_.counts[LatencyHistogram::kBuckets.size()].load()
+      << "\n";
+  out << "inferflux_time_to_first_token_ms_sum{backend=\"" << backend
+      << "\"} " << ttft_latency_.sum_ms.load() << "\n";
+  out << "inferflux_time_to_first_token_ms_count{backend=\"" << backend
+      << "\"} " << ttft_latency_.total.load() << "\n";
 
   // --- OBS-2: per-phase latency histograms ---
   out << "# HELP inferflux_prefill_duration_ms Prefill phase latency "
