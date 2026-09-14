@@ -25,3 +25,9 @@ host/port strings, blocking testable endpoint/TLS/socket evolution.
 - Endpoint precedence is testable without network or process creation.
 - HTTP scheme is not hard-coded in command handlers.
 - Existing CLI output and exit-code contracts remain green.
+
+Design input carried over from the retired worktree reconciliation note: after
+TD-007, move `MakeUnifiedBatchInput` into a shared backend helper and extract
+request assembly/context from the HTTP translation unit using the current
+`completion_payload.h` types. Preserve the `scheduler-executor-metadata-refactor`
+branch as reference — do not cherry-pick it.

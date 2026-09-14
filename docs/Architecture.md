@@ -186,4 +186,4 @@ This doc is the runtime contract, not the benchmark log. Historical perf snapsho
 - [Roadmap](Roadmap.md)
 - [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
 - [MONITORING](MONITORING.md)
-- [design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN](design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md)
+- [design/SAFETENSORS_DECODE_PERFORMANCE_PLAN](design/SAFETENSORS_DECODE_PERFORMANCE_PLAN.md)

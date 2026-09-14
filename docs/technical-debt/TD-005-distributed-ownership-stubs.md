@@ -25,3 +25,6 @@ ownership authority, so topology claims exceed executable semantics.
 - Fault tests prove balanced resources after worker loss, timeout, cancellation,
   duplicate messages, and ownership transfer.
 - Multi-process CI validates the selected topology repeatedly without hangs.
+
+See TD-004's remediation note for the scheduler-executor cleanup design input
+retired from the worktree reconciliation record.

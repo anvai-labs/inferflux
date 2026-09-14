@@ -23,8 +23,6 @@ copyright: Copyright &copy; 2026 Vijaykumar Singh
 # kept in-repo but are not part of the published site.
 exclude_docs: |
   /README.md
-  /MAINTENANCE_REVIEW.md
-  /design/native_kv_device_addressing.md
   /design/memory_accounting_strategy.md
 
 theme:
@@ -112,10 +110,7 @@ nav:
       - GGUF Native Runtime: GGUF_NATIVE_KERNEL_IMPLEMENTATION.md
       - GEMV Kernels: GEMV_KERNEL_ARCHITECTURE.md
       - Design Deep Dives:
-          - design/FUSED_KERNEL_REDESIGN_SPEC.md
-          - design/KV_CACHE_ARCHITECTURE_DEEP_DIVE_2026_03_04.md
           - design/LIGHTWEIGHT_UI.md
-          - design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN.md
           - design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md
   - Project:
       - Docs Index: INDEX.md
