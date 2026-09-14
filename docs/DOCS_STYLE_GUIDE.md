@@ -75,3 +75,10 @@ Architecture decisions, feature specifications, and technical-debt records live
 under `docs/adr/`, `docs/features/`, and `docs/technical-debt/`. Keep IDs unique,
 declare dependencies explicitly, update the directory index and `docs/Roadmap.md`,
 then run `python3 scripts/check_planning_artifacts.py`.
+
+## Site Publishing
+
+The MkDocs Material site (`mkdocs.yml`) publishes every non-excluded page
+under `docs/`; `mkdocs build --strict` gates docs PRs in the `docs.yml`
+workflow, and `docs-gate` enforces this contract. Deleted docs require
+ARCHIVE_INDEX catalog rows and inbound-link repoints in the same change.

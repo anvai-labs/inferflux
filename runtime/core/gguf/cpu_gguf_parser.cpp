@@ -157,18 +157,18 @@ public:
     info->offset = static_cast<size_t>(offset);
 
     // Calculate byte size
-    info->byte_size = 0;
+    size_t elems = 1;
     for (auto dim : info->shape) {
-      info->byte_size *= dim;
+      elems *= dim;
     }
 
     // Type-specific size calculation
-    size_t type_size = 0;
     switch (info->type) {
     case GgufTensorType::F32:
+      info->byte_size = elems * 4;
+      break;
     case GgufTensorType::F16:
-      type_size = (info->type == GgufTensorType::F32) ? 4 : 2;
-      info->byte_size *= type_size;
+      info->byte_size = elems * 2;
       break;
     default:
       // Quantized types - handled differently
@@ -219,13 +219,19 @@ public:
     switch (type) {
     case GgufValueType::UINT8:
     case GgufValueType::INT8:
+    case GgufValueType::BOOL:
+      // 1-byte types
+      return SkipBytes(file, 1);
+
     case GgufValueType::UINT16:
     case GgufValueType::INT16:
+      // 2-byte types
+      return SkipBytes(file, 2);
+
     case GgufValueType::UINT32:
     case GgufValueType::INT32:
     case GgufValueType::FLOAT32:
-    case GgufValueType::BOOL:
-      // Fixed-size types
+      // 4-byte types
       return SkipBytes(file, 4);
 
     case GgufValueType::UINT64:
@@ -242,14 +248,23 @@ public:
     }
 
     case GgufValueType::ARRAY: {
-      uint64_t len;
-      if (!ReadScalar(file, &len) ||
-          !ReadScalar(file, &type)) { // array element type
+      // GGUF spec order: element type (u32) first, then count (u64).
+      uint32_t elem_type;
+      uint64_t count;
+      if (!ReadScalar(file, &elem_type) || !ReadScalar(file, &count)) {
         return false;
       }
-      // Skip all elements
-      for (uint64_t i = 0; i < len; ++i) {
-        if (!SkipValue(file, type)) {
+      if (count > (uint64_t{1} << 32)) {
+        // Sanity bound: real GGUF arrays never approach 4B elements; refuse
+        // to spin on a misaligned cursor.
+        log::Warn("cpu_gguf_parser",
+                  "Unreasonable array length in SkipValue: " +
+                      std::to_string(count));
+        return false;
+      }
+      const auto elem = static_cast<GgufValueType>(elem_type);
+      for (uint64_t i = 0; i < count; ++i) {
+        if (!SkipValue(file, elem)) {
           return false;
         }
       }

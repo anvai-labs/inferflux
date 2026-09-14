@@ -53,7 +53,8 @@ struct RadixPrefixMemorySnapshot {
 
 class RadixPrefixCache {
 public:
-  using EvictCallback = std::function<void(int)>;
+  using EvictCallback = std::function<void(
+      int seq_id, std::shared_ptr<BackendInterface> backend)>;
 
   explicit RadixPrefixCache(std::shared_ptr<PagedKVCache> kv_cache,
                             EvictCallback on_evict_seq,
@@ -65,8 +66,11 @@ public:
   bool Lookup(const std::vector<int> &tokens, BackendInterface *backend,
               RadixLookupResult *result);
 
-  // Insert a sequence of tokens and its corresponding block_table.
-  void Insert(const std::vector<int> &tokens,
+  // Insert a sequence of tokens and its corresponding block_table. Returns
+  // false when nothing was inserted (zero capacity, empty tokens, or empty
+  // block_table) — callers must then release the sequence slot normally
+  // instead of treating it as radix-owned.
+  bool Insert(const std::vector<int> &tokens,
               const std::vector<int> &block_table, int sequence_id,
               const std::shared_ptr<BackendInterface> &backend);
 
@@ -90,9 +94,18 @@ private:
 
   // Evict the leaf node with the smallest last_used timestamp.
   void EvictOne();
+
+public:
   // Evict the sequence-holding node with the smallest last_used timestamp (§
-  // Item 1).
-  void EvictOneSequence();
+  // Item 1). Clears backend KV via the eviction callback and releases the
+  // slot — used as the admission pressure valve when all slots are warm.
+  // Takes the cache lock. Returns true when a sequence was evicted.
+  bool EvictOneSequence();
+
+private:
+  // Locking variant: callers must hold mutex_ exclusively (Insert uses this
+  // under its unique_lock).
+  bool EvictOneSequenceLocked();
 
   // DFS: collect nodes matching a criteria.
   void CollectNodes(RadixNode *node,

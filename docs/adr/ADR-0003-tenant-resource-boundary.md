@@ -3,7 +3,7 @@
 Status: Proposed
 Date: 2026-08-21
 Owners: Security, Scheduler, Runtime
-Dependencies: TD-001
+Dependencies: None
 
 ## Context
 

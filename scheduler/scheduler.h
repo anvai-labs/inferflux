@@ -70,7 +70,7 @@ public:
 
     // Default batch limits optimized for concurrent throughput.
     // max_batch_size=32 allows GPU to process more concurrent requests without
-    // queueing. See docs/concurrent_throughput_investigation.md for rationale.
+    // queueing.
     Config()
         : max_batch_size(32), max_batch_tokens(16384), min_batch_size(1),
           batch_accumulation_ms(2) {}

@@ -4163,14 +4163,14 @@ bool InferfluxCudaExecutor::NativePollFreeSequence(
 #endif
 }
 
-void InferfluxCudaExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
+bool InferfluxCudaExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
                                                      int n_tokens) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!kv_cache_ || n_tokens <= 0 || src_seq < 0 || dst_seq < 0) {
-    return;
+    return false;
   }
   if (src_seq == dst_seq) {
-    return;
+    return false;
   }
   // Writing a prefix into dst_seq's slot invalidates any armed decode relay
   // for it.
@@ -4181,7 +4181,9 @@ void InferfluxCudaExecutor::NativeCopySequencePrefix(int src_seq, int dst_seq,
               "NativeCopySequencePrefix failed (src=" +
                   std::to_string(src_seq) + ", dst=" + std::to_string(dst_seq) +
                   ", tokens=" + std::to_string(n_tokens) + ")");
+    return false;
   }
+  return true;
 #else
   (void)src_seq;
   (void)dst_seq;

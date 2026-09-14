@@ -3,7 +3,7 @@
 Status: Proposed
 Date: 2026-08-21
 Owners: Runtime, Product, QA
-Dependencies: TD-001, TD-006, TD-007
+Dependencies: TD-006, TD-007
 
 ## Context
 
@@ -38,3 +38,14 @@ Threshold changes require an ADR amendment, not an edited benchmark narrative.
 - Native-first by aspiration: spends scarce effort before value is demonstrated.
 - Removing native CUDA now: discards potential differentiated headroom too early.
 - Comparing sampled-text Jaccard alone: it confounds stochastic divergence with correctness.
+
+## Status Update (2026-09-14)
+
+The graduation envelope has been partially met: correctness gates are green
+(llama.cpp backend-op parity suite 11,054/11,054 on gfx1201; parity and
+contract gates in CI), and the throughput criterion is exceeded on the GGUF
+envelope at c=16 — native leads the wrapper 1.56x (reproduced in both runs)
+against the 0.90x floor. The memory-overhead criterion (<=10%) remains open
+(GGUF overhead ~+1.4 GB vs llama.cpp's ~4.1 GB, about +34%). Per this ADR's
+own rule, native is default-eligible for GGUF serving at c>=8 while the
+memory gate keeps the broadest-compatibility default under review.

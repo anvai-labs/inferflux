@@ -246,7 +246,7 @@ public:
   NativeBeginFreeSequence(int sequence_id) override;
   bool NativePollFreeSequence(
       const LlamaCppBackend::SequenceReleaseFence &fence) override;
-  void NativeCopySequencePrefix(int src_seq, int dst_seq,
+  bool NativeCopySequencePrefix(int src_seq, int dst_seq,
                                 int n_tokens) override;
   std::vector<uint8_t> NativeSerializeSequence(int sequence_id) const override;
   bool NativeHydrateSequence(int dest_sequence_id,

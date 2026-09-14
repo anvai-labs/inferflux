@@ -270,6 +270,15 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
     // Ensure reused sequence slots start from a clean KV state on non-prefix
     // phased prefill paths.
     backend->FreeSequence(sequence_id);
+  } else if (!backend->TruncateSequence(sequence_id, bounded_start)) {
+    // The backend could not trim the sequence to [0, bounded_start) (hybrid
+    // memory cannot partially erase its final cell) and has fully cleared it
+    // instead — replay the whole prompt so submitted positions stay
+    // consistent with the KV actually resident (issue #161).
+    log::Warn("scheduler", "Phased prefill truncate failed for sequence " +
+                               std::to_string(sequence_id) +
+                               "; restarting prefill from 0");
+    bounded_start = 0;
   }
 
   const int token_cap =
@@ -2178,10 +2187,17 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                     static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
               }
               if (!reused_session_state) {
-                pending->resolved_backend->CopySequencePrefix(
+                copied_prefix = pending->resolved_backend->CopySequencePrefix(
                     cached_seq_id, seq_id, prefill_start);
+                if (!copied_prefix) {
+                  // Hybrid memory could not hold the copied prefix — the
+                  // backend cleared the slot; fall back to a full prefill
+                  // below (issue #161).
+                  prefill_start = 0;
+                }
+              } else {
+                copied_prefix = true;
               }
-              copied_prefix = true;
             }
 
             bool prefill_ok = ExecutePhasedPrefillStep(
@@ -2197,9 +2213,17 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               if (copied_prefix) {
                 pr = pending->resolved_backend->PrefillPartial(
                     inf.prompt, seq_id, prefill_start);
-              } else {
-                // Misses and stale-prefix hits both fall back to full prefill.
+              }
+              // Partial-prefill fallbacks can fail the same way the phased
+              // step did (no clear + stale positions). Full Prefill always
+              // clears the sequence first, so it is the last resort before
+              // giving up (issue #161).
+              if (!pr.ok) {
                 pr = pending->resolved_backend->Prefill(inf.prompt, seq_id);
+                if (pr.ok) {
+                  copied_prefix = false;
+                  prefill_start = 0;
+                }
               }
             }
             if (pr.ok && copied_prefix) {
@@ -2599,11 +2623,14 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           cache_->AcquireBlocks(
               inference->block_table); // Node ownership (§P1b)
         LogSequenceSlotEvent("prefix_donation_blocks_acquired", *inference);
-        prefix_cache_->Insert(inference->bpe_prompt_tokens,
-                              inference->block_table, inference->sequence_id,
-                              pending->resolved_backend);
+        // Donation must be honest: when Insert is a no-op (e.g. empty
+        // block_table) the trie owns nothing, so the slot must be freed
+        // normally below — otherwise the slot parks in kDecoding with its KV
+        // intact and later hands out stale positions (issue #161).
+        donated = prefix_cache_->Insert(
+            inference->bpe_prompt_tokens, inference->block_table,
+            inference->sequence_id, pending->resolved_backend);
         LogSequenceSlotEvent("prefix_donation_end", *inference);
-        donated = true;
       }
     }
 
@@ -2769,6 +2796,17 @@ int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out) {
     return -1;
   }
   auto lease = slot_manager_->AcquireLease(request_id);
+  if (!lease && prefix_cache_) {
+    // Slot pressure: every slot is held by a warm radix donation. Retire the
+    // LRU donated sequence (the eviction callback clears its backend KV and
+    // releases the slot) and retry, so admission cannot starve on warm
+    // prefixes now that AcquireLease no longer silently evicts occupied
+    // slots (issue #161). EvictOneSequence returns false once the trie has
+    // no more sequences to give up.
+    while (!lease && prefix_cache_->EvictOneSequence()) {
+      lease = slot_manager_->AcquireLease(request_id);
+    }
+  }
   if (!lease) {
     return -1;
   }

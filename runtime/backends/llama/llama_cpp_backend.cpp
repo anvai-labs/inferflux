@@ -103,6 +103,12 @@ ggml_type KvCacheGgmlType(const std::string &name) {
 
 } // namespace
 
+bool CanSampleGreedyArgmax(const SamplingParams &sp) {
+  return sp.temperature <= 0.0f && sp.frequency_penalty == 0.0f &&
+         sp.presence_penalty == 0.0f && sp.repetition_penalty == 1.0f &&
+         sp.logit_bias.empty();
+}
+
 namespace {
 std::mutex g_llama_init_mutex;
 int g_llama_init_refcount = 0;
@@ -153,6 +159,27 @@ bool ConsumeTokenTraceBudget() {
 bool LogitsDebugEnabled() {
   static const bool enabled = std::getenv("INFERFLUX_DEBUG_LOGITS") != nullptr;
   return enabled;
+}
+
+// Kill switch for the unified-batch greedy argmax fast path. The fast path
+// picks the same token as llama's greedy chain (first max over the logits
+// row, up to exact-tie order); this exists only to restore the
+// llama_sampler_sample path for validation.
+bool GreedyArgmaxDisabled() {
+  static const bool disabled = [] {
+    if (const char *env = std::getenv("INFERFLUX_DISABLE_GREEDY_ARGMAX")) {
+      const std::string value = [&] {
+        std::string out(env);
+        for (char &c : out) {
+          c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return out;
+      }();
+      return value != "0" && value != "false" && value != "off";
+    }
+    return false;
+  }();
+  return disabled;
 }
 
 bool ConsumeLogitsDebugBudget() {
@@ -701,7 +728,10 @@ std::string LlamaCppBackend::Generate(
     // token would exceed n_ctx.  We discard the oldest half of the KV cache
     // and shift the remaining positions so generation can continue.
     {
-      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx(context_));
+      // Per-sequence capacity is n_ctx_seq (llama_n_ctx is the KV pool total
+      // across all slot sequences); overflowing n_ctx_seq is what makes
+      // llama_decode fail.
+      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx_seq(context_));
       if (position >= n_ctx - 1 && n_ctx > 1) {
         llama_pos keep = n_ctx / 2;
         llama_pos discard = position - keep + 1;
@@ -974,16 +1004,16 @@ LlamaCppBackend::Prefill(const std::string &prompt, int sequence_id) {
   return result;
 }
 
-void LlamaCppBackend::CopySequencePrefix(int src_seq, int dst_seq,
+bool LlamaCppBackend::CopySequencePrefix(int src_seq, int dst_seq,
                                          int n_tokens) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_)
-    return;
+    return false;
   // Clear dst slot first so no stale KV cells survive from a previous request.
   llama_memory_seq_rm(llama_get_memory(context_),
                       static_cast<llama_seq_id>(dst_seq), -1, -1);
   if (n_tokens <= 0) {
-    return;
+    return true;
   }
   // Partial seq_cp can assert on cross-stream KV layouts; copy full source KV
   // state first, then trim the destination to [0, n_tokens) via seq_rm.
@@ -991,9 +1021,21 @@ void LlamaCppBackend::CopySequencePrefix(int src_seq, int dst_seq,
                       static_cast<llama_seq_id>(src_seq),
                       static_cast<llama_seq_id>(dst_seq),
                       static_cast<llama_pos>(0), static_cast<llama_pos>(-1));
-  llama_memory_seq_rm(
-      llama_get_memory(context_), static_cast<llama_seq_id>(dst_seq),
-      static_cast<llama_pos>(n_tokens), static_cast<llama_pos>(-1));
+  // Hybrid/recurrent memory cannot partially erase a suffix that includes its
+  // final cell: the trim can fail, leaving the stale source tail resident.
+  // Full-clear and report so the caller falls back to a full prefill.
+  if (!llama_memory_seq_rm(
+          llama_get_memory(context_), static_cast<llama_seq_id>(dst_seq),
+          static_cast<llama_pos>(n_tokens), static_cast<llama_pos>(-1))) {
+    log::Warn("llama_backend",
+              "CopySequencePrefix trim failed (hybrid memory); seq " +
+                  std::to_string(dst_seq) +
+                  " cleared for full-prefill fallback");
+    llama_memory_seq_rm(llama_get_memory(context_),
+                        static_cast<llama_seq_id>(dst_seq), -1, -1);
+    return false;
+  }
+  return true;
 }
 
 // Legacy API shape retained for backend compatibility.
@@ -1147,7 +1189,10 @@ std::string LlamaCppBackend::Decode(
     // Context-window management: sliding-window KV eviction (same as
     // Generate(), but scoped to the sequence slot for phased decode).
     {
-      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx(context_));
+      // Per-sequence capacity is n_ctx_seq (llama_n_ctx is the KV pool total
+      // across all slot sequences); overflowing n_ctx_seq is what makes
+      // llama_decode fail.
+      llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx_seq(context_));
       if (position >= n_ctx - 1 && n_ctx > 1) {
         llama_pos keep = n_ctx / 2;
         llama_pos discard = position - keep + 1;
@@ -1197,7 +1242,10 @@ LlamaCppBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
   for (int i = 0; i < n; ++i) {
     auto &inp = inputs[i];
     // Per-sequence context-window eviction (mirrors the logic in Decode()).
-    llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx(context_));
+    // Per-sequence capacity is n_ctx_seq (llama_n_ctx is the KV pool total
+    // across all slot sequences); overflowing n_ctx_seq is what makes
+    // llama_decode fail.
+    llama_pos n_ctx = static_cast<llama_pos>(llama_n_ctx_seq(context_));
     if (inp.n_past >= static_cast<int>(n_ctx) - 1 && n_ctx > 1) {
       llama_pos keep = n_ctx / 2;
       llama_pos discard = static_cast<llama_pos>(inp.n_past) - keep + 1;
@@ -1398,6 +1446,41 @@ LlamaCppBackend::ExecuteUnifiedBatch(
     if (logit_indices[i] >= 0) {
       const auto &inp = inputs[i];
 
+      // Greedy fast path: when sampling is exactly argmax over the raw
+      // logits row, skip llama_sampler_sample's full-vocab token_data
+      // materialization (3.6 MB on a 152k vocab) per request per step.
+      // First-max over the float row selects the same token as the greedy
+      // chain; exact ties between bit-equal maximum logits may resolve to a
+      // different equal-logit token than llama's unstable sorts.
+      if (!GreedyArgmaxDisabled() && CanSampleGreedyArgmax(inp.sampling)) {
+        const float *logits = llama_get_logits_ith(context_, logit_indices[i]);
+        LogTopLogits("unified_batch", logits, n_vocab_, inp.request_id,
+                     inp.client_request_id, inp.sequence_id,
+                     inp.sequence_generation,
+                     inp.n_past + static_cast<int>(inp.tokens.size()) - 1);
+        if (logits) {
+          const int tok = static_cast<int>(std::distance(
+              logits, std::max_element(logits, logits + n_vocab_)));
+          results[i].ok = true;
+          if (IsTerminalGeneratedToken(tok)) {
+            results[i].token = -1;
+          } else {
+            results[i].token = tok;
+            results[i].piece = TokenToString(tok);
+            LogTokenTrace("unified_batch", inp.request_id, inp.sequence_id,
+                          inp.client_request_id, inp.sequence_generation,
+                          inp.n_past + static_cast<int>(inp.tokens.size()), tok,
+                          results[i].piece);
+          }
+        } else {
+          results[i].ok = false;
+        }
+        // Keep the "ExecuteUnifiedBatch leaves no sampler behind" invariant
+        // (a no-op while active_sampler_ is null).
+        TeardownSampler();
+        continue;
+      }
+
       // Correctness Fix (§P1b): Use per-request sampling parameters.
       // We leverage SetupSampler to prepare the backend's active_sampler_
       // for this specific sequence's logit set.
@@ -1460,12 +1543,39 @@ LlamaCppBackend::ExecuteUnifiedBatch(
   return results;
 }
 
+// Full-range seq_rm cannot fail on recurrent/hybrid memory (only partial
+// erases that include the final cell can), so the void return is correct.
 void LlamaCppBackend::FreeSequence(int sequence_id) {
   BackendStateLock lock(backend_state_mutex_);
   if (!context_)
     return;
   llama_memory_seq_rm(llama_get_memory(context_),
                       static_cast<llama_seq_id>(sequence_id), -1, -1);
+}
+
+bool LlamaCppBackend::TruncateSequence(int sequence_id, int keep_from) {
+  BackendStateLock lock(backend_state_mutex_);
+  if (!context_)
+    return false;
+  auto *mem = llama_get_memory(context_);
+  const auto seq = static_cast<llama_seq_id>(sequence_id);
+  if (keep_from <= 0) {
+    llama_memory_seq_rm(mem, seq, -1, -1);
+    return true;
+  }
+  if (llama_memory_seq_rm(mem, seq, static_cast<llama_pos>(keep_from),
+                          static_cast<llama_pos>(-1))) {
+    return true;
+  }
+  // Hybrid/conv/recurrent memory cannot partially erase a suffix that
+  // includes its final cell. Full-clear and tell the caller to prefill
+  // from position 0.
+  log::Warn("llama_backend", "TruncateSequence partial trim failed (hybrid "
+                             "memory); seq " +
+                                 std::to_string(sequence_id) +
+                                 " cleared for full-prefill fallback");
+  llama_memory_seq_rm(mem, seq, -1, -1);
+  return false;
 }
 
 LlamaCppBackend::SequenceReleaseFence

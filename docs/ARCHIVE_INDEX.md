@@ -20,6 +20,34 @@ flowchart LR
 > what existed and where its canonical replacement lives. Names are no
 > longer links.
 
+## 0) Removed Point-in-Time Documents (Sep 14 2026 prune)
+
+| Document | Label | Notes |
+|---|---|---|
+| MAINTENANCE_REVIEW | Reference-Evidence | Mar 2026 maintenance simplification audit; superseded by the current doc map |
+| MODERNIZATION_AUDIT | Reference-Evidence | Mar 2026 modernization migration guide; migrations complete |
+| docs/issues/ (April 2026 import snapshots) | Reference-Evidence | P0/P1 GitHub issue-import tickets; all shipped (native CUDA identity contract, strict request policy, continuous batching, KV page allocator/prefix reuse, behavioral CI gate, FlashAttention path, quantized forward, scheduler lock partitioning, resource metrics, coverage gates) |
+
+## 0.1) 2026-09-14 Consolidation Prune (merged or deleted; catalog only)
+
+| Document | Label | Canonical replacement |
+|---|---|---|
+| FP16_STATUS | Canonical-Elsewhere | [benchmarks](benchmarks.md) (deployment guidance); FP16 evidence snapshots cataloged in §1/§6 |
+| design/FUSED_KERNEL_REDESIGN_SPEC | Reference-Evidence | carried a DO-NOT-IMPLEMENT banner; superseded by shipped fused kernels — [GEMV_KERNEL_ARCHITECTURE](GEMV_KERNEL_ARCHITECTURE.md) |
+| design/KV_CACHE_ARCHITECTURE_DEEP_DIVE_2026_03_04 | Reference-Evidence | its gates shipped; live KV/prefix contract in [Architecture](Architecture.md) |
+| design/SEQUENCE_SLOT_MANAGER_PLAN | Canonical-Elsewhere | implemented (`runtime/scheduler/`); slot-lifecycle fix in #162; see [Architecture](Architecture.md) |
+| design/NATIVE_CUDA_SGLANG_INSPIRED_EXECUTION_PLAN | Canonical-Elsewhere | shipped/restated by [ADR-0004](adr/ADR-0004-distributed-sequence-ownership.md), [TD-005](technical-debt/TD-005-distributed-ownership-stubs.md), features/README (FTR-005) |
+| design/native_kv_device_addressing | Reference-Evidence | phases complete; device addressing lives in the native runtime code |
+| planning/WORKTREE_RECONCILIATION | Reference-Evidence | decisions executed; durable note moved into TD-004/TD-005 |
+| technical-debt/TD-001-green-mainline-baseline | Canonical-Elsewhere | Closed — green-mainline gate enforced in CI (`.github/workflows/ci.yml`) |
+| CUDA_12_SETUP (repo root) | Reference-Evidence | unreferenced setup scratch; hardware reference in [GPU_CI_BOOTSTRAP](GPU_CI_BOOTSTRAP.md) |
+| windows_ncu_session_prompt (repo root) | Reference-Evidence | one-off Nsight session prompt, unreferenced |
+| design/ui_launcher | Canonical-Elsewhere | merged into design/LIGHTWEIGHT_UI (retired with the Sep 14 prune) |
+| design/mlx_backend | Canonical-Elsewhere | status merged into the [Architecture](Architecture.md) backend value matrix |
+| design/REFACTORING_COMMON_BACKEND_LOGIC | Canonical-Elsewhere | naming reference folded into BACKEND_DEVELOPMENT (file deleted)
+| design/Backend_Parity_LlamaCpp_CUDA_MLX | Canonical-Elsewhere | rationale merged into [Architecture](Architecture.md) and the [ADR-0001](adr/ADR-0001-evidence-gated-runtime-portfolio.md) status update |
+| benchmark_multi_backend_steps §6/§6.1 matrices | Reference-Evidence | dated sticky-wait A/B + Mar 27 burst sweeps removed; current numbers in [benchmarks](benchmarks.md) |
+
 ## 1) Performance and Benchmark Evidence
 
 | Document | Label | Notes |
@@ -48,10 +76,10 @@ flowchart LR
 
 | Document | Label | Canonical replacement |
 |---|---|---|
-| VISION_2026_03_05 | Canonical-Elsewhere | [PRD](PRD.md), [Roadmap](Roadmap.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md) |
-| COMPETITIVE_POSITIONING_2026_03_05 | Canonical-Elsewhere | [PRD](PRD.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md) |
-| NFR_2026_03_05 | Canonical-Elsewhere | [PRD](PRD.md), [Roadmap](Roadmap.md) |
-| BACKEND_RENAME_VERIFICATION_2026_03_05 | Reference-Evidence | rename verification snapshot; canonical naming now lives in [design/backend_naming_strategy](design/backend_naming_strategy.md) plus current config/API docs |
+| VISION_2026_03_05 | Canonical-Elsewhere | [PRODUCT](PRODUCT.md), [Roadmap](Roadmap.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md) |
+| COMPETITIVE_POSITIONING_2026_03_05 | Canonical-Elsewhere | [PRODUCT](PRODUCT.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md) |
+| NFR_2026_03_05 | Canonical-Elsewhere | [PRODUCT](PRODUCT.md), [Roadmap](Roadmap.md) |
+| BACKEND_RENAME_VERIFICATION_2026_03_05 | Reference-Evidence | rename verification snapshot; canonical naming now lives in [BACKEND_DEVELOPMENT](BACKEND_DEVELOPMENT.md) plus current config/API docs |
 
 ## 3) Consolidated Operations and Tuning Deep-Dives
 
@@ -66,8 +94,8 @@ flowchart LR
 | Document | Label | Canonical replacement |
 |---|---|---|
 | GGUF_NATIVE_KERNEL_IMPLEMENTATION_2026_03_05 | Canonical-Elsewhere | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md) |
-| GGUF_QUANTIZATION_REFERENCE_2026_03_05 | Canonical-Elsewhere | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md), [GGUF_SMOKE_TEST_GUIDE](GGUF_SMOKE_TEST_GUIDE.md) |
-| GGUF_SMOKE_TEST_GUIDE_2026_03_05 | Canonical-Elsewhere | [GGUF_SMOKE_TEST_GUIDE](GGUF_SMOKE_TEST_GUIDE.md) |
+| GGUF_QUANTIZATION_REFERENCE_2026_03_05 | Canonical-Elsewhere | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md), `scripts/README.md` (GGUF native smoke) |
+| GGUF_SMOKE_TEST_GUIDE_2026_03_05 | Canonical-Elsewhere | `scripts/README.md` (GGUF native smoke) |
 
 ## 5) Consolidated Startup Advisor Deep-Dives
 
@@ -88,17 +116,17 @@ their few live referrers repointed directly at the canonical doc.
 
 | Document | Label | Canonical replacement |
 |---|---|---|
-| NFR | Canonical-Elsewhere | [PRD](PRD.md), [Roadmap](Roadmap.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md) |
-| PERFORMANCE_TUNING | Canonical-Elsewhere | [MONITORING](MONITORING.md), [CONFIG_REFERENCE](CONFIG_REFERENCE.md), [STARTUP_ADVISOR](STARTUP_ADVISOR.md), [benchmark_multi_backend_steps](benchmark_multi_backend_steps.md) |
+| NFR | Canonical-Elsewhere | [PRODUCT](PRODUCT.md), [Roadmap](Roadmap.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md) |
+| PERFORMANCE_TUNING | Canonical-Elsewhere | [MONITORING](MONITORING.md), [CONFIG_REFERENCE](CONFIG_REFERENCE.md), [STARTUP_ADVISOR](STARTUP_ADVISOR.md), [benchmarks](benchmarks.md#multi-backend-harness-reference) |
 | INFERCTL_SERVER_MANAGEMENT | Canonical-Elsewhere | [AdminGuide](AdminGuide.md) |
 | PROFILING_OPERATIONS_GUIDE | Canonical-Elsewhere | [MONITORING](MONITORING.md), [DeveloperGuide](DeveloperGuide.md) |
-| GGUF_QUANTIZATION_REFERENCE | Canonical-Elsewhere | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md), [GGUF_SMOKE_TEST_GUIDE](GGUF_SMOKE_TEST_GUIDE.md) |
-| FP16_MODEL_GUIDE | Canonical-Elsewhere | [FP16_STATUS](FP16_STATUS.md) |
-| FP16_BENCHMARK_RESULTS_FINAL | Canonical-Elsewhere | [FP16_STATUS](FP16_STATUS.md), [benchmarks](benchmarks.md) |
-| FP16_OOM_FIX_FINAL_SUMMARY | Canonical-Elsewhere | [FP16_STATUS](FP16_STATUS.md) |
-| FP16_OOM_FIX_VALIDATION | Canonical-Elsewhere | [FP16_STATUS](FP16_STATUS.md) |
-| OOM_ROOT_CAUSE_ANALYSIS | Canonical-Elsewhere | [FP16_STATUS](FP16_STATUS.md) |
-| PERFORMANCE_OPTIMIZATION_SUMMARY | Canonical-Elsewhere | [FP16_STATUS](FP16_STATUS.md), [benchmarks](benchmarks.md) |
+| GGUF_QUANTIZATION_REFERENCE | Canonical-Elsewhere | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md), `scripts/README.md` (GGUF native smoke) |
+| FP16_MODEL_GUIDE | Canonical-Elsewhere | [benchmarks](benchmarks.md) |
+| FP16_BENCHMARK_RESULTS_FINAL | Canonical-Elsewhere | [benchmarks](benchmarks.md), [benchmarks](benchmarks.md) |
+| FP16_OOM_FIX_FINAL_SUMMARY | Canonical-Elsewhere | [benchmarks](benchmarks.md) |
+| FP16_OOM_FIX_VALIDATION | Canonical-Elsewhere | [benchmarks](benchmarks.md) |
+| OOM_ROOT_CAUSE_ANALYSIS | Canonical-Elsewhere | [benchmarks](benchmarks.md) |
+| PERFORMANCE_OPTIMIZATION_SUMMARY | Canonical-Elsewhere | [benchmarks](benchmarks.md), [benchmarks](benchmarks.md) |
 | LARGE_CONTEXT_CONFIGURATION_GUIDE | Canonical-Elsewhere | [CONFIG_REFERENCE](CONFIG_REFERENCE.md), [STARTUP_ADVISOR](STARTUP_ADVISOR.md) |
 | DYNAMIC_SLOT_ALLOCATION_STARTUP_ADVISOR | Canonical-Elsewhere | [STARTUP_ADVISOR](STARTUP_ADVISOR.md), [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
 | STARTUP_ADVISOR_CONFIGURABLE_CONSTANTS_2026_03_04 | Canonical-Elsewhere | [STARTUP_ADVISOR](STARTUP_ADVISOR.md), [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
@@ -140,11 +168,11 @@ by the current state of the canonical docs and code they investigated.
 
 ## Canonical Sources of Truth
 
-- [README](../README.md)
+- [README](index.md)
 - [INDEX](INDEX.md)
 - [Quickstart](Quickstart.md)
 - [API Surface](API_SURFACE.md)
 - [Architecture](Architecture.md)
-- [PRD](PRD.md)
+- [PRODUCT](PRODUCT.md)
 - [Roadmap](Roadmap.md)
 - [TechDebt and Competitive Roadmap](TechDebt_and_Competitive_Roadmap.md)

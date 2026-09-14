@@ -72,3 +72,65 @@ External engine notes:
 - In practice:
   - GGUF runs include `inferflux_cuda`, `llama_cpp_cuda`, `ollama`, and other GGUF-capable engines.
   - Safetensors runs include `inferflux_cuda`, `vllm`, `sglang`, and other safetensors-capable engines.
+
+## GGUF Native Smoke Test
+
+
+**Status:** Canonical
+
+```mermaid
+flowchart LR
+    A[Prepare GGUF models] --> B[Start inferfluxd]
+    B --> C[Run smoke script]
+    C --> D[Check metrics + outputs]
+```
+
+## 1) Preconditions
+
+| Requirement | Check |
+|---|---|
+| Built binaries | `cmake --build build --target inferfluxd inferctl` |
+| GGUF model files | directory contains `*.gguf` variants |
+| CUDA visibility (if GPU path) | `nvidia-smi` |
+
+## 2) Fast Path (Recommended)
+
+```bash
+./scripts/smoke.sh gguf-native \
+  --model-dir ~/.inferflux/models/qwen-gguf \
+  --num-tokens 20
+```
+
+Expected: each supported quantization variant reports `SUCCESS`.
+
+## 3) Full Comparison Path (Optional)
+
+```bash
+./scripts/archive/test/test_gguf_quantization_smoke.sh (moved to the archive) \
+  --model-path /abs/path/to/source-model \
+  --num-tokens 20
+```
+
+Use this when you want native-vs-llama.cpp comparison behavior in one flow.
+
+## 4) Post-Run Verification
+
+```bash
+curl -s http://127.0.0.1:8080/metrics | grep -E "inferflux_cuda_forward_passes_total|inferflux_cuda_kv_active_sequences"
+./build/inferctl models --json --api-key dev-key-123
+```
+
+## 5) Failure Matrix
+
+| Failure | First check | Action |
+|---|---|---|
+| server startup failure | server log, model path, port | fix config/path and restart |
+| inference failure | model format/backend exposure | enforce `format: gguf`, verify backend policy |
+| empty output | prompt/model mismatch | test with simpler prompt and higher token budget |
+| low performance | batch/skip metrics | tune scheduler and CUDA settings |
+
+## 6) Consolidation Notes
+
+The previous long-form smoke guide is cataloged (name only, no working tree
+copy) in [ARCHIVE_INDEX](ARCHIVE_INDEX.md).
+

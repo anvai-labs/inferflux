@@ -197,6 +197,13 @@ int main(int argc, char **argv) {
       // WebUI is enabled at compile time via INFERFLUX_ENABLE_WEBUI.
       // This flag is accepted for CLI/Docker compatibility but is a no-op at
       // runtime; the UI is always served at /ui when the feature is built in.
+    } else if (arg == "--help" || arg == "-h") {
+      std::cout << "usage: inferfluxd [--config <path>] [--ui]\n";
+      std::exit(0);
+    } else {
+      std::cerr << "[server] unrecognized argument '" << arg
+                << "' (config files are passed with --config <path>); "
+                   "ignoring\n";
     }
   }
 
@@ -216,6 +223,7 @@ int main(int argc, char **argv) {
   std::string tls_key_path;
   bool cuda_enabled = false;
   bool cuda_flash_attention_enabled = false;
+  bool rocm_flash_attention_enabled = false;
   int llama_max_parallel_sequences_configured = -1;
   int cuda_flash_attention_tile = 128;
   std::string cuda_attention_kernel = "auto";
@@ -364,6 +372,13 @@ int main(int argc, char **argv) {
             config["runtime"]["cuda"]["flash_attention"]["enabled"]) {
           cuda_flash_attention_enabled =
               config["runtime"]["cuda"]["flash_attention"]["enabled"]
+                  .as<bool>();
+        }
+        if (config["runtime"]["rocm"] &&
+            config["runtime"]["rocm"]["flash_attention"] &&
+            config["runtime"]["rocm"]["flash_attention"]["enabled"]) {
+          rocm_flash_attention_enabled =
+              config["runtime"]["rocm"]["flash_attention"]["enabled"]
                   .as<bool>();
         }
         // runtime.llama.* matches the startup advisor's emitted snippet;
@@ -1153,8 +1168,20 @@ int main(int argc, char **argv) {
   std::string primary_model_id;
   inferflux::LlamaBackendConfig primary_cfg;
   primary_cfg.gpu_layers = mps_layers;
-  primary_cfg.use_flash_attention =
-      cuda_enabled && cuda_flash_attention_enabled;
+  // Llama-wrapper FlashAttention: the CUDA flag keeps its historical
+  // cuda_enabled gate; ROCm opts in via runtime.rocm.flash_attention (the
+  // llama.cpp HIP backend ships FA for gfx9-gfx12). Env wins for quick A/B.
+  // Unsupported targets fall back via TuneLlamaBackendConfig's trait gate.
+  bool llama_wrapper_flash_attention =
+      (cuda_enabled && cuda_flash_attention_enabled) ||
+      rocm_flash_attention_enabled;
+  if (const char *env_fa = std::getenv("INFERFLUX_LLAMA_FLASH_ATTENTION")) {
+    const std::string env_fa_lower = ToLower(env_fa);
+    llama_wrapper_flash_attention =
+        env_fa_lower == "true" || env_fa_lower == "1" ||
+        env_fa_lower == "yes" || env_fa_lower == "on";
+  }
+  primary_cfg.use_flash_attention = llama_wrapper_flash_attention;
   primary_cfg.flash_attention_tile = cuda_flash_attention_tile;
   primary_cfg.cuda_attention_kernel = cuda_attention_kernel;
   primary_cfg.inferflux_cuda_kv_cache_dtype = inferflux_cuda_kv_cache_dtype;
@@ -1165,6 +1192,19 @@ int main(int argc, char **argv) {
     primary_cfg.llama_kv_cache_type = env_kv_type;
     inferflux::log::Info("server", "llama wrapper KV cache type set to " +
                                        primary_cfg.llama_kv_cache_type);
+  }
+  if (const char *env_ctx = std::getenv("INFERFLUX_LLAMA_CTX_SIZE")) {
+    char *end = nullptr;
+    const long parsed = std::strtol(env_ctx, &end, 10);
+    if (end == env_ctx || *end != '\0' || parsed < 256 || parsed > 2097152) {
+      inferflux::log::Warn(
+          "server", "Ignoring invalid INFERFLUX_LLAMA_CTX_SIZE='" +
+                        std::string(env_ctx) + "' (valid range 256-2097152)");
+    } else {
+      primary_cfg.ctx_size = static_cast<int32_t>(parsed);
+      inferflux::log::Info("server", "llama wrapper context size set to " +
+                                         std::to_string(parsed));
+    }
   }
   if (const char *env_seqs = std::getenv("INFERFLUX_LLAMA_MAX_PARALLEL_SEQS")) {
     char *end = nullptr;
@@ -1262,8 +1302,18 @@ int main(int argc, char **argv) {
 #endif
 
   // Sync primary_cfg with effective post-guard FA state; record Prometheus
-  // gauge (§2.7).
-  primary_cfg.use_flash_attention = cuda_flash_attention_enabled;
+  // gauge (§2.7). Recompute from the guarded flags — the guards above may
+  // have disabled CUDA FA on builds/runtimes without CUDA support — then
+  // re-apply the env override (case-insensitive).
+  llama_wrapper_flash_attention =
+      cuda_flash_attention_enabled || rocm_flash_attention_enabled;
+  if (const char *env_fa = std::getenv("INFERFLUX_LLAMA_FLASH_ATTENTION")) {
+    const std::string env_fa_lower = ToLower(env_fa);
+    llama_wrapper_flash_attention =
+        env_fa_lower == "true" || env_fa_lower == "1" ||
+        env_fa_lower == "yes" || env_fa_lower == "on";
+  }
+  primary_cfg.use_flash_attention = llama_wrapper_flash_attention;
   primary_cfg.cuda_phase_overlap_scaffold = cuda_phase_overlap_scaffold;
   primary_cfg.cuda_phase_overlap_prefill_replica =
       cuda_phase_overlap_prefill_replica;
@@ -1513,9 +1563,15 @@ int main(int argc, char **argv) {
       static_cast<std::size_t>(prefix_cache_capacity);
   auto prefix_cache = std::make_shared<inferflux::RadixPrefixCache>(
       cache,
-      [&sched_ptr](int seq_id) {
-        if (sched_ptr)
-          sched_ptr->FreeSeqSlot(seq_id);
+      [&sched_ptr](int seq_id,
+                   std::shared_ptr<inferflux::BackendInterface> backend) {
+        if (sched_ptr) {
+          // Carry the backend so eviction clears the backend KV, not just
+          // the slot-manager state (issue #161).
+          sched_ptr->FreeSeqSlot(
+              seq_id, 0,
+              std::dynamic_pointer_cast<inferflux::LlamaCppBackend>(backend));
+        }
       },
       prefix_cache_limits);
   std::shared_ptr<inferflux::disaggregated::IKVTransport> kv_transport;

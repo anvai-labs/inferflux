@@ -64,7 +64,8 @@ TEST_CASE("HttpServer admin cache endpoint includes memory payload",
   auto paged_kv = std::make_shared<PagedKVCache>(
       16, 1024, PagedKVCache::EvictionPolicy::kLRU);
   auto prefix_cache = std::make_shared<RadixPrefixCache>(
-      paged_kv, [](int) {}, RadixPrefixCacheLimits{64, 8});
+      paged_kv, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{64, 8});
   auto scheduler = MakeSchedulerWithPrefix(tokenizer, paged_kv, prefix_cache);
 
   const auto retained_blocks = paged_kv->ReserveBlocks(2);

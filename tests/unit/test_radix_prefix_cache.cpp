@@ -1,3 +1,4 @@
+#include "runtime/backends/common/backend_interface.h"
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
 
@@ -10,7 +11,9 @@
 using namespace inferflux;
 
 TEST_CASE("RadixPrefixCache: miss on empty cache", "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{16, 12});
+  RadixPrefixCache cache(
+      nullptr, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{16, 12});
   RadixLookupResult lookup;
   lookup.matched_tokens = -1;
   REQUIRE_FALSE(cache.Lookup({1, 2, 3}, nullptr, &lookup));
@@ -18,7 +21,9 @@ TEST_CASE("RadixPrefixCache: miss on empty cache", "[radix_cache]") {
 }
 
 TEST_CASE("RadixPrefixCache: exact hit after insert", "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{16, 12});
+  RadixPrefixCache cache(
+      nullptr, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{16, 12});
   // Assume [1, 2, 3] covered by block 100, computed in seq 5.
   cache.Insert({1, 2, 3}, {100}, 5, nullptr);
   RadixLookupResult lookup;
@@ -33,7 +38,9 @@ TEST_CASE("RadixPrefixCache: exact hit after insert", "[radix_cache]") {
 
 TEST_CASE("RadixPrefixCache: partial prefix match reports matched_tokens",
           "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{16, 12});
+  RadixPrefixCache cache(
+      nullptr, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{16, 12});
   cache.Insert({1, 2, 3}, {100}, 5, nullptr);
 
   RadixLookupResult lookup;
@@ -48,7 +55,9 @@ TEST_CASE("RadixPrefixCache: partial prefix match reports matched_tokens",
 
 TEST_CASE("RadixPrefixCache: deep radix tree with progressive prefixes",
           "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{32, 12});
+  RadixPrefixCache cache(
+      nullptr, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{32, 12});
   // Blocks of 16 tokens each.
   cache.Insert({1, 2}, {10}, 1, nullptr);
   cache.Insert({1, 2, 3, 4}, {10, 11}, 2, nullptr);
@@ -72,7 +81,9 @@ TEST_CASE("RadixPrefixCache: deep radix tree with progressive prefixes",
 TEST_CASE(
     "RadixPrefixCache: reinserting existing node keeps suffix blocks only",
     "[radix_cache]") {
-  RadixPrefixCache cache(nullptr, [](int) {}, RadixPrefixCacheLimits{64, 12});
+  RadixPrefixCache cache(
+      nullptr, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{64, 12});
 
   std::vector<int> prefix_tokens;
   std::vector<int> full_tokens;
@@ -101,7 +112,10 @@ TEST_CASE("RadixPrefixCache: sequence slot capping and eviction",
           "[radix_cache]") {
   int evicted_seq = -1;
   RadixPrefixCache cache(
-      nullptr, [&](int seq) { evicted_seq = seq; },
+      nullptr,
+      [&](int seq, std::shared_ptr<inferflux::BackendInterface>) {
+        evicted_seq = seq;
+      },
       RadixPrefixCacheLimits{100, 2});
 
   cache.Insert({1}, {10}, 101, nullptr);
@@ -118,7 +132,9 @@ TEST_CASE("RadixPrefixCache: memory snapshot reports unique retained blocks",
           "[radix_cache]") {
   auto paged_kv = std::make_shared<PagedKVCache>(
       8, 1024, PagedKVCache::EvictionPolicy::kLRU);
-  RadixPrefixCache cache(paged_kv, [](int) {}, RadixPrefixCacheLimits{64, 12});
+  RadixPrefixCache cache(
+      paged_kv, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{64, 12});
 
   cache.Insert({1, 2, 3}, {10}, 1001, nullptr);
   cache.Insert({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17},
@@ -128,4 +144,61 @@ TEST_CASE("RadixPrefixCache: memory snapshot reports unique retained blocks",
   REQUIRE(snapshot.unique_retained_blocks == 2);
   REQUIRE(snapshot.retained_bytes == 2048);
   REQUIRE(snapshot.live_sequences == 2);
+}
+
+TEST_CASE("RadixPrefixCache Insert reports honest success (issue #161)",
+          "[radix_cache]") {
+  RadixPrefixCache cache(
+      nullptr, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{16, 12});
+  // Empty block_table: the trie would own nothing, so callers must free the
+  // sequence slot normally instead of treating it as radix-owned.
+  REQUIRE_FALSE(cache.Insert({1, 2}, {}, 7, nullptr));
+  REQUIRE_FALSE(cache.Insert({}, {10}, 7, nullptr));
+  REQUIRE(cache.Insert({1, 2}, {10}, 7, nullptr));
+  REQUIRE(cache.LiveSequences() == 1);
+}
+
+TEST_CASE("RadixPrefixCache EvictOneSequence clears backend and releases the "
+          "sequence (issue #161)",
+          "[radix_cache]") {
+  class RecordingBackend : public inferflux::BackendInterface {
+  public:
+    std::vector<int> freed;
+    std::string Name() const override { return "recording"; }
+    bool LoadModel(const std::filesystem::path &,
+                   const LlamaBackendConfig &) override {
+      return true;
+    }
+    std::vector<UnifiedBatchOutput>
+    ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override {
+      (void)inputs;
+      return {};
+    }
+    void FreeSequence(int sequence_id) override {
+      freed.push_back(sequence_id);
+    }
+  };
+
+  RecordingBackend backend;
+  int callback_seq = -1;
+  std::shared_ptr<inferflux::BackendInterface> callback_backend;
+  RadixPrefixCache cache(
+      nullptr,
+      [&](int seq_id, std::shared_ptr<inferflux::BackendInterface> be) {
+        callback_seq = seq_id;
+        callback_backend = be;
+      },
+      RadixPrefixCacheLimits{16, 12});
+
+  std::shared_ptr<inferflux::BackendInterface> backend_ptr(
+      &backend, [](inferflux::BackendInterface *) {});
+  cache.Insert({1, 2}, {10}, 5, backend_ptr);
+  REQUIRE(cache.LiveSequences() == 1);
+
+  cache.EvictOneSequence();
+  REQUIRE(backend.freed == std::vector<int>{5});
+  REQUIRE(callback_seq == 5);
+  REQUIRE(callback_backend.get() == &backend);
+  REQUIRE(cache.LiveSequences() == 0);
 }

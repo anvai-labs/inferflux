@@ -81,7 +81,7 @@ support claims, and the exact tag SHA must pass the gate before the next release
 
 ## 6) References
 
-- [Installer](Installer.md)
+- [Quickstart](Quickstart.md#installing-a-release-packages)
 - [INDEX](INDEX.md)
 - [DOCS_STYLE_GUIDE](DOCS_STYLE_GUIDE.md)
 - [Trusted Dual-GPU CI Bootstrap](GPU_CI_BOOTSTRAP.md)

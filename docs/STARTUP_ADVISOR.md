@@ -11,7 +11,7 @@ flowchart TD
     A[Server Start] --> B[Load Config]
     B --> C[Probe Hardware]
     C --> D[Load Models]
-    D --> E[Run 8 Rule Checks]
+    D --> E[Run 10 Rule Checks]
 
     E --> F{Any Issues?}
     F -->|Yes| G[Log Recommendations]
@@ -27,7 +27,7 @@ flowchart TD
     style I fill:#1dd1a1
 ```
 
-## The 8 Advisor Rules
+## The 10 Advisor Rules
 
 ### Rule 1: Backend Mismatch
 
@@ -355,6 +355,10 @@ runtime:
 # Environment variable
 INFERFLUX_DISABLE_STARTUP_ADVISOR=true ./build/inferfluxd --config config/server.yaml
 
+Set `INFERFLUX_STARTUP_ADVISOR_VERBOSE=1` to print the memory-calculation
+breakdown during slot sizing (useful when a slot-allocation recommendation
+looks wrong).
+
 # Or in config file (not recommended)
 ```
 
@@ -376,6 +380,21 @@ std::cout << recommendations << " suggestions\n";
 ```
 
 ## Implementation Details
+
+### Rule 9: Dynamic Slot Allocation
+
+Compares the configured `max_parallel_sequences` / context sizing against a
+VRAM-derived optimum. When the current config is below half or above twice
+the recommendation, the advisor emits a `slot_allocation` recommendation
+including a memory breakdown and a ready-to-paste YAML snippet.
+
+### Rule 10: Quantization Mismatch
+
+For GGUF models whose quantization metadata cannot be read (or mismatches
+the filename), the advisor emits a `quantization` recommendation asking you
+to verify the path points at a valid GGUF with readable tensor metadata.
+This check became meaningful when the CPU GGUF parser learned to skip KV
+metadata correctly (see the quantization-detection fix in #163).
 
 ### Rule Evaluation Flow
 
