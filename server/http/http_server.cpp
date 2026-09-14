@@ -10,10 +10,10 @@
 #include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/string_utils.h"
+#include "runtime/text/reasoning_splitter.h"
 #include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
-#include "runtime/text/reasoning_splitter.h"
 #include "server/tracing/span.h"
 
 #include <nlohmann/json.hpp>
@@ -704,16 +704,15 @@ static json BuildChoice(int idx, const InferenceResult &result,
               {"finish_reason", "tool_calls"}};
     } else {
       const std::string fr = result.finish_reason_length ? "length" : "stop";
-      return {
-          {"index", idx},
-          {"message",
-           reasoning_content.empty()
-               ? json{{"role", "assistant"}, {"content", result.completion}}
-               : json{{"role", "assistant"},
-                      {"content", result.completion},
-                      {"reasoning_content", reasoning_content}}},
-          {"logprobs", logprobs_json},
-          {"finish_reason", fr}};
+      return {{"index", idx},
+              {"message",
+               reasoning_content.empty()
+                   ? json{{"role", "assistant"}, {"content", result.completion}}
+                   : json{{"role", "assistant"},
+                          {"content", result.completion},
+                          {"reasoning_content", reasoning_content}}},
+              {"logprobs", logprobs_json},
+              {"finish_reason", fr}};
     }
   } else {
     const std::string fr = result.finish_reason_length ? "length" : "stop";
@@ -784,8 +783,8 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
   }
   j["usage"]["prompt_tokens_details"] = {{"cached_tokens", cached_toks}};
   if (reasoning_tokens > 0) {
-    j["usage"]["completion_tokens_details"] = {{"reasoning_tokens",
-                                                reasoning_tokens}};
+    j["usage"]["completion_tokens_details"] = {
+        {"reasoning_tokens", reasoning_tokens}};
   }
   if (duration_ms >= 0.0) {
     j["usage"]["duration_ms"] = duration_ms;
@@ -817,7 +816,8 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
       const ToolCallResult &tc = (i < static_cast<int>(tool_calls.size()))
                                      ? tool_calls[i]
                                      : ToolCallResult{};
-      const std::string fr = results[i].finish_reason_length ? "length" : "stop";
+      const std::string fr =
+          results[i].finish_reason_length ? "length" : "stop";
       choice_json = {
           {"index", i},
           {"message",
@@ -829,11 +829,10 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
           {"logprobs", json::object()},
           {"finish_reason", fr}};
     } else {
-      choice_json = {
-          {"index", i},
-          {"text", per_result_content},
-          {"finish_reason",
-           results[i].finish_reason_length ? "length" : "stop"}};
+      choice_json = {{"index", i},
+                     {"text", per_result_content},
+                     {"finish_reason",
+                      results[i].finish_reason_length ? "length" : "stop"}};
     }
     choices.push_back(std::move(choice_json));
   }
@@ -842,12 +841,10 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
 }
 
 // Single-result overload: preserves the original call sites unchanged.
-std::string
-BuildCompletionBody(const InferenceResult &result,
-                    const CompletionRequestPayload &request, bool chat_mode,
-                    const ToolCallResult &tool_call = ToolCallResult{},
-                    const std::string &reasoning_content = {},
-                    int reasoning_tokens = 0) {
+std::string BuildCompletionBody(
+    const InferenceResult &result, const CompletionRequestPayload &request,
+    bool chat_mode, const ToolCallResult &tool_call = ToolCallResult{},
+    const std::string &reasoning_content = {}, int reasoning_tokens = 0) {
   return BuildCompletionBody(std::vector<InferenceResult>{result},
                              result.completion_tokens, request, chat_mode,
                              std::vector<ToolCallResult>{tool_call},
@@ -3147,8 +3144,7 @@ void HttpServer::HandleClient(ClientSession &session) {
           auto parts = inferflux::ReasoningSplitter::Split(r.completion);
           if (!parts.reasoning.empty()) {
             reasoning_content = parts.reasoning;
-            reasoning_tokens +=
-                static_cast<int>(parts.reasoning.size());
+            reasoning_tokens += static_cast<int>(parts.reasoning.size());
             r.completion = std::move(parts.content);
           }
         }
