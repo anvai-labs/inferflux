@@ -466,8 +466,9 @@ void LlamaCppBackend::SetupSampler(const std::string &grammar,
   if (has_penalties) {
     llama_sampler_chain_add(chain,
                             llama_sampler_init_penalties(
-                                sp.penalty_last_n, sp.repetition_penalty,
-                                sp.frequency_penalty, sp.presence_penalty));
+                                n_vocab_, sp.penalty_last_n,
+                                sp.repetition_penalty, sp.frequency_penalty,
+                                sp.presence_penalty));
   }
 
   // Logit bias: bias specific tokens.
