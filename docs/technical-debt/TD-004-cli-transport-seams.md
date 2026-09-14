@@ -3,7 +3,7 @@
 Status: Proposed
 Priority: P1
 Owners: CLI
-Dependencies: TD-001, ADR-0002
+Dependencies: ADR-0002
 
 ## Liability
 

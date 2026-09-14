@@ -3,7 +3,7 @@
 Status: In Progress
 Priority: P0
 Owners: QA, Release Engineering
-Dependencies: TD-001
+Dependencies: None
 
 ## Liability
 

@@ -3,7 +3,7 @@
 Status: Proposed
 Priority: P0
 Owners: CLI, Developer Experience
-Dependencies: TD-001, TD-004, ADR-0002
+Dependencies: TD-004, ADR-0002
 
 ## User Outcome
 

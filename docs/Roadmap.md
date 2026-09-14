@@ -41,7 +41,7 @@ flowchart LR
 
 | Order | Artifact | Why it is here | Exit gate |
 |---|---|---|---|
-| 1 | [TD-001](technical-debt/TD-001-green-mainline-baseline.md) | Every later claim depends on a reproducible baseline | CPU build and all model-free tests pass from a non-default build directory |
+| 1 | TD-001 (closed — green-mainline gate enforced in CI) | Every later claim depends on a reproducible baseline | CPU build and all model-free tests pass from a non-default build directory |
 | 2 | [TD-002](technical-debt/TD-002-required-evidence-gates.md) | Prevents correctness and performance regressions from becoming release claims | CPU contracts required; one stable CUDA behavioral lane defined |
 | 3 | [TD-006](technical-debt/TD-006-dependency-runtime-currency.md) | Runtime evidence is invalid when accelerator support silently compiles out or uses obsolete interfaces | Versioned CPU/CUDA/ROCm matrix passes on supported pins |
 | 4 | [TD-007](technical-debt/TD-007-context-sequence-capacity.md) | Load evidence is invalid until context capacity, errors, and request completion are deterministic | Mixed-prompt lifecycle and capacity matrix passes on CPU/CUDA/ROCm |

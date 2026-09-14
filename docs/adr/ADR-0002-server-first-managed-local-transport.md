@@ -3,7 +3,7 @@
 Status: Accepted
 Date: 2026-08-21
 Owners: CLI, Runtime, Developer Experience
-Dependencies: TD-001
+Dependencies: None
 
 ## Context
 

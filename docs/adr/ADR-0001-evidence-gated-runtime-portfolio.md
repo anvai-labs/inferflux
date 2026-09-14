@@ -3,7 +3,7 @@
 Status: Proposed
 Date: 2026-08-21
 Owners: Runtime, Product, QA
-Dependencies: TD-001, TD-006, TD-007
+Dependencies: TD-006, TD-007
 
 ## Context
 
