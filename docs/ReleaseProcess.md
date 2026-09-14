@@ -47,7 +47,7 @@ dispatch `GPU Behavioral Gates` on `main` before step 2.
 
 ```mermaid
 flowchart TD
-    A[Code/API/CLI changed] --> B[Update canonical docs]
+    A["Code/API/CLI changed"] --> B[Update canonical docs]
     B --> C[Run docs contract gate]
     C --> D[Run CI]
     D --> E[Tag release]

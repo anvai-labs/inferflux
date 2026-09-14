@@ -37,7 +37,7 @@ flowchart LR
     B -->|llama_cpp_cuda| C[⚠️ Mismatch]
     B -->|inferflux_cuda| D[✅ Correct]
 
-    C --> E[Recommendation:<br/>Set backend: inferflux_cuda]
+    C --> E["Recommendation:<br/>Set backend: inferflux_cuda"]
     D --> F[No action needed]
 
     style C fill:#ff6b6b
@@ -189,7 +189,7 @@ set runtime.cuda.phase_overlap.enabled: true for mixed-batch decode prioritizati
 ```mermaid
 graph LR
     subgraph "KV Cache Utilization"
-        A[cpu_pages: 32] --> B[9.6 MB<br/>@ 300 KB/page]
+        A[cpu_pages: 32] --> B["9.6 MB<br/>@ 300 KB/page"]
         C[Free VRAM: 16 GB] --> D[⚠️ Underutilized]
     end
 
