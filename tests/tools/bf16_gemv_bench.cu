@@ -9,7 +9,7 @@
 // on these shapes cold; the naive warp-per-row custom kernel here only
 // matches it (M=1-4) and loses at larger M. Beating cuBLAS on skinny bf16
 // GEMV needs a heavier design (multi-row tiles, cp.async double buffering,
-// deep MLP) -- see docs/design/SAFETENSORS_DECODE_PERFORMANCE_PLAN.md.
+// deep MLP) -- see docs/benchmarks.md (safetensors decode section).
 //
 // Build:  nvcc -O3 -arch=native -lcublas bf16_gemv_bench.cu -o bf16_gemv_bench
 // Run:    ./bf16_gemv_bench
