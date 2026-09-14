@@ -16,7 +16,7 @@ flowchart LR
     B --> C[scheduler + batch executor]
     C --> D[inferflux_cuda native kernels]
     C --> E[llama.cpp wrapper]
-    C --> F[ROCm / MPS / Vulkan / CPU]
+    C --> F["ROCm / MPS / Vulkan / CPU"]
     B --> G[auth + policy + metrics]
 ```
 

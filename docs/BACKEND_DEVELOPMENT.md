@@ -732,7 +732,7 @@ bool MyBackend::Prefill(const std::vector<token_id_t> &tokens) {
 
 ```mermaid
 graph LR
-    A[Fork/Clone] --> B[Create Branch]
+    A["Fork/Clone"] --> B[Create Branch]
     B --> C[Implement Backend]
     C --> D[Write Tests]
     D --> E[Update Docs]

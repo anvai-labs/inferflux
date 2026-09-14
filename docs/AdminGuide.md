@@ -62,7 +62,7 @@ flowchart LR
 
 ```mermaid
 graph TD
-    A[API Key / OIDC] --> B[Scope check]
+    A["API Key / OIDC"] --> B[Scope check]
     B --> C[Guardrails]
     C --> D[Audit logging]
 ```
