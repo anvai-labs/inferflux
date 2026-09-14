@@ -4,7 +4,7 @@
 flowchart LR
     A[Build] --> B[Run inferfluxd]
     B --> C[Call OpenAI API]
-    C --> D[Inspect models/admin]
+    C --> D["Inspect models/admin"]
 ```
 
 ## 0) Prerequisites

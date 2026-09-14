@@ -7,15 +7,15 @@
 
 ```mermaid
 flowchart TD
-    A[Client / SDK / inferctl] --> B[HTTP Server]
+    A["Client / SDK / inferctl"] --> B[HTTP Server]
     B --> C[Auth + Scope + Rate Limit]
     C --> D[Scheduler]
     D --> E[Model Router]
     E --> F[Backend Instance]
     F --> G[Runtime Execution]
-    G --> H[Prefill / Decode]
-    G --> I[KV Cache / Prefix Reuse]
-    G --> J[Sampling / Structured Output]
+    G --> H["Prefill / Decode"]
+    G --> I["KV Cache / Prefix Reuse"]
+    G --> J["Sampling / Structured Output"]
     D --> K[Metrics + Traces]
     B --> L[Admin API]
     L --> M[Model + Routing + Cache + Pools Control]

@@ -8,23 +8,23 @@ graph TD
     A --> C[Admin Control Plane]
     A --> D[Health & Metrics]
 
-    B --> B1[/v1/completions]
-    B --> B2[/v1/chat/completions]
-    B --> B3[/v1/models]
-    B --> B4[/v1/models/{id}]
-    B --> B5[/v1/embeddings]
+    B --> B1["v1/completions"]
+    B --> B2["v1/chat/completions"]
+    B --> B3["v1/models"]
+    B --> B4["v1/models/{id"]
+    B --> B5["v1/embeddings"]
 
-    C --> C1[/v1/admin/guardrails]
-    C --> C2[/v1/admin/rate_limit]
-    C --> C3[/v1/admin/api_keys]
-    C --> C4[/v1/admin/models]
-    C --> C5[/v1/admin/models/default]
-    C --> C6[/v1/admin/routing]
-    C --> C7[/v1/admin/cache]
-    C --> C8[/v1/admin/cache/warm]
+    C --> C1["v1/admin/guardrails"]
+    C --> C2["v1/admin/rate_limit"]
+    C --> C3["v1/admin/api_keys"]
+    C --> C4["v1/admin/models"]
+    C --> C5["v1/admin/models/default"]
+    C --> C6["v1/admin/routing"]
+    C --> C7["v1/admin/cache"]
+    C --> C8["v1/admin/cache/warm"]
 
-    D --> D1[/livez /readyz /healthz]
-    D --> D2[/metrics]
+    D --> D1["livez /readyz /healthz"]
+    D --> D2["/metrics"]
 ```
 
 ## 1) Public Endpoints

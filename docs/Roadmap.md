@@ -10,7 +10,7 @@
 flowchart LR
   A[TD-001 Green baseline] --> B[TD-002 Required evidence gates]
   B --> Q[ADR-0005 Trusted GPU release evidence]
-  B --> O[TD-006 Dependency/runtime currency]
+  B --> O["TD-006 Dependency/runtime currency"]
   O --> P[TD-007 Context and sequence capacity]
   P --> R[TD-008 Unified burst sampling parity]
   R --> C[ADR-0001 Runtime proof-or-pivot]
