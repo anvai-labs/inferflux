@@ -162,4 +162,12 @@ docker compose -f docker/docker-compose.yaml up
 - [API Surface](API_SURFACE.md)
 - [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
 - [Admin Guide](AdminGuide.md)
-- [benchmarks](benchmarks.md) (FP16 guidance)
+- [benchmarks](benchmarks.md)
+
+## ROCm throughput and output drift
+
+| Symptom | Check |
+|---|---|
+| ROCm throughput far below expectations | Verify you are running the shipped tuned `config/server.rocm.yaml` (wave-gathering admission, #160). Do not overwrite it with `server.cuda.yaml`. Historical "17-36 tok/s" readings were a CPU-backend misroute artifact, not device throughput — see [benchmarks](benchmarks.md). |
+| Output differs from an earlier version at temperature 0 | The unified-batch greedy argmax fast path is bit-consistent for a given build; to compare against the llama sampler path set `INFERFLUX_DISABLE_GREEDY_ARGMAX=1`. |
+| FlashAttention behavior on ROCm | `runtime.rocm.flash_attention.enabled` in YAML (or `INFERFLUX_LLAMA_FLASH_ATTENTION`) controls the wrapper FA mode; FA off costs up to 2.2x decode at high KV utilization. |

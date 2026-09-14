@@ -25,5 +25,5 @@ InferFlux ships with a native policy store that persists API keys, scopes, rate 
 ## Roadmap
 1. **Persistent backends**: swap the INI file for pluggable stores (SQLite, Postgres, Vault) with watch streams.
 2. **Versioning & Audit**: append-only history and signed commits for compliance.
-3. **Policy plugins**: optional OPA/Cedar adapters for complex rules (tenant quotas, contextual guardrails).
+3. **Policy plugins**: optional Cedar/advanced-rule adapters beyond the shipped OPA client for complex rules (tenant quotas, contextual guardrails).
 4. **UI & CLI parity**: extend `inferctl admin api-keys` and future dashboards to edit policies with RBAC + audit.

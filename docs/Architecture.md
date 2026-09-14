@@ -127,8 +127,9 @@ Backend parity principles (from the retired Backend Parity design note):
 | Dequantized projections | Policy-scoped as `none`, `batch`, or `model`; native quantized path defaults to memory-first `none` |
 | KV cache | Separate lifecycle from weights; precision is fixed at model-load scope |
 | KV sizing | InferFlux CUDA can auto-tune max sequence length against a VRAM budget and exports planning metrics |
-| Prefix reuse | Token-aligned reuse with balanced acquire/release accounting |
+| Prefix reuse | Radix-trie prefix cache (`RadixPrefixCache`) with backend-verified KV consistency and balanced acquire/release accounting |
 | Session reuse | Optional `session_id` lease layer with TTL; disabled in decode-worker mode today |
+| Slot lifecycle | Universal slot manager with generation counters; stale-KV reuse and hybrid-memory trim fixed (#162) |
 
 ## 7) Distributed Runtime Status
 

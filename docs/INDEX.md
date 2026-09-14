@@ -19,7 +19,7 @@ graph TD
     C --> C3[Developer Guide]
     C --> C4[Vision + PRD + Product Roadmap]
     C --> C6[ADRs + Features + Technical Debt]
-    C --> C5[Modernization Audit]
+    C --> C5[Planning Artifacts]
 
     D --> D1[User Guide]
     D --> D2[Troubleshooting]

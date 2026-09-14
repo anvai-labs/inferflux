@@ -68,8 +68,8 @@ quadrantChart
 
 | Area | Current posture | Target posture |
 |---|---|---|
-| Throughput | improving; native GPU maturity in progress | close sustained gap with GPU batching + KV reuse |
-| Hardware coverage | strong baseline | maintain parity across CUDA/ROCm/MPS/CPU |
+| Throughput | improving; native GPU path leads the wrapper at c=16 on GGUF short completions; the safetensors decode gap vs vLLM/SGLang remains the tracked target | close sustained gap with GPU batching + KV reuse |
+| Hardware coverage | strong baseline | maintain parity across CUDA/ROCm/MPS/Vulkan/MLX/CPU |
 | Enterprise controls | strong | keep lead with strict contracts |
 | CI contract enforcement | moderate-to-strong | mandatory GPU behavioral gate |
 
@@ -78,7 +78,7 @@ quadrantChart
 | Phase | Outcome | Primary references |
 |---|---|---|
 | Foundation | API/admin/CLI contracts hardened | [API Surface](API_SURFACE.md), [Developer Guide](DeveloperGuide.md) |
-| Throughput core | GPU batching + KV efficiency + native policy correctness | [Roadmap](Roadmap.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md), `docs/issues/P0-*` |
+| Throughput core | GPU batching + KV efficiency + native policy correctness | [Roadmap](Roadmap.md), [TechDebt](TechDebt_and_Competitive_Roadmap.md), the archived issue-import snapshots (see ARCHIVE_INDEX) |
 | Enterprise runtime | distributed failure contracts + operations maturity | [Admin Guide](AdminGuide.md), [Architecture](Architecture.md) |
 
 ## 7) Out of Scope

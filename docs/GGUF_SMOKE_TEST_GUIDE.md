@@ -30,7 +30,7 @@ Expected: each supported quantization variant reports `SUCCESS`.
 ## 3) Full Comparison Path (Optional)
 
 ```bash
-./scripts/test_gguf_quantization_smoke.sh \
+./scripts/archive/test/test_gguf_quantization_smoke.sh (moved to the archive) \
   --model-path /abs/path/to/source-model \
   --num-tokens 20
 ```
@@ -40,7 +40,7 @@ Use this when you want native-vs-llama.cpp comparison behavior in one flow.
 ## 4) Post-Run Verification
 
 ```bash
-curl -s http://127.0.0.1:8080/metrics | grep -E "native_forward|cuda_attention_kernel"
+curl -s http://127.0.0.1:8080/metrics | grep -E "inferflux_cuda_forward_passes_total|inferflux_cuda_kv_active_sequences"
 ./build/inferctl models --json --api-key dev-key-123
 ```
 
