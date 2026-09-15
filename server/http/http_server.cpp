@@ -317,15 +317,20 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
           if (rf.contains("json_schema")) {
             const auto &js = rf["json_schema"];
             if (js.is_object() && js.contains("schema") &&
-                js["schema"].is_object()) {
+                js["schema"].is_object() &&
+                (js.contains("name") || js.contains("strict"))) {
               // OpenAI contract: json_schema is a wrapper {name, schema,
               // strict}; only the inner schema object converts to a grammar.
               // Converting the wrapper itself yields a no-op "any JSON"
               // grammar (no type/properties keywords) that silently fails to
-              // constrain generation.
+              // constrain generation. The name/strict markers distinguish a
+              // real wrapper from a bare inlined schema that happens to
+              // define a "schema" property of its own.
               payload.response_format_schema = js["schema"].dump();
-            } else if (js.is_object() && !js.contains("schema")) {
-              // Tolerate clients that inline the bare schema in json_schema.
+            } else if (js.is_object()) {
+              // Bare inlined schema (no wrapper markers). Unknown keywords
+              // are ignored by JSON Schema, so an object carrying a "schema"
+              // property stays a valid schema in its own right.
               payload.response_format_schema = js.dump();
             } else {
               payload.response_format_ok = false;
@@ -3408,6 +3413,10 @@ void HttpServer::HandleClient(ClientSession &session) {
                 stream_cancel_flag->store(true);
                 return;
               }
+              // Logprob frames bypass the chunker; account for the bytes so
+              // the EOS residual logic does not re-emit them as a duplicate
+              // trailing content frame.
+              *stream_emitted_content_bytes += content_piece.size();
               stream_had_chunk->store(true);
               return;
             }
@@ -3583,6 +3592,10 @@ void HttpServer::HandleClient(ClientSession &session) {
           if (stream_active->load()) {
             const std::string stream_finish_reason =
                 result.finish_reason_length ? "length" : "stop";
+            // Set when the buffered-replay path splits reasoning out of the
+            // buffer: on_token never fed the splitter there, so the piece
+            // counter alone would miss it in the usage frame.
+            bool replay_split_reasoning = false;
             if (stream_splitter && !buffer_tokens) {
               // Flush the tag holdback and emit what the streaming path has
               // not sent yet: a trailing partial-tag suffix (content) or
@@ -3629,6 +3642,7 @@ void HttpServer::HandleClient(ClientSession &session) {
               if (stream_splitter) {
                 auto parts = inferflux::ReasoningSplitter::Split(replay);
                 if (!parts.reasoning.empty()) {
+                  replay_split_reasoning = true;
                   SendAll(session, BuildStreamReasoningChunkFast(
                                        stream_id, parsed.model, stream_ts,
                                        parts.reasoning));
@@ -3669,10 +3683,12 @@ void HttpServer::HandleClient(ClientSession &session) {
                 uc["usage"]["time_to_first_token_ms"] =
                     result.time_to_first_token_ms;
               }
-              if (*stream_reasoning_piece_count > 0) {
+              if (*stream_reasoning_piece_count > 0 || replay_split_reasoning) {
                 uc["usage"]["completion_tokens_details"] = {
                     {"reasoning_tokens",
-                     static_cast<int>(*stream_reasoning_piece_count)}};
+                     replay_split_reasoning
+                         ? 1
+                         : static_cast<int>(*stream_reasoning_piece_count)}};
               }
               SendAll(session, "data: " + uc.dump() + "\n\n");
             }
