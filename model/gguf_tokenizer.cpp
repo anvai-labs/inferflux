@@ -94,6 +94,7 @@ ITokenizer::ChatResult GGUFTokenizer::ApplyChatTemplate(
   ChatResult result;
   result.prompt = prompt;
   result.valid = !prompt.empty();
+  result.family = DetectChatTemplateFamily(chat_template_);
   return result;
 }
 

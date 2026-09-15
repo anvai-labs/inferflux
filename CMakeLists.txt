@@ -102,6 +102,9 @@ add_library(inferflux_core STATIC
   runtime/text/incremental_utf8.h
   runtime/text/reasoning_splitter.cpp
   runtime/text/reasoning_splitter.h
+  runtime/text/harmony_splitter.cpp
+  runtime/text/harmony_splitter.h
+  runtime/text/response_splitter.h
   runtime/execution/unified_batch_lane_dispatcher.cpp
   runtime/execution/unified_batch_lane_dispatcher.h
   runtime/execution/parallel_context.cpp
@@ -748,6 +751,7 @@ add_executable(inferflux_tests
   tests/unit/test_quantization_detector.cpp
   tests/unit/test_result.cpp
   tests/unit/test_reasoning_splitter.cpp
+  tests/unit/test_harmony_splitter.cpp
   tests/integration/test_http_generation_admission.cpp
   external/catch2/catch_amalgamated.cpp
 )

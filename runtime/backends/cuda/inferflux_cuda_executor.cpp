@@ -4239,6 +4239,7 @@ InferfluxCudaRuntime::ChatResult InferfluxCudaExecutor::NativeFormatChat(
   auto chat = tmpl_tok->ApplyChatTemplate(messages, add_assistant_prefix);
   result.prompt = std::move(chat.prompt);
   result.valid = chat.valid;
+  result.family = chat.family;
   return result;
 }
 
