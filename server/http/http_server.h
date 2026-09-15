@@ -7,6 +7,7 @@
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
 #include "server/auth/rate_limiter.h"
+#include "server/http/completion_payload.h"
 #include "server/http/http_utils.h"
 #include "server/logging/audit_logger.h"
 #include "server/metrics/metrics.h"
@@ -43,6 +44,9 @@ inline std::string LookupHeaderValueForTest(const std::string &headers,
 
 std::string BuildStreamChunkForTest(const std::string &content,
                                     const TokenLogprob *logprob);
+
+// Test hook for the request-body parser (defined in http_server.cpp).
+CompletionRequestPayload ParseJsonPayloadForTest(const std::string &body);
 
 class HttpServer {
 public:

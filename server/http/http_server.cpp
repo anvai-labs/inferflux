@@ -205,6 +205,12 @@ bool IsDefaultModelAlias(const std::string &model) {
   return normalized == "default";
 }
 
+CompletionRequestPayload ParseJsonPayload(const std::string &body);
+
+CompletionRequestPayload ParseJsonPayloadForTest(const std::string &body) {
+  return ParseJsonPayload(body);
+}
+
 CompletionRequestPayload ParseJsonPayload(const std::string &body) {
   CompletionRequestPayload payload;
   if (body.empty()) {
@@ -309,7 +315,23 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
             payload.response_format_schema = rf["schema"].dump();
           }
           if (rf.contains("json_schema")) {
-            payload.response_format_schema = rf["json_schema"].dump();
+            const auto &js = rf["json_schema"];
+            if (js.is_object() && js.contains("schema") &&
+                js["schema"].is_object()) {
+              // OpenAI contract: json_schema is a wrapper {name, schema,
+              // strict}; only the inner schema object converts to a grammar.
+              // Converting the wrapper itself yields a no-op "any JSON"
+              // grammar (no type/properties keywords) that silently fails to
+              // constrain generation.
+              payload.response_format_schema = js["schema"].dump();
+            } else if (js.is_object() && !js.contains("schema")) {
+              // Tolerate clients that inline the bare schema in json_schema.
+              payload.response_format_schema = js.dump();
+            } else {
+              payload.response_format_ok = false;
+              payload.response_format_error =
+                  "response_format json_schema.schema must be a JSON object";
+            }
           }
           if (payload.response_format_schema.size() > kMaxResponseFormatBytes) {
             payload.response_format_ok = false;
