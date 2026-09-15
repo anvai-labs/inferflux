@@ -2889,6 +2889,10 @@ void HttpServer::HandleClient(ClientSession &session) {
       req.client_request_id =
           GetHeaderValue(headers, "x-inferflux-client-request-id");
     }
+    // Header and body are equivalent inputs to the public echo contract.
+    // Response serialization consumes the parsed payload below, while the
+    // scheduler/logging path consumes req, so keep the resolved value in both.
+    parsed.client_request_id = req.client_request_id;
     req.json_mode = parsed.json_mode;
     if (parsed.has_response_format) {
       req.response_format.has_format = true;
@@ -3026,7 +3030,19 @@ void HttpServer::HandleClient(ClientSession &session) {
     // Snapshotted before scheduler_->Generate(std::move(req)) below leaves
     // req in a moved-from state — mirrors the existing
     // stream_collect_logprobs pattern for the same reason.
-    const ChatTemplateFamily chat_template_family = req.chat_template_family;
+    ChatTemplateFamily chat_template_family = req.chat_template_family;
+    // Stub mode has no loaded backend whose tokenizer metadata can identify
+    // the response format. Detect harmony's unambiguous channel marker in the
+    // canned completion so model-free contract tests exercise the same parser
+    // a ready gpt-oss backend selects. Plain text and <think> stubs retain the
+    // ChatML-family default.
+    if (!use_native_template) {
+      if (const char *stub = std::getenv("INFERFLUX_STUB_COMPLETION")) {
+        if (DetectChatTemplateFamily(stub) == ChatTemplateFamily::kHarmony) {
+          chat_template_family = ChatTemplateFamily::kHarmony;
+        }
+      }
+    }
 
     req.priority = static_cast<int>(auth_ctx.scopes.count("admin") ? 10 : 0);
     if (req.prompt.empty()) {
@@ -3517,6 +3533,15 @@ void HttpServer::HandleClient(ClientSession &session) {
                     {"completion_tokens", result.completion_tokens},
                     {"total_tokens",
                      result.prompt_tokens + result.completion_tokens}}}};
+              usage_frame["usage"]["prompt_tokens_details"] = {
+                  {"cached_tokens", result.cached_prompt_tokens}};
+              if (result.duration_ms >= 0.0) {
+                usage_frame["usage"]["duration_ms"] = result.duration_ms;
+              }
+              if (result.time_to_first_token_ms >= 0.0) {
+                usage_frame["usage"]["time_to_first_token_ms"] =
+                    result.time_to_first_token_ms;
+              }
               if ((stream_reasoning_piece_count &&
                    *stream_reasoning_piece_count > 0) ||
                   stub_split_reasoning) {
@@ -3534,9 +3559,10 @@ void HttpServer::HandleClient(ClientSession &session) {
           }
           stream_active->store(false);
         } else {
-          auto payload =
-              BuildResponse(BuildCompletionBody(result, parsed, chat_mode), 200,
-                            "OK", trace_response_header);
+          auto payload = BuildResponse(
+              BuildCompletionBody(result, parsed, chat_mode, ToolCallResult{},
+                                  {}, 0, chat_template_family),
+              200, "OK", trace_response_header);
           SendAll(session, payload);
         }
         if (audit_logger_) {
