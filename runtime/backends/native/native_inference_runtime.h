@@ -120,6 +120,7 @@ public:
   struct ChatResult {
     std::string prompt;
     bool valid{false};
+    ChatTemplateFamily family{ChatTemplateFamily::kChatML};
   };
 
   virtual ChatResult NativeFormatChat(

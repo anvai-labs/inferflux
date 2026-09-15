@@ -69,6 +69,7 @@ ITokenizer::ChatResult HFTokenizer::ApplyChatTemplate(
   ChatResult result;
   result.prompt = prompt;
   result.valid = !prompt.empty();
+  result.family = DetectChatTemplateFamily(inner_.ChatTemplate());
   return result;
 }
 

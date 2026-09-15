@@ -101,7 +101,7 @@ graph TD
 | `duration_ms` | Request accept → last token, server-measured. |
 | `time_to_first_token_ms` | Request accept → first token; streaming requests only. |
 | `client_request_id` | Echoed when the caller supplies `client_request_id` (body) or `x-inferflux-client-request-id` (header); also echoed as a response header. |
-| `message.reasoning_content` | Present on reasoning models (e.g. Qwen3-14B) when the output contains a `<think>` block. The user-facing `content` field has the thinking stripped; the raw reasoning rides in this separate field. |
+| `message.reasoning_content` | Present on reasoning models when the output contains a `<think>` block (e.g. Qwen3-14B, LFM2.5-8B-A1B) or gpt-oss's harmony `analysis` channel (e.g. gpt-oss-20b). The user-facing `content` field has the thinking stripped; the raw reasoning rides in this separate field. Harmony's `commentary` channel (tool-call chatter) is discarded, never surfaced. |
 | `usage.completion_tokens_details.reasoning_tokens` | Count of reasoning tokens (present when reasoning_content is non-empty). |
 | `delta.reasoning_content` (streaming) | Reasoning chunks stream as their own deltas before content deltas; a `<think>` block never leaks into `delta.content`. The terminal usage frame carries `completion_tokens_details.reasoning_tokens` on the same basis. Disable with `INFERFLUX_DISABLE_REASONING_SPLIT` (tags stay in `content` verbatim). |
 | `client_request_id` | Echoed when the caller supplies `client_request_id` (body) or `x-inferflux-client-request-id` (header); also echoed as a response header. |

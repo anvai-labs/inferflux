@@ -1,5 +1,7 @@
 #include "model/chat_template_renderer.h"
 
+#include <ctime>
+
 namespace inferflux {
 
 namespace {
@@ -79,35 +81,122 @@ RenderGemma(const std::vector<std::pair<std::string, std::string>> &messages,
   return out;
 }
 
-// Detect template family from a Jinja2 template string. Returns a function
-// pointer to the matching renderer.
-using TemplateRenderer = std::string (*)(
-    const std::vector<std::pair<std::string, std::string>> &, bool);
+// Server-clock date in the exact "Current date: YYYY-MM-DD" form gpt-oss's
+// own system preamble expects (harmony's minja `strftime_now("%Y-%m-%d")`).
+std::string CurrentDateYyyyMmDd() {
+  std::time_t now = std::time(nullptr);
+  std::tm tm_buf{};
+  gmtime_r(&now, &tm_buf);
+  char buf[16];
+  std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm_buf);
+  return std::string(buf);
+}
 
-TemplateRenderer DetectTemplateFamily(const std::string &jinja_template) {
+// Strategy: Harmony (OpenAI gpt-oss channel-based format)
+// Format: <|start|>role<|message|>content<|end|>, with a fixed system
+// preamble and channel markers (analysis/final) on assistant turns.
+//
+// PROVENANCE: this is a hand transcription of gpt-oss-20b's embedded
+// `tokenizer.chat_template` (extracted from the GGUF and read directly,
+// 2026-09-15) — not a Jinja2 executor. If a future gpt-oss checkpoint
+// changes the system preamble wording or channel contract, this drifts out
+// of sync silently (degraded quality, not a crash) — re-diff against the
+// live GGUF template if output quality regresses on a newer checkpoint.
+//
+// v1 scope: no tool/builtin_tools rendering (the template's TypeScript
+// tool-signature macro is skipped entirely — tool calling with gpt-oss is
+// not implemented), reasoning_effort is hardcoded to "medium" (not exposed
+// as a request-level knob yet), and prior assistant turns are re-rendered
+// with only their final-channel content — reasoning_content is never
+// round-tripped back into message history (matches how the real template
+// treats history too: CoT is dropped for every turn except a training-only
+// edge case that never applies to inference).
+std::string
+RenderHarmony(const std::vector<std::pair<std::string, std::string>> &messages,
+              bool add_assistant_prefix) {
+  std::string out;
+  out += "<|start|>system<|message|>";
+  out += "You are ChatGPT, a large language model trained by OpenAI.\n";
+  out += "Knowledge cutoff: 2024-06\n";
+  out += "Current date: " + CurrentDateYyyyMmDd() + "\n\n";
+  out += "Reasoning: medium\n\n";
+  out += "# Valid channels: analysis, commentary, final. Channel must be "
+         "included for every message.";
+  out += "<|end|>";
+
+  std::size_t start_idx = 0;
+  if (!messages.empty() && messages[0].first == "system") {
+    // Harmony's convention: the leading system-role message maps to the
+    // "developer" role, distinct from the fixed system preamble above.
+    out += "<|start|>developer<|message|># Instructions\n\n";
+    out += messages[0].second;
+    out += "\n\n<|end|>";
+    start_idx = 1;
+  }
+
+  for (std::size_t i = start_idx; i < messages.size(); ++i) {
+    const auto &role = messages[i].first;
+    const auto &content = messages[i].second;
+    if (role == "user") {
+      out += "<|start|>user<|message|>" + content + "<|end|>";
+    } else if (role == "assistant") {
+      out +=
+          "<|start|>assistant<|channel|>final<|message|>" + content + "<|end|>";
+    }
+    // Other roles (a stray mid-conversation "system", or "tool" without
+    // tool-calling support) are dropped, matching gpt-oss's own template —
+    // its per-turn loop only handles assistant/tool/user, and a mid-list
+    // system message matches none of those branches there either.
+  }
+
+  if (add_assistant_prefix) {
+    out += "<|start|>assistant";
+  }
+  return out;
+}
+
+// Detect template family from a Jinja2 template string.
+ChatTemplateFamily DetectTemplateFamilyImpl(const std::string &jinja_template) {
+  if (jinja_template.find("<|channel|>") != std::string::npos)
+    return ChatTemplateFamily::kHarmony;
   if (jinja_template.find("im_start") != std::string::npos)
-    return &RenderChatML;
+    return ChatTemplateFamily::kChatML;
   if (jinja_template.find("start_of_turn") != std::string::npos)
-    return &RenderGemma;
+    return ChatTemplateFamily::kGemma;
   if (jinja_template.find("[INST]") != std::string::npos) {
     // Distinguish Llama (has <<SYS>>) from Mistral (no <<SYS>>)
     if (jinja_template.find("<<SYS>>") != std::string::npos ||
         jinja_template.find("bos_token") != std::string::npos)
-      return &RenderLlama;
-    return &RenderMistral;
+      return ChatTemplateFamily::kLlama;
+    return ChatTemplateFamily::kMistral;
   }
   // Default: ChatML is the safest fallback for instruct models
-  return &RenderChatML;
+  return ChatTemplateFamily::kChatML;
 }
 
 } // namespace
+
+ChatTemplateFamily DetectChatTemplateFamily(const std::string &jinja_template) {
+  return DetectTemplateFamilyImpl(jinja_template);
+}
 
 std::string RenderChatTemplate(
     const std::string &jinja_template,
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) {
-  auto renderer = DetectTemplateFamily(jinja_template);
-  return renderer(messages, add_assistant_prefix);
+  switch (DetectTemplateFamilyImpl(jinja_template)) {
+  case ChatTemplateFamily::kHarmony:
+    return RenderHarmony(messages, add_assistant_prefix);
+  case ChatTemplateFamily::kGemma:
+    return RenderGemma(messages, add_assistant_prefix);
+  case ChatTemplateFamily::kLlama:
+    return RenderLlama(messages, add_assistant_prefix);
+  case ChatTemplateFamily::kMistral:
+    return RenderMistral(messages, add_assistant_prefix);
+  case ChatTemplateFamily::kChatML:
+  default:
+    return RenderChatML(messages, add_assistant_prefix);
+  }
 }
 
 } // namespace inferflux

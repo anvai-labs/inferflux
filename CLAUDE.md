@@ -303,7 +303,7 @@ dim3 declarations (hip_runtime.h vs CUDA vector_types.h in the same TU):
 ```
 
 **Quality fixes applied:**
-- Chat template rendering: strategy-based renderer (ChatML/Llama/Mistral/Gemma) auto-detected from GGUF metadata. Previously a stub returning empty → 43% accuracy.
+- Chat template rendering: strategy-based renderer (ChatML/Llama/Mistral/Gemma/Harmony) auto-detected from GGUF metadata. Previously a stub returning empty → 43% accuracy. `LlamaCppBackend::FormatChatMessages` (the llama_cpp_cuda/rocm/CPU wrapper path) now passes the model's real template to `llama_chat_apply_template` instead of NULL — NULL is not "auto-detect," it's the literal string `"chatml"`, which was silently forcing ChatML for every model on wrapper backends regardless of its actual template; gpt-oss/harmony routes through InferFlux's own `RenderHarmony` since llama.cpp's built-in `LLM_CHAT_TEMPLATE_OPENAI_MOE` omits the system preamble the model was trained on.
 - Repetition penalty: CUDA kernel + per-sequence token tracking. Default 1.15x for greedy decode. Previously missing entirely → 31% degenerate loops.
 - Tokenizer: GGUF special token type parsing (control tokens from tokenizer.ggml.token_type). LlamaTokenizer used for encoding (correct regex pre-tokenization), GGUFTokenizer used for chat template rendering.
 - KV cache clearing: ClearSequenceAsync on prefill when n_past==0.

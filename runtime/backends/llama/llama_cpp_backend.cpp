@@ -1,5 +1,6 @@
 #include "runtime/backends/llama/llama_cpp_backend.h"
 
+#include "model/chat_template_renderer.h"
 #include "runtime/backends/backend_utils.h"
 #include "runtime/execution/parallel_context.h"
 #include "server/logging/logger.h"
@@ -1790,17 +1791,40 @@ std::vector<TopLogitEntry> LlamaCppBackend::TopLogitsForParity(int top_n) {
 
 // §2.3 — model-native chat template formatting.
 // Uses llama_chat_apply_template() from llama.h (built into the llama lib,
-// no extra compilation units required).  The function reads the model's
-// built-in chat template from GGUF metadata (NULL tmpl argument selects the
-// model's own template).  Supported models include Llama 3.x, Mistral/Mixtral,
-// Qwen 2/2.5, Hermes, DeepSeek, Phi-3, ChatML, and others in the predefined
-// list; for unsupported models it returns valid=false and the caller falls
-// back to the plain text preamble.
+// no extra compilation units required).  Supported models include Llama
+// 3.x, Mistral/Mixtral, Qwen 2/2.5, Hermes, DeepSeek, Phi-3, ChatML, and
+// others in the predefined list.
+//
+// The tmpl argument is NOT auto-detected from the model when NULL — despite
+// llama.h's own doc comment suggesting otherwise, llama_chat_apply_template
+// treats a NULL tmpl as the literal 6-byte string "chatml"
+// (external/llama.cpp/src/llama.cpp), unconditionally forcing ChatML
+// rendering regardless of what template the model actually declares. Fetch
+// the model's real template via llama_model_chat_template() and pass that
+// instead, so llama.cpp's own (much larger) family list gets a real chance.
+//
+// gpt-oss/harmony is a special case: llama.cpp's own built-in
+// LLM_CHAT_TEMPLATE_OPENAI_MOE renderer is missing the system preamble and
+// per-message channel tags the model was actually trained on (see
+// model/chat_template_renderer.cpp's RenderHarmony, transcribed directly
+// from gpt-oss-20b's embedded jinja template) — route harmony through
+// InferFlux's own renderer instead. The same renderer is also the final
+// fallback for any template neither list recognizes.
 LlamaCppBackend::ChatTemplateResult LlamaCppBackend::FormatChatMessages(
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) {
   ChatTemplateResult result;
   if (!model_ || messages.empty()) {
+    return result;
+  }
+
+  const char *raw_tmpl = llama_model_chat_template(model_, /*name=*/nullptr);
+  if (raw_tmpl && *raw_tmpl &&
+      DetectChatTemplateFamily(raw_tmpl) == ChatTemplateFamily::kHarmony) {
+    result.prompt =
+        RenderChatTemplate(raw_tmpl, messages, add_assistant_prefix);
+    result.valid = !result.prompt.empty();
+    result.family = ChatTemplateFamily::kHarmony;
     return result;
   }
 
@@ -1822,18 +1846,27 @@ LlamaCppBackend::ChatTemplateResult LlamaCppBackend::FormatChatMessages(
   int buf_size = std::max(4096, total_chars * 2 + 512);
   std::vector<char> buf(buf_size);
 
-  // NULL template → use the model's built-in template.
   int32_t n =
-      llama_chat_apply_template(nullptr, chat.data(), chat.size(),
+      llama_chat_apply_template(raw_tmpl, chat.data(), chat.size(),
                                 add_assistant_prefix, buf.data(), buf_size);
   if (n < 0) {
-    // Template not in the predefined list; caller falls back to preamble.
+    // Not in llama.cpp's predefined family list (raw_tmpl NULL/empty also
+    // lands here, since llama_chat_apply_template's own NULL handling would
+    // silently force ChatML rather than reporting "unrecognized" — always
+    // route the no-template case through InferFlux's own default too).
+    // Fall back to InferFlux's own smaller family detector rather than
+    // giving up outright — it still covers ChatML/Llama/Mistral/Gemma, and
+    // defaults to ChatML for a genuinely undiscoverable template, matching
+    // GGUFTokenizer's long-standing fallback behavior.
+    result.prompt = RenderChatTemplate(raw_tmpl ? raw_tmpl : "", messages,
+                                       add_assistant_prefix);
+    result.valid = !result.prompt.empty();
     return result;
   }
   if (n > buf_size) {
     // Buffer was too small; retry with exact size.
     buf.resize(static_cast<std::size_t>(n) + 1);
-    n = llama_chat_apply_template(nullptr, chat.data(), chat.size(),
+    n = llama_chat_apply_template(raw_tmpl, chat.data(), chat.size(),
                                   add_assistant_prefix, buf.data(), n);
     if (n < 0) {
       return result;

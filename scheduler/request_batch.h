@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "model/chat_template_renderer.h"
 #include "runtime/logprob.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/structured_output/structured_constraint.h"
@@ -144,6 +145,12 @@ struct InferenceRequest {
   std::string client_request_id; // Stable caller-provided trace/debug tag.
   bool session_lease_acquired{false};
   std::string prompt;
+  // Detected chat template family for this request's prompt — set once at
+  // prompt-render time, consumed at the completion-splitting call sites to
+  // pick a matching response parser (HarmonySplitter for gpt-oss's channel
+  // markers; ReasoningSplitter otherwise, including the ChatML/Llama/
+  // Mistral/Gemma default it already handles unconditionally today).
+  ChatTemplateFamily chat_template_family{ChatTemplateFamily::kChatML};
   int max_tokens{256};
   int priority{0}; // Higher = more urgent. 0 = default.
   bool json_mode{false};
