@@ -1147,7 +1147,10 @@ class StubIntegrationReasoningTests(unittest.TestCase):
         self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
         usage_frames = [f for f in frames if f.get("usage")]
         self.assertEqual(len(usage_frames), 1, msg="expected one terminal usage frame")
-        details = usage_frames[0]["usage"].get("completion_tokens_details") or {}
+        usage = usage_frames[0]["usage"]
+        self.assertIn("cached_tokens", usage["prompt_tokens_details"])
+        self.assertGreaterEqual(usage["prompt_tokens_details"]["cached_tokens"], 0)
+        details = usage.get("completion_tokens_details") or {}
         self.assertGreaterEqual(details.get("reasoning_tokens", 0), 1)
 
     def test_non_streaming_reasoning_separation(self):
@@ -1164,6 +1167,31 @@ class StubIntegrationReasoningTests(unittest.TestCase):
         self.assertEqual(message.get("reasoning_content"), "chain of thought")
         details = (payload["usage"].get("completion_tokens_details") or {})
         self.assertGreaterEqual(details.get("reasoning_tokens", 0), 1)
+
+    def test_client_request_header_round_trips_in_header_and_body(self):
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        conn.request(
+            "POST",
+            "/v1/chat/completions",
+            body=json.dumps({
+                "model": "default",
+                "messages": [{"role": "user", "content": "hi"}],
+            }),
+            headers={
+                "Authorization": "Bearer dev-key-123",
+                "Content-Type": "application/json",
+                "x-inferflux-client-request-id": "client-correlation-7",
+            },
+        )
+        resp = conn.getresponse()
+        payload = json.loads(resp.read().decode())
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(
+            resp.getheader("x-inferflux-client-request-id"),
+            "client-correlation-7",
+        )
+        self.assertEqual(payload["client_request_id"], "client-correlation-7")
 
 
 if __name__ == "__main__":
