@@ -84,6 +84,7 @@ gantt
 4. **Adoption gate:** local autostart must preserve the same API/policy semantics as remote serving.
 5. **Tenant gate:** reusable cache, adapter, session, and audit state must share one tenant identity boundary.
 6. **Scale gate:** no distributed maturity claim precedes deterministic ownership and cleanup tests.
+7. **Contract gate:** gateway/agent-facing producer fields (usage, reasoning separation, identity, latency, error shape) follow ADR-0006 — InferFlux is authoritative at the call, and consumers never re-derive what the origin already reports.
 
 ## Deliberate Deferrals
 

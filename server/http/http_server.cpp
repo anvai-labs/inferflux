@@ -491,6 +491,72 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
   return payload;
 }
 
+// /v1/tokenize (W6, three-way co-design): exact token counts for a prompt
+// or prompt list, using the resolved model's tokenizer — no generation, no
+// KV state. Input parsing mirrors /v1/embeddings (string or array of
+// strings; non-string array items skipped).
+TokenizeRequest ParseTokenizeRequest(const std::string &body) {
+  TokenizeRequest req;
+  if (body.empty()) {
+    req.error = "request body is required";
+    return req;
+  }
+  try {
+    auto j = json::parse(body);
+    if (j.contains("model") && j["model"].is_string()) {
+      req.model = j["model"].get<std::string>();
+    }
+    if (j.contains("input")) {
+      if (j["input"].is_string()) {
+        req.inputs.push_back(j["input"].get<std::string>());
+      } else if (j["input"].is_array()) {
+        for (const auto &item : j["input"]) {
+          if (item.is_string()) {
+            req.inputs.push_back(item.get<std::string>());
+          }
+        }
+      }
+    }
+  } catch (const json::exception &ex) {
+    LogJsonParseFailure("tokenize.post", ex);
+    req.error = "invalid JSON body";
+    return req;
+  }
+  if (req.inputs.empty()) {
+    req.error = "input is required";
+    return req;
+  }
+  req.ok = true;
+  return req;
+}
+
+// Response carries one count per input (same order) plus their sum, so a
+// single call can price a whole batched request.
+std::string BuildTokenizeBody(const std::string &model,
+                              const std::vector<int> &token_counts) {
+  json j;
+  j["object"] = "tokenize";
+  j["model"] = model;
+  json tokens = json::array();
+  int total = 0;
+  for (int count : token_counts) {
+    tokens.push_back(count);
+    total += count;
+  }
+  j["tokens"] = tokens;
+  j["input_tokens"] = total;
+  return SerializeJsonUtf8Safe(j);
+}
+
+TokenizeRequest ParseTokenizeRequestForTest(const std::string &body) {
+  return ParseTokenizeRequest(body);
+}
+
+std::string BuildTokenizeBodyForTest(const std::string &model,
+                                     const std::vector<int> &token_counts) {
+  return BuildTokenizeBody(model, token_counts);
+}
+
 std::string FlattenMessages(const std::vector<ChatMessage> &messages) {
   std::string prompt;
   for (const auto &message : messages) {
@@ -750,6 +816,12 @@ static json BuildChoice(int idx, const InferenceResult &result,
   }
 }
 
+// Process-wide monotonic completion-id sequence. Shared by the buffered
+// body builder below and the streaming setup in HandleClient so every
+// completion id on every path is unique within the process (epoch-ms plus
+// this counter; ids are correlation handles, not durable keys).
+std::atomic<uint64_t> completion_seq{0};
+
 // Multi-result overload: used when n>1 or best_of>1.
 // total_completion_tokens covers all generated completions (including
 // best_of candidates not returned), matching OpenAI's usage counting.
@@ -769,8 +841,9 @@ std::string BuildCompletionBody(
   // Unique per call: epoch-ms alone collides for concurrent requests, so a
   // process-wide monotonic counter disambiguates (and survives same-ms
   // bursts). Restart repeats are acceptable — ids are correlation handles,
-  // not durable keys.
-  static std::atomic<uint64_t> completion_seq{0};
+  // not durable keys. The counter is file-scoped so the streaming path
+  // (HandleClient) draws from the same sequence — a seconds-resolution id
+  // there collided for concurrent streams starting in the same second.
   const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           now.time_since_epoch())
                           .count();
@@ -2851,6 +2924,74 @@ void HttpServer::HandleClient(ClientSession &session) {
     return;
   }
 
+  if (method == "POST" && path == "/v1/tokenize") {
+    if (!RequireScope(auth_ctx, "read", session, "read scope required")) {
+      return;
+    }
+    auto req = ParseTokenizeRequest(body);
+    if (!req.ok) {
+      SendAll(session,
+              BuildResponse(BuildErrorBody(req.error), 400, "Bad Request"));
+      return;
+    }
+
+    // Tokenization needs no special capability — any loaded model brings a
+    // tokenizer — so resolve with default (empty) requirements, mirroring
+    // the embeddings flow otherwise.
+    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
+    std::shared_ptr<BackendInterface> tokenize_backend;
+    std::string resolved_model = req.model.empty() ? "default" : req.model;
+    if (router) {
+      BackendFeatureRequirements requirements;
+      ModelSelectionOptions tokenize_options;
+      {
+        std::lock_guard<std::mutex> lock(model_selection_mutex_);
+        tokenize_options = model_selection_options_;
+      }
+      tokenize_options.require_ready_backend = true;
+      auto selection = SelectModelForRequest(router, req.model, requirements,
+                                             tokenize_options);
+      if (selection.status == ModelSelectionStatus::kNotFound &&
+          !req.model.empty() && !IsDefaultModelAlias(req.model)) {
+        SendAll(session, BuildResponse(BuildErrorBody("model_not_found"), 404,
+                                       "Not Found"));
+        if (audit_logger_) {
+          audit_logger_->Log(auth_ctx.subject, req.model, "model_not_found",
+                             "Unknown tokenize model");
+        }
+        return;
+      }
+      if (selection.status == ModelSelectionStatus::kUnsupported) {
+        SendAll(session,
+                BuildResponse(BuildErrorBody(selection.reason.empty()
+                                                 ? "Selected model does not "
+                                                   "support tokenization"
+                                                 : selection.reason),
+                              422, "Unprocessable Entity"));
+        return;
+      }
+      if (selection.status == ModelSelectionStatus::kSelected) {
+        tokenize_backend = selection.backend;
+        if (!selection.info.id.empty()) {
+          resolved_model = selection.info.id;
+        }
+      }
+    }
+    if (!tokenize_backend || !tokenize_backend->IsReady()) {
+      SendAll(session, BuildResponse(BuildErrorBody("no_backend"), 503,
+                                     "Service Unavailable"));
+      return;
+    }
+
+    std::vector<int> counts;
+    counts.reserve(req.inputs.size());
+    for (const auto &input : req.inputs) {
+      counts.push_back(tokenize_backend->TokenCount(input));
+    }
+    SendAll(session, BuildResponse(BuildTokenizeBody(resolved_model, counts)));
+    return;
+  }
+
   if (method == "POST" &&
       (path == "/v1/completions" || path == "/v1/chat/completions")) {
     if (!RequireScope(auth_ctx, "generate", session,
@@ -3226,7 +3367,10 @@ void HttpServer::HandleClient(ClientSession &session) {
                                                           r.completion);
           if (!parts.reasoning.empty()) {
             reasoning_content = parts.reasoning;
-            reasoning_tokens += static_cast<int>(parts.reasoning.size());
+            // 1 per choice with reasoning — a "billed reasoning present"
+            // indicator consistent with the single-completion (also 1) and
+            // streaming (piece count) paths, NOT a byte length (ADR-0006).
+            reasoning_tokens += 1;
             r.completion = std::move(parts.content);
           }
         }
@@ -3341,7 +3485,16 @@ void HttpServer::HandleClient(ClientSession &session) {
       stream_active->store(true);
       // SSE consumes the connection — disable keep-alive for this session.
       session.keep_alive = false;
-      stream_id = std::string("chatcmpl-") + std::to_string(stream_ts);
+      // Same uniqueness scheme as the buffered body builder (epoch-ms +
+      // process-wide counter): a seconds-resolution id collided for
+      // concurrent streams starting in the same second, and Sandhi keys
+      // meter-side correlation on this id (ADR-0006).
+      const auto stream_now_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count();
+      stream_id = "chatcmpl-" + std::to_string(stream_now_ms) + "-" +
+                  std::to_string(completion_seq.fetch_add(1) + 1);
       std::string stream_headers = "HTTP/1.1 200 OK\r\n"
                                    "Content-Type: text/event-stream\r\n"
                                    "Cache-Control: no-cache\r\n"
