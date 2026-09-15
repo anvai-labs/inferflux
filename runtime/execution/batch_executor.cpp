@@ -572,9 +572,17 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
       }
     } else {
       response.no_backend = true;
-      response.completion =
-          "No model backend is loaded. Set INFERFLUX_MODEL_PATH or configure "
-          "model.path in server.yaml.";
+      // INFERFLUX_STUB_COMPLETION overrides the canned text so model-free CI
+      // can exercise payload shapes end-to-end (e.g. a <think> block for
+      // reasoning separation). Tool-stub detection in the HTTP layer keys on
+      // the canned text and intentionally does not fire for custom stubs.
+      if (const char *stub = std::getenv("INFERFLUX_STUB_COMPLETION")) {
+        response.completion = stub;
+      } else {
+        response.completion =
+            "No model backend is loaded. Set INFERFLUX_MODEL_PATH or configure "
+            "model.path in server.yaml.";
+      }
     }
   }
 

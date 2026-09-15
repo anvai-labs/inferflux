@@ -1058,5 +1058,113 @@ class StubIntegrationStrictNativePolicyTests(unittest.TestCase):
         reason = payload.get("reason", "")
         self.assertIn("strict_inferflux_request", reason)
 
+class StubIntegrationReasoningTests(unittest.TestCase):
+    """Reasoning separation (streaming + buffered) against the stub origin.
+
+    Requires INFERFLUX_STUB_COMPLETION so the canned stub completion contains
+    a <think> block; the ctest registration IntegrationStubReasoning sets it.
+    Skips under plain StubIntegration (no override) to keep the default
+    stub-text contract untouched.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.environ.get("INFERFLUX_STUB_COMPLETION"):
+            raise unittest.SkipTest("INFERFLUX_STUB_COMPLETION not set")
+        cls.host = "127.0.0.1"
+        cls.port = 18084
+        env = os.environ.copy()
+        env["INFERFLUX_HOST_OVERRIDE"] = cls.host
+        env["INFERFLUX_PORT_OVERRIDE"] = str(cls.port)
+        env["INFERFLUX_MODEL_PATH"] = ""
+        cls.server_proc = start_server_process(
+            [SERVER_BIN, "--config", "config/server.yaml"], env=env
+        )
+        deadline = time.time() + 20.0
+        ready = False
+        while time.time() < deadline:
+            if cls.server_proc.poll() is not None:
+                break
+            try:
+                conn = http.client.HTTPConnection(cls.host, cls.port, timeout=1)
+                conn.request("GET", "/livez", headers={"Authorization": "Bearer dev-key-123"})
+                resp = conn.getresponse()
+                resp.read()
+                conn.close()
+                if resp.status in (200, 401):
+                    ready = True
+                    break
+            except Exception:
+                time.sleep(0.1)
+        if not ready:
+            raise RuntimeError("reasoning stub server did not become ready")
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, 'server_proc') and cls.server_proc:
+            try:
+                stop_server_process(cls.server_proc)
+            except:
+                pass
+
+    def _post(self, path, data):
+        conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+        body = json.dumps(data)
+        conn.request("POST", path, body=body, headers={
+            "Authorization": "Bearer dev-key-123",
+            "Content-Type": "application/json",
+        })
+        resp = conn.getresponse()
+        raw = resp.read().decode()
+        conn.close()
+        return resp, raw
+
+    def test_streaming_reasoning_separation(self):
+        resp, raw = self._post("/v1/chat/completions", {
+            "model": "default",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10,
+            "temperature": 0,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        })
+        self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {raw}")
+        frames = [json.loads(line[len("data: "):])
+                  for line in raw.splitlines()
+                  if line.startswith("data: ") and line != "data: [DONE]"]
+        reasoning_deltas = [f["choices"][0]["delta"].get("reasoning_content", "")
+                            for f in frames
+                            if f.get("choices") and f["choices"][0].get("delta")
+                            and f["choices"][0]["delta"].get("reasoning_content")]
+        content_deltas = [f["choices"][0]["delta"].get("content", "")
+                          for f in frames
+                          if f.get("choices") and f["choices"][0].get("delta")
+                          and f["choices"][0]["delta"].get("content")]
+        self.assertIn("chain of thought", "".join(reasoning_deltas))
+        self.assertIn("visible answer", "".join(content_deltas))
+        # No reasoning bytes may leak into content deltas.
+        self.assertNotIn("chain of thought", "".join(content_deltas))
+        self.assertTrue(raw.rstrip().endswith("data: [DONE]"))
+        usage_frames = [f for f in frames if f.get("usage")]
+        self.assertEqual(len(usage_frames), 1, msg="expected one terminal usage frame")
+        details = usage_frames[0]["usage"].get("completion_tokens_details") or {}
+        self.assertGreaterEqual(details.get("reasoning_tokens", 0), 1)
+
+    def test_non_streaming_reasoning_separation(self):
+        resp, raw = self._post("/v1/chat/completions", {
+            "model": "default",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 10,
+            "temperature": 0,
+        })
+        self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {raw}")
+        payload = json.loads(raw)
+        message = payload["choices"][0]["message"]
+        self.assertEqual(message["content"], "visible answer")
+        self.assertEqual(message.get("reasoning_content"), "chain of thought")
+        details = (payload["usage"].get("completion_tokens_details") or {})
+        self.assertGreaterEqual(details.get("reasoning_tokens", 0), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

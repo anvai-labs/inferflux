@@ -30,6 +30,13 @@ public:
   // Flush held-back bytes and return the accumulated split.
   Parts Finish();
 
+  // Return the bytes accumulated since the last Drain() (or since start).
+  // Only final bytes are returned — bytes in the holdback buffer (a possible
+  // partial tag) stay pending until Finish() or a later Feed disambiguates
+  // them. Streaming sinks call Feed() then Drain() per piece to emit deltas
+  // without holding the whole output in two more copies.
+  Parts Drain();
+
   // True while inside a <think> block (reasoning still streaming).
   bool in_reasoning() const { return state_ == State::InThink; }
 
@@ -48,6 +55,8 @@ private:
   std::string content_;
   std::size_t reasoning_bytes_{0};
   std::size_t content_bytes_{0};
+  std::size_t drained_reasoning_bytes_{0};
+  std::size_t drained_content_bytes_{0};
 };
 
 } // namespace inferflux
