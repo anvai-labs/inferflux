@@ -10,7 +10,7 @@
 #include "runtime/backends/llama/llama_cpp_backend.h"
 #include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/string_utils.h"
-#include "runtime/text/reasoning_splitter.h"
+#include "runtime/text/response_splitter.h"
 #include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
@@ -753,13 +753,12 @@ static json BuildChoice(int idx, const InferenceResult &result,
 // Multi-result overload: used when n>1 or best_of>1.
 // total_completion_tokens covers all generated completions (including
 // best_of candidates not returned), matching OpenAI's usage counting.
-std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
-                                int total_completion_tokens,
-                                const CompletionRequestPayload &request,
-                                bool chat_mode,
-                                const std::vector<ToolCallResult> &tool_calls,
-                                const std::string &reasoning_content = {},
-                                int reasoning_tokens = 0) {
+std::string BuildCompletionBody(
+    const std::vector<InferenceResult> &results, int total_completion_tokens,
+    const CompletionRequestPayload &request, bool chat_mode,
+    const std::vector<ToolCallResult> &tool_calls,
+    const std::string &reasoning_content = {}, int reasoning_tokens = 0,
+    ChatTemplateFamily chat_template_family = ChatTemplateFamily::kChatML) {
   auto now = std::chrono::system_clock::now();
   auto ts =
       std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch())
@@ -826,7 +825,8 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
     std::string per_result_content = results[i].completion;
     std::string per_result_reasoning;
     if (!ReasoningSplitDisabled()) {
-      auto parts = ReasoningSplitter::Split(results[i].completion);
+      auto parts =
+          ResponseSplitter::Split(chat_template_family, results[i].completion);
       per_result_content = std::move(parts.content);
       per_result_reasoning = std::move(parts.reasoning);
       reasoning_tokens_total +=
@@ -881,11 +881,12 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
 std::string BuildCompletionBody(
     const InferenceResult &result, const CompletionRequestPayload &request,
     bool chat_mode, const ToolCallResult &tool_call = ToolCallResult{},
-    const std::string &reasoning_content = {}, int reasoning_tokens = 0) {
-  return BuildCompletionBody(std::vector<InferenceResult>{result},
-                             result.completion_tokens, request, chat_mode,
-                             std::vector<ToolCallResult>{tool_call},
-                             reasoning_content, reasoning_tokens);
+    const std::string &reasoning_content = {}, int reasoning_tokens = 0,
+    ChatTemplateFamily chat_template_family = ChatTemplateFamily::kChatML) {
+  return BuildCompletionBody(
+      std::vector<InferenceResult>{result}, result.completion_tokens, request,
+      chat_mode, std::vector<ToolCallResult>{tool_call}, reasoning_content,
+      reasoning_tokens, chat_template_family);
 }
 
 std::string BuildErrorBody(const std::string &error) {
@@ -2996,6 +2997,7 @@ void HttpServer::HandleClient(ClientSession &session) {
                 msgs, /*add_assistant_prefix=*/true);
             if (tmpl.valid) {
               req.prompt = tmpl.prompt;
+              req.chat_template_family = tmpl.family;
               use_native_template = true;
               LogToolEvent("native_template=true msgs=" +
                            std::to_string(msgs.size()));
@@ -3020,6 +3022,11 @@ void HttpServer::HandleClient(ClientSession &session) {
             req.prompt.empty() ? tool_prefix : tool_prefix + "\n" + req.prompt;
       }
     }
+
+    // Snapshotted before scheduler_->Generate(std::move(req)) below leaves
+    // req in a moved-from state — mirrors the existing
+    // stream_collect_logprobs pattern for the same reason.
+    const ChatTemplateFamily chat_template_family = req.chat_template_family;
 
     req.priority = static_cast<int>(auth_ctx.scopes.count("admin") ? 10 : 0);
     if (req.prompt.empty()) {
@@ -3199,7 +3206,8 @@ void HttpServer::HandleClient(ClientSession &session) {
       std::string reasoning_content;
       if (!ReasoningSplitDisabled()) {
         for (auto &r : all_results) {
-          auto parts = inferflux::ReasoningSplitter::Split(r.completion);
+          auto parts = inferflux::ResponseSplitter::Split(chat_template_family,
+                                                          r.completion);
           if (!parts.reasoning.empty()) {
             reasoning_content = parts.reasoning;
             reasoning_tokens += static_cast<int>(parts.reasoning.size());
@@ -3253,11 +3261,12 @@ void HttpServer::HandleClient(ClientSession &session) {
       if (mc_ctx.valid())
         mc_trace_hdr = "traceparent: " + mc_ctx.ToTraceparent() + "\r\n";
 
-      SendAll(session, BuildResponse(BuildCompletionBody(
-                                         all_results, total_completion_tokens,
-                                         parsed, chat_mode, tool_calls,
-                                         reasoning_content, reasoning_tokens),
-                                     200, "OK", mc_trace_hdr));
+      SendAll(session,
+              BuildResponse(BuildCompletionBody(
+                                all_results, total_completion_tokens, parsed,
+                                chat_mode, tool_calls, reasoning_content,
+                                reasoning_tokens, chat_template_family),
+                            200, "OK", mc_trace_hdr));
       return;
     }
     // ── End multi-completion path ──────────────────────────────────────────
@@ -3301,10 +3310,10 @@ void HttpServer::HandleClient(ClientSession &session) {
     // Plain size_t is safe across threads: the counters are written by the
     // decode worker inside on_token and read after future.get(), which
     // synchronizes with it.
-    auto stream_splitter =
-        ReasoningSplitDisabled()
-            ? std::shared_ptr<inferflux::ReasoningSplitter>{}
-            : std::make_shared<inferflux::ReasoningSplitter>();
+    auto stream_splitter = ReasoningSplitDisabled()
+                               ? std::shared_ptr<inferflux::ResponseSplitter>{}
+                               : std::make_shared<inferflux::ResponseSplitter>(
+                                     chat_template_family);
     auto stream_emitted_reasoning_bytes = std::make_shared<std::size_t>(0);
     auto stream_emitted_content_bytes = std::make_shared<std::size_t>(0);
     auto stream_reasoning_piece_count = std::make_shared<std::size_t>(0);
@@ -3476,8 +3485,10 @@ void HttpServer::HandleClient(ClientSession &session) {
               if (stream_splitter) {
                 // Reasoning separation applies to the stub path too, so
                 // model-free CI (INFERFLUX_STUB_COMPLETION with a <think>
-                // block) exercises the streaming contract end-to-end.
-                auto parts = inferflux::ReasoningSplitter::Split(stub_content);
+                // or harmony-channel block) exercises the streaming
+                // contract end-to-end.
+                auto parts = inferflux::ResponseSplitter::Split(
+                    chat_template_family, stub_content);
                 if (!parts.reasoning.empty()) {
                   stub_split_reasoning = true;
                   SendAll(session, BuildStreamReasoningChunkFast(
@@ -3640,7 +3651,8 @@ void HttpServer::HandleClient(ClientSession &session) {
               }
               std::string replay_content = replay;
               if (stream_splitter) {
-                auto parts = inferflux::ReasoningSplitter::Split(replay);
+                auto parts = inferflux::ResponseSplitter::Split(
+                    chat_template_family, replay);
                 if (!parts.reasoning.empty()) {
                   replay_split_reasoning = true;
                   SendAll(session, BuildStreamReasoningChunkFast(
@@ -3698,10 +3710,12 @@ void HttpServer::HandleClient(ClientSession &session) {
         stream_active->store(false);
         return;
       } else {
-        // Reasoning separation (#W1): strip <think> blocks from the visible
-        // completion; extracted reasoning rides in its own response field.
+        // Reasoning separation (#W1): strip <think>/harmony-channel blocks
+        // from the visible completion; extracted reasoning rides in its own
+        // response field.
         if (!ReasoningSplitDisabled()) {
-          auto parts = inferflux::ReasoningSplitter::Split(result.completion);
+          auto parts = inferflux::ResponseSplitter::Split(chat_template_family,
+                                                          result.completion);
           if (!parts.reasoning.empty()) {
             result.reasoning_content = std::move(parts.reasoning);
             result.completion = std::move(parts.content);
@@ -3711,7 +3725,7 @@ void HttpServer::HandleClient(ClientSession &session) {
         auto payload = BuildResponse(
             BuildCompletionBody(result, parsed, chat_mode, tool_call,
                                 result.reasoning_content,
-                                result.reasoning_tokens),
+                                result.reasoning_tokens, chat_template_family),
             200, "OK", trace_response_header);
         SendAll(session, payload);
       }

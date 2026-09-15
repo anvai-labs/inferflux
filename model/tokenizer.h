@@ -1,5 +1,7 @@
 #pragma once
 
+#include "model/chat_template_renderer.h"
+
 #include <string>
 #include <utility>
 #include <vector>
@@ -55,6 +57,10 @@ public:
   struct ChatResult {
     std::string prompt;
     bool valid{false};
+    // Detected template family — lets the caller select a matching
+    // response parser (e.g. HarmonySplitter for gpt-oss's channel
+    // markers).
+    ChatTemplateFamily family{ChatTemplateFamily::kChatML};
   };
 
   /**

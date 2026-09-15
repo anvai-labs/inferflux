@@ -1,5 +1,6 @@
 #include "runtime/backends/llama/llama_cpp_backend.h"
 
+#include "model/chat_template_renderer.h"
 #include "runtime/backends/backend_utils.h"
 #include "runtime/execution/parallel_context.h"
 #include "server/logging/logger.h"
@@ -1790,17 +1791,53 @@ std::vector<TopLogitEntry> LlamaCppBackend::TopLogitsForParity(int top_n) {
 
 // §2.3 — model-native chat template formatting.
 // Uses llama_chat_apply_template() from llama.h (built into the llama lib,
-// no extra compilation units required).  The function reads the model's
-// built-in chat template from GGUF metadata (NULL tmpl argument selects the
-// model's own template).  Supported models include Llama 3.x, Mistral/Mixtral,
-// Qwen 2/2.5, Hermes, DeepSeek, Phi-3, ChatML, and others in the predefined
-// list; for unsupported models it returns valid=false and the caller falls
-// back to the plain text preamble.
+// no extra compilation units required).  Supported models include Llama
+// 3.x, Mistral/Mixtral, Qwen 2/2.5, Hermes, DeepSeek, Phi-3, ChatML, and
+// others in the predefined list.
+//
+// The tmpl argument is NOT auto-detected from the model when NULL — despite
+// llama.h's own doc comment suggesting otherwise, llama_chat_apply_template
+// treats a NULL tmpl as the literal 6-byte string "chatml"
+// (external/llama.cpp/src/llama.cpp), unconditionally forcing ChatML
+// rendering regardless of what template the model actually declares. Fetch
+// the model's real template via llama_model_chat_template() and pass that
+// instead, so llama.cpp's own (much larger) family list gets a real chance.
+//
+// gpt-oss/harmony is a special case: llama.cpp's own built-in
+// LLM_CHAT_TEMPLATE_OPENAI_MOE renderer is missing the system preamble and
+// per-message channel tags the model was actually trained on (see
+// model/chat_template_renderer.cpp's RenderHarmony, transcribed directly
+// from gpt-oss-20b's embedded jinja template) — route harmony through
+// InferFlux's own renderer instead. The same renderer is also the final
+// fallback for any template neither list recognizes.
 LlamaCppBackend::ChatTemplateResult LlamaCppBackend::FormatChatMessages(
     const std::vector<std::pair<std::string, std::string>> &messages,
     bool add_assistant_prefix) {
   ChatTemplateResult result;
   if (!model_ || messages.empty()) {
+    return result;
+  }
+
+  const char *raw_tmpl = llama_model_chat_template(model_, /*name=*/nullptr);
+  if (raw_tmpl && *raw_tmpl &&
+      DetectChatTemplateFamily(raw_tmpl) == ChatTemplateFamily::kHarmony) {
+    result.prompt =
+        RenderChatTemplate(raw_tmpl, messages, add_assistant_prefix);
+    result.valid = !result.prompt.empty();
+    result.family = ChatTemplateFamily::kHarmony;
+    return result;
+  }
+
+  if (!raw_tmpl || !*raw_tmpl) {
+    // Genuinely no discoverable template. Do NOT call
+    // llama_chat_apply_template(nullptr, ...) here — llama.cpp's own NULL
+    // handling substitutes the literal string "chatml" internally and
+    // succeeds silently, reproducing (one level down) the exact bug this
+    // function exists to fix. Go straight to InferFlux's own fallback,
+    // which defaults to ChatML explicitly and traceably instead.
+    result.prompt = RenderChatTemplate("", messages, add_assistant_prefix);
+    result.valid = !result.prompt.empty();
+    result.family = ChatTemplateFamily::kChatML;
     return result;
   }
 
@@ -1822,18 +1859,25 @@ LlamaCppBackend::ChatTemplateResult LlamaCppBackend::FormatChatMessages(
   int buf_size = std::max(4096, total_chars * 2 + 512);
   std::vector<char> buf(buf_size);
 
-  // NULL template → use the model's built-in template.
   int32_t n =
-      llama_chat_apply_template(nullptr, chat.data(), chat.size(),
+      llama_chat_apply_template(raw_tmpl, chat.data(), chat.size(),
                                 add_assistant_prefix, buf.data(), buf_size);
   if (n < 0) {
-    // Template not in the predefined list; caller falls back to preamble.
+    // raw_tmpl is guaranteed non-NULL/non-empty here (the earlier check
+    // routed that case out already), so this means the template genuinely
+    // isn't in llama.cpp's predefined family list. Fall back to InferFlux's
+    // own smaller family detector rather than giving up outright — it
+    // still covers ChatML/Llama/Mistral/Gemma/Harmony.
+    result.prompt =
+        RenderChatTemplate(raw_tmpl, messages, add_assistant_prefix);
+    result.valid = !result.prompt.empty();
+    result.family = DetectChatTemplateFamily(raw_tmpl);
     return result;
   }
   if (n > buf_size) {
     // Buffer was too small; retry with exact size.
     buf.resize(static_cast<std::size_t>(n) + 1);
-    n = llama_chat_apply_template(nullptr, chat.data(), chat.size(),
+    n = llama_chat_apply_template(raw_tmpl, chat.data(), chat.size(),
                                   add_assistant_prefix, buf.data(), n);
     if (n < 0) {
       return result;
@@ -1842,6 +1886,15 @@ LlamaCppBackend::ChatTemplateResult LlamaCppBackend::FormatChatMessages(
 
   result.prompt = std::string(buf.data(), static_cast<std::size_t>(n));
   result.valid = true;
+  // llama.cpp's own template list is much larger than InferFlux's family
+  // detector (Llama 3.x/Mistral/Qwen/Hermes/DeepSeek/Phi-3/many others);
+  // report our closest-matching family from the same template string for
+  // response-splitter selection rather than leaving the struct default
+  // (kChatML) — harmless for non-reasoning families today (ResponseSplitter
+  // only branches on kHarmony vs. everything else), but avoids silently
+  // mislabeling a Llama/Mistral/Gemma template as ChatML for any future
+  // consumer that reads the family field more precisely.
+  result.family = DetectChatTemplateFamily(raw_tmpl);
   return result;
 }
 

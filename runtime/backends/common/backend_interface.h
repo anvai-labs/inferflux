@@ -2,6 +2,7 @@
 
 #include "backend_config.h"
 #include "backend_types.h"
+#include "model/chat_template_renderer.h"
 #include "runtime/backends/backend_capabilities.h"
 #include "runtime/logprob.h"
 
@@ -50,6 +51,10 @@ struct AttentionTensorData {
 struct ChatTemplateResult {
   bool valid{false};
   std::string prompt;
+  // Which family the template was detected as — lets the caller select a
+  // matching response parser (e.g. ReasoningSplitter for ChatML-family
+  // <think> tags vs. HarmonySplitter for gpt-oss's channel markers).
+  ChatTemplateFamily family{ChatTemplateFamily::kChatML};
 };
 
 /// Abstract interface for all inference backends.

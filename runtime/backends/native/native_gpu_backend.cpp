@@ -889,6 +889,7 @@ ChatTemplateResult NativeGpuBackend::FormatChatMessages(
       ChatTemplateResult result;
       result.prompt = std::move(native.prompt);
       result.valid = true;
+      result.family = native.family;
       return result;
     }
   }
