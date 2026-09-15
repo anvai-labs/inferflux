@@ -446,9 +446,9 @@ void LlamaCppBackend::SetupSampler(const std::string &grammar,
                                    const std::string &root,
                                    const SamplingParams &sp) {
   BackendStateLock lock(backend_state_mutex_);
-  log::Debug("llama_backend", "SetupSampler: grammar_bytes=" +
-                                  std::to_string(grammar.size()) +
-                                  " root='" + root + "'");
+  log::Debug("llama_backend",
+             "SetupSampler: grammar_bytes=" + std::to_string(grammar.size()) +
+                 " root='" + root + "'");
   TeardownSampler();
   if (!vocab_) {
     return;
@@ -458,16 +458,15 @@ void LlamaCppBackend::SetupSampler(const std::string &grammar,
 
   // Grammar constraint (if provided).
   if (!grammar.empty()) {
-    auto *grammar_sampler = llama_sampler_init_grammar(vocab_, grammar.c_str(),
-                                                       root.c_str());
+    auto *grammar_sampler =
+        llama_sampler_init_grammar(vocab_, grammar.c_str(), root.c_str());
     if (grammar_sampler == nullptr) {
       // llama_sampler_init_grammar returns NULL when grammar_str fails to
       // parse; falling through would sample unconstrained while the request
       // still reports structured output, so surface it.
-      log::Error("llama_backend",
-                 "grammar parse failed (root='" + root + "', " +
-                     std::to_string(grammar.size()) +
-                     " bytes); sampling unconstrained");
+      log::Error("llama_backend", "grammar parse failed (root='" + root +
+                                      "', " + std::to_string(grammar.size()) +
+                                      " bytes); sampling unconstrained");
     } else {
       llama_sampler_chain_add(chain, grammar_sampler);
       log::Debug("llama_backend", "grammar attached (root='" + root + "', " +
@@ -481,11 +480,10 @@ void LlamaCppBackend::SetupSampler(const std::string &grammar,
       (sp.frequency_penalty != 0.0f || sp.presence_penalty != 0.0f ||
        sp.repetition_penalty != 1.0f);
   if (has_penalties) {
-    llama_sampler_chain_add(chain,
-                            llama_sampler_init_penalties(
-                                n_vocab_, sp.penalty_last_n,
-                                sp.repetition_penalty, sp.frequency_penalty,
-                                sp.presence_penalty));
+    llama_sampler_chain_add(
+        chain, llama_sampler_init_penalties(
+                   n_vocab_, sp.penalty_last_n, sp.repetition_penalty,
+                   sp.frequency_penalty, sp.presence_penalty));
   }
 
   // Logit bias: bias specific tokens.
