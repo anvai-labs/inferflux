@@ -205,6 +205,12 @@ bool IsDefaultModelAlias(const std::string &model) {
   return normalized == "default";
 }
 
+CompletionRequestPayload ParseJsonPayload(const std::string &body);
+
+CompletionRequestPayload ParseJsonPayloadForTest(const std::string &body) {
+  return ParseJsonPayload(body);
+}
+
 CompletionRequestPayload ParseJsonPayload(const std::string &body) {
   CompletionRequestPayload payload;
   if (body.empty()) {
@@ -309,7 +315,28 @@ CompletionRequestPayload ParseJsonPayload(const std::string &body) {
             payload.response_format_schema = rf["schema"].dump();
           }
           if (rf.contains("json_schema")) {
-            payload.response_format_schema = rf["json_schema"].dump();
+            const auto &js = rf["json_schema"];
+            if (js.is_object() && js.contains("schema") &&
+                js["schema"].is_object() &&
+                (js.contains("name") || js.contains("strict"))) {
+              // OpenAI contract: json_schema is a wrapper {name, schema,
+              // strict}; only the inner schema object converts to a grammar.
+              // Converting the wrapper itself yields a no-op "any JSON"
+              // grammar (no type/properties keywords) that silently fails to
+              // constrain generation. The name/strict markers distinguish a
+              // real wrapper from a bare inlined schema that happens to
+              // define a "schema" property of its own.
+              payload.response_format_schema = js["schema"].dump();
+            } else if (js.is_object()) {
+              // Bare inlined schema (no wrapper markers). Unknown keywords
+              // are ignored by JSON Schema, so an object carrying a "schema"
+              // property stays a valid schema in its own right.
+              payload.response_format_schema = js.dump();
+            } else {
+              payload.response_format_ok = false;
+              payload.response_format_error =
+                  "response_format json_schema.schema must be a JSON object";
+            }
           }
           if (payload.response_format_schema.size() > kMaxResponseFormatBytes) {
             payload.response_format_ok = false;
@@ -782,10 +809,6 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
     ttft_ms = results[0].time_to_first_token_ms;
   }
   j["usage"]["prompt_tokens_details"] = {{"cached_tokens", cached_toks}};
-  if (reasoning_tokens > 0) {
-    j["usage"]["completion_tokens_details"] = {
-        {"reasoning_tokens", reasoning_tokens}};
-  }
   if (duration_ms >= 0.0) {
     j["usage"]["duration_ms"] = duration_ms;
   }
@@ -808,6 +831,11 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
       per_result_reasoning = std::move(parts.reasoning);
       reasoning_tokens_total +=
           static_cast<int>(per_result_reasoning.size() > 0 ? 1 : 0);
+    }
+    if (per_result_reasoning.empty() && i == 0 && !reasoning_content.empty()) {
+      // Caller pre-split the completion (streaming handler) and passed the
+      // reasoning in; the internal split above found nothing left to strip.
+      per_result_reasoning = reasoning_content;
     }
     auto choice = json::array();
     (void)choice;
@@ -837,6 +865,15 @@ std::string BuildCompletionBody(const std::vector<InferenceResult> &results,
     choices.push_back(std::move(choice_json));
   }
   j["choices"] = choices;
+  // Reasoning token count: the internal per-result split is authoritative
+  // (piece-classified); fall back to the caller-supplied count when the
+  // completion arrived pre-split.
+  const int effective_reasoning_tokens =
+      reasoning_tokens_total > 0 ? reasoning_tokens_total : reasoning_tokens;
+  if (effective_reasoning_tokens > 0) {
+    j["usage"]["completion_tokens_details"] = {
+        {"reasoning_tokens", effective_reasoning_tokens}};
+  }
   return SerializeJsonUtf8Safe(j);
 }
 
@@ -936,6 +973,27 @@ std::string BuildStreamChunkFast(const std::string &id, std::string_view model,
   AppendJsonEscaped(out, model);
   out += "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"";
   AppendJsonEscaped(out, content);
+  out += "\"},\"finish_reason\":null}]}";
+  return "data: " + out + "\n\n";
+}
+
+// Streaming reasoning delta (#W1): same framing as BuildStreamChunkFast but
+// the piece rides in delta.reasoning_content so OpenAI-compatible reasoning
+// consumers can separate it from user-visible content.
+std::string BuildStreamReasoningChunkFast(const std::string &id,
+                                          std::string_view model,
+                                          std::time_t ts,
+                                          std::string_view reasoning) {
+  std::string out;
+  out.reserve(reasoning.size() + model.size() + id.size() + 128);
+  out += "{\"id\":\"";
+  AppendJsonEscaped(out, id);
+  out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
+  out += std::to_string(ts);
+  out += ",\"model\":\"";
+  AppendJsonEscaped(out, model);
+  out += "\",\"choices\":[{\"index\":0,\"delta\":{\"reasoning_content\":\"";
+  AppendJsonEscaped(out, reasoning);
   out += "\"},\"finish_reason\":null}]}";
   return "data: " + out + "\n\n";
 }
@@ -3236,6 +3294,20 @@ void HttpServer::HandleClient(ClientSession &session) {
     auto token_buffer = std::make_shared<std::vector<std::string>>();
     auto sse_chunker =
         std::make_shared<SseStreamChunker>(SseStreamChunker::FromEnv());
+    // Reasoning separation on the streaming path (#W1): one splitter per
+    // request; on_token drains reasoning deltas out of the tag-aware state
+    // machine before content reaches the SSE chunker. The emitted-byte
+    // counters let the completion block emit only the Finish() residual.
+    // Plain size_t is safe across threads: the counters are written by the
+    // decode worker inside on_token and read after future.get(), which
+    // synchronizes with it.
+    auto stream_splitter =
+        ReasoningSplitDisabled()
+            ? std::shared_ptr<inferflux::ReasoningSplitter>{}
+            : std::make_shared<inferflux::ReasoningSplitter>();
+    auto stream_emitted_reasoning_bytes = std::make_shared<std::size_t>(0);
+    auto stream_emitted_content_bytes = std::make_shared<std::size_t>(0);
+    auto stream_reasoning_piece_count = std::make_shared<std::size_t>(0);
     bool buffer_tokens = use_tools;
     if (parsed.stream) {
       stream_ts = std::chrono::duration_cast<std::chrono::seconds>(
@@ -3266,54 +3338,106 @@ void HttpServer::HandleClient(ClientSession &session) {
       // When use_tools=false the buffer is never populated and the normal
       // per-token streaming path runs unchanged.
       bool stream_collect_logprobs = req.collect_logprobs;
-      req.on_token = [this, stream_session, stream_mutex, stream_active,
-                      stream_had_chunk, stream_cancel_flag, stream_id,
-                      stream_model, stream_ts, token_buffer, buffer_tokens,
-                      sse_chunker, stream_collect_logprobs](
-                         const std::string &chunk, const TokenLogprob *lp) {
-        if (chunk.empty() || !stream_active->load()) {
-          return;
-        }
-        if (buffer_tokens) {
-          // Accumulate without sending; will be replayed or discarded below.
-          std::lock_guard<std::mutex> lock(*stream_mutex);
-          token_buffer->push_back(chunk);
-          return;
-        }
-        // When logprobs are requested emit the full token as a single SSE
-        // delta (no splitting) so the logprob is paired 1:1 with its token.
-        if (stream_collect_logprobs && lp != nullptr) {
-          std::string payload = BuildStreamChunk(
-              stream_id, stream_model, stream_ts, chunk, false, "stop", lp);
-          std::lock_guard<std::mutex> lock(*stream_mutex);
-          if (!stream_active->load()) {
-            return;
-          }
-          if (!SendAll(*stream_session, payload)) {
-            stream_active->store(false);
-            stream_cancel_flag->store(true);
-            return;
-          }
-          stream_had_chunk->store(true);
-          return;
-        }
-        sse_chunker->Append(chunk);
-        if (!sse_chunker->ShouldFlush()) {
-          return;
-        }
+      // Emits one reasoning delta frame under the stream mutex; returns false
+      // when the stream died (peer closed), mirroring the content path.
+      auto send_reasoning_delta =
+          [this, stream_session, stream_mutex, stream_active, stream_had_chunk,
+           stream_cancel_flag, stream_id, stream_model,
+           stream_ts](std::string_view reasoning) -> bool {
+        std::string payload = BuildStreamReasoningChunkFast(
+            stream_id, stream_model, stream_ts, reasoning);
         std::lock_guard<std::mutex> lock(*stream_mutex);
         if (!stream_active->load()) {
-          return;
+          return false;
         }
-        if (!SendAll(
-                *stream_session,
-                sse_chunker->TakeFrame(stream_id, stream_model, stream_ts))) {
+        if (!SendAll(*stream_session, payload)) {
           stream_active->store(false);
           stream_cancel_flag->store(true);
-          return;
+          return false;
         }
         stream_had_chunk->store(true);
+        return true;
       };
+      req.on_token =
+          [this, stream_session, stream_mutex, stream_active, stream_had_chunk,
+           stream_cancel_flag, stream_id, stream_model, stream_ts, token_buffer,
+           buffer_tokens, sse_chunker, stream_collect_logprobs, stream_splitter,
+           stream_emitted_reasoning_bytes, stream_emitted_content_bytes,
+           stream_reasoning_piece_count, send_reasoning_delta](
+              const std::string &chunk, const TokenLogprob *lp) {
+            if (chunk.empty() || !stream_active->load()) {
+              return;
+            }
+            if (buffer_tokens) {
+              // Accumulate without sending; will be replayed or discarded
+              // below.
+              std::lock_guard<std::mutex> lock(*stream_mutex);
+              token_buffer->push_back(chunk);
+              return;
+            }
+            // Reasoning separation (#W1): classify the piece before it reaches
+            // the content path. Reasoning deltas go out as their own frames;
+            // content continues through the regular chunker/logprob pipeline.
+            std::string content_piece;
+            if (stream_splitter) {
+              stream_splitter->Feed(chunk);
+              auto parts = stream_splitter->Drain();
+              if (!parts.reasoning.empty()) {
+                ++*stream_reasoning_piece_count;
+                if (!send_reasoning_delta(parts.reasoning)) {
+                  return;
+                }
+                *stream_emitted_reasoning_bytes += parts.reasoning.size();
+              }
+              if (parts.content.empty()) {
+                return; // piece classified entirely as reasoning
+              }
+              content_piece = std::move(parts.content);
+            } else {
+              content_piece = chunk;
+            }
+            // When logprobs are requested emit the token as a single SSE
+            // delta (no splitting) so the logprob is paired 1:1 with its token.
+            // The logprob describes the full generated token even when the
+            // reasoning boundary split it; it rides the content fragment.
+            if (stream_collect_logprobs && lp != nullptr) {
+              std::string payload =
+                  BuildStreamChunk(stream_id, stream_model, stream_ts,
+                                   content_piece, false, "stop", lp);
+              std::lock_guard<std::mutex> lock(*stream_mutex);
+              if (!stream_active->load()) {
+                return;
+              }
+              if (!SendAll(*stream_session, payload)) {
+                stream_active->store(false);
+                stream_cancel_flag->store(true);
+                return;
+              }
+              // Logprob frames bypass the chunker; account for the bytes so
+              // the EOS residual logic does not re-emit them as a duplicate
+              // trailing content frame.
+              *stream_emitted_content_bytes += content_piece.size();
+              stream_had_chunk->store(true);
+              return;
+            }
+            sse_chunker->Append(content_piece);
+            *stream_emitted_content_bytes += content_piece.size();
+            if (!sse_chunker->ShouldFlush()) {
+              return;
+            }
+            std::lock_guard<std::mutex> lock(*stream_mutex);
+            if (!stream_active->load()) {
+              return;
+            }
+            if (!SendAll(*stream_session,
+                         sse_chunker->TakeFrame(stream_id, stream_model,
+                                                stream_ts))) {
+              stream_active->store(false);
+              stream_cancel_flag->store(true);
+              return;
+            }
+            stream_had_chunk->store(true);
+          };
     }
 
     const std::string audit_prompt = req.prompt;
@@ -3343,13 +3467,28 @@ void HttpServer::HandleClient(ClientSession &session) {
           }
           {
             std::lock_guard<std::mutex> lock(*stream_mutex);
+            bool stub_split_reasoning = false;
             if (nb_tc.detected) {
               SendAll(session, BuildToolCallStreamChunks(
                                    stream_id, parsed.model, stream_ts, nb_tc));
             } else {
+              std::string stub_content = result.completion;
+              if (stream_splitter) {
+                // Reasoning separation applies to the stub path too, so
+                // model-free CI (INFERFLUX_STUB_COMPLETION with a <think>
+                // block) exercises the streaming contract end-to-end.
+                auto parts = inferflux::ReasoningSplitter::Split(stub_content);
+                if (!parts.reasoning.empty()) {
+                  stub_split_reasoning = true;
+                  SendAll(session, BuildStreamReasoningChunkFast(
+                                       stream_id, parsed.model, stream_ts,
+                                       parts.reasoning));
+                }
+                stub_content = std::move(parts.content);
+              }
               SendAll(session,
                       BuildStreamChunk(stream_id, parsed.model, stream_ts,
-                                       result.completion, false));
+                                       stub_content, false));
               SendAll(session, BuildStreamChunk(stream_id, parsed.model,
                                                 stream_ts, "", true));
             }
@@ -3367,6 +3506,16 @@ void HttpServer::HandleClient(ClientSession &session) {
                     {"completion_tokens", result.completion_tokens},
                     {"total_tokens",
                      result.prompt_tokens + result.completion_tokens}}}};
+              if ((stream_reasoning_piece_count &&
+                   *stream_reasoning_piece_count > 0) ||
+                  stub_split_reasoning) {
+                const int reasoning_tokens =
+                    stub_split_reasoning
+                        ? 1
+                        : static_cast<int>(*stream_reasoning_piece_count);
+                usage_frame["usage"]["completion_tokens_details"] = {
+                    {"reasoning_tokens", reasoning_tokens}};
+              }
               SendAll(session,
                       "data: " + SerializeJsonUtf8Safe(usage_frame) + "\n\n");
             }
@@ -3443,6 +3592,31 @@ void HttpServer::HandleClient(ClientSession &session) {
           if (stream_active->load()) {
             const std::string stream_finish_reason =
                 result.finish_reason_length ? "length" : "stop";
+            // Set when the buffered-replay path splits reasoning out of the
+            // buffer: on_token never fed the splitter there, so the piece
+            // counter alone would miss it in the usage frame.
+            bool replay_split_reasoning = false;
+            if (stream_splitter && !buffer_tokens) {
+              // Flush the tag holdback and emit what the streaming path has
+              // not sent yet: a trailing partial-tag suffix (content) or
+              // unterminated think-block bytes (reasoning). Reasoning always
+              // precedes content in generation order, so the residual keeps
+              // wire order.
+              auto tail = stream_splitter->Finish();
+              const std::string residual_reasoning =
+                  tail.reasoning.substr(*stream_emitted_reasoning_bytes);
+              if (!residual_reasoning.empty()) {
+                SendAll(session, BuildStreamReasoningChunkFast(
+                                     stream_id, parsed.model, stream_ts,
+                                     residual_reasoning));
+                stream_had_chunk->store(true);
+              }
+              const std::string residual_content =
+                  tail.content.substr(*stream_emitted_content_bytes);
+              if (!residual_content.empty()) {
+                sse_chunker->Append(residual_content);
+              }
+            }
             if (!buffer_tokens && !sse_chunker->Empty()) {
               // Flush any buffered content deltas before the finish frame.
               SendAll(session, sse_chunker->TakeFrame(stream_id, parsed.model,
@@ -3458,12 +3632,26 @@ void HttpServer::HandleClient(ClientSession &session) {
             } else if (buffer_tokens && !token_buffer->empty()) {
               // Model produced plain text despite tools[] being present (no
               // tool call detected).  Replay the buffered tokens as content
-              // deltas.
+              // deltas; reasoning separation applies to the replay so
+              // think-tagged output stays correct on the buffered path too.
+              std::string replay;
               for (const auto &tok : *token_buffer) {
-                for (const auto &piece : SplitForStreaming(tok)) {
-                  SendAll(session, BuildStreamChunk(stream_id, parsed.model,
-                                                    stream_ts, piece, false));
+                replay += tok;
+              }
+              std::string replay_content = replay;
+              if (stream_splitter) {
+                auto parts = inferflux::ReasoningSplitter::Split(replay);
+                if (!parts.reasoning.empty()) {
+                  replay_split_reasoning = true;
+                  SendAll(session, BuildStreamReasoningChunkFast(
+                                       stream_id, parsed.model, stream_ts,
+                                       parts.reasoning));
                 }
+                replay_content = std::move(parts.content);
+              }
+              for (const auto &piece : SplitForStreaming(replay_content)) {
+                SendAll(session, BuildStreamChunk(stream_id, parsed.model,
+                                                  stream_ts, piece, false));
               }
               SendAll(session,
                       BuildStreamChunk(stream_id, parsed.model, stream_ts, "",
@@ -3495,6 +3683,13 @@ void HttpServer::HandleClient(ClientSession &session) {
                 uc["usage"]["time_to_first_token_ms"] =
                     result.time_to_first_token_ms;
               }
+              if (*stream_reasoning_piece_count > 0 || replay_split_reasoning) {
+                uc["usage"]["completion_tokens_details"] = {
+                    {"reasoning_tokens",
+                     replay_split_reasoning
+                         ? 1
+                         : static_cast<int>(*stream_reasoning_piece_count)}};
+              }
               SendAll(session, "data: " + uc.dump() + "\n\n");
             }
             SendAll(session, "data: [DONE]\n\n");
@@ -3510,6 +3705,7 @@ void HttpServer::HandleClient(ClientSession &session) {
           if (!parts.reasoning.empty()) {
             result.reasoning_content = std::move(parts.reasoning);
             result.completion = std::move(parts.content);
+            result.reasoning_tokens = 1;
           }
         }
         auto payload = BuildResponse(

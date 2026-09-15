@@ -116,6 +116,15 @@ ReasoningSplitter::Parts ReasoningSplitter::Finish() {
   return parts;
 }
 
+ReasoningSplitter::Parts ReasoningSplitter::Drain() {
+  Parts parts;
+  parts.reasoning = reasoning_.substr(drained_reasoning_bytes_);
+  parts.content = content_.substr(drained_content_bytes_);
+  drained_reasoning_bytes_ = reasoning_.size();
+  drained_content_bytes_ = content_.size();
+  return parts;
+}
+
 ReasoningSplitter::Parts ReasoningSplitter::Split(std::string_view output) {
   ReasoningSplitter splitter;
   splitter.Feed(output);

@@ -85,3 +85,53 @@ TEST_CASE("ReasoningSplitter: angle-bracket text is not mistaken for tags",
   REQUIRE(parts.reasoning.empty());
   REQUIRE(parts.content == output);
 }
+
+TEST_CASE("ReasoningSplitter::Drain yields incremental deltas", "[reasoning]") {
+  ReasoningSplitter splitter;
+  splitter.Feed("<think>rea");
+  auto d1 = splitter.Drain();
+  REQUIRE(d1.reasoning == "rea");
+  REQUIRE(d1.content.empty());
+
+  splitter.Feed("soning</thi");
+  auto d2 = splitter.Drain();
+  // "soning" is final; "</thi" may still be a partial close tag.
+  REQUIRE(d2.reasoning == "soning");
+
+  splitter.Feed("nk>answer");
+  auto d3 = splitter.Drain();
+  REQUIRE(d3.reasoning.empty());
+  REQUIRE(d3.content == "answer");
+
+  auto tail = splitter.Finish();
+  REQUIRE(tail.reasoning == "reasoning");
+  REQUIRE(tail.content == "answer");
+}
+
+TEST_CASE("ReasoningSplitter::Drain holds bytes that straddle the open tag",
+          "[reasoning]") {
+  ReasoningSplitter splitter;
+  splitter.Feed("hello <th");
+  auto d1 = splitter.Drain();
+  REQUIRE(d1.content == "hello ");
+  REQUIRE(d1.reasoning.empty());
+
+  splitter.Feed("ink>secret");
+  auto d2 = splitter.Drain();
+  REQUIRE(d2.content.empty());
+  REQUIRE(d2.reasoning == "secret");
+}
+
+TEST_CASE("ReasoningSplitter::Drain splits a boundary-straddling chunk",
+          "[reasoning]") {
+  ReasoningSplitter splitter;
+  splitter.Feed("abc</thi");
+  auto d1 = splitter.Drain();
+  REQUIRE(d1.content == "abc");
+
+  splitter.Feed("nk>xyz");
+  auto d2 = splitter.Drain();
+  // The close tag completed: nothing new is reasoning, "xyz" is content.
+  REQUIRE(d2.reasoning.empty());
+  REQUIRE(d2.content == "xyz");
+}

@@ -1279,6 +1279,19 @@ if(Python3_Interpreter_FOUND)
     TIMEOUT 60
     ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
 
+  # Reasoning separation (streaming + buffered) against a stub origin whose
+  # canned completion contains a <think> block.
+  add_test(
+    NAME IntegrationStubReasoning
+    COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
+            StubIntegrationReasoningTests.test_streaming_reasoning_separation
+            StubIntegrationReasoningTests.test_non_streaming_reasoning_separation)
+  set_tests_properties(IntegrationStubReasoning PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERFLUX_STUB_COMPLETION=<think>chain of thought</think>visible answer")
+
   add_test(NAME ShmSmoke
            COMMAND ${Python3_EXECUTABLE} tests/integration/shm_smoke_test.py)
   set_tests_properties(ShmSmoke PROPERTIES

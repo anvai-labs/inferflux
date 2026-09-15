@@ -70,6 +70,83 @@ TEST_CASE("Completion JSON replaces malformed model UTF-8",
   REQUIRE(decoded["choices"][0]["message"]["content"] == "\xEF\xBF\xBD");
 }
 
+namespace {
+nlohmann::json JsonSchemaRequest(const nlohmann::json &json_schema_field) {
+  return {{"model", "default"},
+          {"messages", nlohmann::json::array({{{"role", "user"},
+                                               {"content", "hello"}}})},
+          {"response_format",
+           {{"type", "json_schema"}, {"json_schema", json_schema_field}}}};
+}
+} // namespace
+
+TEST_CASE("json_schema wrapper extracts the inner schema object",
+          "[http_server][structured]") {
+  const nlohmann::json inner = {
+      {"type", "object"},
+      {"properties", {{"color", {{"type", "string"}}}}},
+      {"required", nlohmann::json::array({"color"})}};
+
+  // OpenAI contract: json_schema is a {name, schema, strict} wrapper. The
+  // grammar converter must receive the inner schema, not the wrapper — the
+  // wrapper has no type/properties keywords and converts to a no-op "any
+  // JSON" grammar.
+  const auto payload = ParseJsonPayloadForTest(
+      JsonSchemaRequest({{"name", "c"}, {"strict", true}, {"schema", inner}})
+          .dump());
+
+  REQUIRE(payload.has_response_format);
+  REQUIRE(payload.response_format_type == "json_schema");
+  REQUIRE(payload.json_mode);
+  REQUIRE(payload.response_format_ok);
+  REQUIRE(payload.response_format_schema == inner.dump());
+}
+
+TEST_CASE("json_schema tolerates a bare inlined schema", "[http_server]") {
+  const nlohmann::json bare = {{"type", "object"},
+                               {"properties", {{"n", {{"type", "integer"}}}}}};
+  const auto payload =
+      ParseJsonPayloadForTest(JsonSchemaRequest(bare).dump());
+
+  REQUIRE(payload.response_format_ok);
+  REQUIRE(payload.response_format_schema == bare.dump());
+}
+
+TEST_CASE("json_schema wrapper markers guard the schema property",
+          "[http_server]") {
+  // A bare schema that itself defines a "schema" property must not be
+  // mistaken for the OpenAI wrapper: without name/strict markers the whole
+  // object is the schema.
+  const nlohmann::json bare_with_schema_prop = {
+      {"type", "object"},
+      {"properties", {{"schema", {{"type", "string"}}}}}};
+  const auto bare_payload =
+      ParseJsonPayloadForTest(JsonSchemaRequest(bare_with_schema_prop).dump());
+  REQUIRE(bare_payload.response_format_ok);
+  REQUIRE(bare_payload.response_format_schema ==
+          bare_with_schema_prop.dump());
+
+  // A wrapper with only one of the markers is still a wrapper.
+  const nlohmann::json inner = {{"type", "string"}};
+  const auto name_only = ParseJsonPayloadForTest(
+      JsonSchemaRequest({{"name", "c"}, {"schema", inner}}).dump());
+  REQUIRE(name_only.response_format_ok);
+  REQUIRE(name_only.response_format_schema == inner.dump());
+
+  const auto strict_only = ParseJsonPayloadForTest(
+      JsonSchemaRequest({{"strict", true}, {"schema", inner}}).dump());
+  REQUIRE(strict_only.response_format_ok);
+  REQUIRE(strict_only.response_format_schema == inner.dump());
+}
+
+TEST_CASE("json_schema rejects a non-object schema", "[http_server]") {
+  const auto payload =
+      ParseJsonPayloadForTest(JsonSchemaRequest("not-a-schema").dump());
+  INFO("error=[" << payload.response_format_error << "]");
+  REQUIRE_FALSE(payload.response_format_ok);
+  REQUIRE_FALSE(payload.response_format_error.empty());
+}
+
 TEST_CASE("Streaming logprobs preserve raw token bytes",
           "[http_server][utf8]") {
   TokenLogprob logprob;

@@ -126,3 +126,21 @@ TEST_CASE("ResolveLlamaLoadPath returns empty when no GGUF exists",
 
   fs::remove_all(dir);
 }
+
+TEST_CASE("ResolveLlamaLoadPath discovers a GGUF sidecar subdirectory",
+          "[model_format]") {
+  const auto dir = MakeTempDir("sidecar");
+  fs::create_directories(dir / "sidecar");
+  TouchFile(dir / "model.safetensors");
+  TouchFile(dir / "sidecar" / "model-q4_k_m.gguf");
+
+  REQUIRE(ResolveLlamaLoadPath(dir.string(), "safetensors") ==
+          (dir / "sidecar" / "model-q4_k_m.gguf").string());
+
+  // A top-level GGUF still wins over the sidecar subdirectory.
+  TouchFile(dir / "model.gguf");
+  REQUIRE(ResolveLlamaLoadPath(dir.string(), "safetensors") ==
+          (dir / "model.gguf").string());
+
+  fs::remove_all(dir);
+}
