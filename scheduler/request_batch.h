@@ -57,6 +57,10 @@ struct InferenceResult {
   int cached_prompt_tokens{0};
   double duration_ms{-1.0};
   double time_to_first_token_ms{-1.0};
+  // Reasoning separation (#161 follow-up): content stripped of <think>
+  // blocks and the reasoning text that was split out of it.
+  std::string reasoning_content;
+  int reasoning_tokens{0};
 
   struct {
     int total_chunks{0};

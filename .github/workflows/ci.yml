@@ -29,7 +29,7 @@ jobs:
   # ---------------------------------------------------------------------------
   changes:
     name: Detect change areas
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       docs_only: ${{ steps.detect.outputs.docs_only }}
       shared: ${{ steps.detect.outputs.shared }}
@@ -94,7 +94,7 @@ jobs:
   docs-gate:
     name: Docs contract gate
     needs: changes
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -108,7 +108,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-and-test:
     name: Build & Test (ubuntu-latest)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.docs_only != 'true'
 
@@ -373,7 +373,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-check-cuda:
     name: CUDA compile check (ubuntu-latest)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true   # advisory only; no GPU available for execution
     needs: [changes]
     if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.cuda == 'true' || needs.changes.outputs.shared == 'true')
@@ -426,7 +426,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-check-vulkan:
     name: Build check (Vulkan)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true   # Advisory — no Vulkan GPU in CI
     needs: [changes]
     if: needs.changes.outputs.docs_only != 'true' && (needs.changes.outputs.vulkan == 'true' || needs.changes.outputs.shared == 'true')
@@ -442,7 +442,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake libssl-dev libyaml-cpp-dev \
-            libvulkan-dev vulkan-tools glslc
+            libvulkan-dev vulkan-tools glslc spirv-headers
 
       - name: Configure (Vulkan=ON)
         run: |
@@ -463,7 +463,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-check-webui:
     name: Build check (WebUI)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true   # Advisory — ENABLE_WEBUI ships in releases only
     needs: [changes]
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.shared == 'true'
@@ -636,7 +636,7 @@ jobs:
   # ---------------------------------------------------------------------------
   coverage:
     name: Coverage (ubuntu-latest)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.docs_only != 'true'
 
@@ -785,7 +785,7 @@ jobs:
   # ---------------------------------------------------------------------------
   gguf-quantization-tests:
     name: GGUF & Quantization Tests (ubuntu-latest)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [changes]
     if: needs.changes.outputs.docs_only != 'true'
 
@@ -941,7 +941,7 @@ jobs:
   # ---------------------------------------------------------------------------
   clang-format:
     name: clang-format check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     continue-on-error: true
     needs: [changes]
     if: needs.changes.outputs.docs_only != 'true'

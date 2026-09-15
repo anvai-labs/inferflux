@@ -105,6 +105,37 @@ SelectBestGgufInDirectory(const std::filesystem::path &dir) {
       best_path = entry.path();
     }
   }
+  if (!best_path.empty()) {
+    return best_path;
+  }
+
+  // Conventional sidecar layout: <model_dir>/sidecar/*.gguf (produced by
+  // safetensors -> GGUF conversion tooling). One explicit level, not a
+  // recursive scan.
+  const std::filesystem::path sidecar_dir = dir / "sidecar";
+  ec.clear();
+  std::filesystem::directory_iterator sidecar_it(sidecar_dir, ec);
+  if (ec) {
+    return {};
+  }
+  best_name.clear();
+  for (const auto &entry : sidecar_it) {
+    if (!entry.is_regular_file(ec) || ec) {
+      ec.clear();
+      continue;
+    }
+    const auto ext = ToLower(entry.path().extension().string());
+    if (ext != ".gguf") {
+      continue;
+    }
+    const auto name = entry.path().filename().string();
+    const int score = ScoreGgufFile(name);
+    if (score > best_score || (score == best_score && name < best_name)) {
+      best_score = score;
+      best_name = name;
+      best_path = entry.path();
+    }
+  }
   return best_path;
 }
 

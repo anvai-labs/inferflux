@@ -87,8 +87,26 @@ bool NativeGpuBackend::LoadModel(const std::filesystem::path &model_path,
   parity_load_path_.clear();
 
   if (parity_delegate_enabled_) {
+    // Resolve the GGUF artifact the delegate will consume BEFORE the scaffold
+    // load. The raw model_path may be a safetensors directory, which the
+    // llama.cpp loader cannot consume; the scaffold must always be handed a
+    // regular .gguf file.
+    const std::string resolved_format =
+        ResolveModelFormat(model_path.string(), /*requested_format=*/"auto");
+    parity_load_path_ =
+        ResolveLlamaLoadPath(model_path.string(), resolved_format);
+    if (parity_load_path_.empty()) {
+      log::Info(LogTag(),
+                "Native parity delegate unavailable for model path '" +
+                    model_path.string() +
+                    "' (no GGUF-compatible artifact detected); loading "
+                    "native-only");
+      parity_delegate_enabled_ = false;
+    }
+  }
+  if (parity_delegate_enabled_) {
     // Full load: device init + llama.cpp scaffold (needed for grammar support)
-    if (!GpuAcceleratedBackend::LoadModel(model_path, config)) {
+    if (!GpuAcceleratedBackend::LoadModel(parity_load_path_, config)) {
       log::Error(LogTag(),
                  "GpuAcceleratedBackend device init / model load failed");
       return false;
@@ -132,19 +150,8 @@ bool NativeGpuBackend::LoadModel(const std::filesystem::path &model_path,
     log::Warn(LogTag(), fallback_reason_ + " (runtime=" + runtime_kind_ + ")");
   }
   if (parity_delegate_enabled_) {
-    const std::string resolved_format =
-        ResolveModelFormat(model_path.string(), /*requested_format=*/"auto");
-    const std::string parity_path =
-        ResolveLlamaLoadPath(model_path.string(), resolved_format);
-    if (!parity_path.empty()) {
-      parity_load_path_ = parity_path;
-      parity_delegate_available_ = true;
-    } else {
-      log::Info(LogTag(),
-                "Native parity delegate unavailable for model path '" +
-                    model_path.string() +
-                    "' (no GGUF-compatible artifact detected)");
-    }
+    // parity_load_path_ was resolved before the scaffold load above.
+    parity_delegate_available_ = !parity_load_path_.empty();
   }
   return true;
 }

@@ -516,6 +516,9 @@ void FillResultUsageTelemetry(const InferenceRequest &req,
     result->time_to_first_token_ms = std::chrono::duration<double, std::milli>(
                                          req.first_token_time - req.accept_time)
                                          .count();
+    if (result->time_to_first_token_ms >= 0.0) {
+      GlobalMetrics().RecordTimeToFirstToken(result->time_to_first_token_ms);
+    }
   }
 }
 

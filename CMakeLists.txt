@@ -100,6 +100,8 @@ add_library(inferflux_core STATIC
   runtime/execution/batch_executor.h
   runtime/text/incremental_utf8.cpp
   runtime/text/incremental_utf8.h
+  runtime/text/reasoning_splitter.cpp
+  runtime/text/reasoning_splitter.h
   runtime/execution/unified_batch_lane_dispatcher.cpp
   runtime/execution/unified_batch_lane_dispatcher.h
   runtime/execution/parallel_context.cpp
@@ -745,6 +747,7 @@ add_executable(inferflux_tests
   tests/unit/test_startup_advisor.cpp
   tests/unit/test_quantization_detector.cpp
   tests/unit/test_result.cpp
+  tests/unit/test_reasoning_splitter.cpp
   tests/integration/test_http_generation_admission.cpp
   external/catch2/catch_amalgamated.cpp
 )
@@ -1275,6 +1278,19 @@ if(Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
     ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
+
+  # Reasoning separation (streaming + buffered) against a stub origin whose
+  # canned completion contains a <think> block.
+  add_test(
+    NAME IntegrationStubReasoning
+    COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
+            StubIntegrationReasoningTests.test_streaming_reasoning_separation
+            StubIntegrationReasoningTests.test_non_streaming_reasoning_separation)
+  set_tests_properties(IntegrationStubReasoning PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERFLUX_STUB_COMPLETION=<think>chain of thought</think>visible answer")
 
   add_test(NAME ShmSmoke
            COMMAND ${Python3_EXECUTABLE} tests/integration/shm_smoke_test.py)
