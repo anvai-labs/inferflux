@@ -3,7 +3,10 @@
 Status: Accepted
 Date: 2026-09-15
 Owners: Runtime (InferFlux), Gateway (Sandhi), Agent (Victor)
-Dependencies: ADR-0003 (tenant boundary), Sandhi ADR-0008/TD-0008, Sandhi TD-0013
+Dependencies: ADR-0003 (tenant boundary)
+
+(Cross-repo records — not local dependencies: sandhi ADR-0008 / TD-0008 for
+the boundary this extends, sandhi TD-0013 for the no-re-tokenization rule.)
 
 ## Context
 
@@ -61,9 +64,9 @@ Kill switch: `INFERFLUX_DISABLE_REASONING_SPLIT` restores legacy verbatim `conte
   interrupted-stream fallback remains until Sandhi's own W7 lands.
 - The conformance suite (Sandhi `tests/sdk-conformance/`) pins this contract against drift;
   InferFlux contract changes must update the pin in the same or a same-day follow-up PR.
-- `reasoning_tokens` currently counts reasoning *pieces* (streaming) or 1 (buffered) — a
-  "billed reasoning present" indicator, not an exact token count; tightening it is a
-  follow-up, not a contract break.
+- `reasoning_tokens` currently counts reasoning *pieces* (streaming deltas) or 1 per choice
+  with reasoning (buffered paths, including n>1) — a "billed reasoning present" indicator,
+  not an exact token count; tightening it is a follow-up, not a contract break.
 
 ## Implementation record
 

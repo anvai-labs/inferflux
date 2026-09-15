@@ -9,7 +9,7 @@
 | [ADR-0003](ADR-0003-tenant-resource-boundary.md) | Tenant identity as the reusable-state boundary | Proposed | None |
 | [ADR-0004](ADR-0004-distributed-sequence-ownership.md) | Lease-based distributed sequence ownership | Proposed | ADR-0003, TD-002 |
 | [ADR-0005](ADR-0005-trusted-gpu-release-evidence.md) | Trusted GPU evidence runs after merge | Accepted | TD-002 |
-| [ADR-0006](ADR-0006-three-way-origin-contract.md) | Three-way origin contract (InferFlux authoritative producer) | Accepted | ADR-0003, Sandhi TD-0013 |
+| [ADR-0006](ADR-0006-three-way-origin-contract.md) | Three-way origin contract (InferFlux authoritative producer) | Accepted | ADR-0003 |
 
 Statuses are `Proposed`, `Accepted`, `Rejected`, `Superseded`, or `Deprecated`.
 Dependent implementation may prototype a proposed ADR, but release behavior

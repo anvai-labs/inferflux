@@ -816,6 +816,12 @@ static json BuildChoice(int idx, const InferenceResult &result,
   }
 }
 
+// Process-wide monotonic completion-id sequence. Shared by the buffered
+// body builder below and the streaming setup in HandleClient so every
+// completion id on every path is unique within the process (epoch-ms plus
+// this counter; ids are correlation handles, not durable keys).
+std::atomic<uint64_t> completion_seq{0};
+
 // Multi-result overload: used when n>1 or best_of>1.
 // total_completion_tokens covers all generated completions (including
 // best_of candidates not returned), matching OpenAI's usage counting.
@@ -835,8 +841,9 @@ std::string BuildCompletionBody(
   // Unique per call: epoch-ms alone collides for concurrent requests, so a
   // process-wide monotonic counter disambiguates (and survives same-ms
   // bursts). Restart repeats are acceptable — ids are correlation handles,
-  // not durable keys.
-  static std::atomic<uint64_t> completion_seq{0};
+  // not durable keys. The counter is file-scoped so the streaming path
+  // (HandleClient) draws from the same sequence — a seconds-resolution id
+  // there collided for concurrent streams starting in the same second.
   const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           now.time_since_epoch())
                           .count();
@@ -3344,7 +3351,10 @@ void HttpServer::HandleClient(ClientSession &session) {
                                                           r.completion);
           if (!parts.reasoning.empty()) {
             reasoning_content = parts.reasoning;
-            reasoning_tokens += static_cast<int>(parts.reasoning.size());
+            // 1 per choice with reasoning — a "billed reasoning present"
+            // indicator consistent with the single-completion (also 1) and
+            // streaming (piece count) paths, NOT a byte length (ADR-0006).
+            reasoning_tokens += 1;
             r.completion = std::move(parts.content);
           }
         }
@@ -3459,7 +3469,16 @@ void HttpServer::HandleClient(ClientSession &session) {
       stream_active->store(true);
       // SSE consumes the connection — disable keep-alive for this session.
       session.keep_alive = false;
-      stream_id = std::string("chatcmpl-") + std::to_string(stream_ts);
+      // Same uniqueness scheme as the buffered body builder (epoch-ms +
+      // process-wide counter): a seconds-resolution id collided for
+      // concurrent streams starting in the same second, and Sandhi keys
+      // meter-side correlation on this id (ADR-0006).
+      const auto stream_now_ms =
+          std::chrono::duration_cast<std::chrono::milliseconds>(
+              std::chrono::system_clock::now().time_since_epoch())
+              .count();
+      stream_id = "chatcmpl-" + std::to_string(stream_now_ms) + "-" +
+                  std::to_string(completion_seq.fetch_add(1) + 1);
       std::string stream_headers = "HTTP/1.1 200 OK\r\n"
                                    "Content-Type: text/event-stream\r\n"
                                    "Cache-Control: no-cache\r\n"
