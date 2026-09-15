@@ -139,6 +139,22 @@ class StubIntegrationTests(unittest.TestCase):
         resp, body = self._post("/v1/admin/cache/warm", {"tokens": [1, 2, 3], "block_table": [100]})
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
 
+    def test_tokenize_requires_input(self):
+        resp, body = self._post("/v1/tokenize", {"model": "default"})
+        self.assertEqual(resp.status, 400, msg=f"Status: {resp.status}, Body: {body}")
+
+    def test_tokenize_backend_unavailable_default_model(self):
+        resp, body = self._post("/v1/tokenize", {"input": "hello"})
+        self.assertEqual(resp.status, 503, msg=f"Status: {resp.status}, Body: {body}")
+        payload = json.loads(body)
+        self.assertEqual((payload.get("error") or {}).get("code"), "no_backend")
+
+    def test_tokenize_explicit_model_not_found(self):
+        resp, body = self._post("/v1/tokenize", {"model": "explicit-model", "input": "hello"})
+        self.assertEqual(resp.status, 404, msg=f"Status: {resp.status}, Body: {body}")
+        payload = json.loads(body)
+        self.assertEqual((payload.get("error") or {}).get("code"), "model_not_found")
+
     def test_embeddings_requires_input(self):
         resp, body = self._post("/v1/embeddings", {})
         self.assertEqual(resp.status, 400, msg=f"Status: {resp.status}, Body: {body}")

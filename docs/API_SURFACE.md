@@ -13,6 +13,7 @@ graph TD
     B --> B3["v1/models"]
     B --> B4["v1/models/{id"]
     B --> B5["v1/embeddings"]
+    B --> B6["v1/tokenize"]
 
     C --> C1["v1/admin/guardrails"]
     C --> C2["v1/admin/rate_limit"]
@@ -36,6 +37,7 @@ graph TD
 | `/v1/models` | `GET` | `read` | OpenAI-compatible model list |
 | `/v1/models/{id}` | `GET` | `read` | Single model descriptor |
 | `/v1/embeddings` | `POST` | `read` | Embedding generation with capability routing |
+| `/v1/tokenize` | `POST` | `read` | Exact token counts for input text using the resolved model's tokenizer — no generation, no KV state. `input` is a string or array of strings (same shape as embeddings); the response carries one count per input in order plus their sum. Diagnostics/calibration surface for gateways, not a hot-path dependency. |
 
 ## 2) Admin Endpoints
 

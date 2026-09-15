@@ -1150,6 +1150,19 @@ if(Python3_Interpreter_FOUND)
     TIMEOUT 60
     ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
 
+  # /v1/tokenize contract (W6, three-way co-design): exact token counts
+  # without generation. Error paths run model-free against the stub origin.
+  add_test(
+    NAME IntegrationTokenizeContract
+    COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
+            StubIntegrationTests.test_tokenize_requires_input
+            StubIntegrationTests.test_tokenize_backend_unavailable_default_model
+            StubIntegrationTests.test_tokenize_explicit_model_not_found)
+  set_tests_properties(IntegrationTokenizeContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
+
   add_test(
     NAME IntegrationModelIdentityContract
     COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py

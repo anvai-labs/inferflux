@@ -48,6 +48,21 @@ std::string BuildStreamChunkForTest(const std::string &content,
 // Test hook for the request-body parser (defined in http_server.cpp).
 CompletionRequestPayload ParseJsonPayloadForTest(const std::string &body);
 
+// /v1/tokenize request parse result (W6, three-way co-design: gateways need
+// exact token counts without generating).
+struct TokenizeRequest {
+  bool ok{false};
+  std::string error;
+  std::string model;
+  std::vector<std::string> inputs;
+};
+
+// Test hooks for the /v1/tokenize request parser and response builder
+// (defined in http_server.cpp).
+TokenizeRequest ParseTokenizeRequestForTest(const std::string &body);
+std::string BuildTokenizeBodyForTest(const std::string &model,
+                                     const std::vector<int> &token_counts);
+
 class HttpServer {
 public:
   struct TlsConfig {
