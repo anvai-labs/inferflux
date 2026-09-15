@@ -124,14 +124,32 @@ RenderHarmony(const std::vector<std::pair<std::string, std::string>> &messages,
          "included for every message.";
   out += "<|end|>";
 
+  // Leading system/developer-role messages map to harmony's "developer"
+  // block. The real template only ever reads messages[0] — a stricter
+  // transcription would silently drop a second leading system message,
+  // which InferFlux's HTTP layer produces routinely (BuildToolSystemPrompt
+  // prepends its own synthesized system message ahead of the caller's real
+  // one when tools[] is present). Fold every leading system/developer
+  // message into one combined block instead of dropping the rest — an
+  // intentional divergence from strict transcription to avoid silent
+  // instruction loss, not a transcription error. "developer" is also
+  // recognized directly: it's the role OpenAI-compatible clients targeting
+  // reasoning models increasingly send instead of "system".
   std::size_t start_idx = 0;
-  if (!messages.empty() && messages[0].first == "system") {
-    // Harmony's convention: the leading system-role message maps to the
-    // "developer" role, distinct from the fixed system preamble above.
+  std::string developer_content;
+  while (start_idx < messages.size() &&
+         (messages[start_idx].first == "system" ||
+          messages[start_idx].first == "developer")) {
+    if (!developer_content.empty()) {
+      developer_content += "\n\n";
+    }
+    developer_content += messages[start_idx].second;
+    ++start_idx;
+  }
+  if (!developer_content.empty()) {
     out += "<|start|>developer<|message|># Instructions\n\n";
-    out += messages[0].second;
+    out += developer_content;
     out += "\n\n<|end|>";
-    start_idx = 1;
   }
 
   for (std::size_t i = start_idx; i < messages.size(); ++i) {
@@ -143,10 +161,10 @@ RenderHarmony(const std::vector<std::pair<std::string, std::string>> &messages,
       out +=
           "<|start|>assistant<|channel|>final<|message|>" + content + "<|end|>";
     }
-    // Other roles (a stray mid-conversation "system", or "tool" without
-    // tool-calling support) are dropped, matching gpt-oss's own template —
-    // its per-turn loop only handles assistant/tool/user, and a mid-list
-    // system message matches none of those branches there either.
+    // Other roles (a stray mid-conversation "system"/"developer", or "tool"
+    // without tool-calling support) are dropped, matching gpt-oss's own
+    // template — its per-turn loop only handles assistant/tool/user, and a
+    // mid-list system message matches none of those branches there either.
   }
 
   if (add_assistant_prefix) {

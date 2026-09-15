@@ -143,3 +143,35 @@ TEST_CASE("RenderChatTemplate: harmony has no developer block when no "
   const std::string out = RenderChatTemplate("<|channel|>", messages, false);
   REQUIRE(out.find("<|start|>developer") == std::string::npos);
 }
+
+TEST_CASE("RenderChatTemplate: harmony maps a leading developer role to the "
+          "developer block",
+          "[chat_template_renderer]") {
+  // OpenAI-compatible clients targeting reasoning models increasingly send
+  // "developer" directly instead of "system".
+  const Messages messages = {{"developer", "Be concise."}, {"user", "hi"}};
+  const std::string out = RenderChatTemplate("<|channel|>", messages, false);
+  REQUIRE(out.find("<|start|>developer<|message|># Instructions\n\n"
+                   "Be concise.\n\n<|end|>") != std::string::npos);
+}
+
+TEST_CASE("RenderChatTemplate: harmony folds multiple leading system/"
+          "developer messages into one developer block instead of dropping "
+          "them",
+          "[chat_template_renderer]") {
+  // InferFlux's HTTP layer prepends a synthesized system message ahead of
+  // the caller's own when tools[] is present (BuildToolSystemPrompt); the
+  // real gpt-oss template only ever reads messages[0], which would
+  // silently drop the caller's real instructions in that combination.
+  const Messages messages = {{"system", "TOOL SCHEMA: {...}"},
+                             {"system", "Always answer in French."},
+                             {"user", "hi"}};
+  const std::string out = RenderChatTemplate("<|channel|>", messages, false);
+  REQUIRE(out.find("<|start|>developer<|message|># Instructions\n\n"
+                   "TOOL SCHEMA: {...}\n\nAlways answer in French.\n\n"
+                   "<|end|>") != std::string::npos);
+  // Only one developer block, not two.
+  REQUIRE(out.find("<|start|>developer", out.find("<|start|>developer") + 1) ==
+          std::string::npos);
+  REQUIRE(out.find("<|start|>user<|message|>hi<|end|>") != std::string::npos);
+}
