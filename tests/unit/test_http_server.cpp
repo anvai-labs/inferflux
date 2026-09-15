@@ -73,8 +73,8 @@ TEST_CASE("Completion JSON replaces malformed model UTF-8",
 namespace {
 nlohmann::json JsonSchemaRequest(const nlohmann::json &json_schema_field) {
   return {{"model", "default"},
-          {"messages", nlohmann::json::array({{{"role", "user"},
-                                               {"content", "hello"}}})},
+          {"messages",
+           nlohmann::json::array({{{"role", "user"}, {"content", "hello"}}})},
           {"response_format",
            {{"type", "json_schema"}, {"json_schema", json_schema_field}}}};
 }
@@ -105,8 +105,7 @@ TEST_CASE("json_schema wrapper extracts the inner schema object",
 TEST_CASE("json_schema tolerates a bare inlined schema", "[http_server]") {
   const nlohmann::json bare = {{"type", "object"},
                                {"properties", {{"n", {{"type", "integer"}}}}}};
-  const auto payload =
-      ParseJsonPayloadForTest(JsonSchemaRequest(bare).dump());
+  const auto payload = ParseJsonPayloadForTest(JsonSchemaRequest(bare).dump());
 
   REQUIRE(payload.response_format_ok);
   REQUIRE(payload.response_format_schema == bare.dump());
@@ -118,13 +117,11 @@ TEST_CASE("json_schema wrapper markers guard the schema property",
   // mistaken for the OpenAI wrapper: without name/strict markers the whole
   // object is the schema.
   const nlohmann::json bare_with_schema_prop = {
-      {"type", "object"},
-      {"properties", {{"schema", {{"type", "string"}}}}}};
+      {"type", "object"}, {"properties", {{"schema", {{"type", "string"}}}}}};
   const auto bare_payload =
       ParseJsonPayloadForTest(JsonSchemaRequest(bare_with_schema_prop).dump());
   REQUIRE(bare_payload.response_format_ok);
-  REQUIRE(bare_payload.response_format_schema ==
-          bare_with_schema_prop.dump());
+  REQUIRE(bare_payload.response_format_schema == bare_with_schema_prop.dump());
 
   // A wrapper with only one of the markers is still a wrapper.
   const nlohmann::json inner = {{"type", "string"}};
@@ -489,4 +486,63 @@ TEST_CASE("HttpServer admin pools status tolerates missing metrics registry",
   REQUIRE_FALSE(status.distributed_kv.tickets_acknowledged_total.has_value());
   REQUIRE_FALSE(status.distributed_kv.tickets_committed_total.has_value());
   REQUIRE_FALSE(status.distributed_kv.tickets_timed_out_total.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// /v1/tokenize — request parsing + response building (W6, three-way
+// co-design: gateways need exact token counts without generating).
+// ---------------------------------------------------------------------------
+
+TEST_CASE("ParseTokenizeRequest accepts a single string input",
+          "[http_server][tokenize]") {
+  const auto req = ParseTokenizeRequestForTest(
+      R"({"model":"default","input":"hello world"})");
+  REQUIRE(req.ok);
+  REQUIRE(req.model == "default");
+  REQUIRE(req.inputs == std::vector<std::string>{"hello world"});
+}
+
+TEST_CASE("ParseTokenizeRequest accepts an array input", "[http_server]") {
+  const auto req = ParseTokenizeRequestForTest(R"({"input":["a","bb","ccc"]})");
+  REQUIRE(req.ok);
+  REQUIRE(req.model.empty());
+  REQUIRE(req.inputs == std::vector<std::string>({"a", "bb", "ccc"}));
+}
+
+TEST_CASE("ParseTokenizeRequest skips non-string array items like "
+          "embeddings",
+          "[http_server]") {
+  const auto req =
+      ParseTokenizeRequestForTest(R"({"input":["a",42,null,"b"]})");
+  REQUIRE(req.ok);
+  REQUIRE(req.inputs == std::vector<std::string>({"a", "b"}));
+}
+
+TEST_CASE("ParseTokenizeRequest rejects a missing input", "[http_server]") {
+  const auto req = ParseTokenizeRequestForTest(R"({"model":"default"})");
+  REQUIRE_FALSE(req.ok);
+  REQUIRE_FALSE(req.error.empty());
+}
+
+TEST_CASE("ParseTokenizeRequest rejects an empty input array",
+          "[http_server]") {
+  const auto req = ParseTokenizeRequestForTest(R"({"input":[]})");
+  REQUIRE_FALSE(req.ok);
+  REQUIRE_FALSE(req.error.empty());
+}
+
+TEST_CASE("ParseTokenizeRequest rejects a malformed body", "[http_server]") {
+  const auto req = ParseTokenizeRequestForTest("{not json");
+  REQUIRE_FALSE(req.ok);
+  REQUIRE_FALSE(req.error.empty());
+}
+
+TEST_CASE("BuildTokenizeBody carries per-input counts and their total",
+          "[http_server]") {
+  const std::string body = BuildTokenizeBodyForTest("qwen3-14b", {3, 5, 0});
+  const auto j = nlohmann::json::parse(body);
+  REQUIRE(j["object"] == "tokenize");
+  REQUIRE(j["model"] == "qwen3-14b");
+  REQUIRE(j["tokens"] == nlohmann::json::array({3, 5, 0}));
+  REQUIRE(j["input_tokens"] == 8);
 }

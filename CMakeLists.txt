@@ -1150,6 +1150,19 @@ if(Python3_Interpreter_FOUND)
     TIMEOUT 60
     ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
 
+  # /v1/tokenize contract (W6, three-way co-design): exact token counts
+  # without generation. Error paths run model-free against the stub origin.
+  add_test(
+    NAME IntegrationTokenizeContract
+    COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
+            StubIntegrationTests.test_tokenize_requires_input
+            StubIntegrationTests.test_tokenize_backend_unavailable_default_model
+            StubIntegrationTests.test_tokenize_explicit_model_not_found)
+  set_tests_properties(IntegrationTokenizeContract PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
+
   add_test(
     NAME IntegrationModelIdentityContract
     COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
@@ -1289,12 +1302,25 @@ if(Python3_Interpreter_FOUND)
     NAME IntegrationStubReasoning
     COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
             StubIntegrationReasoningTests.test_streaming_reasoning_separation
-            StubIntegrationReasoningTests.test_non_streaming_reasoning_separation)
+            StubIntegrationReasoningTests.test_non_streaming_reasoning_separation
+            StubIntegrationReasoningTests.test_client_request_header_round_trips_in_header_and_body)
   set_tests_properties(IntegrationStubReasoning PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
     ENVIRONMENT
       "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERFLUX_STUB_COMPLETION=<think>chain of thought</think>visible answer")
+
+  add_test(
+    NAME IntegrationStubReasoningHarmony
+    COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
+            StubIntegrationReasoningTests.test_streaming_reasoning_separation
+            StubIntegrationReasoningTests.test_non_streaming_reasoning_separation
+            StubIntegrationReasoningTests.test_client_request_header_round_trips_in_header_and_body)
+  set_tests_properties(IntegrationStubReasoningHarmony PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 60
+    ENVIRONMENT
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERFLUX_STUB_COMPLETION=<|channel|>analysis<|message|>chain of thought<|end|><|start|>assistant<|channel|>final<|message|>visible answer<|return|>")
 
   add_test(NAME ShmSmoke
            COMMAND ${Python3_EXECUTABLE} tests/integration/shm_smoke_test.py)
