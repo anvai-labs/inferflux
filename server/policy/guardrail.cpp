@@ -21,8 +21,7 @@ std::vector<std::string> NormalizeWords(const std::vector<std::string> &words) {
 } // namespace
 
 void Guardrail::SetBlocklist(const std::vector<std::string> &words) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  blocklist_ = NormalizeWords(words);
+  UpdateBlocklist(words);
 }
 
 void Guardrail::UpdateBlocklist(const std::vector<std::string> &words) {

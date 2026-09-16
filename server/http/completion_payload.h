@@ -12,6 +12,8 @@
 #include <nlohmann/json.hpp>
 
 #include <cstdint>
+#include <ctime>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -43,6 +45,14 @@ struct ToolCallResult {
   // Visible text left after removing the detected tool call (whitespace
   // trimmed). Empty when the completion was purely a tool call, so
   // non-streaming chat bodies can emit content: null per the OpenAI shape.
+  std::string remaining_text;
+};
+
+// Aggregate returned by DetectToolCalls: every extracted call plus the
+// visible prose left over after the calls were removed. remaining_text lives
+// here (once) rather than duplicated on each call.
+struct ToolCallExtraction {
+  std::vector<ToolCallResult> calls;
   std::string remaining_text;
 };
 
@@ -99,5 +109,26 @@ std::string BuildErrorBody(const std::string &error);
 std::string BuildResponse(const std::string &body, int status = 200,
                           std::string_view status_text = "OK",
                           const std::string &extra_headers = "");
+
+/// Tool-call extraction (shared by the single, multi, and streaming
+/// completion paths; implementation in completion_payload.cpp). Exposed so
+/// inferflux_tests (which link inferflux_core) exercise the real
+/// implementation instead of a ported copy.
+ToolCallExtraction DetectToolCalls(const std::string &text);
+
+/// One OpenAI tool_call entry: {"id","type","function"{name,arguments}}.
+/// `index` is included only when engaged (streaming frames carry it).
+nlohmann::json BuildToolCallEntry(const ToolCallResult &tc,
+                                  std::optional<int> index);
+
+/// SSE frames for a detected tool call batch: role frame, per-call
+/// name/arguments frames with tool_call index, single
+/// finish_reason="tool_calls" frame.
+std::string BuildToolCallStreamChunks(const std::string &id,
+                                      std::string_view model, std::time_t ts,
+                                      const std::vector<ToolCallResult> &tool_calls);
+
+/// Debug log for JSON parse failures (level: debug).
+void LogJsonParseFailure(const char *context, const std::exception &ex);
 
 } // namespace inferflux
