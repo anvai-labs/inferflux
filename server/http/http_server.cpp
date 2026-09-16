@@ -3344,16 +3344,30 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
     }
     std::string guard_reason;
-    if (guardrail_ && guardrail_->Enabled() &&
-        !guardrail_->Check(req.prompt, &guard_reason)) {
-      auto payload =
-          BuildResponse(BuildErrorBody(guard_reason), 400, "Bad Request");
-      SendAll(session, payload);
-      if (audit_logger_) {
-        audit_logger_->Log(auth_ctx.subject, parsed.model, "blocked",
-                           guard_reason);
+    if (guardrail_ && guardrail_->Enabled()) {
+      // Scan only caller-authored text: the raw completions prompt and
+      // user-role chat turns. The rendered prompt also carries system
+      // prompts and tool results that routinely quote repo content, and
+      // keyword-blocking those hard-400s the request - because agent
+      // clients replay their context on every turn, one flagged tool
+      // result would poison the session permanently.
+      std::string guard_text = parsed.prompt;
+      for (const auto &m : parsed.messages) {
+        if (m.role == "user") {
+          guard_text += m.content;
+          guard_text += '\n';
+        }
       }
-      return;
+      if (!guardrail_->Check(guard_text, &guard_reason)) {
+        auto payload =
+            BuildResponse(BuildErrorBody(guard_reason), 400, "Bad Request");
+        SendAll(session, payload);
+        if (audit_logger_) {
+          audit_logger_->Log(auth_ctx.subject, parsed.model, "blocked",
+                             guard_reason);
+        }
+        return;
+      }
     }
     // ── Multi-completion path (n>1 or best_of>1) ──────────────────────────
     // Must be handled before the streaming setup because n>1 is incompatible
