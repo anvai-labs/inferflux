@@ -1,0 +1,59 @@
+# InferFlux ROCm config - Qwen3-Coder-30B-A3B (UD-Q4_K_XL) on R9700 (gfx1201 / WSL2)
+# Model store: /mnt/c/Users/vjsin/inferflux-models/<model-id>/  (Windows drive, 492G free)
+server:
+  host: 0.0.0.0
+  http_port: 8080
+  max_concurrent: 1024
+  enable_metrics: true
+  enable_tracing: false
+
+models:
+  - id: qwen3-coder-30b
+    path: /mnt/c/Users/vjsin/inferflux-models/qwen3-coder-30b-a3b/Qwen3-Coder-30B-A3B-Instruct-UD-Q4_K_XL.gguf
+    format: gguf
+    backend: rocm
+    default: true
+
+runtime:
+  backend_priority: [rocm, cpu]
+  rocm:
+    enabled: true
+    flash_attention:
+      enabled: true
+    device_id: 0
+  # llama.cpp wrapper pool: 65536 total ctx across 2 sequences = 32768 per
+  # sequence (agentic prompts) - env INFERFLUX_LLAMA_CTX_SIZE at launch is the
+  # authoritative path for ctx_size.
+  llama:
+    max_parallel_sequences: 2
+  backend_exposure:
+    prefer_inferflux: false
+    allow_llama_cpp_fallback: true
+  capability_routing:
+    allow_default_fallback: true
+    require_ready_backend: true
+    fallback_scope: any_compatible
+  scheduler:
+    max_batch_size: 16
+    max_batch_tokens: 16384
+    # Solo coding-agent traffic: admit immediately - the 100ms full-wave
+    # gather in server.rocm.yaml only pays off at c=16 batch throughput.
+    min_batch_size: 1
+    batch_accumulation_ms: 2
+  tensor_parallel: 1
+  mps_layers: 0
+  paged_kv:
+    cpu_pages: 4096
+    eviction: lru
+
+adapters: []
+
+auth:
+  api_keys:
+    - key: dev-key-123
+      scopes: [generate, read, admin]
+  rate_limit_per_minute: 120
+
+logging:
+  level: info
+  format: text

@@ -4,7 +4,7 @@
 /// @brief Shared types for HTTP request parsing and response building.
 ///
 /// Extracted from http_server.cpp (Phase C2) to enable reuse across
-/// completion_payload.cpp, sse_streaming.cpp, and tool_call_detection.cpp.
+/// completion_payload.cpp and server/http/http_server.cpp.
 
 #include "runtime/multimodal/image_preprocessor.h"
 #include "scheduler/request_batch.h"
@@ -40,6 +40,10 @@ struct ToolCallResult {
   std::string call_id;
   std::string function_name;
   std::string arguments_json; // JSON-encoded arguments object.
+  // Visible text left after removing the detected tool call (whitespace
+  // trimmed). Empty when the completion was purely a tool call, so
+  // non-streaming chat bodies can emit content: null per the OpenAI shape.
+  std::string remaining_text;
 };
 
 struct CompletionRequestPayload {

@@ -1732,6 +1732,9 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
   active_max_batch_ = max_batch;
   active_max_seq_ = max_seq;
   GlobalMetrics().SetInferfluxCudaKvMaxSeq(max_seq);
+  // The sequence (slot) count is max_batch; the singular field above is the
+  // per-slot token extent. The scheduler clamps slot ids to this count.
+  GlobalMetrics().SetInferfluxCudaKvMaxSequences(max_batch);
 
   if (kv_plan.auto_tuned_seq) {
     log::Info(

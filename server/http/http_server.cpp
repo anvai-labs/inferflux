@@ -610,128 +610,209 @@ std::string BuildToolSystemPrompt(const std::vector<Tool> &tools,
 //   [{"name":"...","arguments":{...}}]
 //
 // Returns the first detected tool call or an empty result.
-ToolCallResult DetectToolCall(const std::string &text) {
-  ToolCallResult result;
+// Leading/trailing-whitespace trim for the visible text left over after
+// detected tool calls are removed from a completion.
+static std::string TrimWs(const std::string &sv) {
+  const auto a = sv.find_first_not_of(" \t\r\n");
+  if (a == std::string::npos) return {};
+  const auto b = sv.find_last_not_of(" \t\r\n");
+  return sv.substr(a, b - a + 1);
+}
 
-  // Helper: populate result from a parsed JSON object that has "name" key.
-  auto fill_from_obj = [&](const json &tc) -> bool {
-    if (!tc.contains("name") || !tc["name"].is_string())
-      return false;
-    result.function_name = tc["name"].get<std::string>();
-    result.call_id = "call_" + result.function_name + "_0";
-    const char *args_key =
-        tc.contains("arguments")
-            ? "arguments"
-            : (tc.contains("parameters") ? "parameters" : nullptr);
-    if (args_key && tc.contains(args_key)) {
-      result.arguments_json = tc[args_key].is_object()
-                                  ? tc[args_key].dump()
-                                  : tc[args_key].get<std::string>();
-    } else {
-      result.arguments_json = "{}";
+// Index one past the '}' matching the '{' at `start`, tracking JSON string
+// literals (escapes included) so braces inside argument payloads don't
+// misnest. std::string::npos when unbalanced.
+static std::size_t ScanBalancedObject(const std::string &sv,
+                                      std::size_t start) {
+  int depth = 0;
+  bool in_str = false;
+  bool esc = false;
+  for (std::size_t k = start; k < sv.size(); ++k) {
+    const char c = sv[k];
+    if (in_str) {
+      if (esc) {
+        esc = false;
+      } else if (c == '\\') {
+        esc = true;
+      } else if (c == '"') {
+        in_str = false;
+      }
+      continue;
     }
-    result.detected = true;
+    if (c == '"') {
+      in_str = true;
+    } else if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      if (--depth == 0) return k + 1;
+      if (depth < 0) return std::string::npos;
+    }
+  }
+  return std::string::npos;
+}
+
+// Extract EVERY tool call in `text`. Accepted shapes per call:
+//   {"tool_call":{"name":...,"arguments":...}}   (InferFlux convention)
+//   {"name":"...","arguments"|"parameters":...}  (OpenAI-style bare object)
+//   <tool_call>{"name":...}</tool_call>          (Hermes / Qwen XML), and
+//   [TOOL_CALLS] [{...},{...}]                   (Mistral)
+// Models routinely emit several calls in one completion (one per line when
+// chaining, e.g. write-then-run), which a single-object parse rejects as
+// "Extra data". Non-tool prose survives as each result's remaining_text.
+std::vector<ToolCallResult> DetectToolCalls(const std::string &text) {
+  std::vector<ToolCallResult> calls;
+  auto fill = [&calls](const json &obj) -> bool {
+    json tc = obj;
+    if (tc.contains("tool_call") && tc["tool_call"].is_object())
+      tc = tc["tool_call"];
+    if (!tc.is_object() || !tc.contains("name") || !tc["name"].is_string())
+      return false;
+    ToolCallResult r;
+    r.function_name = tc["name"].get<std::string>();
+    r.call_id =
+        "call_" + r.function_name + "_" + std::to_string(calls.size());
+    const char *args_key = tc.contains("arguments")
+                               ? "arguments"
+                               : (tc.contains("parameters") ? "parameters"
+                                                            : nullptr);
+    if (args_key && tc.contains(args_key)) {
+      r.arguments_json = tc[args_key].is_object() ? tc[args_key].dump()
+                                                  : tc[args_key].get<std::string>();
+    } else {
+      r.arguments_json = "{}";
+    }
+    r.detected = true;
+    calls.push_back(std::move(r));
     return true;
   };
 
-  // Format 1: {"tool_call":{...}}  (InferFlux preamble convention)
-  auto try_inferflux = [&](const std::string &s) -> bool {
-    try {
-      auto j = json::parse(s);
-      if (j.contains("tool_call") && j["tool_call"].is_object())
-        return fill_from_obj(j["tool_call"]);
-    } catch (const json::exception &ex) {
-      LogJsonParseFailure("ExtractToolCall.try_inferflux", ex);
-    }
-    return false;
-  };
-  if (try_inferflux(text))
-    return result;
+  // 1) <tool_call>...</tool_call> spans — all of them, arrays supported.
+  static const std::string kOpenTag = "<tool_call>";
+  static const std::string kCloseTag = "</tool_call>";
+  std::string residual;
+  residual.reserve(text.size());
   {
-    auto pos = text.find("{\"tool_call\"");
-    if (pos != std::string::npos && try_inferflux(text.substr(pos)))
-      return result;
+    std::size_t pos = 0;
+    while (true) {
+      const auto a = text.find(kOpenTag, pos);
+      if (a == std::string::npos) break;
+      const auto b = text.find(kCloseTag, a + kOpenTag.size());
+      if (b == std::string::npos) break;
+      residual.append(text, pos, a - pos);
+      const std::string inner =
+          TrimWs(text.substr(a + kOpenTag.size(), b - a - kOpenTag.size()));
+      bool matched = false;
+      try {
+        const auto j = json::parse(inner);
+        if (j.is_object()) {
+          matched = fill(j);
+        } else if (j.is_array()) {
+          for (const auto &el : j)
+            if (el.is_object()) matched = fill(el) || matched;
+        }
+      } catch (const json::exception &ex) {
+        LogJsonParseFailure("DetectToolCalls.tool_call_tag", ex);
+      }
+      if (!matched) residual.append(text, a, b + kCloseTag.size() - a);
+      pos = b + kCloseTag.size();
+    }
+    residual.append(text, pos, text.size() - pos);
   }
 
-  // Format 3: <tool_call>…</tool_call>  (Hermes / Llama-3.1)
+  // 2) [TOOL_CALLS] [{...},...] (Mistral) — walk bracket depth for the
+  //    matching ']' so trailing prose doesn't break the parse.
   {
-    static const std::string open_tag = "<tool_call>";
-    static const std::string close_tag = "</tool_call>";
-    auto a = text.find(open_tag);
-    auto b = text.find(close_tag);
-    if (a != std::string::npos && b != std::string::npos && b > a) {
-      std::string inner =
-          text.substr(a + open_tag.size(), b - a - open_tag.size());
-      // Trim whitespace
-      auto ws_start = inner.find_first_not_of(" \t\r\n");
-      auto ws_end = inner.find_last_not_of(" \t\r\n");
-      if (ws_start != std::string::npos)
-        inner = inner.substr(ws_start, ws_end - ws_start + 1);
+    static const std::string kMistral = "[TOOL_CALLS]";
+    for (;;) {
+      const auto tag = residual.find(kMistral);
+      if (tag == std::string::npos) break;
+      const auto bracket = residual.find('[', tag + kMistral.size());
+      if (bracket == std::string::npos) break;
+      int depth = 0;
+      bool in_str = false;
+      bool esc = false;
+      std::size_t close = std::string::npos;
+      for (std::size_t k = bracket; k < residual.size(); ++k) {
+        const char c = residual[k];
+        if (in_str) {
+          if (esc) esc = false;
+          else if (c == '\\') esc = true;
+          else if (c == '"') in_str = false;
+          continue;
+        }
+        if (c == '"') in_str = true;
+        else if (c == '[') ++depth;
+        else if (c == ']') {
+          if (--depth == 0) {
+            close = k;
+            break;
+          }
+        }
+      }
+      if (close == std::string::npos) break;
+      bool matched = false;
       try {
-        auto j = json::parse(inner);
-        if (j.is_object() && fill_from_obj(j))
-          return result;
+        const auto arr = json::parse(residual.substr(bracket, close - bracket + 1));
+        if (arr.is_array()) {
+          for (const auto &el : arr)
+            if (el.is_object()) matched = fill(el) || matched;
+        }
       } catch (const json::exception &ex) {
-        LogJsonParseFailure("ExtractToolCall.tool_call_tag", ex);
+        LogJsonParseFailure("DetectToolCalls.mistral", ex);
+      }
+      if (matched) {
+        residual.erase(tag, close + 1 - tag);
+      } else {
+        // Not a usable array; keep scanning after this occurrence.
+        const std::string after = residual.substr(close + 1);
+        residual = residual.substr(0, tag + kMistral.size()) + after;
+        break;
       }
     }
   }
 
-  // Format 4: [TOOL_CALLS] [{"name":"...","arguments":{...}}]  (Mistral)
-  // Mistral models may append [/TOOL_CALLS] after the JSON array.  Parsing
-  // text.substr(bracket) to end-of-string fails because nlohmann::json rejects
-  // trailing non-JSON content.  Walk the bracket depth to find the matching ']'
-  // and parse only that bounded substring.
+  // 3) Bare JSON objects — one or many, brace-balanced so adjacent calls
+  //    or surrounding prose never yield "Extra data".
   {
-    static const std::string mistral_tag = "[TOOL_CALLS]";
-    auto pos = text.find(mistral_tag);
-    if (pos != std::string::npos) {
-      auto bracket = text.find('[', pos + mistral_tag.size());
-      if (bracket != std::string::npos) {
-        // Find matching closing bracket, tracking nesting depth.
-        std::size_t depth = 0;
-        std::size_t close = std::string::npos;
-        for (std::size_t i = bracket; i < text.size(); ++i) {
-          if (text[i] == '[')
-            ++depth;
-          else if (text[i] == ']') {
-            if (--depth == 0) {
-              close = i;
-              break;
+    std::string out;
+    out.reserve(residual.size());
+    std::size_t i = 0;
+    while (i < residual.size()) {
+      if (residual[i] == '{') {
+        const auto end = ScanBalancedObject(residual, i);
+        if (end != std::string::npos) {
+          const std::string cand = residual.substr(i, end - i);
+          if (cand.find("\"tool_call\"") != std::string::npos ||
+              cand.find("\"name\"") != std::string::npos) {
+            bool filled = false;
+            try {
+              filled = fill(json::parse(cand));
+            } catch (const json::exception &ex) {
+              LogJsonParseFailure("DetectToolCalls.bare_object", ex);
+            }
+            if (filled) {
+              i = end;
+              continue;
             }
           }
         }
-        if (close != std::string::npos) {
-          try {
-            auto arr = json::parse(text.substr(bracket, close - bracket + 1));
-            if (arr.is_array() && !arr.empty() && arr[0].is_object() &&
-                fill_from_obj(arr[0]))
-              return result;
-          } catch (const json::exception &ex) {
-            LogJsonParseFailure("ExtractToolCall.mistral_tool_calls", ex);
-          }
-        }
       }
+      out += residual[i++];
     }
+    residual = std::move(out);
   }
 
-  // Format 2: bare {"name":"...","arguments":{...}}  (generic OpenAI-style
-  // output)
-  {
-    auto pos = text.find("{\"name\"");
-    if (pos != std::string::npos) {
-      try {
-        auto j = json::parse(text.substr(pos));
-        if (j.is_object() && fill_from_obj(j))
-          return result;
-      } catch (const json::exception &ex) {
-        LogJsonParseFailure("ExtractToolCall.bare_name_object", ex);
-      }
-    }
-  }
-
-  return result;
+  if (calls.empty()) return calls;
+  const std::string remaining = TrimWs(residual);
+  for (auto &r : calls) r.remaining_text = remaining;
+  return calls;
 }
+
+ToolCallResult DetectToolCall(const std::string &text) {
+  auto calls = DetectToolCalls(text);
+  return calls.empty() ? ToolCallResult{} : std::move(calls.front());
+}
+
 
 // Build logprobs JSON for one result (shared helper).
 // Chat format: {"content":[...]}; completions format: {tokens, token_logprobs,
@@ -775,47 +856,6 @@ static json BuildLogprobsJson(const InferenceResult &result, bool chat_mode) {
   }
 }
 
-// Build one choice object for a single result.
-static json BuildChoice(int idx, const InferenceResult &result,
-                        const std::string &reasoning_content,
-                        const ToolCallResult &tool_call, bool chat_mode) {
-  json logprobs_json = BuildLogprobsJson(result, chat_mode);
-  if (chat_mode) {
-    if (tool_call.detected) {
-      json tc_arr =
-          json::array({{{"id", tool_call.call_id},
-                        {"type", "function"},
-                        {"function",
-                         {{"name", tool_call.function_name},
-                          {"arguments", tool_call.arguments_json}}}}});
-      return {{"index", idx},
-              {"message",
-               {{"role", "assistant"},
-                {"content", nullptr},
-                {"tool_calls", tc_arr}}},
-              {"logprobs", logprobs_json},
-              {"finish_reason", "tool_calls"}};
-    } else {
-      const std::string fr = result.finish_reason_length ? "length" : "stop";
-      return {{"index", idx},
-              {"message",
-               reasoning_content.empty()
-                   ? json{{"role", "assistant"}, {"content", result.completion}}
-                   : json{{"role", "assistant"},
-                          {"content", result.completion},
-                          {"reasoning_content", reasoning_content}}},
-              {"logprobs", logprobs_json},
-              {"finish_reason", fr}};
-    }
-  } else {
-    const std::string fr = result.finish_reason_length ? "length" : "stop";
-    return {{"index", idx},
-            {"text", result.completion},
-            {"logprobs", logprobs_json},
-            {"finish_reason", fr}};
-  }
-}
-
 // Process-wide monotonic completion-id sequence. Shared by the buffered
 // body builder below and the streaming setup in HandleClient so every
 // completion id on every path is unique within the process (epoch-ms plus
@@ -828,7 +868,7 @@ std::atomic<uint64_t> completion_seq{0};
 std::string BuildCompletionBody(
     const std::vector<InferenceResult> &results, int total_completion_tokens,
     const CompletionRequestPayload &request, bool chat_mode,
-    const std::vector<ToolCallResult> &tool_calls,
+    const std::vector<std::vector<ToolCallResult>> &tool_calls,
     const std::string &reasoning_content = {}, int reasoning_tokens = 0,
     ChatTemplateFamily chat_template_family = ChatTemplateFamily::kChatML) {
   auto now = std::chrono::system_clock::now();
@@ -914,21 +954,46 @@ std::string BuildCompletionBody(
     (void)choice;
     json choice_json;
     if (chat_mode) {
-      const ToolCallResult &tc = (i < static_cast<int>(tool_calls.size()))
-                                     ? tool_calls[i]
-                                     : ToolCallResult{};
-      const std::string fr =
-          results[i].finish_reason_length ? "length" : "stop";
+      const auto empty_calls = std::vector<ToolCallResult>{};
+      const auto &tcs = (i < static_cast<int>(tool_calls.size()))
+                            ? tool_calls[i]
+                            : empty_calls;
+      json message = {{"role", "assistant"}};
+      if (!tcs.empty()) {
+        // Non-streaming tool calls ride message.tool_calls with finish_reason
+        // "tool_calls", mirroring the streaming emitter
+        // (BuildToolCallStreamChunks) and the OpenAI chat shape. The tool-call
+        // text is removed from visible content; anything the model wrote
+        // around it stays in content (null when the completion was purely
+        // tool calls).
+        json tc_arr = json::array();
+        for (const auto &tc : tcs) {
+          tc_arr.push_back({{"id", tc.call_id},
+                            {"type", "function"},
+                            {"function",
+                             {{"name", tc.function_name},
+                              {"arguments", tc.arguments_json}}}});
+        }
+        message["tool_calls"] = std::move(tc_arr);
+        message["content"] =
+            tcs.front().remaining_text.empty()
+                ? json(nullptr)
+                : json(tcs.front().remaining_text);
+      } else {
+        message["content"] = per_result_content;
+      }
+      if (!per_result_reasoning.empty()) {
+        message["reasoning_content"] = per_result_reasoning;
+      }
       choice_json = {
           {"index", i},
-          {"message",
-           per_result_reasoning.empty()
-               ? json{{"role", "assistant"}, {"content", per_result_content}}
-               : json{{"role", "assistant"},
-                      {"content", per_result_content},
-                      {"reasoning_content", per_result_reasoning}}},
+          {"message", std::move(message)},
           {"logprobs", json::object()},
-          {"finish_reason", fr}};
+          {"finish_reason",
+           !tcs.empty()
+               ? std::string("tool_calls")
+               : std::string(results[i].finish_reason_length ? "length"
+                                                             : "stop")}};
     } else {
       choice_json = {{"index", i},
                      {"text", per_result_content},
@@ -953,13 +1018,15 @@ std::string BuildCompletionBody(
 // Single-result overload: preserves the original call sites unchanged.
 std::string BuildCompletionBody(
     const InferenceResult &result, const CompletionRequestPayload &request,
-    bool chat_mode, const ToolCallResult &tool_call = ToolCallResult{},
+    bool chat_mode,
+    std::vector<ToolCallResult> tool_calls = std::vector<ToolCallResult>{},
     const std::string &reasoning_content = {}, int reasoning_tokens = 0,
     ChatTemplateFamily chat_template_family = ChatTemplateFamily::kChatML) {
   return BuildCompletionBody(
       std::vector<InferenceResult>{result}, result.completion_tokens, request,
-      chat_mode, std::vector<ToolCallResult>{tool_call}, reasoning_content,
-      reasoning_tokens, chat_template_family);
+      chat_mode, std::vector<std::vector<ToolCallResult>>{
+                     std::move(tool_calls)},
+      reasoning_content, reasoning_tokens, chat_template_family);
 }
 
 std::string BuildErrorBody(const std::string &error) {
@@ -1172,11 +1239,11 @@ std::string BuildStreamChunkForTest(const std::string &content,
 //   2. tool_calls[0] with id + type + function.name + empty arguments
 //   3. tool_calls[0] function.arguments (full JSON string)
 //   4. finish_reason=tool_calls, empty delta
-std::string BuildToolCallStreamChunks(const std::string &id,
-                                      std::string_view model, std::time_t ts,
-                                      const ToolCallResult &tc) {
+std::string BuildToolCallStreamChunks(
+    const std::string &id, std::string_view model, std::time_t ts,
+    const std::vector<ToolCallResult> &tool_calls) {
   std::string out;
-  out.reserve(4096);
+  out.reserve(4096 * (tool_calls.size() + 1));
   auto base = [&]() -> json {
     json j;
     j["id"] = id;
@@ -1186,7 +1253,7 @@ std::string BuildToolCallStreamChunks(const std::string &id,
     return j;
   };
 
-  // Chunk 1: role=assistant, content=null
+  // Chunk 1: role=assistant, content=null (once for the message)
   {
     json j = base();
     j["choices"] =
@@ -1196,32 +1263,38 @@ std::string BuildToolCallStreamChunks(const std::string &id,
     out += "data: " + j.dump() + "\n\n";
   }
 
-  // Chunk 2: tool_calls[0] — id, type, function name, empty arguments
-  {
-    json j = base();
-    json tc_delta = json::array(
-        {{{"index", 0},
-          {"id", tc.call_id},
-          {"type", "function"},
-          {"function", {{"name", tc.function_name}, {"arguments", ""}}}}});
-    j["choices"] = json::array({{{"index", 0},
-                                 {"delta", {{"tool_calls", tc_delta}}},
-                                 {"finish_reason", nullptr}}});
-    out += "data: " + j.dump() + "\n\n";
+  // Per call: id/type/name frame with empty arguments, then the arguments
+  // frame — tool_call `index` distinguishes parallel calls per the OpenAI
+  // streaming shape.
+  for (std::size_t k = 0; k < tool_calls.size(); ++k) {
+    const ToolCallResult &tc = tool_calls[k];
+    const int call_index = static_cast<int>(k);
+    {
+      json j = base();
+      json tc_delta = json::array(
+          {{{"index", call_index},
+            {"id", tc.call_id},
+            {"type", "function"},
+            {"function", {{"name", tc.function_name}, {"arguments", ""}}}}});
+      j["choices"] = json::array({{{"index", 0},
+                                   {"delta", {{"tool_calls", tc_delta}}},
+                                   {"finish_reason", nullptr}}});
+      out += "data: " + j.dump() + "\n\n";
+    }
+
+    if (!tc.arguments_json.empty()) {
+      json j = base();
+      json arg_delta = json::array({{{"index", call_index},
+                                     {"function",
+                                      {{"arguments", tc.arguments_json}}}}});
+      j["choices"] = json::array({{{"index", 0},
+                                   {"delta", {{"tool_calls", arg_delta}}},
+                                   {"finish_reason", nullptr}}});
+      out += "data: " + j.dump() + "\n\n";
+    }
   }
 
-  // Chunk 3: function arguments
-  if (!tc.arguments_json.empty()) {
-    json j = base();
-    json arg_delta = json::array(
-        {{{"index", 0}, {"function", {{"arguments", tc.arguments_json}}}}});
-    j["choices"] = json::array({{{"index", 0},
-                                 {"delta", {{"tool_calls", arg_delta}}},
-                                 {"finish_reason", nullptr}}});
-    out += "data: " + j.dump() + "\n\n";
-  }
-
-  // Chunk 4: finish_reason=tool_calls
+  // Final frame: finish_reason=tool_calls (once for the message)
   {
     json j = base();
     j["choices"] = json::array({{{"index", 0},
@@ -3377,8 +3450,8 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
 
       // Detect tool calls per choice.
-      std::vector<ToolCallResult> tool_calls;
-      tool_calls.reserve(all_results.size());
+      std::vector<std::vector<ToolCallResult>> per_result_tool_calls;
+      per_result_tool_calls.reserve(all_results.size());
       for (auto &r : all_results) {
         if (use_tools) {
           bool is_stub =
@@ -3392,12 +3465,12 @@ void HttpServer::HandleClient(ClientSession &session) {
               tc.function_name = "stub_tool";
             tc.call_id = "call_stub_" + tc.function_name;
             tc.arguments_json = json{{"reason", "no_model_available"}}.dump();
-            tool_calls.push_back(std::move(tc));
+            per_result_tool_calls.push_back({std::move(tc)});
           } else {
-            tool_calls.push_back(DetectToolCall(r.completion));
+            per_result_tool_calls.push_back(DetectToolCalls(r.completion));
           }
         } else {
-          tool_calls.push_back(ToolCallResult{});
+          per_result_tool_calls.push_back({});
         }
       }
 
@@ -3424,8 +3497,9 @@ void HttpServer::HandleClient(ClientSession &session) {
       SendAll(session,
               BuildResponse(BuildCompletionBody(
                                 all_results, total_completion_tokens, parsed,
-                                chat_mode, tool_calls, reasoning_content,
-                                reasoning_tokens, chat_template_family),
+                                chat_mode, per_result_tool_calls,
+                                reasoning_content, reasoning_tokens,
+                                chat_template_family),
                             200, "OK", mc_trace_hdr));
       return;
     }
@@ -3647,8 +3721,11 @@ void HttpServer::HandleClient(ClientSession &session) {
             std::lock_guard<std::mutex> lock(*stream_mutex);
             bool stub_split_reasoning = false;
             if (nb_tc.detected) {
-              SendAll(session, BuildToolCallStreamChunks(
-                                   stream_id, parsed.model, stream_ts, nb_tc));
+              SendAll(session,
+                      BuildToolCallStreamChunks(stream_id, parsed.model,
+                                                stream_ts,
+                                                std::vector<ToolCallResult>{
+                                                    std::move(nb_tc)}));
             } else {
               std::string stub_content = result.completion;
               if (stream_splitter) {
@@ -3713,8 +3790,9 @@ void HttpServer::HandleClient(ClientSession &session) {
           stream_active->store(false);
         } else {
           auto payload = BuildResponse(
-              BuildCompletionBody(result, parsed, chat_mode, ToolCallResult{},
-                                  {}, 0, chat_template_family),
+              BuildCompletionBody(result, parsed, chat_mode,
+                                  std::vector<ToolCallResult>{}, {}, 0,
+                                  chat_template_family),
               200, "OK", trace_response_header);
           SendAll(session, payload);
         }
@@ -3737,9 +3815,9 @@ void HttpServer::HandleClient(ClientSession &session) {
                                   result.completion, result.prompt_tokens,
                                   result.completion_tokens);
       }
-      // §2.3: detect tool call in model output (used by non-streaming
-      // responses).
-      ToolCallResult tool_call;
+      // §2.3: detect tool calls in model output — models chain several
+      // calls per completion (e.g. write then run), so extract them all.
+      std::vector<ToolCallResult> tool_calls;
       if (use_tools) {
         bool stub_completion =
             result.no_backend ||
@@ -3761,10 +3839,12 @@ void HttpServer::HandleClient(ClientSession &session) {
           json arguments = {
               {"reason", "no_model_available"},
               {"hint", "set INFERFLUX_MODEL_PATH or configure models[]"}};
-          tool_call.detected = true;
-          tool_call.function_name = fallback_name;
-          tool_call.call_id = "call_stub_" + fallback_name;
-          tool_call.arguments_json = arguments.dump();
+          ToolCallResult stub_call;
+          stub_call.detected = true;
+          stub_call.function_name = fallback_name;
+          stub_call.call_id = "call_stub_" + fallback_name;
+          stub_call.arguments_json = arguments.dump();
+          tool_calls.push_back(std::move(stub_call));
           std::string log_line = "[tools] stub tool call for " + fallback_name;
           LogToolEvent(log_line);
           std::cout << log_line << std::endl;
@@ -3773,7 +3853,7 @@ void HttpServer::HandleClient(ClientSession &session) {
                                arguments.dump());
           }
         } else {
-          tool_call = DetectToolCall(result.completion);
+          tool_calls = DetectToolCalls(result.completion);
         }
       }
       if (parsed.stream) {
@@ -3813,12 +3893,12 @@ void HttpServer::HandleClient(ClientSession &session) {
                                                       stream_ts));
               stream_had_chunk->store(true);
             }
-            if (tool_call.detected) {
-              // §2.3: emit structured tool_calls delta sequence (role → name →
-              // args → finish).
+            if (!tool_calls.empty()) {
+              // §2.3: emit structured tool_calls delta sequence (role →
+              // per-call name/args → finish).
               SendAll(session,
                       BuildToolCallStreamChunks(stream_id, parsed.model,
-                                                stream_ts, tool_call));
+                                                stream_ts, tool_calls));
             } else if (buffer_tokens && !token_buffer->empty()) {
               // Model produced plain text despite tools[] being present (no
               // tool call detected).  Replay the buffered tokens as content
@@ -3902,7 +3982,7 @@ void HttpServer::HandleClient(ClientSession &session) {
           }
         }
         auto payload = BuildResponse(
-            BuildCompletionBody(result, parsed, chat_mode, tool_call,
+            BuildCompletionBody(result, parsed, chat_mode, tool_calls,
                                 result.reasoning_content,
                                 result.reasoning_tokens, chat_template_family),
             200, "OK", trace_response_header);
