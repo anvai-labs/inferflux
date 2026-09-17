@@ -155,8 +155,8 @@ cpack --config build/CPackConfig.cmake -G WIX
 
 | Check | Command |
 |---|---|
-| Binary starts | `inferfluxd --help` |
-| CLI works | `inferctl --help` |
+| Binary starts | `inferfluxd --help` (prints usage, exits 0) |
+| CLI works | `inferctl --help` (prints usage, exits 1) |
 | Health endpoint | `curl -s http://127.0.0.1:8080/livez` |
 | Model listing | `./build/inferctl models --api-key dev-key-123` |
 

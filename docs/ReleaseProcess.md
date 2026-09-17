@@ -36,12 +36,34 @@ flowchart LR
 2. Confirm `Dual-GPU gate result` passed for the same commit SHA.
 3. Retain the matching `cuda-gate-<sha>` and `rocm-gate-<sha>` artifacts.
 4. Confirm pre-release packaging completed from `release.yml`.
-5. Smoke-test installers from artifacts.
+5. Confirm every packaging job's installer/archive smoke passed before artifact upload.
 6. Tag the tested commit: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 7. Confirm tagged run publishes a GitHub Release; verify assets and checksums.
 
 If the promoted SHA did not match the GPU workflow path filter, manually
 dispatch `GPU Behavioral Gates` on `main` before step 2.
+
+### Automated package smoke
+
+`scripts/smoke_release_packages.py` fails packaging on missing/duplicate artifacts,
+installation failure, missing binaries, unexpected exit status, or missing help output.
+It executes each artifact's own binaries: `inferctl --help` prints `Usage:` and exits
+**1**; `inferfluxd --help` prints `usage: inferfluxd` and exits **0**.
+
+| Artifact | Hosted runner check before upload |
+|---|---|
+| Linux TGZ (x86_64/arm64) | Extract and run both binaries |
+| Linux DEB (x86_64/arm64) | `apt-get install`, run installed binaries, remove package; CPack derives ABI dependencies |
+| Linux RPM (x86_64/arm64) | `rpm --install --nodeps` into an isolated root, run installed binaries using Ubuntu libraries |
+| macOS TGZ / DMG | Extract TGZ; verify and mount DMG, copy payload, run both binaries, detach |
+| macOS PKG | Execute `installer -pkg ... -target /`, run installed binaries |
+| Windows ZIP / MSI | Extract ZIP and run binaries; execute `msiexec /i`, run installed binaries, uninstall |
+
+The RPM check verifies installer payload execution, **not RPM dependency resolution**:
+Ubuntu's installed dependencies are tracked by dpkg. Fedora/RHEL compatibility needs
+a separate check on that target distribution. Archive extraction and DMG copying are
+not installer execution. These checks need no model and do not replace exact-SHA GPU
+evidence, endpoint tests, signing/notarization, or clean-machine dependency validation.
 
 ## 4) Release Docs Gate (Must Pass)
 

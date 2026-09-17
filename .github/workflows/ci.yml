@@ -115,6 +115,9 @@ jobs:
       - name: Assert docs contract gate
         run: python3 scripts/check_docs_contract.py
 
+      - name: Test release package smoke orchestration
+        run: python3 tests/integration/release_package_smoke_test.py
+
   # ---------------------------------------------------------------------------
   # Primary build + test job
   # Builds a CPU-only release binary, runs the full unit + stub-integration
