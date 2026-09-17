@@ -607,8 +607,20 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
   // indexes device memory by raw sequence id. Backends that publish no
   // capacity (metric 0) keep the historical defaults.
   size_t slot_capacity = kMaxSequenceSlots;
-  if (const int kv_capacity = metrics_->GetInferfluxCudaKvMaxSequences();
-      kv_capacity > 0) {
+  int kv_capacity = metrics_->GetInferfluxCudaKvMaxSequences();
+  // Slots are shared across models: conservatively fit every loaded backend,
+  // independently of model load order or a last-writer-wins telemetry gauge.
+  if (router_) {
+    for (const auto &model : router_->ListModels()) {
+      auto backend = router_->GetBackend(model.id);
+      const int capacity = backend ? backend->SequenceCapacity() : 0;
+      if (capacity > 0) {
+        kv_capacity =
+            kv_capacity > 0 ? std::min(kv_capacity, capacity) : capacity;
+      }
+    }
+  }
+  if (kv_capacity > 0) {
     if (config_.max_batch_size > kv_capacity) {
       log::Info("scheduler", "Clamping scheduler max_batch_size " +
                                  std::to_string(config_.max_batch_size) +
@@ -1101,7 +1113,8 @@ void Scheduler::DecodeWorkerLoop() {
                 if (!pkt->kv_blob.empty() && pending->resolved_backend) {
                   uint64_t seq_generation = 0;
                   int seq_id = AllocSeqSlot(
-                      static_cast<int64_t>(pending->sequence), &seq_generation);
+                      static_cast<int64_t>(pending->sequence), &seq_generation,
+                      pending->resolved_backend->SequenceCapacity());
                   if (seq_id >= 0) {
                     if (pending->resolved_backend->HydrateSequence(
                             seq_id, pkt->kv_blob)) {
@@ -2081,10 +2094,14 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
 
         uint64_t seq_generation =
             reused_session_state ? cached_seq_generation : 0;
-        int seq_id = reused_session_state
-                         ? cached_seq_id
-                         : AllocSeqSlot(static_cast<int64_t>(pending->sequence),
-                                        &seq_generation);
+        int seq_id =
+            reused_session_state
+                ? cached_seq_id
+                : AllocSeqSlot(
+                      static_cast<int64_t>(pending->sequence), &seq_generation,
+                      pending->resolved_backend
+                          ? pending->resolved_backend->SequenceCapacity()
+                          : 0);
         // Admission logic (§ Item 4): can admit if we have a seq slot AND
         // (no paged cache configured OR new blocks were successfully reserved).
         bool can_admit = (seq_id >= 0) && (!cache_ || new_blocks_needed == 0 ||
@@ -2793,12 +2810,13 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
   fairness_controller_.ApplyTimeslice(&batch_entries);
 }
 
-int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out) {
+int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out,
+                            int sequence_capacity) {
   PollDeferredSequenceRetirements();
   if (!slot_manager_) {
     return -1;
   }
-  auto lease = slot_manager_->AcquireLease(request_id);
+  auto lease = slot_manager_->AcquireLease(request_id, sequence_capacity);
   if (!lease && prefix_cache_) {
     // Slot pressure: every slot is held by a warm radix donation. Retire the
     // LRU donated sequence (the eviction callback clears its backend KV and
@@ -2807,7 +2825,7 @@ int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out) {
     // slots (issue #161). EvictOneSequence returns false once the trie has
     // no more sequences to give up.
     while (!lease && prefix_cache_->EvictOneSequence()) {
-      lease = slot_manager_->AcquireLease(request_id);
+      lease = slot_manager_->AcquireLease(request_id, sequence_capacity);
     }
   }
   if (!lease) {

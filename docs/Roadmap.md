@@ -53,6 +53,22 @@ flowchart LR
 | 10 | FTR-004 (features/README) | Operators buy predictable service, not peak-token anecdotes | SLO admission, routing, and capacity signals validated under load |
 | 11 | FTR-005 (features/README) | Distribution magnifies lifecycle errors and follows single-node rigor | Worker-loss and ownership matrix passes in multi-process CI |
 
+## September 17, 2026 Progress: v0.3.0 Candidate
+
+The candidate now includes develop `d10b5bbc5507f6dfacac9165cf04ed140dd462a0` (#179), release
+portability/installer-smoke changes, and independently reviewed tool-stream/parser/KV fixes.
+The [release candidate record](releases/v0.3.0.md) identifies the reviewed source and evidence.
+
+| Workstream | Completed candidate scope | Remaining exit evidence |
+|---|---|---|
+| Agent/origin contract (FTR-002, ADR-0006) | Multi-tool-call ordering; reasoning, visible prose, and terminal usage in tool streams; opaque ordinary JSON | Final-source three-repository conformance and hosted CI; broader Responses/structured-output scope remains open |
+| Sequence capacity (TD-007) | Per-context llama bounds, startup minimum across loaded models, bounded request leases; load-order regression tests | Exact-main CUDA/ROCm and loaded-model lifecycle/capacity evidence; TD-007 is not closed by CPU tests |
+| Release evidence (TD-002, ADR-0005) | MSVC renderer check and installer/archive smoke gates implemented; eight offline orchestration tests pass | Hosted CI, actual CUDA/ROCm jobs and artifacts, native package smoke, then promotion/tag/publication verification |
+| Local verification | Implementer: 47/47 CTest groups and 70 focused cases; reviewer: 22 cases/223 assertions independently passed | Record final committed SHA and keep later code changes tied to fresh evidence |
+
+Earlier candidate and main results remain historical. v0.3.0 publication is pending; this
+progress does not close the runtime proof-or-pivot, tenant isolation, or distributed fault gates.
+
 ## Critical-Path Gantt
 
 ```mermaid
@@ -162,4 +178,3 @@ rank discovery and sequencing; acceptance evidence, not the score, authorizes re
 | Local UX prototype | Confirm autostart policy and endpoint/context precedence |
 | Tenant contract | Confirm identity source and isolation threat model |
 | Distributed proof | Confirm the next topology solves a measured SLO/cost constraint |
-

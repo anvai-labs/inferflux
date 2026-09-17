@@ -132,7 +132,8 @@ public:
   // FreeSeqSlot() may also be called from DecodeWorkerLoop or RadixPrefixCache
   // eviction — callers must hold queue_mutex_ when calling from a
   // non-worker-loop context.
-  int AllocSeqSlot(int64_t request_id = -1, uint64_t *generation_out = nullptr);
+  int AllocSeqSlot(int64_t request_id = -1, uint64_t *generation_out = nullptr,
+                   int sequence_capacity = 0);
   void FreeSeqSlot(int slot, uint64_t generation = 0,
                    std::shared_ptr<LlamaCppBackend> backend = nullptr);
 

@@ -21,6 +21,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  release-provenance:
+    name: Release source provenance
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Record actual triggering ref
+        run: python3 scripts/release_eligibility.py record-source --output source.json
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-release-source-${{ github.sha }}-${{ github.run_attempt }}
+          path: source.json
+          if-no-files-found: error
+          retention-days: 30
+
   template-portability:
     name: Chat template portability (Windows MSVC)
     runs-on: windows-2022
@@ -114,6 +131,11 @@ jobs:
         uses: actions/checkout@v4
       - name: Assert docs contract gate
         run: python3 scripts/check_docs_contract.py
+
+      - name: Test release package smoke orchestration
+        run: |
+          python3 tests/integration/release_package_smoke_test.py
+          python3 tests/integration/release_eligibility_test.py
 
   # ---------------------------------------------------------------------------
   # Primary build + test job

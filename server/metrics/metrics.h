@@ -316,6 +316,10 @@ public:
   int GetInferfluxCudaKvMaxSequences() const {
     return inferflux_cuda_kv_max_sequences_.load(std::memory_order_relaxed);
   }
+  void SetInferfluxCudaKvMaxSequences(int max_sequences) {
+    inferflux_cuda_kv_max_sequences_.store(max_sequences,
+                                           std::memory_order_relaxed);
+  }
   void SetInferfluxCudaKvMaxSeq(int max_seq) {
     inferflux_cuda_kv_max_seq_.store(max_seq, std::memory_order_relaxed);
   }

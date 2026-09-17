@@ -8,21 +8,45 @@ on:
 
 permissions:
   contents: read
+  actions: read
 
 env:
   BUILD_TYPE: Release
-  RELEASE_REF: ${{ github.event.workflow_run.head_sha }}
-  HEAD_BRANCH: ${{ github.event.workflow_run.head_branch || '' }}
-  # workflow_run.head_branch for a tag push is the bare tag name (e.g. "v1.0.0"),
-  # NOT "refs/tags/v1.0.0" — so we match on the semver prefix instead.
-  IS_TAG_RELEASE: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/') }}
-  SHOULD_PACKAGE: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
 
 jobs:
+  eligibility:
+    name: Validate release source and evidence
+    runs-on: ubuntu-24.04
+    outputs:
+      package: ${{ steps.validate.outputs.package }}
+      publish: ${{ steps.validate.outputs.publish }}
+      sha: ${{ steps.validate.outputs.sha }}
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+    steps:
+      - name: Checkout trusted default-branch validator
+        uses: actions/checkout@v7
+        with:
+          # workflow_run's github.sha belongs to the default branch, unlike
+          # event.workflow_run.head_sha which is still untrusted here.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate triggering CI, provenance, refs and GPU evidence
+        id: validate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/release_eligibility.py check
+          --event "$GITHUB_EVENT_PATH" --repository "$GITHUB_REPOSITORY"
+          --output "$GITHUB_OUTPUT"
+
   linux-packages:
     name: Linux (tgz/deb/rpm)
-    runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
+    runs-on: ubuntu-24.04
+    needs: eligibility
+    if: needs.eligibility.outputs.package == 'true'
+    env:
+      RELEASE_REF: ${{ needs.eligibility.outputs.sha }}
 
     steps:
       - name: Checkout (with submodules)
@@ -79,6 +103,13 @@ jobs:
           mv inferflux-*Linux*.rpm artifacts/linux/ 2>/dev/null || true
           ls -R artifacts/linux
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Smoke Linux packages
+        run: python scripts/smoke_release_packages.py --packages artifacts/linux
+
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -92,7 +123,10 @@ jobs:
   linux-arm64-packages:
     name: Linux arm64 (tgz/deb/rpm)
     runs-on: ubuntu-24.04-arm
-    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
+    needs: eligibility
+    if: needs.eligibility.outputs.package == 'true'
+    env:
+      RELEASE_REF: ${{ needs.eligibility.outputs.sha }}
 
     steps:
       - name: Checkout (with submodules)
@@ -149,6 +183,13 @@ jobs:
           mv inferflux-*Linux-aarch64*.rpm artifacts/linux-arm64/ 2>/dev/null || true
           ls -R artifacts/linux-arm64
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Smoke Linux arm64 packages
+        run: python scripts/smoke_release_packages.py --packages artifacts/linux-arm64
+
       - name: Upload Linux arm64 artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -159,7 +200,10 @@ jobs:
   mac-packages:
     name: macOS (tgz/pkg/dmg)
     runs-on: macos-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
+    needs: eligibility
+    if: needs.eligibility.outputs.package == 'true'
+    env:
+      RELEASE_REF: ${{ needs.eligibility.outputs.sha }}
 
     steps:
       - name: Checkout (with submodules)
@@ -207,6 +251,13 @@ jobs:
           mv inferflux-*.dmg artifacts/macos/ 2>/dev/null || true
           ls -R artifacts/macos
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Smoke macOS packages
+        run: python scripts/smoke_release_packages.py --packages artifacts/macos
+
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -217,7 +268,10 @@ jobs:
   windows-packages:
     name: Windows (MSI)
     runs-on: windows-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
+    needs: eligibility
+    if: needs.eligibility.outputs.package == 'true'
+    env:
+      RELEASE_REF: ${{ needs.eligibility.outputs.sha }}
 
     steps:
       - name: Checkout (with submodules)
@@ -267,6 +321,13 @@ jobs:
           Get-ChildItem -Path . -Filter "inferflux-*.zip" | ForEach-Object { Copy-Item $_.FullName artifacts/windows/ }
           Get-ChildItem -Recurse artifacts/windows
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Smoke Windows packages
+        run: python scripts/smoke_release_packages.py --packages artifacts/windows
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -276,9 +337,11 @@ jobs:
 
   manifests:
     name: Homebrew & Winget manifests
-    runs-on: ubuntu-latest
-    needs: [linux-packages, mac-packages, windows-packages]
-    if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
+    runs-on: ubuntu-24.04
+    needs: [eligibility, linux-packages, mac-packages, windows-packages]
+    if: needs.eligibility.outputs.package == 'true'
+    env:
+      RELEASE_REF: ${{ needs.eligibility.outputs.sha }}
 
     steps:
       - name: Checkout (templates)
@@ -306,118 +369,15 @@ jobs:
           name: windows-packages
           path: _artifacts/windows
 
-      - name: Derive metadata
-        id: meta
-        shell: bash
+      - name: Render pinned Homebrew and Winget manifests
         env:
-          HEAD_BRANCH: ${{ env.HEAD_BRANCH }}
-          RELEASE_REF: ${{ env.RELEASE_REF }}
-        run: |
-          branch="${HEAD_BRANCH}"
-          sha="${RELEASE_REF}"
-          # workflow_run.head_branch for a tag push is the bare tag name
-          # (e.g. "v1.0.0"), not "refs/tags/v1.0.0".  Detect by semver prefix.
-          if [[ "$branch" =~ ^v[0-9]+\.[0-9]+ && "$branch" != */* ]]; then
-            tag="$branch"
-            version="${tag#v}"
-            is_tag="true"
-            src_url="https://github.com/inferencial/InferFlux/archive/refs/tags/${tag}.tar.gz"
-          elif [[ "$branch" == "main" ]]; then
-            short="${sha:0:7}"
-            tag="nightly-${short}"
-            version="0.0.0-dev-${short}"
-            is_tag="false"
-            src_url="https://github.com/inferencial/InferFlux/archive/${sha}.tar.gz"
-          else
-            short="${sha:0:7}"
-            tag="snapshot-${short}"
-            version="0.0.0-dev-${short}"
-            is_tag="false"
-            src_url="https://github.com/inferencial/InferFlux/archive/${sha}.tar.gz"
-          fi
-          curl -sSL "$src_url" -o source.tar.gz
-          src_sha=$(sha256sum source.tar.gz | awk '{print $1}')
-          msi_path=$(ls _artifacts/windows/*.msi | head -n 1)
-          msi_name=$(basename "$msi_path")
-          msi_sha=$(sha256sum "$msi_path" | awk '{print $1}')
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "is_tag=$is_tag" >> "$GITHUB_OUTPUT"
-          echo "src_url=$src_url" >> "$GITHUB_OUTPUT"
-          echo "src_sha=$src_sha" >> "$GITHUB_OUTPUT"
-          echo "msi_name=$msi_name" >> "$GITHUB_OUTPUT"
-          echo "msi_sha=$msi_sha" >> "$GITHUB_OUTPUT"
-
-      - name: Render manifests
-        shell: bash
-        env:
-          SRC_URL: ${{ steps.meta.outputs.src_url }}
-          SRC_SHA: ${{ steps.meta.outputs.src_sha }}
-          VERSION: ${{ steps.meta.outputs.version }}
-          MSI_TAG: ${{ steps.meta.outputs.tag }}
-          MSI_NAME: ${{ steps.meta.outputs.msi_name }}
-          MSI_SHA: ${{ steps.meta.outputs.msi_sha }}
-          IS_TAG: ${{ steps.meta.outputs.is_tag }}
-        run: |
-          mkdir -p artifacts/manifests/homebrew
-
-          # Homebrew formula is valid for both tag and nightly builds because
-          # the source URL points to an existing commit/tag archive on GitHub.
-          cat > artifacts/manifests/homebrew/inferflux.rb <<EOF
-          class Inferflux < Formula
-            desc "InferFlux inference server and CLI"
-            homepage "https://github.com/inferencial/InferFlux"
-            url "${SRC_URL}"
-            version "${VERSION}"
-            sha256 "${SRC_SHA}"
-            license "Apache-2.0"
-
-            depends_on "cmake" => :build
-            depends_on "openssl@3"
-            depends_on "yaml-cpp"
-
-            def install
-              system "cmake", "-S", ".", "-B", "build", "-DENABLE_WEBUI=ON", *std_cmake_args
-              system "cmake", "--build", "build", "-j"
-              bin.install "build/inferfluxd", "build/inferctl"
-              pkgshare.install "docs/Quickstart.md"
-            end
-
-            test do
-              assert_match "Usage", shell_output("#{bin}/inferctl status --help", 1)
-            end
-          end
-          EOF
-
-          # Winget manifests reference release download URLs that only exist
-          # once a GitHub Release is published.  Only generate for tagged builds;
-          # nightly/snapshot runs never produce a GitHub Release so those URLs
-          # would be permanently dead.
-          if [[ "${IS_TAG}" == "true" ]]; then
-            mkdir -p artifacts/manifests/winget
-            installer_url="https://github.com/inferencial/InferFlux/releases/download/${MSI_TAG}/${MSI_NAME}"
-            cat > artifacts/manifests/winget/inferencial.inferflux.yaml <<EOF
-          Id: Inferencial.InferFlux
-          Name: InferFlux
-          Publisher: Inferencial Labs
-          PublisherUrl: https://inferencial.ai
-          PackageUrl: https://github.com/inferencial/InferFlux
-          License: Apache-2.0
-          ShortDescription: C++ LLM inference server and CLI.
-          Moniker: inferflux
-          Version: ${VERSION}
-          InstallerType: wix
-          Installers:
-            - Architecture: x64
-              InstallerUrl: ${installer_url}
-              InstallerSha256: ${MSI_SHA}
-          Commands:
-            - inferfluxd
-            - inferctl
-          UpgradeBehavior: install
-          ReleaseNotesUrl: https://github.com/inferencial/InferFlux/releases/tag/${MSI_TAG}
-          EOF
-          fi
+          RELEASE_TAG: ${{ needs.eligibility.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.eligibility.outputs.version }}
+        run: >-
+          python3 scripts/release_eligibility.py render
+          --repository "$GITHUB_REPOSITORY" --sha "$RELEASE_REF"
+          --version "$RELEASE_VERSION" --tag "$RELEASE_TAG"
+          --packages _artifacts/windows --destination artifacts/manifests
 
       - name: Upload manifests
         uses: actions/upload-artifact@v7
@@ -428,9 +388,9 @@ jobs:
 
   create-release:
     name: Publish tagged release
-    needs: [linux-packages, linux-arm64-packages, mac-packages, windows-packages, manifests]
-    if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/') }}
-    runs-on: ubuntu-latest
+    needs: [eligibility, linux-packages, linux-arm64-packages, mac-packages, windows-packages, manifests]
+    if: needs.eligibility.outputs.publish == 'true'
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
 
@@ -456,20 +416,40 @@ jobs:
             done
           cat release-assets/sha256sums.txt
 
-      - name: Derive tag name
-        id: release_tag
-        run: |
-          ref="${HEAD_BRANCH}"
-          ref="${ref#refs/tags/}"
-          echo "value=$ref" >> $GITHUB_OUTPUT
+      - name: Revalidate immutable release tag
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
-          HEAD_BRANCH: ${{ env.HEAD_BRANCH }}
+          RELEASE_TAG: ${{ needs.eligibility.outputs.tag }}
+          RELEASE_SHA: ${{ needs.eligibility.outputs.sha }}
+        with:
+          script: |
+            const tag = process.env.RELEASE_TAG;
+            const expected = process.env.RELEASE_SHA;
+            if (!/^v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$/.test(tag) ||
+                !/^[0-9a-f]{40}$/.test(expected)) {
+              throw new Error('Invalid validated release identity');
+            }
+            const response = await github.rest.git.getRef({
+              ...context.repo, ref: `tags/${tag}`
+            });
+            let object = response.data.object;
+            for (let depth = 0; object.type === 'tag' && depth < 10; depth++) {
+              const peeled = await github.rest.git.getTag({
+                ...context.repo, tag_sha: object.sha
+              });
+              object = peeled.data.object;
+            }
+            // Excessive nesting remains type 'tag' and fails closed here.
+            if (object.type !== 'commit' || object.sha !== expected) {
+              throw new Error('Release tag no longer resolves to the tested SHA');
+            }
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.release_tag.outputs.value }}
-          name: InferFlux ${{ steps.release_tag.outputs.value }}
+          tag_name: ${{ needs.eligibility.outputs.tag }}
+          target_commitish: ${{ needs.eligibility.outputs.sha }}
+          name: InferFlux ${{ needs.eligibility.outputs.tag }}
           draft: false
           prerelease: false
           files: release-assets/**/* 
