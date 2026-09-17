@@ -4,6 +4,7 @@
 #include "runtime/backends/backend_utils.h"
 #include "runtime/execution/parallel_context.h"
 #include "server/logging/logger.h"
+#include "server/metrics/metrics.h"
 #include <cctype>
 
 #include <llama.h>
@@ -50,9 +51,18 @@ struct BatchSeqTokenInput {
   bool logits{false};
 };
 
-void BatchAddSeq(llama_batch &batch, const BatchSeqTokenInput &input) {
+// Each context owns its sequence capacity. A process-wide last-loaded model
+// bound can permit an out-of-range id into a smaller model's KV cache.
+void BatchAddSeq(llama_batch &batch, const llama_context *context,
+                 const BatchSeqTokenInput &input) {
   if (!batch.seq_id[batch.n_tokens]) {
     throw std::runtime_error("llama_batch capacity exceeded");
+  }
+  const int kv_seq_bound = static_cast<int>(llama_n_seq_max(context));
+  if (input.seq_id < 0 || input.seq_id >= kv_seq_bound) {
+    throw std::runtime_error("sequence id " + std::to_string(input.seq_id) +
+                             " outside llama KV pool (n_seq_max=" +
+                             std::to_string(kv_seq_bound) + ")");
   }
   batch.token[batch.n_tokens] = input.id;
   batch.pos[batch.n_tokens] = input.pos;
@@ -383,6 +393,9 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
   }
   n_vocab_ = llama_vocab_n_tokens(vocab_);
   config_ = config;
+
+  // Scheduler admission reads each backend's SequenceCapacity(), rather than
+  // overwriting a process-global CUDA metric with the last llama model loaded.
 
   // §P1f: Initialize Expert Parallel dispatcher.
   if (IsMoE()) {
@@ -980,9 +993,10 @@ LlamaCppBackend::Prefill(const std::string &prompt, int sequence_id) {
     std::size_t end = std::min(prompt_tokens.size(),
                                start + static_cast<std::size_t>(token_cap));
     for (std::size_t i = start; i < end; ++i) {
-      BatchAddSeq(batch, {prompt_tokens[i], static_cast<llama_pos>(i),
-                          static_cast<llama_seq_id>(sequence_id),
-                          /*logits=*/i == prompt_tokens.size() - 1});
+      BatchAddSeq(batch, context_,
+                  {prompt_tokens[i], static_cast<llama_pos>(i),
+                   static_cast<llama_seq_id>(sequence_id),
+                   /*logits=*/i == prompt_tokens.size() - 1});
     }
     if (llama_decode(context_, batch) != 0) {
       log::Error("llama_backend", "Prefill: llama_decode failed for seq " +
@@ -1081,10 +1095,11 @@ LlamaCppBackend::PrefillPartial(const std::string &prompt, int sequence_id,
   for (int start = n_past_start; start < n_total; start += token_cap) {
     int end = std::min(n_total, start + token_cap);
     for (int i = start; i < end; ++i) {
-      BatchAddSeq(batch, {prompt_tokens[static_cast<std::size_t>(i)],
-                          static_cast<llama_pos>(i),
-                          static_cast<llama_seq_id>(sequence_id),
-                          /*logits=*/i == n_total - 1});
+      BatchAddSeq(batch, context_,
+                  {prompt_tokens[static_cast<std::size_t>(i)],
+                   static_cast<llama_pos>(i),
+                   static_cast<llama_seq_id>(sequence_id),
+                   /*logits=*/i == n_total - 1});
     }
     if (llama_decode(context_, batch) != 0) {
       log::Error("llama_backend", "PrefillPartial: llama_decode failed seq " +
@@ -1166,8 +1181,9 @@ std::string LlamaCppBackend::Decode(
       llama_batch_free(batch);
       return output;
     }
-    BatchAddSeq(batch, {first_token, position++,
-                        static_cast<llama_seq_id>(sequence_id), true});
+    BatchAddSeq(batch, context_,
+                {first_token, position++,
+                 static_cast<llama_seq_id>(sequence_id), true});
     if (llama_decode(context_, batch) != 0) {
       llama_batch_free(batch);
       return output;
@@ -1224,8 +1240,9 @@ std::string LlamaCppBackend::Decode(
         }
       }
     }
-    BatchAddSeq(batch, {token, position++,
-                        static_cast<llama_seq_id>(sequence_id), true});
+    BatchAddSeq(
+        batch, context_,
+        {token, position++, static_cast<llama_seq_id>(sequence_id), true});
     if (llama_decode(context_, batch) != 0) {
       log::Error("llama_backend", "Decode: llama_decode failed for seq " +
                                       std::to_string(sequence_id));
@@ -1276,9 +1293,10 @@ LlamaCppBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
         inp.n_past -= static_cast<int>(discard);
       }
     }
-    BatchAddSeq(batch, {inp.feed_token, static_cast<llama_pos>(inp.n_past),
-                        static_cast<llama_seq_id>(inp.sequence_id),
-                        /*logits=*/true});
+    BatchAddSeq(batch, context_,
+                {inp.feed_token, static_cast<llama_pos>(inp.n_past),
+                 static_cast<llama_seq_id>(inp.sequence_id),
+                 /*logits=*/true});
   }
 
   if (llama_decode(context_, batch) != 0) {
@@ -1317,6 +1335,10 @@ bool LlamaCppBackend::SupportsAsyncUnifiedBatch() const { return false; }
 
 int LlamaCppBackend::UnifiedBatchTokenCapacity() const {
   return EffectiveBatchTokenCap(context_, config_.batch_size);
+}
+
+int LlamaCppBackend::SequenceCapacity() const {
+  return context_ ? static_cast<int>(llama_n_seq_max(context_)) : 0;
 }
 
 LlamaCppBackend::UnifiedBatchHandle LlamaCppBackend::SubmitUnifiedBatchAsync(
@@ -1423,7 +1445,7 @@ LlamaCppBackend::ExecuteUnifiedBatch(
       bool is_last = (j == inp.tokens.size() - 1);
       bool should_request = is_last && inp.request_logits;
 
-      BatchAddSeq(batch,
+      BatchAddSeq(batch, context_,
                   {inp.tokens[j], static_cast<llama_pos>(inp.n_past + j),
                    static_cast<llama_seq_id>(inp.sequence_id), should_request});
 
@@ -1933,9 +1955,10 @@ std::vector<float> LlamaCppBackend::Embed(const std::string &text) {
       config_.batch_size, static_cast<int32_t>(tokens.size()) + 1);
   llama_batch batch = llama_batch_init(batch_cap, 0, 1);
   for (std::size_t i = 0; i < tokens.size(); ++i) {
-    BatchAddSeq(batch, {tokens[i], static_cast<llama_pos>(i),
-                        /*seq_id=*/0,
-                        /*logits=*/i == tokens.size() - 1});
+    BatchAddSeq(batch, embed_ctx_,
+                {tokens[i], static_cast<llama_pos>(i),
+                 /*seq_id=*/0,
+                 /*logits=*/i == tokens.size() - 1});
   }
 
   if (llama_decode(embed_ctx_, batch) != 0) {

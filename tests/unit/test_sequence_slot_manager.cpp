@@ -89,6 +89,25 @@ TEST_CASE("SequenceSlotManager lease generations invalidate stale slot reuse",
   REQUIRE(manager.CurrentGeneration(reused->slot_id) == reused->generation);
 }
 
+TEST_CASE("SequenceSlotManager respects each model's addressable slot range",
+          "[slot_manager]") {
+  SequenceSlotManager manager(32);
+  for (int i = 0; i < 16; ++i) {
+    const auto lease = manager.AcquireLease(i, 16);
+    REQUIRE(lease.has_value());
+    REQUIRE(lease->slot_id < 16);
+  }
+  // A later-loaded smaller model must not receive a free but unaddressable id.
+  REQUIRE_FALSE(manager.AcquireLease(100, 16).has_value());
+  const auto larger = manager.AcquireLease(101, 32);
+  REQUIRE(larger.has_value());
+  REQUIRE(larger->slot_id == 16);
+  manager.ReleaseSlot(3);
+  const auto smaller = manager.AcquireLease(102, 16);
+  REQUIRE(smaller.has_value());
+  REQUIRE(smaller->slot_id == 3);
+}
+
 TEST_CASE("SequenceSlotManager rejects stale lease release after slot reuse",
           "[slot_manager]") {
   SequenceSlotManager manager(1);

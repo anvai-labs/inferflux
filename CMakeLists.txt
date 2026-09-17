@@ -718,6 +718,7 @@ add_executable(inferflux_tests
   tests/unit/test_flash_attn.cpp
   tests/unit/test_shm_transport.cpp
   tests/unit/test_chat_template.cpp
+  tests/unit/test_tool_calls.cpp
   tests/unit/test_mlx_tokenizer.cpp
   tests/unit/test_chat_template_renderer.cpp
   tests/unit/test_hf_tokenizer.cpp
@@ -983,7 +984,9 @@ set(CPACK_DMG_SLA_USE_RESOURCE_FILE_LICENSE OFF)
 set(CPACK_PACKAGE_FILE_NAME
     "${CPACK_PACKAGE_NAME}-${CPACK_PACKAGE_VERSION}-${CMAKE_SYSTEM_NAME}-${CMAKE_SYSTEM_PROCESSOR}")
 set(CPACK_STRIP_FILES TRUE)
-set(CPACK_DEBIAN_PACKAGE_DEPENDS "libssl3, libyaml-cpp0.7")
+# Derive ABI-specific dependencies from the built binaries (Ubuntu 24.04 uses
+# libyaml-cpp0.8 and libssl3t64; hard-coded older names make apt installation fail).
+set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
 set(CPACK_DEBIAN_PACKAGE_SECTION "utils")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 set(CPACK_RPM_PACKAGE_LICENSE "Apache-2.0")
