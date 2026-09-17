@@ -994,6 +994,10 @@ set(CPACK_RPM_PACKAGE_REQUIRES "openssl, yaml-cpp")
 set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION
     "${CMAKE_INSTALL_SYSCONFDIR}/inferflux")
 set(CPACK_GENERATOR "TGZ")
+if(APPLE)
+  set(CPACK_PROJECT_CONFIG_FILE
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CPackMacOS.cmake")
+endif()
 include(CPack)
 
 # ---------------------------------------------------------------------------

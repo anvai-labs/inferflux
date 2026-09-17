@@ -3,6 +3,8 @@
 import importlib.util
 import io
 from pathlib import Path
+import shutil
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -83,13 +85,102 @@ class PackageSmokeTests(unittest.TestCase):
         self.artifacts([f"inferflux-1-Linux.{ext}" for ext in ("tar.gz", "deb", "rpm")])
         with patch.object(smoke, "run") as run, patch.object(
             smoke, "smoke_archive"
-        ), patch.object(smoke, "smoke_binaries") as binaries:
+        ), patch.object(smoke, "smoke_deb_binaries") as deb_binaries, patch.object(
+            smoke, "smoke_binaries"
+        ) as binaries:
             smoke.smoke_linux(self.packages, self.scratch)
         calls = [call.args for call in run.call_args_list]
         self.assertEqual(calls[0][:4], ("sudo", "apt-get", "install", "-y"))
         self.assertIn("--install", calls[3])
         self.assertIn("--nodeps", calls[3])
-        self.assertEqual(binaries.call_args_list[1].args[0], self.scratch / "rpm-root")
+        deb_binaries.assert_called_once_with()
+        self.assertEqual(binaries.call_args_list[0].args[0], self.scratch / "rpm-root")
+
+    def test_deb_smokes_exact_package_owned_paths(self):
+        for prefix in ("/usr", "/usr/local", "/opt/inferflux"):
+            with self.subTest(prefix=prefix), patch.object(
+                smoke,
+                "run",
+                return_value=f"{prefix}/bin/inferctl\n{prefix}/bin/inferfluxd\n",
+            ) as run, patch.object(smoke, "smoke_binary_paths") as binaries:
+                smoke.smoke_deb_binaries()
+                run.assert_called_once_with("dpkg-query", "--listfiles", "inferflux")
+                binaries.assert_called_once_with(
+                    Path(prefix) / "bin/inferctl", Path(prefix) / "bin/inferfluxd"
+                )
+
+    def test_deb_missing_duplicate_or_relative_paths_fail(self):
+        for listing in (
+            "/usr/bin/inferctl\n",
+            "/usr/bin/inferctl\n/opt/bin/inferctl\n/usr/bin/inferfluxd\n",
+            "usr/bin/inferctl\n/usr/bin/inferfluxd\n",
+        ):
+            with self.subTest(listing=listing), patch.object(
+                smoke, "run", return_value=listing
+            ), patch.object(smoke, "smoke_binary_paths") as binaries:
+                with self.assertRaises(smoke.SmokeError):
+                    smoke.smoke_deb_binaries()
+                binaries.assert_not_called()
+
+    def test_deb_cleanup_runs_after_installed_binary_failure(self):
+        self.artifacts([f"inferflux-1-Linux.{ext}" for ext in ("tar.gz", "deb", "rpm")])
+        with patch.object(smoke, "run") as run, patch.object(
+            smoke, "smoke_archive"
+        ), patch.object(
+            smoke, "smoke_deb_binaries", side_effect=smoke.SmokeError("bad")
+        ):
+            with self.assertRaises(smoke.SmokeError):
+                smoke.smoke_linux(self.packages, self.scratch)
+        self.assertEqual(
+            run.call_args_list[-1].args,
+            ("sudo", "apt-get", "remove", "-y", "inferflux"),
+        )
+
+    def test_pkg_distribution_requires_referenced_payload(self):
+        valid = '<installer-gui-script><choices-outline><line choice="runtime"/></choices-outline><choice id="runtime"><pkg-ref id="ai.inferencial.inferflux.Unspecified"/></choice><pkg-ref id="ai.inferencial.inferflux.Unspecified">runtime.pkg</pkg-ref></installer-gui-script>'
+        distribution = self.scratch / "Distribution"
+        distribution.write_text(valid)
+        smoke.validate_pkg_distribution(self.scratch)
+        for invalid in (
+            "<installer-gui-script><choices-outline/></installer-gui-script>",
+            valid.replace('choice="runtime"', 'choice="missing"'),
+            valid.replace(">runtime.pkg</pkg-ref>", "></pkg-ref>"),
+            valid.replace(
+                'id="ai.inferencial.inferflux.Unspecified"/>', 'id="missing"/>'
+            ),
+        ):
+            distribution.write_text(invalid)
+            with self.assertRaises(smoke.SmokeError):
+                smoke.validate_pkg_distribution(self.scratch)
+
+    @unittest.skipUnless(
+        shutil.which("cmake"), "CMake is required for packaging config probe"
+    )
+    def test_productbuild_config_has_component_identifier_and_cli_prefix(self):
+        probe = self.scratch / "probe.cmake"
+        probe.write_text(f"""
+include("{ROOT / 'cmake/CPackMacOS.cmake'}")
+if(CPACK_GENERATOR STREQUAL "productbuild")
+  if(NOT CPACK_COMPONENTS_ALL STREQUAL "Unspecified" OR
+     NOT CPACK_PRODUCTBUILD_IDENTIFIER STREQUAL "ai.inferencial.inferflux" OR
+     NOT CPACK_PACKAGING_INSTALL_PREFIX STREQUAL "/usr/local")
+    message(FATAL_ERROR "Invalid CLI productbuild metadata")
+  endif()
+elseif(DEFINED CPACK_COMPONENTS_ALL OR DEFINED CPACK_PRODUCTBUILD_IDENTIFIER OR
+       DEFINED CPACK_PACKAGING_INSTALL_PREFIX)
+  message(FATAL_ERROR "Productbuild settings leaked to another generator")
+endif()
+""")
+        for generator in ("productbuild", "TGZ", "DragNDrop", "DEB", "RPM", "WIX"):
+            subprocess.run(
+                ["cmake", f"-DCPACK_GENERATOR={generator}", "-P", str(probe)],
+                check=True,
+            )
+        cmake = (ROOT / "CMakeLists.txt").read_text()
+        self.assertIn(
+            'if(APPLE)\n  set(CPACK_PROJECT_CONFIG_FILE\n      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CPackMacOS.cmake")\nendif()\ninclude(CPack)',
+            cmake,
+        )
 
     def test_macos_installs_pkg_and_detaches_dmg_on_smoke_failure(self):
         self.artifacts(
@@ -97,13 +188,34 @@ class PackageSmokeTests(unittest.TestCase):
         )
         with patch.object(smoke, "run") as run, patch.object(
             smoke, "smoke_archive"
-        ), patch.object(smoke.shutil, "copytree"), patch.object(
+        ), patch.object(
+            smoke, "validate_pkg_distribution"
+        ) as distribution, patch.object(
+            smoke.shutil, "copytree"
+        ), patch.object(
             smoke, "smoke_binaries", side_effect=[None, smoke.SmokeError("bad")]
         ):
             with self.assertRaises(smoke.SmokeError):
                 smoke.smoke_macos(self.packages, self.scratch)
-        self.assertEqual(run.call_args_list[0].args[:3], ("sudo", "installer", "-pkg"))
+        self.assertEqual(run.call_args_list[0].args[:2], ("pkgutil", "--expand"))
+        distribution.assert_called_once_with(self.scratch / "pkg-expanded")
+        self.assertEqual(run.call_args_list[1].args[:3], ("sudo", "installer", "-pkg"))
         self.assertEqual(run.call_args_list[-1].args[:2], ("hdiutil", "detach"))
+
+    def test_invalid_pkg_stops_before_native_installer(self):
+        self.artifacts(
+            ["inferflux-1-Darwin.tar.gz", "inferflux-1.pkg", "inferflux-1.dmg"]
+        )
+        with patch.object(smoke, "run") as run, patch.object(
+            smoke, "smoke_archive"
+        ), patch.object(
+            smoke, "validate_pkg_distribution", side_effect=smoke.SmokeError("empty")
+        ):
+            with self.assertRaises(smoke.SmokeError):
+                smoke.smoke_macos(self.packages, self.scratch)
+        self.assertEqual(
+            [call.args[:2] for call in run.call_args_list], [("pkgutil", "--expand")]
+        )
 
     def test_windows_executes_msi_and_uninstalls_after_binary_failure(self):
         self.artifacts(["inferflux-1.zip", "inferflux-1.msi"])
