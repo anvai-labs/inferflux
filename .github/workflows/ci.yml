@@ -21,6 +21,20 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  template-portability:
+    name: Chat template portability (Windows MSVC)
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - name: Configure dependency-free renderer tests
+        run: cmake -S tests/portability -B build-portability -A x64
+      - name: Compile and test the release renderer on MSVC
+        run: |
+          cmake --build build-portability --config Release
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ctest --test-dir build-portability -C Release --output-on-failure
+
   # ---------------------------------------------------------------------------
   # Path-aware gating: a change set that touches ONLY markdown skips the
   # heavy build matrix below. The docs contract gate stays unconditional
