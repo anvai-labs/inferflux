@@ -41,6 +41,8 @@ static std::size_t ScanBalancedObject(const std::string &sv,
   int depth = 0;
   bool in_str = false;
   bool esc = false;
+  const char open = sv[start];
+  const char close = open == '[' ? ']' : '}';
   for (std::size_t k = start; k < sv.size(); ++k) {
     const char c = sv[k];
     if (in_str) {
@@ -55,9 +57,9 @@ static std::size_t ScanBalancedObject(const std::string &sv,
     }
     if (c == '"') {
       in_str = true;
-    } else if (c == '{') {
+    } else if (c == open) {
       ++depth;
-    } else if (c == '}') {
+    } else if (c == close) {
       if (--depth == 0)
         return k + 1;
       if (depth < 0)
@@ -78,20 +80,28 @@ static std::size_t ScanBalancedObject(const std::string &sv,
 ToolCallExtraction DetectToolCalls(const std::string &text) {
   ToolCallExtraction extraction;
   auto &calls = extraction.calls;
-  auto fill = [&calls](const json &obj) -> bool {
+  auto fill = [&calls](const json &obj, bool explicit_call) -> bool {
     json tc = obj;
-    if (tc.contains("tool_call") && tc["tool_call"].is_object())
+    if (tc.contains("tool_call") && tc["tool_call"].is_object()) {
       tc = tc["tool_call"];
-    if (!tc.is_object() || !tc.contains("name") || !tc["name"].is_string())
+      explicit_call = true;
+    }
+    if (!tc.is_object() || !tc.contains("name") || !tc["name"].is_string() ||
+        tc["name"].get<std::string>().empty())
       return false;
-    ToolCallResult r;
-    r.function_name = tc["name"].get<std::string>();
-    r.call_id = "call_" + r.function_name + "_" + std::to_string(calls.size());
     const char *args_key =
         tc.contains("arguments")
             ? "arguments"
             : (tc.contains("parameters") ? "parameters" : nullptr);
-    if (args_key && tc.contains(args_key)) {
+    // A generic {"name":"Alice"} object is not an implicit tool call.
+    if (!explicit_call && !args_key)
+      return false;
+    ToolCallResult r;
+    r.function_name = tc["name"].get<std::string>();
+    r.call_id = "call_" + r.function_name + "_" + std::to_string(calls.size());
+    if (args_key) {
+      if (!tc[args_key].is_object() && !tc[args_key].is_string())
+        return false;
       r.arguments_json = tc[args_key].is_object()
                              ? tc[args_key].dump()
                              : tc[args_key].get<std::string>();
@@ -103,153 +113,83 @@ ToolCallExtraction DetectToolCalls(const std::string &text) {
     return true;
   };
 
-  // 1) <tool_call>...</tool_call> spans - all of them, arrays supported.
-  static const std::string kOpenTag = "<tool_call>";
-  static const std::string kCloseTag = "</tool_call>";
-  std::string residual;
-  residual.reserve(text.size());
-  {
-    std::size_t pos = 0;
-    while (true) {
-      const auto a = text.find(kOpenTag, pos);
-      if (a == std::string::npos)
-        break;
-      const auto b = text.find(kCloseTag, a + kOpenTag.size());
-      if (b == std::string::npos)
-        break;
-      residual.append(text, pos, a - pos);
-      const std::string inner =
-          TrimWs(text.substr(a + kOpenTag.size(), b - a - kOpenTag.size()));
-      bool matched = false;
-      try {
-        const auto j = json::parse(inner);
-        if (j.is_object()) {
-          matched = fill(j);
-        } else if (j.is_array()) {
-          for (const auto &el : j)
-            if (el.is_object())
-              matched = fill(el) || matched;
-        }
-      } catch (const json::exception &ex) {
-        LogJsonParseFailure("DetectToolCalls.tool_call_tag", ex);
-      }
-      if (!matched)
-        residual.append(text, a, b + kCloseTag.size() - a);
-      pos = b + kCloseTag.size();
-    }
-    residual.append(text, pos, text.size() - pos);
-  }
-
-  // 2) [TOOL_CALLS] [{...},...] (Mistral) - walk bracket depth for the
-  //    matching ']' so trailing prose doesn't break the parse.
-  {
-    static const std::string kMistral = "[TOOL_CALLS]";
-    for (;;) {
-      const auto tag = residual.find(kMistral);
-      if (tag == std::string::npos)
-        break;
-      const auto bracket = residual.find('[', tag + kMistral.size());
-      if (bracket == std::string::npos)
-        break;
-      int depth = 0;
-      bool in_str = false;
-      bool esc = false;
-      std::size_t close = std::string::npos;
-      for (std::size_t k = bracket; k < residual.size(); ++k) {
-        const char c = residual[k];
-        if (in_str) {
-          if (esc)
-            esc = false;
-          else if (c == '\\')
-            esc = true;
-          else if (c == '"')
-            in_str = false;
-          continue;
-        }
-        if (c == '"')
-          in_str = true;
-        else if (c == '[')
-          ++depth;
-        else if (c == ']') {
-          if (--depth == 0) {
-            close = k;
+  // Parse each envelope atomically: invalid array entries must not leave calls
+  // behind while retaining the original envelope in the visible content.
+  auto parse = [&](std::size_t begin, std::size_t end, bool explicit_call) {
+    const auto before = calls.size();
+    bool matched = false;
+    try {
+      const auto value = json::parse(text.substr(begin, end - begin));
+      if (value.is_object()) {
+        matched = fill(value, explicit_call);
+      } else if (explicit_call && value.is_array() && !value.empty()) {
+        matched = true;
+        for (const auto &item : value) {
+          if (!fill(item, true)) {
+            matched = false;
             break;
           }
         }
       }
-      if (close == std::string::npos)
-        break;
-      bool matched = false;
-      try {
-        const auto arr =
-            json::parse(residual.substr(bracket, close - bracket + 1));
-        if (arr.is_array()) {
-          for (const auto &el : arr)
-            if (el.is_object())
-              matched = fill(el) || matched;
-        }
-      } catch (const json::exception &ex) {
-        LogJsonParseFailure("DetectToolCalls.mistral", ex);
-      }
-      if (matched) {
-        residual.erase(tag, close + 1 - tag);
-      } else {
-        // Not a usable array; keep scanning after this occurrence.
-        const std::string after = residual.substr(close + 1);
-        residual = residual.substr(0, tag + kMistral.size()) + after;
-        break;
-      }
+    } catch (const json::exception &ex) {
+      matched = false;
+      LogJsonParseFailure("DetectToolCalls", ex);
     }
-  }
+    if (!matched)
+      calls.resize(before);
+    return matched;
+  };
 
-  // 3) Bare JSON objects - one or many, brace-balanced so adjacent calls
-  //    or surrounding prose never yield "Extra data".
-  {
-    std::string out;
-    out.reserve(residual.size());
-    std::size_t i = 0;
-    while (i < residual.size()) {
-      if (residual[i] == '{') {
-        const auto end = ScanBalancedObject(residual, i);
+  // One left-to-right pass preserves ordering across mixed formats. A balanced
+  // ordinary JSON object/array is consumed intact, never rescanned for nested
+  // "name" fields that happen to look like tool calls.
+  const std::string open = "<tool_call>", close = "</tool_call>";
+  const std::string mistral = "[TOOL_CALLS]";
+  std::string residual;
+  for (std::size_t pos = 0; pos < text.size();) {
+    std::size_t body = pos, end = std::string::npos, consumed = pos;
+    bool explicit_call = false;
+    if (text.compare(pos, open.size(), open) == 0) {
+      body = pos + open.size();
+      end = text.find(close, body);
+      if (end == std::string::npos) {
+        residual.append(text, pos, std::string::npos);
+        break;
+      }
+      consumed = end + close.size();
+      explicit_call = true;
+    } else if (text.compare(pos, mistral.size(), mistral) == 0) {
+      body = text.find_first_not_of(" \t\r\n", pos + mistral.size());
+      if (body != std::string::npos && text[body] == '[') {
+        end = ScanBalancedObject(text, body);
+        consumed = end;
+        explicit_call = true;
         if (end != std::string::npos) {
-          const std::string cand = residual.substr(i, end - i);
-          if (cand.find("\"tool_call\"") != std::string::npos ||
-              cand.find("\"name\"") != std::string::npos) {
-            bool filled = false;
-            try {
-              filled = fill(json::parse(cand));
-            } catch (const json::exception &ex) {
-              LogJsonParseFailure("DetectToolCalls.bare_object", ex);
-            }
-            if (filled) {
-              i = end;
-              continue;
-            }
-          }
+          const auto suffix = text.find_first_not_of(" \t\r\n", end);
+          if (suffix != std::string::npos &&
+              text.compare(suffix, 13, "[/TOOL_CALLS]") == 0)
+            consumed = suffix + 13;
         }
       }
-      out += residual[i++];
-    }
-    residual = std::move(out);
-  }
-
-  // Strip tool-call scaffolding the phases did not consume (e.g. a
-  // [/TOOL_CALLS] sentinel or unmatched tags around a rescued call) so it
-  // never leaks into visible content.
-  if (!calls.empty()) {
-    const std::string scaffolding[] = {kOpenTag, kCloseTag, "[TOOL_CALLS]",
-                                       "[/TOOL_CALLS]"};
-    for (const auto &tag : scaffolding) {
-      std::size_t at;
-      while ((at = residual.find(tag)) != std::string::npos) {
-        residual.erase(at, tag.size());
+    } else if (text[pos] == '{' || text[pos] == '[') {
+      end = ScanBalancedObject(text, pos);
+      consumed = end;
+      if (end == std::string::npos) {
+        residual.append(text, pos, std::string::npos);
+        break;
       }
+    }
+    if (end != std::string::npos) {
+      if (!parse(body, end, explicit_call))
+        residual.append(text, pos, consumed - pos);
+      pos = consumed;
+    } else {
+      residual += text[pos++];
     }
   }
   extraction.remaining_text = TrimWs(residual);
   return extraction;
 }
-
 json BuildToolCallEntry(const ToolCallResult &tc, std::optional<int> index) {
   json entry = {
       {"id", tc.call_id},
@@ -262,10 +202,10 @@ json BuildToolCallEntry(const ToolCallResult &tc, std::optional<int> index) {
   return entry;
 }
 
-std::string
-BuildToolCallStreamChunks(const std::string &id, std::string_view model,
-                          std::time_t ts,
-                          const std::vector<ToolCallResult> &tool_calls) {
+std::string BuildToolCallStreamChunks(
+    const std::string &id, std::string_view model, std::time_t ts,
+    const std::vector<ToolCallResult> &tool_calls, std::string_view reasoning,
+    std::string_view content) {
   std::string out;
   out.reserve(4096 * (tool_calls.size() + 1));
   auto base = [&]() -> json {
@@ -285,6 +225,22 @@ BuildToolCallStreamChunks(const std::string &id, std::string_view model,
                       {"delta", {{"role", "assistant"}, {"content", nullptr}}},
                       {"finish_reason", nullptr}}});
     out += "data: " + j.dump() + "\n\n";
+  }
+
+  // Buffered tool calls have not emitted any tokens yet. Preserve separated
+  // reasoning and residual prose before the structured calls and finish frame.
+  for (const auto &[key, value] :
+       {std::pair<std::string_view, std::string_view>{"reasoning_content",
+                                                      reasoning},
+        {"content", content}}) {
+    if (!value.empty()) {
+      json j = base();
+      j["choices"] =
+          json::array({{{"index", 0},
+                        {"delta", {{std::string(key), std::string(value)}}},
+                        {"finish_reason", nullptr}}});
+      out += "data: " + SerializeJsonUtf8Safe(j) + "\n\n";
+    }
   }
 
   // Per call: id/type/name frame with empty arguments, then the arguments

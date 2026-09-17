@@ -11,6 +11,7 @@
 
 #include <catch2/catch_amalgamated.hpp>
 
+#include "runtime/text/response_splitter.h"
 #include "server/http/completion_payload.h"
 
 #include <nlohmann/json.hpp>
@@ -107,6 +108,82 @@ TEST_CASE("DetectToolCalls keeps malformed JSON in residual without crashing",
   auto ex = DetectToolCalls(text);
   REQUIRE(ex.calls.empty());
   REQUIRE(ex.remaining_text == text);
+}
+
+TEST_CASE("DetectToolCalls preserves order across mixed call formats",
+          "[tool_calls]") {
+  const std::string text =
+      R"({"tool_call":{"name":"write_file","arguments":{}}} <tool_call>{"name":"shell","arguments":{}}</tool_call> [TOOL_CALLS] [{"name":"read","arguments":{}}])";
+  const auto result = DetectToolCalls(text);
+  REQUIRE(result.calls.size() == 3);
+  REQUIRE(result.calls[0].function_name == "write_file");
+  REQUIRE(result.calls[1].function_name == "shell");
+  REQUIRE(result.calls[2].function_name == "read");
+  REQUIRE(result.calls[0].call_id == "call_write_file_0");
+  REQUIRE(result.calls[1].call_id == "call_shell_1");
+  REQUIRE(result.remaining_text.empty());
+}
+
+TEST_CASE("DetectToolCalls preserves ordinary nested JSON atomically",
+          "[tool_calls]") {
+  for (const std::string text :
+       {R"(Report: {"profile":{"name":"Alice"}})",
+        R"(Report: {"profile":{"name":"shell","arguments":{}}})",
+        R"(Report: [{"name":"shell","arguments":{}}])",
+        R"({"name":"Alice"})"}) {
+    const auto result = DetectToolCalls(text);
+    REQUIRE(result.calls.empty());
+    REQUIRE(result.remaining_text == text);
+  }
+}
+
+TEST_CASE(
+    "DetectToolCalls rejects partial invalid arrays without duplicate calls",
+    "[tool_calls]") {
+  for (
+      const std::string text :
+      {R"(<tool_call>[{"name":"write_file","arguments":{}},{"name":"shell","arguments":7}]</tool_call>)",
+       R"([TOOL_CALLS] [{"name":"write_file","arguments":{}},{"not_a_call":true}])"}) {
+    const auto result = DetectToolCalls(text);
+    REQUIRE(result.calls.empty());
+    REQUIRE(result.remaining_text == text);
+  }
+}
+
+TEST_CASE(
+    "Buffered tool stream preserves separated reasoning and residual prose",
+    "[tool_calls][reasoning]") {
+  const auto split = ResponseSplitter::Split(
+      ChatTemplateFamily::kChatML,
+      R"(<think>plan</think>Before <tool_call>{"name":"read","arguments":{}}</tool_call> After)");
+  const auto extraction = DetectToolCalls(split.content);
+  REQUIRE(extraction.calls.size() == 1);
+  const auto stream =
+      BuildToolCallStreamChunks("id", "m", 1, extraction.calls, split.reasoning,
+                                extraction.remaining_text);
+  std::string reasoning, content;
+  int finish = 0, tool_calls = 0;
+  for (std::size_t pos = 0; pos < stream.size();) {
+    const auto end = stream.find("\n\n", pos);
+    REQUIRE(end != std::string::npos);
+    const auto frame = json::parse(stream.substr(pos + 6, end - pos - 6));
+    const auto &choice = frame["choices"][0];
+    const auto &delta = choice["delta"];
+    reasoning += delta.value("reasoning_content", std::string{});
+    if (delta.contains("content") && delta["content"].is_string())
+      content += delta["content"].get<std::string>();
+    if (delta.contains("tool_calls"))
+      ++tool_calls;
+    if (!choice["finish_reason"].is_null()) {
+      REQUIRE(choice["finish_reason"] == "tool_calls");
+      ++finish;
+    }
+    pos = end + 2;
+  }
+  REQUIRE(reasoning == "plan");
+  REQUIRE(content == "Before  After");
+  REQUIRE(tool_calls == 2);
+  REQUIRE(finish == 1);
 }
 
 // ---------------------------------------------------------------------------

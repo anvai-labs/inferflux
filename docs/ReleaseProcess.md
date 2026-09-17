@@ -32,16 +32,26 @@ flowchart LR
 
 ## 3) Promotion Runbook
 
+Prepare the release branch from the agreed develop revision before candidate CI. Record its
+source SHA and independent review, then promote through the protected branch workflow.
+Rebasing or adding runtime fixes invalidates earlier exact-revision evidence for promotion.
+The [v0.3.0 candidate record](releases/v0.3.0.md) distinguishes completed local verification
+from the hosted/native gates still required for that release.
+
 1. Merge to `main` and wait for green `CI`.
-2. Confirm `Dual-GPU gate result` passed for the same commit SHA.
+2. Confirm `Dual-GPU gate result` and both CUDA/ROCm runtime jobs actually succeeded for the same commit SHA; a disabled/skipped aggregate is insufficient.
 3. Retain the matching `cuda-gate-<sha>` and `rocm-gate-<sha>` artifacts.
-4. Confirm pre-release packaging completed from `release.yml`.
+4. Confirm pre-release packaging completed from `release.yml` for that same main SHA.
 5. Confirm every packaging job's installer/archive smoke passed before artifact upload.
 6. Tag the tested commit: `git tag vX.Y.Z && git push origin vX.Y.Z`.
 7. Confirm tagged run publishes a GitHub Release; verify assets and checksums.
 
 If the promoted SHA did not match the GPU workflow path filter, manually
 dispatch `GPU Behavioral Gates` on `main` before step 2.
+
+CPU/stub conformance, independent source review, and mocked installer tests support candidate
+readiness. They do not replace the actual GPU jobs or native installer/archive smoke. Consumer
+releases and their installed-package checks remain separately versioned and independently gated.
 
 ### Automated package smoke
 
