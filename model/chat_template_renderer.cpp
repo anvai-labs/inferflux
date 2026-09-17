@@ -86,9 +86,19 @@ RenderGemma(const std::vector<std::pair<std::string, std::string>> &messages,
 std::string CurrentDateYyyyMmDd() {
   std::time_t now = std::time(nullptr);
   std::tm tm_buf{};
-  gmtime_r(&now, &tm_buf);
-  char buf[16];
-  std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm_buf);
+#ifdef _WIN32
+  if (gmtime_s(&tm_buf, &now) != 0) {
+    return {};
+  }
+#else
+  if (gmtime_r(&now, &tm_buf) == nullptr) {
+    return {};
+  }
+#endif
+  char buf[16]{};
+  if (std::strftime(buf, sizeof(buf), "%Y-%m-%d", &tm_buf) == 0) {
+    return {};
+  }
   return std::string(buf);
 }
 
