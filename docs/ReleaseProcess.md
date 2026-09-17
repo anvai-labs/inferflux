@@ -17,17 +17,17 @@ flowchart LR
 
 | Trigger | Workflow path | Output |
 |---|---|---|
-| `CI` success on `main` | `release.yml` via `workflow_run` | pre-release artifacts (Linux/macOS/Windows + manifests) |
+| upstream push `CI` success on `main` | validated `release.yml` via `workflow_run` | pre-release artifacts (Linux/macOS/Windows + Homebrew metadata) |
 | Push to `main` affecting runtime/GPU paths | `gpu-gates.yml` | exact-SHA CUDA + ROCm behavioral evidence |
-| `CI` success on `v*.*.*` tag | same packaging jobs + release job | GitHub Release with installers + manifests |
+| upstream push `CI` success on real `vX.Y.Z` tag | validated packaging + exact-SHA GPU evidence + release job | GitHub Release with installers + manifests |
 
 ## 2) Artifact Contract
 
 | Platform | Artifacts |
 |---|---|
-| Linux | `inferflux-<version>-Linux.tar.gz`, `.deb`, `.rpm` |
-| macOS | `inferflux-<version>-Darwin.tar.gz`, `.pkg`, `.dmg` |
-| Windows | `inferflux-<version>-win64.msi`, `.zip` |
+| Linux x86_64 / aarch64 | `inferflux-<version>-Linux-<arch>.tar.gz`, `.deb`, `.rpm` |
+| macOS arm64 | `inferflux-<version>-Darwin-arm64.tar.gz`, `.pkg`, `.dmg` |
+| Windows x64 | `inferflux-<version>-Windows-AMD64.msi`, `.zip` |
 | Package metadata | `homebrew/inferflux.rb`, `winget/inferencial.inferflux.yaml` |
 
 ## 3) Promotion Runbook
@@ -52,6 +52,37 @@ dispatch `GPU Behavioral Gates` on `main` before step 2.
 CPU/stub conformance, independent source review, and mocked installer tests support candidate
 readiness. They do not replace the actual GPU jobs or native installer/archive smoke. Consumer
 releases and their installed-package checks remain separately versioned and independently gated.
+
+### Release eligibility and recovery
+
+The release workflow first runs the validator from the trusted default-branch revision,
+with read-only permissions. It accepts only successful upstream **push** CI, backed by
+the source-provenance artifact from the triggering CI run and attempt. Pull requests,
+forks, schedules and branch names that resemble tags cannot authorize publication.
+The actual tag (including annotated tags) must resolve to the tested SHA, that SHA must
+be on main's ancestry, and its CMake version must match the stable `vX.Y.Z` tag.
+Immediately before publication, the workflow resolves the actual tag again and fails
+if it is missing or no longer points to that same tested SHA.
+
+Main pre-release packaging may run while GPU checks are pending. Tagged packaging and
+publication require a successful trusted-main GPU run for the exact SHA, both runtime
+jobs and their model-backed steps, the aggregate, and nonexpired CUDA/ROCm artifacts.
+GPU evidence is tied to one successful run and SHA; GitHub may retain successful jobs
+from earlier attempts of that same run. A disabled aggregate with skipped runtime jobs
+is not evidence. No infrastructure-exception override is implemented by the validator.
+
+CI provenance is intentionally attempt-specific. After **rerun failed jobs**, it may be
+absent for the new attempt; rerun the entire CI workflow to refresh it. If a GPU retry's
+API job listing lacks either successful runtime job, rerun the entire GPU workflow.
+Missing, expired, ambiguous or unavailable API evidence fails closed; do not bypass the
+validator. A different candidate requires a new version tag and matching CI/GPU/package
+evidence; never move an existing release tag.
+
+Homebrew metadata pins the tested Git revision using Homebrew's recursive Git download
+strategy, because GitHub source archives omit the required llama.cpp submodule. The
+formula links bundled libraries statically and tests both binaries. Winget metadata is
+generated only for tags and hashes the actual MSI. Package-manager metadata is attached
+to the GitHub Release; this workflow does not submit it to Homebrew or Winget registries.
 
 ### Automated package smoke
 
