@@ -4,6 +4,7 @@
 #include "runtime/backends/backend_utils.h"
 #include "runtime/execution/parallel_context.h"
 #include "server/logging/logger.h"
+#include "server/metrics/metrics.h"
 #include <cctype>
 
 #include <llama.h>
@@ -50,9 +51,22 @@ struct BatchSeqTokenInput {
   bool logits{false};
 };
 
+// Registered by the backend when the context is created (n_seq_max). The
+// scheduler bounds slot ids to this via the KV-sequence metric; this guard
+// is the last line of defense so a miscoordinated id fails the request
+// instead of GGML_ASSERT-aborting the process inside llama-kv-cache
+// (seq_to_stream is sized by n_seq_max). 0 = unbounded.
+std::atomic<int> g_llama_kv_seq_bound{0};
+
 void BatchAddSeq(llama_batch &batch, const BatchSeqTokenInput &input) {
   if (!batch.seq_id[batch.n_tokens]) {
     throw std::runtime_error("llama_batch capacity exceeded");
+  }
+  const int kv_seq_bound = g_llama_kv_seq_bound.load(std::memory_order_relaxed);
+  if (kv_seq_bound > 0 && input.seq_id >= kv_seq_bound) {
+    throw std::runtime_error("sequence id " + std::to_string(input.seq_id) +
+                             " outside llama KV pool (n_seq_max=" +
+                             std::to_string(kv_seq_bound) + ")");
   }
   batch.token[batch.n_tokens] = input.id;
   batch.pos[batch.n_tokens] = input.pos;
@@ -383,6 +397,16 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
   }
   n_vocab_ = llama_vocab_n_tokens(vocab_);
   config_ = config;
+
+  // Publish the KV pool's sequence capacity so the scheduler bounds slot
+  // ids (and decode batch width) to what this backend can address:
+  // retained/retiring leases keep high slot ids circulating, and llama.cpp
+  // aborts on any seq_id >= n_seq_max. Mirrors the inferflux_cuda executor's
+  // publication of its KV plan.
+  g_llama_kv_seq_bound.store(static_cast<int>(ctx_params.n_seq_max),
+                             std::memory_order_relaxed);
+  GlobalMetrics().SetInferfluxCudaKvMaxSequences(
+      static_cast<int>(ctx_params.n_seq_max));
 
   // §P1f: Initialize Expert Parallel dispatcher.
   if (IsMoE()) {

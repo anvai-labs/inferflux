@@ -1451,6 +1451,20 @@ int main(int argc, char **argv) {
   if (const char *env_policy = std::getenv("INFERFLUX_POLICY_STORE")) {
     policy_store_path = env_policy;
   }
+  // Resolve a relative store path against the config file's directory, not
+  // the process CWD: launching inferfluxd from anywhere else silently
+  // loaded a different (or no) policy store.
+  if (!policy_store_path.empty() && policy_store_path.front() != '/' &&
+      !config_path.empty()) {
+    std::filesystem::path config_dir =
+        std::filesystem::path(config_path).parent_path();
+    std::filesystem::path candidate =
+        config_dir.empty() ? std::filesystem::path(policy_store_path)
+                           : config_dir / policy_store_path;
+    if (std::filesystem::exists(candidate)) {
+      policy_store_path = candidate.string();
+    }
+  }
   std::string policy_passphrase;
   if (const char *env_pass = std::getenv("INFERFLUX_POLICY_PASSPHRASE")) {
     policy_passphrase = env_pass;

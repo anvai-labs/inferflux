@@ -718,6 +718,7 @@ add_executable(inferflux_tests
   tests/unit/test_flash_attn.cpp
   tests/unit/test_shm_transport.cpp
   tests/unit/test_chat_template.cpp
+  tests/unit/test_tool_calls.cpp
   tests/unit/test_mlx_tokenizer.cpp
   tests/unit/test_chat_template_renderer.cpp
   tests/unit/test_hf_tokenizer.cpp

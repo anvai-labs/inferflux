@@ -130,10 +130,6 @@ namespace {
 
 // kKiB/kMiB/kGiB are provided by runtime/string_utils.h (inferflux namespace).
 
-void LogJsonParseFailure(const char *context, const std::exception &ex) {
-  log::Debug("http_server", std::string(context) + ": " + ex.what());
-}
-
 constexpr std::size_t kMaxResponseFormatBytes =
     16ULL * kKiB; // 16 KB cap for schemas/grammars.
 
@@ -610,128 +606,6 @@ std::string BuildToolSystemPrompt(const std::vector<Tool> &tools,
 //   [{"name":"...","arguments":{...}}]
 //
 // Returns the first detected tool call or an empty result.
-ToolCallResult DetectToolCall(const std::string &text) {
-  ToolCallResult result;
-
-  // Helper: populate result from a parsed JSON object that has "name" key.
-  auto fill_from_obj = [&](const json &tc) -> bool {
-    if (!tc.contains("name") || !tc["name"].is_string())
-      return false;
-    result.function_name = tc["name"].get<std::string>();
-    result.call_id = "call_" + result.function_name + "_0";
-    const char *args_key =
-        tc.contains("arguments")
-            ? "arguments"
-            : (tc.contains("parameters") ? "parameters" : nullptr);
-    if (args_key && tc.contains(args_key)) {
-      result.arguments_json = tc[args_key].is_object()
-                                  ? tc[args_key].dump()
-                                  : tc[args_key].get<std::string>();
-    } else {
-      result.arguments_json = "{}";
-    }
-    result.detected = true;
-    return true;
-  };
-
-  // Format 1: {"tool_call":{...}}  (InferFlux preamble convention)
-  auto try_inferflux = [&](const std::string &s) -> bool {
-    try {
-      auto j = json::parse(s);
-      if (j.contains("tool_call") && j["tool_call"].is_object())
-        return fill_from_obj(j["tool_call"]);
-    } catch (const json::exception &ex) {
-      LogJsonParseFailure("ExtractToolCall.try_inferflux", ex);
-    }
-    return false;
-  };
-  if (try_inferflux(text))
-    return result;
-  {
-    auto pos = text.find("{\"tool_call\"");
-    if (pos != std::string::npos && try_inferflux(text.substr(pos)))
-      return result;
-  }
-
-  // Format 3: <tool_call>…</tool_call>  (Hermes / Llama-3.1)
-  {
-    static const std::string open_tag = "<tool_call>";
-    static const std::string close_tag = "</tool_call>";
-    auto a = text.find(open_tag);
-    auto b = text.find(close_tag);
-    if (a != std::string::npos && b != std::string::npos && b > a) {
-      std::string inner =
-          text.substr(a + open_tag.size(), b - a - open_tag.size());
-      // Trim whitespace
-      auto ws_start = inner.find_first_not_of(" \t\r\n");
-      auto ws_end = inner.find_last_not_of(" \t\r\n");
-      if (ws_start != std::string::npos)
-        inner = inner.substr(ws_start, ws_end - ws_start + 1);
-      try {
-        auto j = json::parse(inner);
-        if (j.is_object() && fill_from_obj(j))
-          return result;
-      } catch (const json::exception &ex) {
-        LogJsonParseFailure("ExtractToolCall.tool_call_tag", ex);
-      }
-    }
-  }
-
-  // Format 4: [TOOL_CALLS] [{"name":"...","arguments":{...}}]  (Mistral)
-  // Mistral models may append [/TOOL_CALLS] after the JSON array.  Parsing
-  // text.substr(bracket) to end-of-string fails because nlohmann::json rejects
-  // trailing non-JSON content.  Walk the bracket depth to find the matching ']'
-  // and parse only that bounded substring.
-  {
-    static const std::string mistral_tag = "[TOOL_CALLS]";
-    auto pos = text.find(mistral_tag);
-    if (pos != std::string::npos) {
-      auto bracket = text.find('[', pos + mistral_tag.size());
-      if (bracket != std::string::npos) {
-        // Find matching closing bracket, tracking nesting depth.
-        std::size_t depth = 0;
-        std::size_t close = std::string::npos;
-        for (std::size_t i = bracket; i < text.size(); ++i) {
-          if (text[i] == '[')
-            ++depth;
-          else if (text[i] == ']') {
-            if (--depth == 0) {
-              close = i;
-              break;
-            }
-          }
-        }
-        if (close != std::string::npos) {
-          try {
-            auto arr = json::parse(text.substr(bracket, close - bracket + 1));
-            if (arr.is_array() && !arr.empty() && arr[0].is_object() &&
-                fill_from_obj(arr[0]))
-              return result;
-          } catch (const json::exception &ex) {
-            LogJsonParseFailure("ExtractToolCall.mistral_tool_calls", ex);
-          }
-        }
-      }
-    }
-  }
-
-  // Format 2: bare {"name":"...","arguments":{...}}  (generic OpenAI-style
-  // output)
-  {
-    auto pos = text.find("{\"name\"");
-    if (pos != std::string::npos) {
-      try {
-        auto j = json::parse(text.substr(pos));
-        if (j.is_object() && fill_from_obj(j))
-          return result;
-      } catch (const json::exception &ex) {
-        LogJsonParseFailure("ExtractToolCall.bare_name_object", ex);
-      }
-    }
-  }
-
-  return result;
-}
 
 // Build logprobs JSON for one result (shared helper).
 // Chat format: {"content":[...]}; completions format: {tokens, token_logprobs,
@@ -775,47 +649,6 @@ static json BuildLogprobsJson(const InferenceResult &result, bool chat_mode) {
   }
 }
 
-// Build one choice object for a single result.
-static json BuildChoice(int idx, const InferenceResult &result,
-                        const std::string &reasoning_content,
-                        const ToolCallResult &tool_call, bool chat_mode) {
-  json logprobs_json = BuildLogprobsJson(result, chat_mode);
-  if (chat_mode) {
-    if (tool_call.detected) {
-      json tc_arr =
-          json::array({{{"id", tool_call.call_id},
-                        {"type", "function"},
-                        {"function",
-                         {{"name", tool_call.function_name},
-                          {"arguments", tool_call.arguments_json}}}}});
-      return {{"index", idx},
-              {"message",
-               {{"role", "assistant"},
-                {"content", nullptr},
-                {"tool_calls", tc_arr}}},
-              {"logprobs", logprobs_json},
-              {"finish_reason", "tool_calls"}};
-    } else {
-      const std::string fr = result.finish_reason_length ? "length" : "stop";
-      return {{"index", idx},
-              {"message",
-               reasoning_content.empty()
-                   ? json{{"role", "assistant"}, {"content", result.completion}}
-                   : json{{"role", "assistant"},
-                          {"content", result.completion},
-                          {"reasoning_content", reasoning_content}}},
-              {"logprobs", logprobs_json},
-              {"finish_reason", fr}};
-    }
-  } else {
-    const std::string fr = result.finish_reason_length ? "length" : "stop";
-    return {{"index", idx},
-            {"text", result.completion},
-            {"logprobs", logprobs_json},
-            {"finish_reason", fr}};
-  }
-}
-
 // Process-wide monotonic completion-id sequence. Shared by the buffered
 // body builder below and the streaming setup in HandleClient so every
 // completion id on every path is unique within the process (epoch-ms plus
@@ -828,7 +661,7 @@ std::atomic<uint64_t> completion_seq{0};
 std::string BuildCompletionBody(
     const std::vector<InferenceResult> &results, int total_completion_tokens,
     const CompletionRequestPayload &request, bool chat_mode,
-    const std::vector<ToolCallResult> &tool_calls,
+    const std::vector<ToolCallExtraction> &tool_calls,
     const std::string &reasoning_content = {}, int reasoning_tokens = 0,
     ChatTemplateFamily chat_template_family = ChatTemplateFamily::kChatML) {
   auto now = std::chrono::system_clock::now();
@@ -914,21 +747,40 @@ std::string BuildCompletionBody(
     (void)choice;
     json choice_json;
     if (chat_mode) {
-      const ToolCallResult &tc = (i < static_cast<int>(tool_calls.size()))
-                                     ? tool_calls[i]
-                                     : ToolCallResult{};
-      const std::string fr =
-          results[i].finish_reason_length ? "length" : "stop";
-      choice_json = {
-          {"index", i},
-          {"message",
-           per_result_reasoning.empty()
-               ? json{{"role", "assistant"}, {"content", per_result_content}}
-               : json{{"role", "assistant"},
-                      {"content", per_result_content},
-                      {"reasoning_content", per_result_reasoning}}},
-          {"logprobs", json::object()},
-          {"finish_reason", fr}};
+      const auto empty_extraction = ToolCallExtraction{};
+      const auto &ex = (i < static_cast<int>(tool_calls.size()))
+                           ? tool_calls[i]
+                           : empty_extraction;
+      const auto &tcs = ex.calls;
+      json message = {{"role", "assistant"}};
+      if (!tcs.empty()) {
+        // Non-streaming tool calls ride message.tool_calls with finish_reason
+        // "tool_calls", mirroring the streaming emitter
+        // (BuildToolCallStreamChunks) and the OpenAI chat shape. The tool-call
+        // text is removed from visible content; anything the model wrote
+        // around it stays in content (null when the completion was purely
+        // tool calls).
+        json tc_arr = json::array();
+        for (const auto &tc : tcs) {
+          tc_arr.push_back(BuildToolCallEntry(tc, std::nullopt));
+        }
+        message["tool_calls"] = std::move(tc_arr);
+        message["content"] =
+            ex.remaining_text.empty() ? json(nullptr) : json(ex.remaining_text);
+      } else {
+        message["content"] = per_result_content;
+      }
+      if (!per_result_reasoning.empty()) {
+        message["reasoning_content"] = per_result_reasoning;
+      }
+      choice_json = {{"index", i},
+                     {"message", std::move(message)},
+                     {"logprobs", json::object()},
+                     {"finish_reason",
+                      !tcs.empty() ? std::string("tool_calls")
+                                   : std::string(results[i].finish_reason_length
+                                                     ? "length"
+                                                     : "stop")}};
     } else {
       choice_json = {{"index", i},
                      {"text", per_result_content},
@@ -953,13 +805,13 @@ std::string BuildCompletionBody(
 // Single-result overload: preserves the original call sites unchanged.
 std::string BuildCompletionBody(
     const InferenceResult &result, const CompletionRequestPayload &request,
-    bool chat_mode, const ToolCallResult &tool_call = ToolCallResult{},
+    bool chat_mode, ToolCallExtraction extraction = {},
     const std::string &reasoning_content = {}, int reasoning_tokens = 0,
     ChatTemplateFamily chat_template_family = ChatTemplateFamily::kChatML) {
   return BuildCompletionBody(
       std::vector<InferenceResult>{result}, result.completion_tokens, request,
-      chat_mode, std::vector<ToolCallResult>{tool_call}, reasoning_content,
-      reasoning_tokens, chat_template_family);
+      chat_mode, std::vector<ToolCallExtraction>{std::move(extraction)},
+      reasoning_content, reasoning_tokens, chat_template_family);
 }
 
 std::string BuildErrorBody(const std::string &error) {
@@ -1172,66 +1024,6 @@ std::string BuildStreamChunkForTest(const std::string &content,
 //   2. tool_calls[0] with id + type + function.name + empty arguments
 //   3. tool_calls[0] function.arguments (full JSON string)
 //   4. finish_reason=tool_calls, empty delta
-std::string BuildToolCallStreamChunks(const std::string &id,
-                                      std::string_view model, std::time_t ts,
-                                      const ToolCallResult &tc) {
-  std::string out;
-  out.reserve(4096);
-  auto base = [&]() -> json {
-    json j;
-    j["id"] = id;
-    j["object"] = "chat.completion.chunk";
-    j["created"] = ts;
-    j["model"] = model;
-    return j;
-  };
-
-  // Chunk 1: role=assistant, content=null
-  {
-    json j = base();
-    j["choices"] =
-        json::array({{{"index", 0},
-                      {"delta", {{"role", "assistant"}, {"content", nullptr}}},
-                      {"finish_reason", nullptr}}});
-    out += "data: " + j.dump() + "\n\n";
-  }
-
-  // Chunk 2: tool_calls[0] — id, type, function name, empty arguments
-  {
-    json j = base();
-    json tc_delta = json::array(
-        {{{"index", 0},
-          {"id", tc.call_id},
-          {"type", "function"},
-          {"function", {{"name", tc.function_name}, {"arguments", ""}}}}});
-    j["choices"] = json::array({{{"index", 0},
-                                 {"delta", {{"tool_calls", tc_delta}}},
-                                 {"finish_reason", nullptr}}});
-    out += "data: " + j.dump() + "\n\n";
-  }
-
-  // Chunk 3: function arguments
-  if (!tc.arguments_json.empty()) {
-    json j = base();
-    json arg_delta = json::array(
-        {{{"index", 0}, {"function", {{"arguments", tc.arguments_json}}}}});
-    j["choices"] = json::array({{{"index", 0},
-                                 {"delta", {{"tool_calls", arg_delta}}},
-                                 {"finish_reason", nullptr}}});
-    out += "data: " + j.dump() + "\n\n";
-  }
-
-  // Chunk 4: finish_reason=tool_calls
-  {
-    json j = base();
-    j["choices"] = json::array({{{"index", 0},
-                                 {"delta", json::object()},
-                                 {"finish_reason", "tool_calls"}}});
-    out += "data: " + j.dump() + "\n\n";
-  }
-
-  return out;
-}
 
 std::string BuildApiKeysPayload(const std::vector<PolicyKeyEntry> &keys) {
   json arr = json::array();
@@ -1724,6 +1516,18 @@ bool HttpServer::RequireScope(const AuthContext &ctx, const std::string &scope,
     audit_logger_->Log(ctx.subject, "", "insufficient_scope", error_message);
   }
   return false;
+}
+
+// Synthetic no-backend tool call: the stub answers tool-driving requests with
+// a deterministic call so clients can exercise their tool loops model-free.
+static ToolCallResult MakeStubToolCall(const std::string &function_name,
+                                       json arguments) {
+  ToolCallResult tc;
+  tc.detected = true;
+  tc.function_name = function_name.empty() ? "stub_tool" : function_name;
+  tc.call_id = "call_stub_" + tc.function_name;
+  tc.arguments_json = arguments.dump();
+  return tc;
 }
 
 void HttpServer::HandleClient(ClientSession &session) {
@@ -3271,16 +3075,33 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
     }
     std::string guard_reason;
-    if (guardrail_ && guardrail_->Enabled() &&
-        !guardrail_->Check(req.prompt, &guard_reason)) {
-      auto payload =
-          BuildResponse(BuildErrorBody(guard_reason), 400, "Bad Request");
-      SendAll(session, payload);
-      if (audit_logger_) {
-        audit_logger_->Log(auth_ctx.subject, parsed.model, "blocked",
-                           guard_reason);
+    if (guardrail_ && guardrail_->Enabled()) {
+      // Scan only caller-authored text: the raw completions prompt and
+      // user-role chat turns. DELIBERATE SCOPE: system prompts and tool
+      // results are machine-assembled context that routinely quotes repo
+      // content, and keyword-blocking those hard-400s the request - because
+      // agent clients replay their context on every turn, a single flagged
+      // tool result would poison the session permanently. Consequence (for
+      // hostile-client analysis): text moved into a system role evades the
+      // keyword scan; use OPA policies on the same endpoint for content
+      // policy that must see the full prompt.
+      std::string guard_text = parsed.prompt;
+      for (const auto &m : parsed.messages) {
+        if (m.role == "user") {
+          guard_text += m.content;
+          guard_text += '\n';
+        }
       }
-      return;
+      if (!guardrail_->Check(guard_text, &guard_reason)) {
+        auto payload =
+            BuildResponse(BuildErrorBody(guard_reason), 400, "Bad Request");
+        SendAll(session, payload);
+        if (audit_logger_) {
+          audit_logger_->Log(auth_ctx.subject, parsed.model, "blocked",
+                             guard_reason);
+        }
+        return;
+      }
     }
     // ── Multi-completion path (n>1 or best_of>1) ──────────────────────────
     // Must be handled before the streaming setup because n>1 is incompatible
@@ -3377,27 +3198,23 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
 
       // Detect tool calls per choice.
-      std::vector<ToolCallResult> tool_calls;
-      tool_calls.reserve(all_results.size());
+      std::vector<ToolCallExtraction> per_result_extractions;
+      per_result_extractions.reserve(all_results.size());
       for (auto &r : all_results) {
         if (use_tools) {
           bool is_stub =
               r.no_backend || r.completion.find("No model backend is loaded") !=
                                   std::string::npos;
           if (is_stub && !parsed.tools.empty()) {
-            ToolCallResult tc;
-            tc.detected = true;
-            tc.function_name = parsed.tools.front().function.name;
-            if (tc.function_name.empty())
-              tc.function_name = "stub_tool";
-            tc.call_id = "call_stub_" + tc.function_name;
-            tc.arguments_json = json{{"reason", "no_model_available"}}.dump();
-            tool_calls.push_back(std::move(tc));
+            per_result_extractions.push_back(ToolCallExtraction{
+                {MakeStubToolCall(parsed.tools.front().function.name,
+                                  json{{"reason", "no_model_available"}})},
+                ""});
           } else {
-            tool_calls.push_back(DetectToolCall(r.completion));
+            per_result_extractions.push_back(DetectToolCalls(r.completion));
           }
         } else {
-          tool_calls.push_back(ToolCallResult{});
+          per_result_extractions.push_back({});
         }
       }
 
@@ -3422,11 +3239,12 @@ void HttpServer::HandleClient(ClientSession &session) {
         mc_trace_hdr = "traceparent: " + mc_ctx.ToTraceparent() + "\r\n";
 
       SendAll(session,
-              BuildResponse(BuildCompletionBody(
-                                all_results, total_completion_tokens, parsed,
-                                chat_mode, tool_calls, reasoning_content,
-                                reasoning_tokens, chat_template_family),
-                            200, "OK", mc_trace_hdr));
+              BuildResponse(
+                  BuildCompletionBody(all_results, total_completion_tokens,
+                                      parsed, chat_mode, per_result_extractions,
+                                      reasoning_content, reasoning_tokens,
+                                      chat_template_family),
+                  200, "OK", mc_trace_hdr));
       return;
     }
     // ── End multi-completion path ──────────────────────────────────────────
@@ -3647,8 +3465,10 @@ void HttpServer::HandleClient(ClientSession &session) {
             std::lock_guard<std::mutex> lock(*stream_mutex);
             bool stub_split_reasoning = false;
             if (nb_tc.detected) {
-              SendAll(session, BuildToolCallStreamChunks(
-                                   stream_id, parsed.model, stream_ts, nb_tc));
+              SendAll(session,
+                      BuildToolCallStreamChunks(
+                          stream_id, parsed.model, stream_ts,
+                          std::vector<ToolCallResult>{std::move(nb_tc)}));
             } else {
               std::string stub_content = result.completion;
               if (stream_splitter) {
@@ -3712,10 +3532,11 @@ void HttpServer::HandleClient(ClientSession &session) {
           }
           stream_active->store(false);
         } else {
-          auto payload = BuildResponse(
-              BuildCompletionBody(result, parsed, chat_mode, ToolCallResult{},
-                                  {}, 0, chat_template_family),
-              200, "OK", trace_response_header);
+          auto payload =
+              BuildResponse(BuildCompletionBody(result, parsed, chat_mode,
+                                                ToolCallExtraction{}, {}, 0,
+                                                chat_template_family),
+                            200, "OK", trace_response_header);
           SendAll(session, payload);
         }
         if (audit_logger_) {
@@ -3737,9 +3558,24 @@ void HttpServer::HandleClient(ClientSession &session) {
                                   result.completion, result.prompt_tokens,
                                   result.completion_tokens);
       }
-      // §2.3: detect tool call in model output (used by non-streaming
-      // responses).
-      ToolCallResult tool_call;
+      // Reasoning separation must precede tool-call detection: thinking
+      // models (Qwen3 hybrid) deliberate inside <think> blocks, and a tool
+      // call written during deliberation is not a real call. Splitting first
+      // also keeps <think> text out of the extraction residual (it would
+      // otherwise be duplicated into content alongside reasoning_content).
+      if (!ReasoningSplitDisabled()) {
+        auto parts = inferflux::ResponseSplitter::Split(chat_template_family,
+                                                        result.completion);
+        if (!parts.reasoning.empty()) {
+          result.reasoning_content = std::move(parts.reasoning);
+          result.completion = std::move(parts.content);
+          result.reasoning_tokens = 1;
+        }
+      }
+
+      // §2.3: detect tool calls in model output — models chain several
+      // calls per completion (e.g. write then run), so extract them all.
+      ToolCallExtraction extraction;
       if (use_tools) {
         bool stub_completion =
             result.no_backend ||
@@ -3761,10 +3597,8 @@ void HttpServer::HandleClient(ClientSession &session) {
           json arguments = {
               {"reason", "no_model_available"},
               {"hint", "set INFERFLUX_MODEL_PATH or configure models[]"}};
-          tool_call.detected = true;
-          tool_call.function_name = fallback_name;
-          tool_call.call_id = "call_stub_" + fallback_name;
-          tool_call.arguments_json = arguments.dump();
+          extraction = ToolCallExtraction{
+              {MakeStubToolCall(fallback_name, arguments)}, ""};
           std::string log_line = "[tools] stub tool call for " + fallback_name;
           LogToolEvent(log_line);
           std::cout << log_line << std::endl;
@@ -3773,7 +3607,7 @@ void HttpServer::HandleClient(ClientSession &session) {
                                arguments.dump());
           }
         } else {
-          tool_call = DetectToolCall(result.completion);
+          extraction = DetectToolCalls(result.completion);
         }
       }
       if (parsed.stream) {
@@ -3813,12 +3647,12 @@ void HttpServer::HandleClient(ClientSession &session) {
                                                       stream_ts));
               stream_had_chunk->store(true);
             }
-            if (tool_call.detected) {
-              // §2.3: emit structured tool_calls delta sequence (role → name →
-              // args → finish).
+            if (!extraction.calls.empty()) {
+              // §2.3: emit structured tool_calls delta sequence (role →
+              // per-call name/args → finish).
               SendAll(session,
                       BuildToolCallStreamChunks(stream_id, parsed.model,
-                                                stream_ts, tool_call));
+                                                stream_ts, extraction.calls));
             } else if (buffer_tokens && !token_buffer->empty()) {
               // Model produced plain text despite tools[] being present (no
               // tool call detected).  Replay the buffered tokens as content
@@ -3902,8 +3736,8 @@ void HttpServer::HandleClient(ClientSession &session) {
           }
         }
         auto payload = BuildResponse(
-            BuildCompletionBody(result, parsed, chat_mode, tool_call,
-                                result.reasoning_content,
+            BuildCompletionBody(result, parsed, chat_mode,
+                                std::move(extraction), result.reasoning_content,
                                 result.reasoning_tokens, chat_template_family),
             200, "OK", trace_response_header);
         SendAll(session, payload);
