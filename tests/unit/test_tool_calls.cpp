@@ -22,7 +22,8 @@ using json = nlohmann::json;
 
 namespace {
 
-ToolCallResult make_call(const std::string &name, const std::string &arguments_json) {
+ToolCallResult make_call(const std::string &name,
+                         const std::string &arguments_json) {
   ToolCallResult tc;
   tc.detected = true;
   tc.call_id = "call_" + name + "_0";
@@ -37,23 +38,27 @@ ToolCallResult make_call(const std::string &name, const std::string &arguments_j
 // DetectToolCalls
 // ---------------------------------------------------------------------------
 
-TEST_CASE("DetectToolCalls returns empty for plain text with residual", "[tool_calls]") {
+TEST_CASE("DetectToolCalls returns empty for plain text with residual",
+          "[tool_calls]") {
   const std::string text = "Just an answer, no tools here.";
   auto ex = DetectToolCalls(text);
   REQUIRE(ex.calls.empty());
   REQUIRE(ex.remaining_text == text);
 }
 
-TEST_CASE("DetectToolCalls extracts InferFlux preamble convention", "[tool_calls]") {
+TEST_CASE("DetectToolCalls extracts InferFlux preamble convention",
+          "[tool_calls]") {
   auto ex = DetectToolCalls(
       R"({"tool_call":{"name":"calculator","arguments":{"expression":"2+2"}}})");
   REQUIRE(ex.calls.size() == 1);
   REQUIRE(ex.calls[0].function_name == "calculator");
-  REQUIRE(json::parse(ex.calls[0].arguments_json) == json{{"expression", "2+2"}});
+  REQUIRE(json::parse(ex.calls[0].arguments_json) ==
+          json{{"expression", "2+2"}});
   REQUIRE(ex.calls[0].remaining_text.empty());
 }
 
-TEST_CASE("DetectToolCalls extracts bare OpenAI-style objects", "[tool_calls]") {
+TEST_CASE("DetectToolCalls extracts bare OpenAI-style objects",
+          "[tool_calls]") {
   auto ex = DetectToolCalls(R"({"name":"read","parameters":{"path":"a.py"}})");
   REQUIRE(ex.calls.size() == 1);
   REQUIRE(ex.calls[0].function_name == "read");
@@ -61,8 +66,9 @@ TEST_CASE("DetectToolCalls extracts bare OpenAI-style objects", "[tool_calls]") 
 }
 
 TEST_CASE("DetectToolCalls extracts Hermes/Qwen XML spans", "[tool_calls]") {
-  auto ex = DetectToolCalls(
-      "Sure.\n<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"a.py\"}}</tool_call>\nDone.");
+  auto ex =
+      DetectToolCalls("Sure.\n<tool_call>{\"name\":\"write\",\"arguments\":{"
+                      "\"path\":\"a.py\"}}</tool_call>\nDone.");
   REQUIRE(ex.calls.size() == 1);
   REQUIRE(ex.calls[0].function_name == "write");
   // Prose around the span survives as residual.
@@ -71,17 +77,20 @@ TEST_CASE("DetectToolCalls extracts Hermes/Qwen XML spans", "[tool_calls]") {
 }
 
 TEST_CASE("DetectToolCalls extracts Mistral arrays", "[tool_calls]") {
-  auto ex = DetectToolCalls(
-      "[TOOL_CALLS] [{\"name\":\"a\",\"arguments\":{}},{\"name\":\"b\",\"arguments\":{}}] tail");
+  auto ex = DetectToolCalls("[TOOL_CALLS] "
+                            "[{\"name\":\"a\",\"arguments\":{}},{\"name\":"
+                            "\"b\",\"arguments\":{}}] tail");
   REQUIRE(ex.calls.size() == 2);
   REQUIRE(ex.calls[0].function_name == "a");
   REQUIRE(ex.calls[1].function_name == "b");
   REQUIRE(ex.remaining_text == "tail");
 }
 
-TEST_CASE("DetectToolCalls preserves multi-call ordering and per-call ids", "[tool_calls]") {
+TEST_CASE("DetectToolCalls preserves multi-call ordering and per-call ids",
+          "[tool_calls]") {
   const std::string text =
-      "{\"tool_call\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"x\"}}}\n"
+      "{\"tool_call\":{\"name\":\"write_file\",\"arguments\":{\"path\":\"x\"}}}"
+      "\n"
       "{\"tool_call\":{\"name\":\"shell\",\"arguments\":{\"cmd\":\"ls\"}}}";
   auto ex = DetectToolCalls(text);
   REQUIRE(ex.calls.size() == 2);
@@ -92,7 +101,8 @@ TEST_CASE("DetectToolCalls preserves multi-call ordering and per-call ids", "[to
   REQUIRE(ex.remaining_text.empty());
 }
 
-TEST_CASE("DetectToolCalls keeps malformed JSON in residual without crashing", "[tool_calls]") {
+TEST_CASE("DetectToolCalls keeps malformed JSON in residual without crashing",
+          "[tool_calls]") {
   const std::string text = "{\"tool_call\":{\"name\":";
   auto ex = DetectToolCalls(text);
   REQUIRE(ex.calls.empty());
@@ -121,7 +131,8 @@ TEST_CASE("BuildToolCallEntry carries index when engaged", "[tool_calls]") {
 // BuildToolCallStreamChunks
 // ---------------------------------------------------------------------------
 
-TEST_CASE("BuildToolCallStreamChunks emits per-call indices and one finish", "[tool_calls]") {
+TEST_CASE("BuildToolCallStreamChunks emits per-call indices and one finish",
+          "[tool_calls]") {
   std::vector<ToolCallResult> calls;
   calls.push_back(make_call("write_file", "{\"path\":\"a.py\"}"));
   calls.push_back(make_call("shell", "{\"cmd\":\"pytest\"}"));
@@ -150,15 +161,18 @@ TEST_CASE("BuildToolCallStreamChunks emits per-call indices and one finish", "[t
   size_t frame = 1;
   for (size_t k = 0; k < calls.size(); ++k) {
     const auto &name_frame = frames[frame];
-    REQUIRE(name_frame["choices"][0]["delta"]["tool_calls"][0]["index"] == static_cast<int>(k));
-    REQUIRE(name_frame["choices"][0]["delta"]["tool_calls"][0]["function"]["name"] ==
-            calls[k].function_name);
-    REQUIRE(name_frame["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] == "");
+    REQUIRE(name_frame["choices"][0]["delta"]["tool_calls"][0]["index"] ==
+            static_cast<int>(k));
+    REQUIRE(name_frame["choices"][0]["delta"]["tool_calls"][0]["function"]
+                      ["name"] == calls[k].function_name);
+    REQUIRE(name_frame["choices"][0]["delta"]["tool_calls"][0]["function"]
+                      ["arguments"] == "");
     ++frame;
     const auto &args_frame = frames[frame];
-    REQUIRE(args_frame["choices"][0]["delta"]["tool_calls"][0]["index"] == static_cast<int>(k));
-    REQUIRE(args_frame["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"] ==
-            calls[k].arguments_json);
+    REQUIRE(args_frame["choices"][0]["delta"]["tool_calls"][0]["index"] ==
+            static_cast<int>(k));
+    REQUIRE(args_frame["choices"][0]["delta"]["tool_calls"][0]["function"]
+                      ["arguments"] == calls[k].arguments_json);
     ++frame;
   }
 

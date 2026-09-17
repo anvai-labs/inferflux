@@ -27,7 +27,8 @@ void LogJsonParseFailure(const char *context, const std::exception &ex) {
 // detected tool calls are removed from a completion.
 static std::string TrimWs(const std::string &sv) {
   const auto a = sv.find_first_not_of(" \t\r\n");
-  if (a == std::string::npos) return {};
+  if (a == std::string::npos)
+    return {};
   const auto b = sv.find_last_not_of(" \t\r\n");
   return sv.substr(a, b - a + 1);
 }
@@ -57,8 +58,10 @@ static std::size_t ScanBalancedObject(const std::string &sv,
     } else if (c == '{') {
       ++depth;
     } else if (c == '}') {
-      if (--depth == 0) return k + 1;
-      if (depth < 0) return std::string::npos;
+      if (--depth == 0)
+        return k + 1;
+      if (depth < 0)
+        return std::string::npos;
     }
   }
   return std::string::npos;
@@ -83,15 +86,15 @@ ToolCallExtraction DetectToolCalls(const std::string &text) {
       return false;
     ToolCallResult r;
     r.function_name = tc["name"].get<std::string>();
-    r.call_id =
-        "call_" + r.function_name + "_" + std::to_string(calls.size());
-    const char *args_key = tc.contains("arguments")
-                               ? "arguments"
-                               : (tc.contains("parameters") ? "parameters"
-                                                            : nullptr);
+    r.call_id = "call_" + r.function_name + "_" + std::to_string(calls.size());
+    const char *args_key =
+        tc.contains("arguments")
+            ? "arguments"
+            : (tc.contains("parameters") ? "parameters" : nullptr);
     if (args_key && tc.contains(args_key)) {
-      r.arguments_json = tc[args_key].is_object() ? tc[args_key].dump()
-                                                  : tc[args_key].get<std::string>();
+      r.arguments_json = tc[args_key].is_object()
+                             ? tc[args_key].dump()
+                             : tc[args_key].get<std::string>();
     } else {
       r.arguments_json = "{}";
     }
@@ -109,9 +112,11 @@ ToolCallExtraction DetectToolCalls(const std::string &text) {
     std::size_t pos = 0;
     while (true) {
       const auto a = text.find(kOpenTag, pos);
-      if (a == std::string::npos) break;
+      if (a == std::string::npos)
+        break;
       const auto b = text.find(kCloseTag, a + kOpenTag.size());
-      if (b == std::string::npos) break;
+      if (b == std::string::npos)
+        break;
       residual.append(text, pos, a - pos);
       const std::string inner =
           TrimWs(text.substr(a + kOpenTag.size(), b - a - kOpenTag.size()));
@@ -122,12 +127,14 @@ ToolCallExtraction DetectToolCalls(const std::string &text) {
           matched = fill(j);
         } else if (j.is_array()) {
           for (const auto &el : j)
-            if (el.is_object()) matched = fill(el) || matched;
+            if (el.is_object())
+              matched = fill(el) || matched;
         }
       } catch (const json::exception &ex) {
         LogJsonParseFailure("DetectToolCalls.tool_call_tag", ex);
       }
-      if (!matched) residual.append(text, a, b + kCloseTag.size() - a);
+      if (!matched)
+        residual.append(text, a, b + kCloseTag.size() - a);
       pos = b + kCloseTag.size();
     }
     residual.append(text, pos, text.size() - pos);
@@ -139,9 +146,11 @@ ToolCallExtraction DetectToolCalls(const std::string &text) {
     static const std::string kMistral = "[TOOL_CALLS]";
     for (;;) {
       const auto tag = residual.find(kMistral);
-      if (tag == std::string::npos) break;
+      if (tag == std::string::npos)
+        break;
       const auto bracket = residual.find('[', tag + kMistral.size());
-      if (bracket == std::string::npos) break;
+      if (bracket == std::string::npos)
+        break;
       int depth = 0;
       bool in_str = false;
       bool esc = false;
@@ -149,13 +158,18 @@ ToolCallExtraction DetectToolCalls(const std::string &text) {
       for (std::size_t k = bracket; k < residual.size(); ++k) {
         const char c = residual[k];
         if (in_str) {
-          if (esc) esc = false;
-          else if (c == '\\') esc = true;
-          else if (c == '"') in_str = false;
+          if (esc)
+            esc = false;
+          else if (c == '\\')
+            esc = true;
+          else if (c == '"')
+            in_str = false;
           continue;
         }
-        if (c == '"') in_str = true;
-        else if (c == '[') ++depth;
+        if (c == '"')
+          in_str = true;
+        else if (c == '[')
+          ++depth;
         else if (c == ']') {
           if (--depth == 0) {
             close = k;
@@ -163,13 +177,16 @@ ToolCallExtraction DetectToolCalls(const std::string &text) {
           }
         }
       }
-      if (close == std::string::npos) break;
+      if (close == std::string::npos)
+        break;
       bool matched = false;
       try {
-        const auto arr = json::parse(residual.substr(bracket, close - bracket + 1));
+        const auto arr =
+            json::parse(residual.substr(bracket, close - bracket + 1));
         if (arr.is_array()) {
           for (const auto &el : arr)
-            if (el.is_object()) matched = fill(el) || matched;
+            if (el.is_object())
+              matched = fill(el) || matched;
         }
       } catch (const json::exception &ex) {
         LogJsonParseFailure("DetectToolCalls.mistral", ex);
@@ -221,20 +238,21 @@ ToolCallExtraction DetectToolCalls(const std::string &text) {
 }
 
 json BuildToolCallEntry(const ToolCallResult &tc, std::optional<int> index) {
-  json entry = {{"id", tc.call_id},
-                {"type", "function"},
-                {"function",
-                 {{"name", tc.function_name},
-                  {"arguments", tc.arguments_json}}}};
+  json entry = {
+      {"id", tc.call_id},
+      {"type", "function"},
+      {"function",
+       {{"name", tc.function_name}, {"arguments", tc.arguments_json}}}};
   if (index.has_value()) {
     entry["index"] = *index;
   }
   return entry;
 }
 
-std::string BuildToolCallStreamChunks(
-    const std::string &id, std::string_view model, std::time_t ts,
-    const std::vector<ToolCallResult> &tool_calls) {
+std::string
+BuildToolCallStreamChunks(const std::string &id, std::string_view model,
+                          std::time_t ts,
+                          const std::vector<ToolCallResult> &tool_calls) {
   std::string out;
   out.reserve(4096 * (tool_calls.size() + 1));
   auto base = [&]() -> json {
@@ -277,9 +295,9 @@ std::string BuildToolCallStreamChunks(
 
     if (!tc.arguments_json.empty()) {
       json j = base();
-      json arg_delta = json::array({{{"index", call_index},
-                                     {"function",
-                                      {{"arguments", tc.arguments_json}}}}});
+      json arg_delta =
+          json::array({{{"index", call_index},
+                        {"function", {{"arguments", tc.arguments_json}}}}});
       j["choices"] = json::array({{{"index", 0},
                                    {"delta", {{"tool_calls", arg_delta}}},
                                    {"finish_reason", nullptr}}});

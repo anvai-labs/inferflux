@@ -124,9 +124,10 @@ nlohmann::json BuildToolCallEntry(const ToolCallResult &tc,
 /// SSE frames for a detected tool call batch: role frame, per-call
 /// name/arguments frames with tool_call index, single
 /// finish_reason="tool_calls" frame.
-std::string BuildToolCallStreamChunks(const std::string &id,
-                                      std::string_view model, std::time_t ts,
-                                      const std::vector<ToolCallResult> &tool_calls);
+std::string
+BuildToolCallStreamChunks(const std::string &id, std::string_view model,
+                          std::time_t ts,
+                          const std::vector<ToolCallResult> &tool_calls);
 
 /// Debug log for JSON parse failures (level: debug).
 void LogJsonParseFailure(const char *context, const std::exception &ex);

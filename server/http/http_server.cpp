@@ -607,7 +607,6 @@ std::string BuildToolSystemPrompt(const std::vector<Tool> &tools,
 //
 // Returns the first detected tool call or an empty result.
 
-
 // Build logprobs JSON for one result (shared helper).
 // Chat format: {"content":[...]}; completions format: {tokens, token_logprobs,
 // top_logprobs}.
@@ -774,15 +773,14 @@ std::string BuildCompletionBody(
       if (!per_result_reasoning.empty()) {
         message["reasoning_content"] = per_result_reasoning;
       }
-      choice_json = {
-          {"index", i},
-          {"message", std::move(message)},
-          {"logprobs", json::object()},
-          {"finish_reason",
-           !tcs.empty()
-               ? std::string("tool_calls")
-               : std::string(results[i].finish_reason_length ? "length"
-                                                             : "stop")}};
+      choice_json = {{"index", i},
+                     {"message", std::move(message)},
+                     {"logprobs", json::object()},
+                     {"finish_reason",
+                      !tcs.empty() ? std::string("tool_calls")
+                                   : std::string(results[i].finish_reason_length
+                                                     ? "length"
+                                                     : "stop")}};
     } else {
       choice_json = {{"index", i},
                      {"text", per_result_content},
@@ -3238,12 +3236,12 @@ void HttpServer::HandleClient(ClientSession &session) {
         mc_trace_hdr = "traceparent: " + mc_ctx.ToTraceparent() + "\r\n";
 
       SendAll(session,
-              BuildResponse(BuildCompletionBody(
-                                all_results, total_completion_tokens, parsed,
-                                chat_mode, per_result_extractions,
-                                reasoning_content, reasoning_tokens,
-                                chat_template_family),
-                            200, "OK", mc_trace_hdr));
+              BuildResponse(
+                  BuildCompletionBody(all_results, total_completion_tokens,
+                                      parsed, chat_mode, per_result_extractions,
+                                      reasoning_content, reasoning_tokens,
+                                      chat_template_family),
+                  200, "OK", mc_trace_hdr));
       return;
     }
     // ── End multi-completion path ──────────────────────────────────────────
@@ -3531,11 +3529,11 @@ void HttpServer::HandleClient(ClientSession &session) {
           }
           stream_active->store(false);
         } else {
-          auto payload = BuildResponse(
-              BuildCompletionBody(result, parsed, chat_mode,
-                                  ToolCallExtraction{}, {}, 0,
-                                  chat_template_family),
-              200, "OK", trace_response_header);
+          auto payload =
+              BuildResponse(BuildCompletionBody(result, parsed, chat_mode,
+                                                ToolCallExtraction{}, {}, 0,
+                                                chat_template_family),
+                            200, "OK", trace_response_header);
           SendAll(session, payload);
         }
         if (audit_logger_) {
@@ -3725,8 +3723,7 @@ void HttpServer::HandleClient(ClientSession &session) {
         }
         auto payload = BuildResponse(
             BuildCompletionBody(result, parsed, chat_mode,
-                                std::move(extraction),
-                                result.reasoning_content,
+                                std::move(extraction), result.reasoning_content,
                                 result.reasoning_tokens, chat_template_family),
             200, "OK", trace_response_header);
         SendAll(session, payload);
