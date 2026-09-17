@@ -3077,11 +3077,14 @@ void HttpServer::HandleClient(ClientSession &session) {
     std::string guard_reason;
     if (guardrail_ && guardrail_->Enabled()) {
       // Scan only caller-authored text: the raw completions prompt and
-      // user-role chat turns. The rendered prompt also carries system
-      // prompts and tool results that routinely quote repo content, and
-      // keyword-blocking those hard-400s the request - because agent
-      // clients replay their context on every turn, one flagged tool
-      // result would poison the session permanently.
+      // user-role chat turns. DELIBERATE SCOPE: system prompts and tool
+      // results are machine-assembled context that routinely quotes repo
+      // content, and keyword-blocking those hard-400s the request - because
+      // agent clients replay their context on every turn, a single flagged
+      // tool result would poison the session permanently. Consequence (for
+      // hostile-client analysis): text moved into a system role evades the
+      // keyword scan; use OPA policies on the same endpoint for content
+      // policy that must see the full prompt.
       std::string guard_text = parsed.prompt;
       for (const auto &m : parsed.messages) {
         if (m.role == "user") {
@@ -3555,6 +3558,21 @@ void HttpServer::HandleClient(ClientSession &session) {
                                   result.completion, result.prompt_tokens,
                                   result.completion_tokens);
       }
+      // Reasoning separation must precede tool-call detection: thinking
+      // models (Qwen3 hybrid) deliberate inside <think> blocks, and a tool
+      // call written during deliberation is not a real call. Splitting first
+      // also keeps <think> text out of the extraction residual (it would
+      // otherwise be duplicated into content alongside reasoning_content).
+      if (!ReasoningSplitDisabled()) {
+        auto parts = inferflux::ResponseSplitter::Split(chat_template_family,
+                                                        result.completion);
+        if (!parts.reasoning.empty()) {
+          result.reasoning_content = std::move(parts.reasoning);
+          result.completion = std::move(parts.content);
+          result.reasoning_tokens = 1;
+        }
+      }
+
       // §2.3: detect tool calls in model output — models chain several
       // calls per completion (e.g. write then run), so extract them all.
       ToolCallExtraction extraction;
@@ -3579,12 +3597,8 @@ void HttpServer::HandleClient(ClientSession &session) {
           json arguments = {
               {"reason", "no_model_available"},
               {"hint", "set INFERFLUX_MODEL_PATH or configure models[]"}};
-          ToolCallResult stub_call;
-          stub_call.detected = true;
-          stub_call.function_name = fallback_name;
-          stub_call.call_id = "call_stub_" + fallback_name;
-          stub_call.arguments_json = arguments.dump();
-          extraction = ToolCallExtraction{{std::move(stub_call)}, ""};
+          extraction = ToolCallExtraction{
+              {MakeStubToolCall(fallback_name, arguments)}, ""};
           std::string log_line = "[tools] stub tool call for " + fallback_name;
           LogToolEvent(log_line);
           std::cout << log_line << std::endl;

@@ -42,10 +42,6 @@ struct ToolCallResult {
   std::string call_id;
   std::string function_name;
   std::string arguments_json; // JSON-encoded arguments object.
-  // Visible text left after removing the detected tool call (whitespace
-  // trimmed). Empty when the completion was purely a tool call, so
-  // non-streaming chat bodies can emit content: null per the OpenAI shape.
-  std::string remaining_text;
 };
 
 // Aggregate returned by DetectToolCalls: every extracted call plus the

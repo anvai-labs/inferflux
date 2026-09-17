@@ -54,7 +54,7 @@ TEST_CASE("DetectToolCalls extracts InferFlux preamble convention",
   REQUIRE(ex.calls[0].function_name == "calculator");
   REQUIRE(json::parse(ex.calls[0].arguments_json) ==
           json{{"expression", "2+2"}});
-  REQUIRE(ex.calls[0].remaining_text.empty());
+  REQUIRE(ex.remaining_text.empty());
 }
 
 TEST_CASE("DetectToolCalls extracts bare OpenAI-style objects",

@@ -233,6 +233,19 @@ ToolCallExtraction DetectToolCalls(const std::string &text) {
     residual = std::move(out);
   }
 
+  // Strip tool-call scaffolding the phases did not consume (e.g. a
+  // [/TOOL_CALLS] sentinel or unmatched tags around a rescued call) so it
+  // never leaks into visible content.
+  if (!calls.empty()) {
+    const std::string scaffolding[] = {kOpenTag, kCloseTag, "[TOOL_CALLS]",
+                                       "[/TOOL_CALLS]"};
+    for (const auto &tag : scaffolding) {
+      std::size_t at;
+      while ((at = residual.find(tag)) != std::string::npos) {
+        residual.erase(at, tag.size());
+      }
+    }
+  }
   extraction.remaining_text = TrimWs(residual);
   return extraction;
 }
