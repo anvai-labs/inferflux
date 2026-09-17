@@ -3651,8 +3651,10 @@ void HttpServer::HandleClient(ClientSession &session) {
               // §2.3: emit structured tool_calls delta sequence (role →
               // per-call name/args → finish).
               SendAll(session,
-                      BuildToolCallStreamChunks(stream_id, parsed.model,
-                                                stream_ts, extraction.calls));
+                      BuildToolCallStreamChunks(
+                          stream_id, parsed.model, stream_ts, extraction.calls,
+                          buffer_tokens ? result.reasoning_content : "",
+                          buffer_tokens ? extraction.remaining_text : ""));
             } else if (buffer_tokens && !token_buffer->empty()) {
               // Model produced plain text despite tools[] being present (no
               // tool call detected).  Replay the buffered tokens as content
@@ -3708,10 +3710,14 @@ void HttpServer::HandleClient(ClientSession &session) {
                 uc["usage"]["time_to_first_token_ms"] =
                     result.time_to_first_token_ms;
               }
-              if (*stream_reasoning_piece_count > 0 || replay_split_reasoning) {
+              const int buffered_reasoning_tokens =
+                  buffer_tokens ? result.reasoning_tokens : 0;
+              if (*stream_reasoning_piece_count > 0 || replay_split_reasoning ||
+                  buffered_reasoning_tokens > 0) {
                 uc["usage"]["completion_tokens_details"] = {
                     {"reasoning_tokens",
-                     replay_split_reasoning
+                     buffered_reasoning_tokens > 0 ? buffered_reasoning_tokens
+                     : replay_split_reasoning
                          ? 1
                          : static_cast<int>(*stream_reasoning_piece_count)}};
               }

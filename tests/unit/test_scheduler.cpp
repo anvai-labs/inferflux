@@ -2471,6 +2471,44 @@ TEST_CASE("Scheduler keeps default admission without a native KV capacity",
   REQUIRE(access.max_batch_size() == 32);
 }
 
+TEST_CASE("Scheduler fits all model capacities independently of load order",
+          "[scheduler]") {
+  class CapacityBackend : public ReadyStubBackend {
+  public:
+    explicit CapacityBackend(int capacity)
+        : ReadyStubBackend("ok"), capacity_(capacity) {}
+    int SequenceCapacity() const override { return capacity_; }
+
+  private:
+    int capacity_;
+  };
+  for (const bool small_first : {true, false}) {
+    SimpleTokenizer tokenizer;
+    auto router = std::make_shared<SingleModelRouter>();
+    for (int capacity :
+         (small_first ? std::vector<int>{16, 32} : std::vector<int>{32, 16})) {
+      ModelInfo info;
+      info.id = std::to_string(capacity);
+      info.ready = true;
+      REQUIRE(router->RegisterModel(
+          info, std::make_shared<CapacityBackend>(capacity)));
+    }
+    MetricsRegistry metrics;
+    metrics.SetInferfluxCudaKvMaxSequences(32);
+    Scheduler::Config config;
+    config.max_batch_size = 32;
+    config.metrics = &metrics;
+    Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(),
+                        std::make_shared<PagedKVCache>(
+                            4, 1024, PagedKVCache::EvictionPolicy::kLRU),
+                        router, nullptr, nullptr, {}, {},
+                        ModelSelectionOptions{}, config);
+    SchedulerTestAccess access(scheduler);
+    REQUIRE(access.slot_manager()->GetMaxSlots() == 16);
+    REQUIRE(access.max_batch_size() == 16);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Issue #161: sequence-position consistency across slot reuse
 // ---------------------------------------------------------------------------

@@ -88,7 +88,7 @@ void SequenceSlotManager::InitializeSlots() {
 }
 
 std::optional<SequenceLease>
-SequenceSlotManager::AcquireLease(int64_t request_id) {
+SequenceSlotManager::AcquireLease(int64_t request_id, int sequence_capacity) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
 
   ReapRetiredSlotsLocked(std::chrono::steady_clock::now());
@@ -98,7 +98,7 @@ SequenceSlotManager::AcquireLease(int64_t request_id) {
   // LRU pressure through the prefix cache's EvictOneSequence instead, which
   // clears backend KV before releasing the slot.
 
-  auto slot = FindFreeSlot();
+  auto slot = FindFreeSlot(sequence_capacity);
   if (!slot) {
     const auto retiring = std::count_if(
         slots_.begin(), slots_.end(), [](const SequenceSlot &entry) {
@@ -403,12 +403,13 @@ bool SequenceSlotManager::RestoreLease(const SequenceLease &lease,
   return true;
 }
 
-std::optional<int> SequenceSlotManager::FindFreeSlot() {
+std::optional<int> SequenceSlotManager::FindFreeSlot(int sequence_capacity) {
   // Note: mutex_ should already be locked by caller
-  auto it =
-      std::find_if(slots_.begin(), slots_.end(), [](const SequenceSlot &s) {
-        return s.state == SequenceState::kIdle ||
-               s.state == SequenceState::kEvicted;
+  auto it = std::find_if(
+      slots_.begin(), slots_.end(), [sequence_capacity](const SequenceSlot &s) {
+        return (sequence_capacity <= 0 || s.slot_id < sequence_capacity) &&
+               (s.state == SequenceState::kIdle ||
+                s.state == SequenceState::kEvicted);
       });
 
   if (it != slots_.end()) {

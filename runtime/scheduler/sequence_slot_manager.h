@@ -117,7 +117,8 @@ public:
    * @param request_id Request ID for tracking
    * @return Lease if available, nullopt if all slots in use
    */
-  std::optional<SequenceLease> AcquireLease(int64_t request_id);
+  std::optional<SequenceLease> AcquireLease(int64_t request_id,
+                                            int sequence_capacity = 0);
 
   /**
    * @brief Acquire a slot for a request
@@ -293,7 +294,7 @@ private:
    * @brief Find available slot
    * @return Slot ID if found, nullopt if all slots in use
    */
-  std::optional<int> FindFreeSlot();
+  std::optional<int> FindFreeSlot(int sequence_capacity);
 
   /**
    * @brief Find slot by request ID

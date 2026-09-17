@@ -21,7 +21,7 @@ env:
 jobs:
   linux-packages:
     name: Linux (tgz/deb/rpm)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
 
     steps:
@@ -78,6 +78,13 @@ jobs:
           mv inferflux-*Linux*.deb artifacts/linux/ 2>/dev/null || true
           mv inferflux-*Linux*.rpm artifacts/linux/ 2>/dev/null || true
           ls -R artifacts/linux
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Smoke Linux packages
+        run: python scripts/smoke_release_packages.py --packages artifacts/linux
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v7
@@ -149,6 +156,13 @@ jobs:
           mv inferflux-*Linux-aarch64*.rpm artifacts/linux-arm64/ 2>/dev/null || true
           ls -R artifacts/linux-arm64
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Smoke Linux arm64 packages
+        run: python scripts/smoke_release_packages.py --packages artifacts/linux-arm64
+
       - name: Upload Linux arm64 artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -206,6 +220,13 @@ jobs:
           mv inferflux-*.pkg artifacts/macos/ 2>/dev/null || true
           mv inferflux-*.dmg artifacts/macos/ 2>/dev/null || true
           ls -R artifacts/macos
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Smoke macOS packages
+        run: python scripts/smoke_release_packages.py --packages artifacts/macos
 
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v7
@@ -267,6 +288,13 @@ jobs:
           Get-ChildItem -Path . -Filter "inferflux-*.zip" | ForEach-Object { Copy-Item $_.FullName artifacts/windows/ }
           Get-ChildItem -Recurse artifacts/windows
 
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Smoke Windows packages
+        run: python scripts/smoke_release_packages.py --packages artifacts/windows
+
       - name: Upload Windows artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -276,7 +304,7 @@ jobs:
 
   manifests:
     name: Homebrew & Winget manifests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     needs: [linux-packages, mac-packages, windows-packages]
     if: ${{ github.event.workflow_run.conclusion == 'success' && (github.event.workflow_run.head_branch == 'main' || (startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/'))) }}
 
@@ -430,7 +458,7 @@ jobs:
     name: Publish tagged release
     needs: [linux-packages, linux-arm64-packages, mac-packages, windows-packages, manifests]
     if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.head_branch, 'v') && !contains(github.event.workflow_run.head_branch, '/') }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
 
