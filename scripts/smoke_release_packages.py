@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
 
 
@@ -50,10 +51,46 @@ def smoke_binaries(root):
     suffix = ".exe" if platform.system() == "Windows" else ""
     cli = one(root, f"**/bin/inferctl{suffix}")
     server = one(root, f"**/bin/inferfluxd{suffix}")
+    smoke_binary_paths(cli, server)
+
+
+def smoke_binary_paths(cli, server):
     if "Usage:" not in run(cli, "--help", expected=(1,), timeout=20):
         raise SmokeError("inferctl --help did not print its usage contract")
     if "usage: inferfluxd" not in run(server, "--help", timeout=20):
         raise SmokeError("inferfluxd --help did not print its usage contract")
+
+
+def smoke_deb_binaries():
+    # CPack DEB defaults to /usr, unlike a plain CMake install's /usr/local.
+    # Query the installed package, never search PATH or another staging tree.
+    files = run("dpkg-query", "--listfiles", "inferflux").splitlines()
+    binaries = []
+    for name in ("inferctl", "inferfluxd"):
+        matches = [Path(path) for path in files if path.endswith(f"/bin/{name}")]
+        if len(matches) != 1 or not matches[0].is_absolute():
+            raise SmokeError(f"Expected one package-owned bin/{name}; found {matches}")
+        binaries.append(matches[0])
+    smoke_binary_paths(*binaries)
+
+
+def validate_pkg_distribution(expanded):
+    """Reject CPack's empty monolithic distribution before native installation."""
+    distribution = ET.parse(expanded / "Distribution").getroot()
+    choices = {choice.get("id"): choice for choice in distribution.findall("choice")}
+    referenced = set()
+    for line in distribution.findall("choices-outline//line"):
+        choice = choices.get(line.get("choice"))
+        if choice is None:
+            raise SmokeError("PKG distribution references a missing choice")
+        referenced.update(ref.get("id") for ref in choice.findall("pkg-ref"))
+    payloads = {
+        ref.get("id")
+        for ref in distribution.findall("pkg-ref")
+        if ref.text and ref.text.strip()
+    }
+    if not referenced or None in referenced or not referenced <= payloads:
+        raise SmokeError("PKG distribution has no complete installable package choices")
 
 
 def smoke_archive(package, root):
@@ -77,9 +114,8 @@ def smoke_linux(packages, temporary):
     rpm = one(packages, "inferflux-*Linux*.rpm")
     smoke_archive(archive, temporary / "tgz")
     run("sudo", "apt-get", "install", "-y", deb)
-    # CPack's UNIX install prefix; verify the installed files, not staging output.
     try:
-        smoke_binaries(Path("/usr/local"))
+        smoke_deb_binaries()
     finally:
         run("sudo", "apt-get", "remove", "-y", "inferflux")
 
@@ -103,6 +139,9 @@ def smoke_macos(packages, temporary):
     pkg = one(packages, "inferflux-*.pkg")
     dmg = one(packages, "inferflux-*.dmg")
     smoke_archive(archive, temporary / "tgz")
+    expanded = temporary / "pkg-expanded"
+    run("pkgutil", "--expand", pkg, expanded)
+    validate_pkg_distribution(expanded)
     run("sudo", "installer", "-pkg", pkg, "-target", "/")
     smoke_binaries(Path("/usr/local"))
     run("hdiutil", "verify", dmg)
@@ -162,6 +201,7 @@ def main(argv=None):
         subprocess.TimeoutExpired,
         tarfile.TarError,
         zipfile.BadZipFile,
+        ET.ParseError,
     ) as exc:
         print(f"Package smoke FAILED: {exc}", flush=True)
         return 1
