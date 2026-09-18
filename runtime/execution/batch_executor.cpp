@@ -1195,6 +1195,9 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
         if (req->prefill_offset >=
             static_cast<int>(req->bpe_prompt_tokens.size())) {
           states[i].in_prefill = false;
+          if (res.ok) {
+            req->cache_reused_tokens = req->cache_reuse_pending_tokens;
+          }
           // After final chunk, the 'res' contains the first generated token.
           if (!res.ok || res.token < 0) {
             states[i].active = false;
@@ -1657,6 +1660,9 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
       if (req->prefill_offset >=
           static_cast<int>(req->bpe_prompt_tokens.size())) {
         req->execution.in_prefill = false;
+        if (res.ok) {
+          req->cache_reused_tokens = req->cache_reuse_pending_tokens;
+        }
         if (!res.ok || res.token < 0) {
           req->execution.active = false;
           continue;

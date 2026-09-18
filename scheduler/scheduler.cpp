@@ -566,9 +566,13 @@ void SyncUnifiedDecodeStepProgress(InferenceRequest *req) {
 // clamped to the reported prompt length so a stale radix match can never
 // exceed the prompt it is reported against.
 void FillResultUsageTelemetry(const InferenceRequest &req,
-                              InferenceResult *result) {
+                              InferenceResult *result,
+                              MetricsRegistry *metrics) {
   result->cached_prompt_tokens =
-      std::clamp(req.cache_matched_tokens, 0, result->prompt_tokens);
+      std::clamp(req.cache_reused_tokens, 0, result->prompt_tokens);
+  if (result->cached_prompt_tokens > 0) {
+    metrics->RecordKVPrefixReuse(result->cached_prompt_tokens);
+  }
   const auto epoch = std::chrono::steady_clock::time_point{};
   if (req.accept_time == epoch) {
     return; // Accept time unavailable; timings stay "not measured".
@@ -1337,7 +1341,7 @@ void Scheduler::DecodeWorkerLoop() {
           }
 
           FinalizeUnifiedDecodeStepResult(inference, &result);
-          FillResultUsageTelemetry(*inference, &result);
+          FillResultUsageTelemetry(*inference, &result, metrics_);
           {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             if (inference->session_lease_acquired &&
@@ -1577,7 +1581,7 @@ void Scheduler::DecodeWorkerLoop() {
         if (!use_stepwise_decode) {
           inference->phase = RequestPhase::kFinished;
         }
-        FillResultUsageTelemetry(*inference, &result);
+        FillResultUsageTelemetry(*inference, &result, metrics_);
         pending->promise.set_value(std::move(result));
       }
 
@@ -2018,6 +2022,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // state. Phased prefill + Decode() would split sampler state across
         // phases and force sequence-state handoff between heterogeneous paths.
         if (inf.collect_logprobs || inf.response_format.has_format) {
+          inf.cache_reused_tokens = 0;
+          inf.cache_reuse_pending_tokens = 0;
           LogCacheDecision(inf, pending->resolved_backend.get(),
                            "policy_bypass");
           inf.n_past = -1;
@@ -2084,10 +2090,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           cached_seq_id = lookup.sequence_id;
           matched_tokens = lookup.matched_tokens;
         }
-        // Per-request usage telemetry (usage.cached_tokens): only tokens
-        // whose KV blocks are actually reused count as cached — a partial
-        // trie match that cannot donate blocks reports zero.
+        // A lookup is only a candidate. Copy, replay, and full-prefill recovery
+        // determine the accepted reuse extent below.
         inf.cache_matched_tokens = prefix_hit ? matched_tokens : 0;
+        inf.cache_reused_tokens = 0;
+        inf.cache_reuse_pending_tokens = 0;
         LogCacheDecision(inf, pending->resolved_backend.get(), "lookup",
                          matched_tokens, 0, cached_seq_id);
 
@@ -2232,10 +2239,17 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                     static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
               }
               if (!reused_session_state) {
-                pending->resolved_backend->CopySequencePrefix(
+                copied_prefix = pending->resolved_backend->CopySequencePrefix(
                     cached_seq_id, seq_id, prefill_start);
+                if (!copied_prefix) {
+                  LogCacheDecision(inf, pending->resolved_backend.get(),
+                                   "copy_failed", matched_tokens, 0,
+                                   cached_seq_id);
+                  prefill_start = 0;
+                }
+              } else {
+                copied_prefix = true;
               }
-              copied_prefix = true;
             }
 
             // Defer prefill compute into ExecuteUnifiedBatchPhased so decode
@@ -2250,9 +2264,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             inf.first_token = -1;
             inf.first_piece.clear();
             SyncSequenceSlotProgress(inf);
-            if (copied_prefix && prefill_start > 0) {
-              metrics_->RecordKVPrefixReuse(prefill_start);
-            }
+            inf.cache_reuse_pending_tokens = copied_prefix ? prefill_start : 0;
             staged_decode_local.push_back(pending);
             queued_via_unified_prefill = true;
           } else {
@@ -2320,11 +2332,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                 }
               }
             }
-            if (pr.ok && copied_prefix) {
-              metrics_->RecordKVPrefixReuse(prefill_start);
-            }
-
             if (pr.ok) {
+              inf.cache_reused_tokens = copied_prefix ? prefill_start : 0;
               inf.n_past = pr.n_past;
               inf.prompt_bpe_tokens = pr.n_past;
               inf.sequence_id = seq_id;
@@ -2751,7 +2760,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       ResetSequenceLease(inference);
     }
     inference->phase = RequestPhase::kFinished;
-    FillResultUsageTelemetry(*inference, &result);
+    FillResultUsageTelemetry(*inference, &result, metrics_);
     pending->promise.set_value(std::move(result));
     LogSequenceSlotEvent("promise_completed", *inference);
   }
