@@ -2791,3 +2791,50 @@ TEST_CASE("Scheduler reports only accepted cache reuse",
     }
   }
 }
+
+TEST_CASE("Scheduler releases blocks when admission or donation is declined",
+          "[scheduler][cache_ownership]") {
+  class TwoSequenceBackend : public PositionCheckingBackend {
+  public:
+    int SequenceCapacity() const override { return 2; }
+  };
+  for (const std::string scenario :
+       {"donation_disabled", "slots_full", "pages_full"}) {
+    CAPTURE(scenario);
+    const bool slots_full = scenario == "slots_full";
+    SimpleTokenizer tokenizer;
+    auto cache = std::make_shared<PagedKVCache>(
+        32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+    auto router = std::make_shared<SingleModelRouter>();
+    auto backend = std::make_shared<TwoSequenceBackend>();
+    ModelInfo info;
+    info.id = "ownership";
+    info.backend = "cpu";
+    REQUIRE(router->RegisterModel(info, backend));
+    auto prefix = std::make_shared<RadixPrefixCache>(
+        cache, [](int, std::shared_ptr<BackendInterface>) {},
+        RadixPrefixCacheLimits{scenario == "donation_disabled" ? 0u : 64u, 8});
+    MetricsRegistry metrics;
+    Scheduler::Config config;
+    config.metrics = &metrics;
+    Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(), cache,
+                        router, nullptr, prefix, {}, {}, {}, config);
+    if (slots_full) {
+      REQUIRE(scheduler.AllocSeqSlot(100, nullptr, 2) >= 0);
+      REQUIRE(scheduler.AllocSeqSlot(101, nullptr, 2) >= 0);
+    }
+    const auto held = scenario == "pages_full" ? cache->ReserveBlocks(29)
+                                               : std::vector<int>{};
+    InferenceRequest request;
+    request.prompt = "ownership";
+    request.max_tokens = 2;
+    const auto result = scheduler.Generate(std::move(request)).get();
+    REQUIRE_FALSE(result.no_backend);
+    REQUIRE(result.cached_prompt_tokens == 0);
+    if (slots_full || scenario == "pages_full") {
+      REQUIRE(backend->generate_calls == 1);
+    }
+    cache->ReleaseBlocksRef(held);
+    REQUIRE(cache->NumFreeBlocks() == 32);
+  }
+}

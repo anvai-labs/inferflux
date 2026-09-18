@@ -63,33 +63,59 @@ def main():
                 {"role": "system", "content": prefix},
                 {"role": "user", "content": 'Return {"ok":true}.'},
             ]
-            payload = dict(model=args.model, messages=messages, temperature=0,
-                           max_tokens=32, stream=stream)
+            payload = dict(
+                model=args.model,
+                messages=messages,
+                temperature=0,
+                max_tokens=32,
+                stream=stream,
+            )
             if stream:
                 payload["stream_options"] = {"include_usage": True}
             if shape == "tools":
-                payload["tools"] = [{"type": "function", "function": {
-                    "name": "read", "parameters": {"type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"]}}}]
+                payload["tools"] = [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "read",
+                            "parameters": {
+                                "type": "object",
+                                "properties": {"path": {"type": "string"}},
+                                "required": ["path"],
+                            },
+                        },
+                    }
+                ]
             elif shape == "json":
                 payload["response_format"] = {"type": "json_object"}
             elif shape == "logprobs":
                 payload["logprobs"] = True
             for stage in ("unique_prefix", "repeat", "appended"):
                 correlation = f"{run}-{shape}-{stream}-{stage}"
-                usage, content = complete(args.base_url, key, payload,
-                                          correlation, run)
-                rows.append(dict(client_request_id=correlation, shape=shape,
-                                 stream=stream, stage=stage, usage=usage,
-                                 system_sha256=hashlib.sha256(prefix.encode()).hexdigest()))
+                usage, content = complete(args.base_url, key, payload, correlation, run)
+                rows.append(
+                    dict(
+                        client_request_id=correlation,
+                        shape=shape,
+                        stream=stream,
+                        stage=stage,
+                        usage=usage,
+                        system_sha256=hashlib.sha256(prefix.encode()).hexdigest(),
+                    )
+                )
                 print(correlation, json.dumps(usage), flush=True)
                 if stage == "repeat":
-                    messages.extend([{"role": "assistant", "content": content},
-                                     {"role": "user", "content": "Again."}])
+                    messages.extend(
+                        [
+                            {"role": "assistant", "content": content},
+                            {"role": "user", "content": "Again."},
+                        ]
+                    )
                 # Persist partial evidence if a later request fails. No key,
                 # prompt, response text, or inferred internal state is stored.
-                args.output.write_text(json.dumps({"run": run, "rows": rows}, indent=2) + "\n")
+                args.output.write_text(
+                    json.dumps({"run": run, "rows": rows}, indent=2) + "\n"
+                )
 
 
 if __name__ == "__main__":
