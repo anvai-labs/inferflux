@@ -1341,6 +1341,10 @@ int LlamaCppBackend::SequenceCapacity() const {
   return context_ ? static_cast<int>(llama_n_seq_max(context_)) : 0;
 }
 
+int LlamaCppBackend::SequenceContextCapacity() const {
+  return context_ ? static_cast<int>(llama_n_ctx_seq(context_)) : 0;
+}
+
 LlamaCppBackend::UnifiedBatchHandle LlamaCppBackend::SubmitUnifiedBatchAsync(
     const std::vector<UnifiedBatchInput> &inputs, UnifiedBatchLane /*lane*/) {
   auto outputs = ExecuteUnifiedBatch(inputs);

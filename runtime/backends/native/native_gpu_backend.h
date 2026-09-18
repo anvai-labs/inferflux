@@ -56,6 +56,8 @@ public:
       UnifiedBatchHandle handle,
       std::vector<UnifiedBatchOutput> *outputs) override;
   int UnifiedBatchTokenCapacity() const override;
+  int SequenceCapacity() const override;
+  int SequenceContextCapacity() const override;
   PrefillResult Prefill(const std::string &prompt, int sequence_id) override;
   PrefillResult PrefillPartial(const std::string &prompt, int sequence_id,
                                int n_past_start) override;

@@ -78,6 +78,16 @@ public:
     return backend && backend->IsReady();
   }
 
+  virtual int NativeSequenceCapacity() const {
+    auto backend = BackendHandle();
+    return backend ? backend->SequenceCapacity() : 0;
+  }
+
+  virtual int NativeSequenceContextCapacity() const {
+    auto backend = BackendHandle();
+    return backend ? backend->SequenceContextCapacity() : 0;
+  }
+
   virtual void NativeFreeSequence(int sequence_id) {
     auto backend = BackendHandle();
     if (backend) {

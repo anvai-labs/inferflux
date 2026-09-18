@@ -93,6 +93,8 @@ public:
 
   std::string Name() const override { return "inferflux_cuda"; }
   bool IsFallback() const override { return false; }
+  int NativeSequenceCapacity() const override { return 2; }
+  int NativeSequenceContextCapacity() const override { return 32768; }
   const std::string &FallbackReason() const override {
     return fallback_reason_;
   }
@@ -228,6 +230,8 @@ TEST_CASE("NativeGpuBackend Decode uses burst path for eligible greedy decode",
   TestNativeGpuBackend backend(std::move(runtime));
 
   REQUIRE(backend.LoadModel("fake.gguf", {}));
+  REQUIRE(backend.SequenceCapacity() == 2);
+  REQUIRE(backend.SequenceContextCapacity() == 32768);
 
   SamplingParams greedy;
   greedy.temperature = 0.0f;

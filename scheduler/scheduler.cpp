@@ -182,6 +182,10 @@ std::string SchedulerBatchPolicyToString(SchedulerBatchPolicy policy) {
   }
 }
 
+bool Scheduler::PrefixReuseEnabled() const {
+  return prefix_cache_ && cache_ && prefix_cache_->ReuseEnabled();
+}
+
 bool IsSchedulerBatchPolicyValue(const std::string &value) {
   const std::string normalized = ToLower(value);
   return normalized == "priority_age" || normalized == "lpm_priority" ||
