@@ -4,6 +4,27 @@
 
 #include <string>
 
+TEST_CASE("Cache reuse counters share execution events across model labels",
+          "[metrics][cache_usage]") {
+  inferflux::MetricsRegistry registry;
+  registry.RecordKVPrefixReuse(39, "qwen", "llama_cpp_rocm");
+  registry.RecordKVPrefixReuse(10, "qwen", "llama_cpp_rocm");
+  registry.RecordKVPrefixReuse(7, "other", "cpu");
+  registry.RecordKVPrefixReuse(0, "qwen", "llama_cpp_rocm");
+  registry.RecordKVPrefixReuse(-1, "qwen", "llama_cpp_rocm");
+  const auto out = registry.RenderPrometheus();
+  REQUIRE(out.find("inferflux_kv_prefix_reuse_total 3\n") != std::string::npos);
+  REQUIRE(out.find("inferflux_kv_prefix_reuse_tokens_total 56\n") !=
+          std::string::npos);
+  REQUIRE(out.find("inferflux_cache_reuse_tokens_total{model=\"qwen\",backend="
+                   "\"llama_cpp_rocm\"} 49\n") != std::string::npos);
+  REQUIRE(out.find("inferflux_cache_reuse_requests_total{model=\"other\","
+                   "backend=\"cpu\"} 1\n") != std::string::npos);
+  registry.RecordKVPrefixReuse(1, "quote\"line\nslash\\", "cpu");
+  REQUIRE(registry.RenderPrometheus().find(
+              "model=\"quote\\\"line\\nslash\\\\\"") != std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry default backend is cpu", "[metrics]") {
   inferflux::MetricsRegistry registry;
   auto output = registry.RenderPrometheus();

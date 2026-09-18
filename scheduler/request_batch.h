@@ -206,6 +206,8 @@ struct InferenceRequest {
   // Deferred prefill commits its candidate only after successful evaluation.
   int cache_reuse_pending_tokens{0};
   int cache_reused_tokens{0};
+  bool cache_session_handles_enabled{false};
+  std::string cache_execution_path{"unresolved"};
 
   // W3C trace-id propagated from the incoming HTTP traceparent header.
   // Empty string if no traceparent was present in the request.
