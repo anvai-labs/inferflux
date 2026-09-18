@@ -18,11 +18,75 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <nlohmann/json.hpp>
+#include <openssl/sha.h>
 #include <unordered_set>
 
 namespace inferflux {
 
 namespace {
+
+// Opt-in, bounded capture for a single caller-selected correlation prefix.
+// Never emit token IDs, prompt text, response text, or raw session IDs.
+void LogCacheDecision(const InferenceRequest &req,
+                      const BackendInterface *backend, std::string_view stage,
+                      int matched_tokens = 0, int reused_tokens = 0,
+                      int source_sequence = -1) {
+  static const std::string filter = [] {
+    const char *value =
+        std::getenv("INFERFLUX_CACHE_DIAGNOSTIC_REQUEST_PREFIX");
+    return value ? std::string(value) : std::string{};
+  }();
+  static std::atomic<int> remaining{64};
+  if (filter.empty() || req.client_request_id.rfind(filter, 0) != 0) {
+    return;
+  }
+  int budget = remaining.load(std::memory_order_relaxed);
+  do {
+    if (budget <= 0) {
+      return;
+    }
+  } while (!remaining.compare_exchange_weak(budget, budget - 1,
+                                            std::memory_order_relaxed));
+  auto hash = [](const std::string &value) {
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    SHA256(reinterpret_cast<const unsigned char *>(value.data()), value.size(),
+           digest);
+    std::string out;
+    constexpr char hex[] = "0123456789abcdef";
+    for (unsigned char byte : digest) {
+      out += hex[byte >> 4];
+      out += hex[byte & 15];
+    }
+    return out;
+  };
+  // Decimal encoding is architecture independent, including negative tokens.
+  std::string tokens;
+  for (int token : req.bpe_prompt_tokens) {
+    tokens += std::to_string(token) + ",";
+  }
+  const nlohmann::json event = {
+      {"stage", stage},
+      {"request_id", req.id},
+      {"client_request_id", req.client_request_id},
+      {"model", req.resolved_model},
+      {"backend", backend ? backend->Name() : "unresolved"},
+      {"path", req.collect_logprobs || req.response_format.has_format
+                   ? "full_generate"
+                   : "phased"},
+      {"logprobs", req.collect_logprobs},
+      {"structured", req.response_format.has_format},
+      {"session_sha256", hash(req.session_id)},
+      {"session_lease_acquired", req.session_lease_acquired},
+      {"prompt_tokens", req.bpe_prompt_tokens.size()},
+      {"tokens_sha256", hash(tokens)},
+      {"matched_tokens", matched_tokens},
+      {"reused_tokens", reused_tokens},
+      {"source_sequence", source_sequence},
+      {"sequence_id", req.sequence_id},
+      {"sequence_generation", req.sequence_generation}};
+  log::Info("cache_decision", event.dump());
+}
 
 bool FairnessTraceEnabled() {
   static const bool enabled = []() {
@@ -1954,6 +2018,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // state. Phased prefill + Decode() would split sampler state across
         // phases and force sequence-state handoff between heterogeneous paths.
         if (inf.collect_logprobs || inf.response_format.has_format) {
+          LogCacheDecision(inf, pending->resolved_backend.get(),
+                           "policy_bypass");
           inf.n_past = -1;
           inf.prompt_bpe_tokens = 0;
           ResetSequenceLease(&inf);
@@ -2022,6 +2088,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // whose KV blocks are actually reused count as cached — a partial
         // trie match that cannot donate blocks reports zero.
         inf.cache_matched_tokens = prefix_hit ? matched_tokens : 0;
+        LogCacheDecision(inf, pending->resolved_backend.get(), "lookup",
+                         matched_tokens, 0, cached_seq_id);
 
         // PagedAttention Block Allocation: calculate additional blocks needed.
         std::size_t prompt_len = inf.bpe_prompt_tokens.size();
@@ -2210,6 +2278,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                 copied_prefix = pending->resolved_backend->CopySequencePrefix(
                     cached_seq_id, seq_id, prefill_start);
                 if (!copied_prefix) {
+                  LogCacheDecision(inf, pending->resolved_backend.get(),
+                                   "copy_failed", matched_tokens, 0,
+                                   cached_seq_id);
                   // Hybrid memory could not hold the copied prefix — the
                   // backend cleared the slot; fall back to a full prefill
                   // below (issue #161).
@@ -2225,6 +2296,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                 {seq_id, prefill_start, seq_generation}, &pr,
                 /*chunk_token_cap=*/config_.chunked_prefill_tokens);
             if (!prefill_ok) {
+              LogCacheDecision(inf, pending->resolved_backend.get(),
+                               "partial_prefill_failed", matched_tokens, 0,
+                               cached_seq_id);
               log::Warn("scheduler",
                         "Phased prefill failed for request " +
                             std::to_string(inf.id) + " (prompt_tokens=" +
@@ -2258,6 +2332,10 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               inf.first_token = pr.first_token;
               inf.first_piece = pr.first_piece;
               SyncSequenceSlotProgress(inf);
+              LogCacheDecision(inf, pending->resolved_backend.get(),
+                               "prefill_accepted", matched_tokens,
+                               copied_prefix ? prefill_start : 0,
+                               cached_seq_id);
             } else {
               // Prefill failed: release only the NEW blocks (warm blocks belong
               // to the cache).
