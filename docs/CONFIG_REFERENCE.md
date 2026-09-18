@@ -219,9 +219,10 @@ Session handle contract:
 
 Gateway-fronted deployments (recommended posture when a proxy such as Sandhi fronts
 InferFlux and stamps `x-inferflux-session-id`):
-- Set `runtime.scheduler.session_handles.enabled: true` — without it the affinity header
-  is accepted but ignored, and every turn re-prefills from scratch (no session KV reuse,
-  no `prompt_tokens_details.cached_tokens` from session leases).
+- Set `runtime.scheduler.session_handles.enabled: true` when retained session leases
+  are desired. Without it the affinity header does not retain a session lease;
+  global radix prefix reuse can still produce `prompt_tokens_details.cached_tokens`.
+  Verify effective configuration and sequence capacity before changing this setting.
 - Size `max_sessions` (default 1024) for peak concurrent agent **conversations**, not
   requests: a lease is held per session id across its turns, while many requests may
   share one conversation. When the cap is hit, the least-recently-used **idle** lease is
