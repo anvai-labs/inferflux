@@ -78,6 +78,22 @@ bytes (2499, 2961, 3478); **these are not tokenized common-prefix lengths**.
 Tokenized comparisons and exact allocation/copy decisions require the diagnostic
 build, which has not been deployed to the shared GPU service.
 
+The reusable local replay is:
+
+```bash
+python scripts/cache_member_replay.py \
+  --victor-repo /tmp/inferflux-victor-cache-replay \
+  --sandhi-binary /tmp/inferflux-cache-sandhi-target/debug/sandhi-proxy
+```
+
+Use a Python environment with Victor's dependencies and privately set
+`INFERCTL_API_KEY`. The script bounds capture at 32 requests, uses only the Qwen
+writer portion of WS-E, launches loopback gateway/observer ports 18789/18084,
+stops its gateway on exit, and checks each SQLite row against wire usage. No
+Mac credentials or ZAI calls are needed. The validated reusable-script run,
+`inferflux-member-973c745aa4`, completed two calls (1720/155/0 and 1929/246/0),
+passed the generated pytest test, and automatically reconciled both ledger rows.
+
 For a separately scheduled deployment of the diagnostic build, set
 `INFERFLUX_CACHE_DIAGNOSTIC_REQUEST_PREFIX` to the correlation prefix of one local
 member's requests. Capture emits at most 64 JSON events per process, requires a
@@ -86,6 +102,11 @@ session IDs. It records policy bypass, lookup common-prefix length, copy failure
 partial-prefill failure, and accepted synchronous prefill reuse with sequence
 generation. Lookup length is a candidate, never proof of successful reuse.
 The token hash uses comma-separated decimal token IDs before SHA-256.
+The completed diagnostic implementation also records capacity-eviction counts,
+admission failure, effective session configuration/lease outcome, actual execution
+path, and tokenized common-prefix length against the previous captured request
+in the same model/session. First observations report a null previous-prefix
+length. The bounded comparison retains token IDs in memory but never logs them.
 
 These events are request diagnostics, not distributed traces. An OTEL collector
 requires explicit configuration. Capture does not expose prompt text or token
@@ -112,3 +133,48 @@ copies, matches without donors, full-prefill recovery, and Generate fallback.
 The CPU test build is `build-cpu-ci`; these tests use deterministic backends and
 do not claim GPU coverage. Rollback is a revert of the accounting commit; no
 model, config, grammar, or wire-field removal is involved.
+
+## Block ownership follow-up
+
+A deterministic regression reproduced a radix reference leak: two 40-token
+donations diverging at token 20 reserved eight blocks, but the trie retained only
+seven in its ownership tables. The new leaf stored suffix blocks while the
+scheduler had acquired references to its complete table. Eviction therefore
+could not release all donated references. Nodes now retain complete donor tables;
+lookup selects the chosen donor's table without concatenating ancestor tables.
+Hits cannot extend past the selected donor's token extent.
+
+Separate deterministic scheduler cases reproduced four leaked blocks when a
+zero-capacity cache declined donation. Cleanup now releases rejected donation
+references and unowned reservations when slot admission fails. Full-prefill
+failure also drops scheduler references to warm blocks. Tests require all 32
+blocks to become free again after donation rejection, occupied-slot fallback,
+and page-pressure fallback. Page-pressure fallback calls full Generate and
+reports zero reused tokens, consistent with the current replay's resource
+snapshot. This is a verified defect and mechanism, not retrospective proof of
+what caused the original 40 calls.
+
+Rollback: revert the ownership commit together with its donor-table lookup
+change. Do not mix old suffix-only insertion with complete-table lookup. The
+running Qwen process still uses the old binary; repairing its retained state
+requires a separately scheduled deployment/rollback, not a live cache flush.
+
+## Local adversarial review
+
+The author review checked donor ownership, slot admission, failed prefill,
+response/metric agreement, per-model capacity, and capture privacy. It is not
+an independent approval. Two additional deterministic regressions failed before
+their fixes:
+
+- With one sequence slot, admission evicted the selected donor but its successful
+  empty-slot copy still reported 39 cached tokens. Admission now discards prefix
+  candidates after slot eviction and reserves a fresh table. Synchronous and
+  deferred repetitions must report zero, avoid copying the retired donor, and
+  return every block after eviction.
+- A failed deferred prefill still created a live donor. Radix donation and session
+  retention now require an explicit successful-prefill flag, set only after all
+  prompt chunks complete. Intermediate/final prefill failures must leave no
+  retained blocks, and the next same-session request must start cold.
+
+These are review findings in the implementation paths; neither establishes the
+historical cause of the original WS-E calls. The deployed GPU binary is unchanged.

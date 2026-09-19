@@ -86,6 +86,7 @@ bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,
   std::size_t offset = 0;
   std::vector<int> blocks;
   int last_seq_id = -1;
+  int last_seq_tokens = 0;
   bool node_hit = false;
 
   while (offset < tokens.size()) {
@@ -119,12 +120,12 @@ bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,
     offset += common;
     node = child;
     node_hit = true;
-    if (!node->block_table.empty()) {
-      blocks.insert(blocks.end(), node->block_table.begin(),
-                    node->block_table.end());
-    }
     if (node->sequence_id >= 0) {
       last_seq_id = node->sequence_id;
+      last_seq_tokens = static_cast<int>(offset);
+      // Each donor owns a complete sequence table. Ancestors may reference
+      // different physical prefixes; concatenating tables duplicates blocks.
+      blocks = node->block_table;
     }
     // Relaxed atomics: Lookup runs under the SHARED lock, so the touch must
     // not tear (previously ++clock_ and last_used were plain uint64_t — a
@@ -138,10 +139,11 @@ bool RadixPrefixCache::Lookup(const std::vector<int> &tokens,
     result->matched_tokens = static_cast<int>(offset);
   }
 
-  if (node_hit && node != root_.get()) {
+  if (node_hit && node != root_.get() && last_seq_id >= 0 && !blocks.empty()) {
     if (result) {
       result->block_table = std::move(blocks);
       result->sequence_id = last_seq_id;
+      result->matched_tokens = last_seq_tokens;
     }
     return true;
   }
@@ -183,8 +185,6 @@ bool RadixPrefixCache::Insert(
 
   RadixNode *node = root_.get();
   std::size_t offset = 0;
-  std::size_t node_start_offset = 0;
-  const int kTokensPerBlock = 16;
 
   while (offset < tokens.size()) {
     int first = tokens[offset];
@@ -196,12 +196,10 @@ bool RadixPrefixCache::Insert(
       leaf->edge.assign(tokens.begin() + static_cast<std::ptrdiff_t>(offset),
                         tokens.end());
 
-      std::size_t block_offset = offset / kTokensPerBlock;
-      if (block_offset < block_table.size()) {
-        leaf->block_table.assign(block_table.begin() +
-                                     static_cast<std::ptrdiff_t>(block_offset),
-                                 block_table.end());
-      }
+      // The scheduler transfers one reference for EVERY donated block.
+      // Keeping only suffix blocks loses ownership of the prefix references
+      // when an edge splits, eventually exhausting the paged cache.
+      leaf->block_table = block_table;
 
       leaf->sequence_id = sequence_id;
       leaf->backend = backend;
@@ -230,7 +228,6 @@ bool RadixPrefixCache::Insert(
       child = node->children[first].get();
     }
 
-    node_start_offset = offset;
     offset += common;
     node = child;
   }
@@ -238,20 +235,10 @@ bool RadixPrefixCache::Insert(
   // Live-sequence accounting for the (re)donation happens at the assignment
   // below, together with old-donor cleanup.
 
-  // Update the block table for this node only (prefix blocks are owned by
-  // ancestor nodes and are concatenated during lookup).
-  std::vector<int> node_blocks;
-  std::size_t block_offset = node_start_offset / kTokensPerBlock;
-  if (block_offset < block_table.size()) {
-    node_blocks.assign(block_table.begin() +
-                           static_cast<std::ptrdiff_t>(block_offset),
-                       block_table.end());
-  }
-
   if (kv_cache_ && !node->block_table.empty()) {
     kv_cache_->ReleaseBlocksRef(node->block_table);
   }
-  node->block_table = std::move(node_blocks);
+  node->block_table = block_table;
 
   // Re-donation overwrites the previous donor's claim on this node. Free the
   // old donor's backend KV and release its slot first — otherwise the old

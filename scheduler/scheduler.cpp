@@ -31,7 +31,7 @@ namespace {
 void LogCacheDecision(const InferenceRequest &req,
                       const BackendInterface *backend, std::string_view stage,
                       int matched_tokens = 0, int reused_tokens = 0,
-                      int source_sequence = -1) {
+                      int source_sequence = -1, int evicted_sequences = 0) {
   static const std::string filter = [] {
     const char *value =
         std::getenv("INFERFLUX_CACHE_DIAGNOSTIC_REQUEST_PREFIX");
@@ -65,6 +65,33 @@ void LogCacheDecision(const InferenceRequest &req,
   for (int token : req.bpe_prompt_tokens) {
     tokens += std::to_string(token) + ",";
   }
+  nlohmann::json previous_common = nullptr;
+  if (!req.session_id.empty() &&
+      (stage == "lookup" || stage == "policy_bypass")) {
+    struct PreviousPrompt {
+      uint64_t request_id;
+      std::vector<int> tokens;
+    };
+    static std::mutex previous_mutex;
+    static std::unordered_map<std::string, PreviousPrompt> previous;
+    // At most 64 captured events can add entries. Keep token IDs in memory
+    // solely for exact comparison; neither IDs nor prompt contents are logged.
+    const auto key = req.resolved_model + '\0' + req.session_id;
+    std::lock_guard<std::mutex> lock(previous_mutex);
+    const auto found = previous.find(key);
+    if (found == previous.end() || found->second.request_id != req.id) {
+      if (found != previous.end()) {
+        std::size_t common = 0;
+        while (common < found->second.tokens.size() &&
+               common < req.bpe_prompt_tokens.size() &&
+               found->second.tokens[common] == req.bpe_prompt_tokens[common]) {
+          ++common;
+        }
+        previous_common = common;
+      }
+      previous[key] = {req.id, req.bpe_prompt_tokens};
+    }
+  }
   const nlohmann::json event = {
       {"stage", stage},
       {"request_id", req.id},
@@ -79,9 +106,11 @@ void LogCacheDecision(const InferenceRequest &req,
       {"session_lease_acquired", req.session_lease_acquired},
       {"prompt_tokens", req.bpe_prompt_tokens.size()},
       {"tokens_sha256", hash(tokens)},
+      {"previous_request_common_prefix_tokens", previous_common},
       {"matched_tokens", matched_tokens},
       {"reused_tokens", reused_tokens},
       {"source_sequence", source_sequence},
+      {"evicted_sequences", evicted_sequences},
       {"sequence_id", req.sequence_id},
       {"sequence_generation", req.sequence_generation}};
   log::Info("cache_decision", event.dump());
@@ -2037,6 +2066,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           inf.cache_execution_path = "full_generate";
           inf.cache_reused_tokens = 0;
           inf.cache_reuse_pending_tokens = 0;
+          inf.cache_prefill_complete = false;
           LogCacheDecision(inf, pending->resolved_backend.get(),
                            "policy_bypass");
           inf.n_past = -1;
@@ -2115,6 +2145,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         inf.cache_matched_tokens = prefix_hit ? matched_tokens : 0;
         inf.cache_reused_tokens = 0;
         inf.cache_reuse_pending_tokens = 0;
+        inf.cache_prefill_complete = false;
         LogCacheDecision(inf, pending->resolved_backend.get(), "lookup",
                          matched_tokens, 0, cached_seq_id);
 
@@ -2189,6 +2220,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
 
         uint64_t seq_generation =
             reused_session_state ? cached_seq_generation : 0;
+        int evicted_sequences = 0;
         int seq_id =
             reused_session_state
                 ? cached_seq_id
@@ -2196,7 +2228,35 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                       static_cast<int64_t>(pending->sequence), &seq_generation,
                       pending->resolved_backend
                           ? pending->resolved_backend->SequenceCapacity()
-                          : 0);
+                          : 0,
+                      &evicted_sequences);
+        if (evicted_sequences > 0) {
+          LogCacheDecision(inf, pending->resolved_backend.get(),
+                           "capacity_eviction", matched_tokens, 0,
+                           cached_seq_id, evicted_sequences);
+          if (prefix_hit && !reused_session_state) {
+            // Admission can retire the donor selected by Lookup and reuse its
+            // slot. A successful copy from that now-empty slot is not reuse.
+            // Conservatively discard the candidate after any slot eviction;
+            // its unacquired block IDs may already have been freed as well.
+            prefix_hit = false;
+            cached_blocks.clear();
+            cached_seq_id = -1;
+            matched_tokens = 0;
+            new_blocks_needed = total_blocks_needed;
+            if (cache_) {
+              cache_->ReleaseBlocksRef(new_blocks);
+              new_blocks.clear();
+              if (cache_->NumFreeBlocks() >= new_blocks_needed) {
+                try {
+                  new_blocks = cache_->ReserveBlocks(new_blocks_needed);
+                } catch (const std::exception &) {
+                  new_blocks.clear();
+                }
+              }
+            }
+          }
+        }
         // Admission logic (§ Item 4): can admit if we have a seq slot AND
         // (no paged cache configured OR new blocks were successfully reserved).
         bool can_admit = (seq_id >= 0) && (!cache_ || new_blocks_needed == 0 ||
@@ -2363,6 +2423,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             }
             if (pr.ok) {
               inf.cache_reused_tokens = copied_prefix ? prefill_start : 0;
+              inf.cache_prefill_complete = true;
               inf.n_past = pr.n_past;
               inf.prompt_bpe_tokens = pr.n_past;
               inf.sequence_id = seq_id;
@@ -2375,8 +2436,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                                copied_prefix ? prefill_start : 0,
                                cached_seq_id);
             } else {
-              // Prefill failed: release only the NEW blocks (warm blocks belong
-              // to the cache).
+              // Drop every scheduler-owned reference, including the references
+              // acquired on warm blocks. The radix donor retains its own refs.
               if (reused_session_state) {
                 if (cache_) {
                   cache_->ReleaseBlocksRef(inf.block_table);
@@ -2387,7 +2448,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                 FreeSeqSlot(seq_id, seq_generation, pending->resolved_backend);
               } else {
                 if (cache_) {
-                  cache_->ReleaseBlocks(new_blocks);
+                  cache_->ReleaseBlocksRef(inf.block_table);
                 }
                 // Non-session path: also free the sequence slot — the
                 // backend sequence was allocated for this request and a
@@ -2400,8 +2461,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               inf.n_past = -1;
             }
           }
-        } else if (seq_id >= 0 && !reused_session_state) {
-          FreeSeqSlot(seq_id, seq_generation);
+        } else {
+          // Blocks were reserved before slot admission. If no slot is available
+          // (or a session restore fails), no request owns those reservations.
+          if (cache_) {
+            cache_->ReleaseBlocksRef(new_blocks);
+          }
+          if (seq_id >= 0 && !reused_session_state) {
+            FreeSeqSlot(seq_id, seq_generation);
+          }
         }
         if (queued_via_unified_prefill) {
           continue;
@@ -2748,7 +2816,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     const bool session_owned = inference->session_lease_acquired &&
                                RequestUsesSessionHandle(*inference);
     if (prefix_cache_ && inference->sequence_id >= 0 &&
-        !inference->fairness.yielded && !session_owned) {
+        inference->cache_prefill_complete && !inference->fairness.yielded &&
+        !session_owned) {
       // Concatenate prompt BPE tokens and any generated output BPE tokens.
       // (Simplified: we use prompt_bpe_tokens for the architectural
       // foundation).
@@ -2766,6 +2835,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         donated = prefix_cache_->Insert(
             inference->bpe_prompt_tokens, inference->block_table,
             inference->sequence_id, pending->resolved_backend);
+        if (!donated && cache_) {
+          cache_->ReleaseBlocksRef(inference->block_table);
+        }
         LogSequenceSlotEvent("prefix_donation_end", *inference);
       }
     }
@@ -2928,7 +3000,10 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
 }
 
 int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out,
-                            int sequence_capacity) {
+                            int sequence_capacity, int *evicted_sequences) {
+  if (evicted_sequences) {
+    *evicted_sequences = 0;
+  }
   PollDeferredSequenceRetirements();
   if (!slot_manager_) {
     return -1;
@@ -2942,6 +3017,9 @@ int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out,
     // slots (issue #161). EvictOneSequence returns false once the trie has
     // no more sequences to give up.
     while (!lease && prefix_cache_->EvictOneSequence()) {
+      if (evicted_sequences) {
+        ++*evicted_sequences;
+      }
       lease = slot_manager_->AcquireLease(request_id, sequence_capacity);
     }
   }
@@ -3131,7 +3209,8 @@ void Scheduler::FinalizeSessionLease(PendingRequest *pending,
     return;
   }
 
-  if (commit_state && inference.sequence_id >= 0) {
+  if (commit_state && inference.sequence_id >= 0 &&
+      inference.cache_prefill_complete) {
     LogSequenceSlotEvent("session_commit", inference, inference.session_id);
     if (slot_manager_ && inference.sequence_generation != 0) {
       const bool marked_completed = slot_manager_->MarkCompleted(
