@@ -127,3 +127,22 @@ URLs/artifacts, post-deployment model/capacity responses, member diagnostic even
 wire-to-ledger-to-dashboard reconciliation, cancellation/late-usage results and
 the full mixed-team verdict. Original request bodies were not retained: explain
 new reproductions on their own evidence and keep historical causality unproven.
+
+## Disconnect acceptance follow-up
+
+An unbuffered early-disconnect check against an owned CPU Qwen server caused that
+process to exit. A separate model-free subprocess reproduced termination by
+SIGPIPE (exit -13) after the peer closed its SSE connection. This is a verified
+HTTP response-lifecycle defect, separate from cache accounting and the original
+40-call symptom. The shared GPU service was not used for this reproduction.
+
+The repair suppresses broken-pipe signals on server-owned sockets where the OS
+provides that option, or scopes signal blocking/draining to the current socket
+operation's thread. It covers plain response writes and TLS writes, reads,
+handshakes and shutdown, preserves the caller's signal state and errno, and uses
+a nonblocking drain. Failed writes still reach the existing cancellation path.
+A subprocess regression exercises plain/TLS closed peers, default signal
+disposition, pre-existing pending signals and a subsequent healthy connection.
+Rollback is a revert of this HTTP-only repair; it does not change model or cache
+configuration. Runtime cancellation acceptance remains distinct from observing
+client-side closure or late gateway usage.

@@ -28,6 +28,8 @@ inline int inferflux_close_socket(int fd) { return ::closesocket(fd); }
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pthread.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -59,6 +61,71 @@ using json = nlohmann::json;
 namespace inferflux {
 
 namespace {
+
+// Socket BIO writes can raise SIGPIPE during TLS reads/handshakes as well as
+// response writes. Use the per-socket option where available; otherwise block
+// only this operation's thread and preserve its mask and pending signal.
+class ScopedSocketSignals {
+public:
+  explicit ScopedSocketSignals(int fd) {
+    const int saved_errno = errno;
+    (void)fd;
+#if defined(SO_NOSIGPIPE)
+    // The option remains set for this server-owned socket, including later TLS
+    // operations. It does not alter any process-wide signal disposition.
+    const int enabled = 1;
+    active_ = ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &enabled,
+                           sizeof(enabled)) == 0;
+#elif !defined(_WIN32)
+    (void)fd;
+    sigemptyset(&pipe_set_);
+    sigaddset(&pipe_set_, SIGPIPE);
+    active_ = pthread_sigmask(SIG_BLOCK, &pipe_set_, &previous_mask_) == 0;
+    if (active_) {
+      sigset_t pending;
+      if (sigpending(&pending) != 0) {
+        pthread_sigmask(SIG_SETMASK, &previous_mask_, nullptr);
+        active_ = false;
+      } else {
+        previously_pending_ = sigismember(&pending, SIGPIPE) == 1;
+      }
+    }
+#endif
+    errno = saved_errno;
+  }
+  ~ScopedSocketSignals() {
+    const int saved_errno = errno;
+#if !defined(_WIN32) && !defined(SO_NOSIGPIPE)
+    if (active_) {
+      sigset_t pending;
+      if (!previously_pending_ && sigpending(&pending) == 0 &&
+          sigismember(&pending, SIGPIPE) == 1) {
+        // A process-directed signal can be consumed by another thread after
+        // sigpending. A zero timeout must not leave this worker waiting for it.
+        const timespec no_wait{0, 0};
+        sigtimedwait(&pipe_set_, nullptr, &no_wait);
+      }
+      pthread_sigmask(SIG_SETMASK, &previous_mask_, nullptr);
+    }
+#endif
+    errno = saved_errno;
+  }
+  bool ready() const { return active_; }
+  ScopedSocketSignals(const ScopedSocketSignals &) = delete;
+  ScopedSocketSignals &operator=(const ScopedSocketSignals &) = delete;
+
+private:
+#ifdef _WIN32
+  bool active_{true};
+#else
+  bool active_{false};
+#if !defined(SO_NOSIGPIPE)
+  bool previously_pending_{false};
+  sigset_t pipe_set_{};
+  sigset_t previous_mask_{};
+#endif
+#endif
+};
 
 // Kill switch for reasoning separation: when enabled, <think> blocks stay in
 // content verbatim (legacy behavior for A/B validation).
@@ -1415,7 +1482,8 @@ void HttpServer::Run() {
         continue;
       }
       SSL_set_fd(ssl, client_fd);
-      if (SSL_accept(ssl) != 1) {
+      ScopedSocketSignals socket_signals(client_fd);
+      if (!socket_signals.ready() || SSL_accept(ssl) != 1) {
         SSL_free(ssl);
         inferflux_close_socket(client_fd);
         continue;
@@ -3783,6 +3851,10 @@ void HttpServer::HandleClient(ClientSession &session) {
 }
 
 bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
+  ScopedSocketSignals socket_signals(session.fd);
+  if (!socket_signals.ready()) {
+    return false;
+  }
   std::string connection_scoped_payload;
   const std::string *wire_payload = &payload;
   if (!session.keep_alive) {
@@ -3842,6 +3914,10 @@ bool HttpServer::SendAll(ClientSession &session, const std::string &payload) {
 ssize_t HttpServer::Receive(ClientSession &session, char *buffer,
                             std::size_t length) {
   if (session.ssl) {
+    ScopedSocketSignals socket_signals(session.fd);
+    if (!socket_signals.ready()) {
+      return -1;
+    }
     // Same wall-clock bound as SendAll: a retry count would multiply the
     // recv deadline by the cap (64 x 120s ~ 2.1 hours pinning an HTTP
     // worker on an idle TLS keep-alive connection).
@@ -3876,7 +3952,10 @@ ssize_t HttpServer::Receive(ClientSession &session, char *buffer,
 
 void HttpServer::CloseSession(ClientSession &session) {
   if (session.ssl) {
-    SSL_shutdown(session.ssl);
+    ScopedSocketSignals socket_signals(session.fd);
+    if (socket_signals.ready()) {
+      SSL_shutdown(session.ssl);
+    }
     SSL_free(session.ssl);
     session.ssl = nullptr;
   }
