@@ -41,6 +41,14 @@ jobs:
           submodules: recursive
           clean: true
 
+      - name: Expose installed GPU tools
+        run: |
+          for tool_dir in /usr/lib/wsl/lib /usr/local/cuda/bin /opt/rocm/bin; do
+            if [ -d "${tool_dir}" ]; then
+              printf '%s\n' "${tool_dir}" >> "${GITHUB_PATH}"
+            fi
+          done
+
       - name: Verify NVIDIA device and model
         run: |
           set -euo pipefail
@@ -121,6 +129,14 @@ jobs:
         with:
           submodules: recursive
           clean: true
+
+      - name: Expose installed GPU tools
+        run: |
+          for tool_dir in /usr/lib/wsl/lib /usr/local/cuda/bin /opt/rocm/bin; do
+            if [ -d "${tool_dir}" ]; then
+              printf '%s\n' "${tool_dir}" >> "${GITHUB_PATH}"
+            fi
+          done
 
       - name: Verify AMD device and model
         run: |
