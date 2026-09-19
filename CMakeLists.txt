@@ -701,6 +701,7 @@ add_executable(inferflux_tests
   tests/unit/test_audit_logger.cpp
   tests/unit/test_metrics.cpp
   tests/unit/test_http_server.cpp
+  tests/unit/test_http_closed_peer.cpp
   tests/unit/test_incremental_utf8.cpp
   tests/unit/test_scheduler.cpp
   tests/unit/test_batch_selection_policy.cpp
