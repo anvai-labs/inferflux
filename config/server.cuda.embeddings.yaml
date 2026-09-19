@@ -1,0 +1,101 @@
+# Dedicated embedding server for arxive GPU offload (aiserver1, RTX 4000 Ada).
+# Serves BAAI/bge-small-en-v1.5 (Q8_0 GGUF) on /v1/embeddings via the
+# llama.cpp CUDA backend.
+# Run: INFERFLUX_CONFIG=config/server.cuda.embeddings.yaml ./build-cuda/inferfluxd
+# (or INFERFLUX_PORT_OVERRIDE / INFERFLUX_HOST_OVERRIDE as needed)
+
+server:
+  host: 0.0.0.0
+  http_port: 8090
+  max_concurrent: 1024
+  enable_metrics: true
+  enable_tracing: false
+
+models:
+  - id: bge-small-en-v1.5
+    path: models/bge-small-en-v1.5/bge-small-en-v1.5-q8_0.gguf
+    format: gguf
+    backend: llama_cpp_cuda
+    default: true
+
+runtime:
+  backend_priority: [llama_cpp_cuda, cuda, cpu]
+  cuda:
+    enabled: true
+    attention:
+      kernel: auto
+    kv_cache_dtype: auto
+    dequantized_cache_policy: none
+    quantized_runtime:
+      require_fused_matmul: false
+    flash_attention:
+      enabled: true
+      tile_size: 128
+    phase_overlap:
+      enabled: false
+      min_prefill_tokens: 256
+      prefill_replica: false
+  backend_exposure:
+    prefer_inferflux: false
+    allow_llama_cpp_fallback: true
+    strict_inferflux_request: false
+  capability_routing:
+    allow_default_fallback: true
+    require_ready_backend: true
+    fallback_scope: any_compatible
+  scheduler:
+    max_batch_size: 32
+    max_batch_tokens: 16384
+    min_batch_size: 1
+    batch_accumulation_ms: 2
+    policy: priority_age
+    decode_burst_tokens: 0
+    chunked_prefill_tokens: 512
+    mixed_prefill_budget_ratio: 1.0
+    session_handles:
+      enabled: false
+      ttl_ms: 300000
+      max_sessions: 1024
+  tensor_parallel: 1
+  mps_layers: 0
+  fairness:
+    enable_preemption: false
+    high_priority_threshold: 5
+    max_timeslice_tokens: 0
+  speculative_decoding:
+    enabled: false
+    draft_model: ""
+    max_prefill_tokens: 256
+    chunk_size: 4
+  nvme_offload:
+    path: ""
+    workers: 1
+    queue_depth: 256
+  paged_kv:
+    cpu_pages: 4096
+    eviction: lru
+
+adapters: []
+
+auth:
+  api_keys:
+    - key: dev-key-123
+      scopes: [generate, read, admin]
+    - key: user-key-123
+      scopes: [generate, read]
+  rate_limit_per_minute: 0
+  oidc_issuer: https://issuer.example.com
+  oidc_audience: inferflux
+
+guardrails:
+  blocklist: []
+  opa_endpoint: ""
+
+logging:
+  level: info
+  format: json
+  audit_log: logs/audit.log
+
+registry:
+  path: ""
+  poll_interval_ms: 5000

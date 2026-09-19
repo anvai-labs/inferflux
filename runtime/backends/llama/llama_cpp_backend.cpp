@@ -51,6 +51,11 @@ struct BatchSeqTokenInput {
   bool logits{false};
 };
 
+// Batched-embedding geometry: concurrent sequences per decode and the
+// per-sequence context (bge-small class models train at 512 tokens).
+constexpr int kEmbedBatchMaxSeqs = 32;
+constexpr std::size_t kEmbedBatchCtxPerSeq = 512;
+
 // Each context owns its sequence capacity. A process-wide last-loaded model
 // bound can permit an out-of-range id into a smaller model's KV cache.
 void BatchAddSeq(llama_batch &batch, const llama_context *context,
@@ -320,6 +325,10 @@ LlamaCppBackend::~LlamaCppBackend() {
   if (embed_ctx_ != nullptr) {
     llama_free(embed_ctx_);
     embed_ctx_ = nullptr;
+  }
+  if (embed_batch_ctx_ != nullptr) {
+    llama_free(embed_batch_ctx_);
+    embed_batch_ctx_ = nullptr;
   }
   if (context_ != nullptr) {
     llama_free(context_);
@@ -1931,10 +1940,29 @@ bool LlamaCppBackend::EnsureEmbedCtx() {
     return false;
   auto ep = llama_context_default_params();
   ep.embeddings = true;
-  ep.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+  // Honor the model's own pooling type (e.g. CLS for BGE-family embedding
+  // models, declared in GGUF metadata) instead of forcing MEAN, which
+  // silently changes the embedding semantics vs the reference runtime.
+  ep.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
   ep.n_ctx = 512;
   embed_ctx_ = llama_init_from_model(model_, ep);
   return embed_ctx_ != nullptr;
+}
+
+bool LlamaCppBackend::EnsureEmbedBatchCtx() {
+  if (embed_batch_ctx_)
+    return true;
+  if (!model_)
+    return false;
+  auto ep = llama_context_default_params();
+  ep.embeddings = true;
+  ep.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+  ep.n_seq_max = kEmbedBatchMaxSeqs;
+  ep.n_ctx = kEmbedBatchMaxSeqs * kEmbedBatchCtxPerSeq;
+  ep.n_batch = kEmbedBatchMaxSeqs * kEmbedBatchCtxPerSeq;
+  ep.n_ubatch = kEmbedBatchMaxSeqs * kEmbedBatchCtxPerSeq;
+  embed_batch_ctx_ = llama_init_from_model(model_, ep);
+  return embed_batch_ctx_ != nullptr;
 }
 
 int LlamaCppBackend::EmbedDims() const {
@@ -1987,6 +2015,86 @@ std::vector<float> LlamaCppBackend::Embed(const std::string &text) {
   // Clear KV state for the sequence so the context can be reused.
   llama_memory_seq_rm(llama_get_memory(embed_ctx_), 0, -1, -1);
   return result;
+}
+
+std::vector<std::vector<float>>
+LlamaCppBackend::EmbedBatch(const std::vector<std::string> &texts) {
+  std::vector<std::vector<float>> results(texts.size());
+  BackendStateLock lock(backend_state_mutex_);
+  if (!EnsureEmbedBatchCtx() || !vocab_)
+    return results;
+
+  const int n_embd = llama_model_n_embd(model_);
+  const std::size_t group_token_cap =
+      static_cast<std::size_t>(kEmbedBatchMaxSeqs) * kEmbedBatchCtxPerSeq;
+  std::size_t idx = 0;
+  while (idx < texts.size()) {
+    // Assemble the next group: up to kEmbedBatchMaxSeqs sequences bounded by
+    // per-sequence and whole-batch token budgets. `orig` tracks the result
+    // index of each sequence so empty-token inputs can be skipped without
+    // shifting the output mapping.
+    std::vector<std::vector<llama_token>> group;
+    std::vector<std::size_t> orig;
+    std::size_t group_tokens = 0;
+    while (idx < texts.size() &&
+           static_cast<int>(group.size()) < kEmbedBatchMaxSeqs) {
+      auto tokens = Tokenize(texts[idx], /*add_bos=*/false);
+      if (tokens.size() > kEmbedBatchCtxPerSeq) {
+        tokens.resize(kEmbedBatchCtxPerSeq);
+      }
+      if (tokens.empty()) {
+        ++idx; // leave results[idx] empty; caller reports unsupported input
+        continue;
+      }
+      if (!group.empty() && group_tokens + tokens.size() > group_token_cap) {
+        break; // flush current group before starting a new one
+      }
+      group_tokens += tokens.size();
+      orig.push_back(idx);
+      group.push_back(std::move(tokens));
+      ++idx;
+    }
+    if (group.empty())
+      continue;
+
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(group_tokens),
+                                         /*embd=*/0, /*n_seq_max=*/1);
+    bool decode_ok = true;
+    try {
+      for (std::size_t s = 0; s < group.size(); ++s) {
+        const auto &tokens = group[s];
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+          BatchAddSeq(batch, embed_batch_ctx_,
+                      {tokens[i], static_cast<llama_pos>(i),
+                       static_cast<llama_seq_id>(s),
+                       /*logits=*/i == tokens.size() - 1});
+        }
+      }
+    } catch (const std::exception &ex) {
+      log::Error("llama_backend", std::string("EmbedBatch: ") + ex.what());
+      decode_ok = false;
+    }
+    if (decode_ok && llama_decode(embed_batch_ctx_, batch) != 0) {
+      log::Error("llama_backend", "EmbedBatch: llama_decode failed");
+      decode_ok = false;
+    }
+    llama_batch_free(batch);
+
+    if (decode_ok) {
+      for (std::size_t s = 0; s < group.size(); ++s) {
+        float *emb = llama_get_embeddings_seq(embed_batch_ctx_,
+                                              static_cast<llama_seq_id>(s));
+        if (emb) {
+          results[orig[s]].assign(emb, emb + n_embd);
+        }
+      }
+    }
+    auto *mem = llama_get_memory(embed_batch_ctx_);
+    for (std::size_t s = 0; s < group.size(); ++s) {
+      llama_memory_seq_rm(mem, static_cast<llama_seq_id>(s), -1, -1);
+    }
+  }
+  return results;
 }
 
 std::string LlamaCppBackend::Name() const { return "llama_cpu"; }

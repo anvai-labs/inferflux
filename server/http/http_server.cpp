@@ -2714,11 +2714,19 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
 
-    // Generate embeddings for each input.
+    // Generate embeddings for each input (batched when the backend supports
+    // it — one decode for many sequences on embedding models).
+    auto embeddings = embed_backend->EmbedBatch(inputs);
+    if (embeddings.size() != inputs.size()) {
+      SendAll(session,
+              BuildResponse(BuildErrorBody("model_does_not_support_embeddings"),
+                            422, "Unprocessable Entity"));
+      return;
+    }
     json data = json::array();
     int total_tokens = 0;
     for (std::size_t idx = 0; idx < inputs.size(); ++idx) {
-      std::vector<float> emb = embed_backend->Embed(inputs[idx]);
+      const std::vector<float> &emb = embeddings[idx];
       if (emb.empty()) {
         SendAll(session, BuildResponse(BuildErrorBody(
                                            "model_does_not_support_embeddings"),

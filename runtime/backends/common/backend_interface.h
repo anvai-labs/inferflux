@@ -259,6 +259,19 @@ public:
     return {};
   }
 
+  // Batched embedding. Returns one vector per input (same order); an empty
+  // vector at index i means that input could not be embedded. Backends that
+  // can amortize tokenizer/setup cost across inputs should override this.
+  virtual std::vector<std::vector<float>>
+  EmbedBatch(const std::vector<std::string> &texts) {
+    std::vector<std::vector<float>> results;
+    results.reserve(texts.size());
+    for (const auto &text : texts) {
+      results.push_back(Embed(text));
+    }
+    return results;
+  }
+
   virtual int EmbedDims() const { return 0; }
 
   // ========================================================================
