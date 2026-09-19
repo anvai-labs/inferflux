@@ -205,6 +205,53 @@ TEST_CASE(
   REQUIRE(finish_frames == 1);
 }
 
+TEST_CASE("HttpServer model endpoints expose effective runtime policy",
+          "[http_server][model_identity]") {
+  SimpleTokenizer tokenizer;
+  auto backend = std::make_shared<LlamaCppBackend>();
+  backend->ForceReadyForTests();
+  ModelInfo info;
+  info.id = "runtime-model";
+  auto router = std::make_shared<SingleModelRouter>(backend, info);
+  Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(), nullptr,
+                      router);
+  MetricsRegistry metrics;
+  auto auth = std::make_shared<ApiKeyAuth>();
+  auth->AddKey("admin-key", {"admin", "read"});
+  HttpServer server("127.0.0.1", 0, &scheduler, auth, &metrics, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, nullptr,
+                    HttpServer::TlsConfig{}, 1);
+  for (const std::string path :
+       {"/v1/models", "/v1/models/runtime-model", "/v1/admin/models"}) {
+    CAPTURE(path);
+    int fds[2];
+    REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+    const std::string request =
+        "GET " + path +
+        " HTTP/1.1\r\n"
+        "Host: localhost\r\nAuthorization: Bearer admin-key\r\n\r\n";
+    REQUIRE(::write(fds[0], request.data(), request.size()) ==
+            static_cast<ssize_t>(request.size()));
+    REQUIRE(::shutdown(fds[0], SHUT_WR) == 0);
+    HttpServer::ClientSession session;
+    session.fd = fds[1];
+    server.HandleClient(session);
+    ::close(fds[1]);
+    const std::string response = ReadAll(fds[0]);
+    ::close(fds[0]);
+    REQUIRE(response.find("HTTP/1.1 200 OK") != std::string::npos);
+    auto body = json::parse(response.substr(response.find("\r\n\r\n") + 4));
+    if (path == "/v1/models")
+      body = body["data"][0];
+    if (path == "/v1/admin/models")
+      body = body["models"][0];
+    REQUIRE(body["runtime"]["sequence_capacity"].is_null());
+    REQUIRE(body["runtime"]["session_handles_enabled"] == false);
+    REQUIRE(body["runtime"]["cache_reuse"]["phased"]["prefix"] == false);
+    REQUIRE(body["runtime"]["cache_reuse"]["full_generate"]["prefix"] == false);
+  }
+}
+
 TEST_CASE("HttpServer admin cache endpoint includes memory payload",
           "[http_server]") {
   SimpleTokenizer tokenizer;

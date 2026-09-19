@@ -125,6 +125,8 @@ public:
   ModelRouter *Router() const { return router_.get(); }
   RadixPrefixCache *PrefixCache() const { return prefix_cache_.get(); }
   PagedKVCache *Cache() const { return cache_.get(); }
+  bool SessionHandlesEnabled() const { return config_.session_handles.enabled; }
+  bool PrefixReuseEnabled() const;
 
   // Sequence slot allocator for §2.5 phased prefill/decode.
   // Slots are borrowed during Prefill() and returned after full request
@@ -133,7 +135,7 @@ public:
   // eviction — callers must hold queue_mutex_ when calling from a
   // non-worker-loop context.
   int AllocSeqSlot(int64_t request_id = -1, uint64_t *generation_out = nullptr,
-                   int sequence_capacity = 0);
+                   int sequence_capacity = 0, int *evicted_sequences = nullptr);
   void FreeSeqSlot(int slot, uint64_t generation = 0,
                    std::shared_ptr<LlamaCppBackend> backend = nullptr);
 

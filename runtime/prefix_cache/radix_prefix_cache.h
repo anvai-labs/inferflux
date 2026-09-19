@@ -18,7 +18,8 @@ struct RadixNode {
   std::unordered_map<int, std::unique_ptr<RadixNode>> children;
   RadixNode *parent{nullptr};
 
-  // KV block IDs assigned to this prefix segment.
+  // Complete donated sequence table. This node owns one reference per block,
+  // including prefix blocks shared with other donors.
   std::vector<int> block_table;
   // The sequence_id where these blocks were originally computed (§P1b).
   int sequence_id{-1};
@@ -61,8 +62,8 @@ public:
                             const RadixPrefixCacheLimits &limits = {});
 
   // Returns true if a full node match was found (allowing CopySequencePrefix).
-  // matched_tokens is always filled with the longest common prefix length
-  // including partial edge matches for metrics (§ Item 3).
+  // matched_tokens is the usable donor extent on a hit, or the tokenized
+  // common-prefix length on a miss (including partial edge matches).
   bool Lookup(const std::vector<int> &tokens, BackendInterface *backend,
               RadixLookupResult *result);
 
@@ -75,6 +76,7 @@ public:
               const std::shared_ptr<BackendInterface> &backend);
 
   std::size_t Capacity() const { return capacity_; }
+  bool ReuseEnabled() const { return capacity_ > 0 && max_sequences_ > 0; }
   std::size_t Size() const; // total nodes in tree
   std::size_t LiveSequences() const;
   RadixPrefixMemorySnapshot MemorySnapshot() const;

@@ -306,12 +306,20 @@ void MetricsRegistry::RecordPartialPrefixHit() {
   prefix_partial_hits_.fetch_add(1, std::memory_order_relaxed);
 }
 
-void MetricsRegistry::RecordKVPrefixReuse(int tokens_saved) {
-  kv_prefix_reuse_count_.fetch_add(1, std::memory_order_relaxed);
-  if (tokens_saved > 0) {
-    kv_prefix_reuse_tokens_.fetch_add(static_cast<uint64_t>(tokens_saved),
-                                      std::memory_order_relaxed);
+void MetricsRegistry::RecordKVPrefixReuse(int tokens_saved,
+                                          const std::string &model,
+                                          const std::string &backend) {
+  if (tokens_saved <= 0) {
+    return;
   }
+  kv_prefix_reuse_count_.fetch_add(1, std::memory_order_relaxed);
+  kv_prefix_reuse_tokens_.fetch_add(static_cast<uint64_t>(tokens_saved),
+                                    std::memory_order_relaxed);
+  std::lock_guard<std::mutex> lock(cache_reuse_mutex_);
+  auto &counts = cache_reuse_[{model.empty() ? "unknown" : model,
+                               backend.empty() ? "unknown" : backend}];
+  ++counts.first;
+  counts.second += static_cast<uint64_t>(tokens_saved);
 }
 
 void MetricsRegistry::RecordStreamTokens(std::size_t tokens) {
@@ -1512,6 +1520,37 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_kv_prefix_reuse_tokens_total counter\n";
   out << "inferflux_kv_prefix_reuse_tokens_total "
       << kv_prefix_reuse_tokens_.load() << "\n";
+
+  out << "# HELP inferflux_cache_reuse_requests_total Completed requests with "
+         "accepted prefix reuse by resolved model and backend\n";
+  out << "# TYPE inferflux_cache_reuse_requests_total counter\n";
+  out << "# HELP inferflux_cache_reuse_tokens_total Accepted reused prompt "
+         "tokens "
+         "by resolved model and backend (same events as kv_prefix_reuse)\n";
+  out << "# TYPE inferflux_cache_reuse_tokens_total counter\n";
+  {
+    auto escape = [](const std::string &value) {
+      std::string escaped;
+      for (char ch : value) {
+        if (ch == '\\' || ch == '"')
+          escaped += '\\';
+        if (ch == '\n')
+          escaped += "\\n";
+        else
+          escaped += ch;
+      }
+      return escaped;
+    };
+    std::lock_guard<std::mutex> lock(cache_reuse_mutex_);
+    for (const auto &[labels, counts] : cache_reuse_) {
+      const auto suffix = "{model=\"" + escape(labels.first) + "\",backend=\"" +
+                          escape(labels.second) + "\"} ";
+      out << "inferflux_cache_reuse_requests_total" << suffix << counts.first
+          << "\n";
+      out << "inferflux_cache_reuse_tokens_total" << suffix << counts.second
+          << "\n";
+    }
+  }
 
   out << "# HELP inferflux_stream_tokens_total Tokens streamed via SSE\n";
   out << "# TYPE inferflux_stream_tokens_total counter\n";

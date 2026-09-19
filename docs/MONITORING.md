@@ -34,6 +34,31 @@ flowchart LR
 | Distributed KV health | `inferflux_disagg_kv_tickets_total{stage=...}`, `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt` |
 | Cache reuse | `inferflux_prefix_hits_total`, `inferflux_prefix_partial_hits_total`, `inferflux_prefix_matched_tokens_total`, `inferflux_kv_prefix_reuse_total` |
 
+## Cache counter scopes
+
+`inferflux_prefix_hits_total`, `inferflux_prefix_misses_total`,
+`inferflux_prefix_matched_tokens_total`, and `inferflux_prefix_partial_hits_total`
+are legacy lookup-instrumentation counters. Their `backend` label is the
+registry's process-wide label. The scheduler's radix KV execution path does not
+call those legacy recording methods; zeros there do not mean KV reuse is absent.
+
+`inferflux_kv_prefix_reuse_total` and `inferflux_kv_prefix_reuse_tokens_total`
+remain process aggregates. New `inferflux_cache_reuse_requests_total` and
+`inferflux_cache_reuse_tokens_total` expose the same finalized execution events
+with `model` (resolved model ID) and `backend` (executing backend name) labels.
+Sum the labelled family to compare with its aggregate; never add both families.
+Zero-token matches, failed copies, full-prefill recovery, and replayed input
+positions are excluded. Counters update at request finalization, using the same
+accepted count as response usage. Labels never contain request or session IDs.
+
+For bounded per-request diagnostics, set
+`INFERFLUX_CACHE_DIAGNOSTIC_REQUEST_PREFIX` for one member's correlation prefix.
+At most 64 JSON events are emitted per process. `client_request_id` is Sandhi's
+`x-inferflux-client-request-id`; `request_id` is InferFlux's scheduler ID. These
+are distinct IDs, linked in the event. Session and token content is SHA-256
+hashed. Correlated gateway usage records are not distributed traces. See the
+[cache execution contract](CACHE_REUSE.md) and [replay evidence](planning/CACHE_REPLAY_2026-09-18.md).
+
 ## 2) Fast Checks
 
 ```bash

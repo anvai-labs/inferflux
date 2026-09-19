@@ -201,10 +201,15 @@ struct InferenceRequest {
   // refreshed on fairness requeue, so it cannot serve as the request-accept
   // origin for duration/TTFT reporting).
   std::chrono::steady_clock::time_point accept_time;
-  // Per-request prefix-cache hit (BPE tokens matched from the radix trie or a
-  // session lease), recorded at prefill staging and reported via the result's
-  // cached_prompt_tokens.
+  // Lookup candidate only; this is not execution or billable reuse.
   int cache_matched_tokens{0};
+  // Deferred prefill commits its candidate only after successful evaluation.
+  int cache_reuse_pending_tokens{0};
+  int cache_reused_tokens{0};
+  // Retain a donor/session only after every prompt chunk has succeeded.
+  bool cache_prefill_complete{false};
+  bool cache_session_handles_enabled{false};
+  std::string cache_execution_path{"unresolved"};
 
   // W3C trace-id propagated from the incoming HTTP traceparent header.
   // Empty string if no traceparent was present in the request.
