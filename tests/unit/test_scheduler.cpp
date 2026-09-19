@@ -2838,3 +2838,99 @@ TEST_CASE("Scheduler releases blocks when admission or donation is declined",
     REQUIRE(cache->NumFreeBlocks() == 32);
   }
 }
+
+TEST_CASE("Scheduler rejects a prefix donor evicted during slot admission",
+          "[scheduler][cache_ownership]") {
+  class OneSequenceBackend : public PositionCheckingBackend {
+  public:
+    int copy_calls = 0;
+    int SequenceCapacity() const override { return 1; }
+    bool CopySequencePrefix(int source, int target, int tokens) override {
+      ++copy_calls;
+      return PositionCheckingBackend::CopySequencePrefix(source, target,
+                                                         tokens);
+    }
+  };
+  for (const bool deferred : {false, true}) {
+    CAPTURE(deferred);
+    SimpleTokenizer tokenizer;
+    auto cache = std::make_shared<PagedKVCache>(
+        32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+    auto router = std::make_shared<SingleModelRouter>();
+    auto backend = std::make_shared<OneSequenceBackend>();
+    backend->defer_prefill = deferred;
+    ModelInfo info;
+    info.id = "single-slot";
+    info.backend = "cpu";
+    REQUIRE(router->RegisterModel(info, backend));
+    Scheduler *owner = nullptr;
+    auto prefix = std::make_shared<RadixPrefixCache>(
+        cache,
+        [&](int sequence, std::shared_ptr<BackendInterface>) {
+          owner->FreeSeqSlot(sequence);
+        },
+        RadixPrefixCacheLimits{64, 8});
+    Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(), cache,
+                        router, nullptr, prefix);
+    owner = &scheduler;
+    for (int i = 0; i < 3; ++i) {
+      InferenceRequest request;
+      request.prompt = "single-slot repeated prompt";
+      request.prompt_tokens = backend->TokenizeForCache(request.prompt);
+      request.max_tokens = 2;
+      const auto result = scheduler.Generate(std::move(request)).get();
+      REQUIRE_FALSE(result.no_backend);
+      REQUIRE(result.completion_tokens > 0);
+      REQUIRE(result.cached_prompt_tokens == 0);
+      REQUIRE(backend->copy_calls == 0);
+      REQUIRE(cache->NumFreeBlocks() == 28);
+    }
+    REQUIRE(prefix->EvictOneSequence());
+    REQUIRE(cache->NumFreeBlocks() == 32);
+  }
+}
+
+TEST_CASE("Scheduler discards failed deferred prefill instead of retaining it",
+          "[scheduler][cache_ownership]") {
+  for (const bool session : {false, true}) {
+    for (const int chunk : {16, 512}) {
+      CAPTURE(session, chunk);
+      SimpleTokenizer tokenizer;
+      auto cache = std::make_shared<PagedKVCache>(
+          32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+      auto router = std::make_shared<SingleModelRouter>();
+      auto backend = std::make_shared<PositionCheckingBackend>();
+      backend->defer_prefill = true;
+      backend->fail_phased_prefill = true;
+      ModelInfo info;
+      info.id = "failed-prefill";
+      info.backend = "cpu";
+      REQUIRE(router->RegisterModel(info, backend));
+      auto prefix = std::make_shared<RadixPrefixCache>(
+          cache, [](int, std::shared_ptr<BackendInterface>) {},
+          RadixPrefixCacheLimits{64, 8});
+      Scheduler::Config config;
+      config.session_handles.enabled = session;
+      config.chunked_prefill_tokens = chunk;
+      Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(),
+                          cache, router, nullptr, prefix, {}, {}, {}, config);
+      auto request = [&] {
+        InferenceRequest req;
+        req.prompt = "deferred failure";
+        req.prompt_tokens = backend->TokenizeForCache(req.prompt);
+        req.session_id = "failed-prefill-session";
+        req.max_tokens = 2;
+        return req;
+      };
+      const auto failed = scheduler.Generate(request()).get();
+      REQUIRE(failed.cached_prompt_tokens == 0);
+      REQUIRE(prefix->LiveSequences() == 0);
+      REQUIRE(cache->NumFreeBlocks() == 32);
+      backend->fail_phased_prefill = false;
+      const auto next = scheduler.Generate(request()).get();
+      REQUIRE_FALSE(next.no_backend);
+      REQUIRE(next.completion_tokens > 0);
+      REQUIRE(next.cached_prompt_tokens == 0);
+    }
+  }
+}

@@ -2066,6 +2066,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           inf.cache_execution_path = "full_generate";
           inf.cache_reused_tokens = 0;
           inf.cache_reuse_pending_tokens = 0;
+          inf.cache_prefill_complete = false;
           LogCacheDecision(inf, pending->resolved_backend.get(),
                            "policy_bypass");
           inf.n_past = -1;
@@ -2144,6 +2145,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         inf.cache_matched_tokens = prefix_hit ? matched_tokens : 0;
         inf.cache_reused_tokens = 0;
         inf.cache_reuse_pending_tokens = 0;
+        inf.cache_prefill_complete = false;
         LogCacheDecision(inf, pending->resolved_backend.get(), "lookup",
                          matched_tokens, 0, cached_seq_id);
 
@@ -2232,6 +2234,28 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           LogCacheDecision(inf, pending->resolved_backend.get(),
                            "capacity_eviction", matched_tokens, 0,
                            cached_seq_id, evicted_sequences);
+          if (prefix_hit && !reused_session_state) {
+            // Admission can retire the donor selected by Lookup and reuse its
+            // slot. A successful copy from that now-empty slot is not reuse.
+            // Conservatively discard the candidate after any slot eviction;
+            // its unacquired block IDs may already have been freed as well.
+            prefix_hit = false;
+            cached_blocks.clear();
+            cached_seq_id = -1;
+            matched_tokens = 0;
+            new_blocks_needed = total_blocks_needed;
+            if (cache_) {
+              cache_->ReleaseBlocksRef(new_blocks);
+              new_blocks.clear();
+              if (cache_->NumFreeBlocks() >= new_blocks_needed) {
+                try {
+                  new_blocks = cache_->ReserveBlocks(new_blocks_needed);
+                } catch (const std::exception &) {
+                  new_blocks.clear();
+                }
+              }
+            }
+          }
         }
         // Admission logic (§ Item 4): can admit if we have a seq slot AND
         // (no paged cache configured OR new blocks were successfully reserved).
@@ -2399,6 +2423,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             }
             if (pr.ok) {
               inf.cache_reused_tokens = copied_prefix ? prefill_start : 0;
+              inf.cache_prefill_complete = true;
               inf.n_past = pr.n_past;
               inf.prompt_bpe_tokens = pr.n_past;
               inf.sequence_id = seq_id;
@@ -2791,7 +2816,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     const bool session_owned = inference->session_lease_acquired &&
                                RequestUsesSessionHandle(*inference);
     if (prefix_cache_ && inference->sequence_id >= 0 &&
-        !inference->fairness.yielded && !session_owned) {
+        inference->cache_prefill_complete && !inference->fairness.yielded &&
+        !session_owned) {
       // Concatenate prompt BPE tokens and any generated output BPE tokens.
       // (Simplified: we use prompt_bpe_tokens for the architectural
       // foundation).
@@ -3183,7 +3209,8 @@ void Scheduler::FinalizeSessionLease(PendingRequest *pending,
     return;
   }
 
-  if (commit_state && inference.sequence_id >= 0) {
+  if (commit_state && inference.sequence_id >= 0 &&
+      inference.cache_prefill_complete) {
     LogSequenceSlotEvent("session_commit", inference, inference.session_id);
     if (slot_manager_ && inference.sequence_generation != 0) {
       const bool marked_completed = slot_manager_->MarkCompleted(

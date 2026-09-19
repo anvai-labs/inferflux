@@ -206,6 +206,8 @@ struct InferenceRequest {
   // Deferred prefill commits its candidate only after successful evaluation.
   int cache_reuse_pending_tokens{0};
   int cache_reused_tokens{0};
+  // Retain a donor/session only after every prompt chunk has succeeded.
+  bool cache_prefill_complete{false};
   bool cache_session_handles_enabled{false};
   std::string cache_execution_path{"unresolved"};
 

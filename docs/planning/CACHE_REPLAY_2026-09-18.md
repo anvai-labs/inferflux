@@ -158,3 +158,23 @@ Rollback: revert the ownership commit together with its donor-table lookup
 change. Do not mix old suffix-only insertion with complete-table lookup. The
 running Qwen process still uses the old binary; repairing its retained state
 requires a separately scheduled deployment/rollback, not a live cache flush.
+
+## Local adversarial review
+
+The author review checked donor ownership, slot admission, failed prefill,
+response/metric agreement, per-model capacity, and capture privacy. It is not
+an independent approval. Two additional deterministic regressions failed before
+their fixes:
+
+- With one sequence slot, admission evicted the selected donor but its successful
+  empty-slot copy still reported 39 cached tokens. Admission now discards prefix
+  candidates after slot eviction and reserves a fresh table. Synchronous and
+  deferred repetitions must report zero, avoid copying the retired donor, and
+  return every block after eviction.
+- A failed deferred prefill still created a live donor. Radix donation and session
+  retention now require an explicit successful-prefill flag, set only after all
+  prompt chunks complete. Intermediate/final prefill failures must leave no
+  retained blocks, and the next same-session request must start cold.
+
+These are review findings in the implementation paths; neither establishes the
+historical cause of the original WS-E calls. The deployed GPU binary is unchanged.
