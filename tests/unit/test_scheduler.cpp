@@ -2934,3 +2934,88 @@ TEST_CASE("Scheduler discards failed deferred prefill instead of retaining it",
     }
   }
 }
+
+TEST_CASE("Scheduler retires warm session state after failed extension",
+          "[scheduler][cache_ownership][session_handles]") {
+  class WarmFailureBackend : public PositionCheckingBackend {
+  public:
+    int prompt_length = 40;
+    std::string failure;
+    std::shared_ptr<std::atomic<bool>> cancellation;
+    std::vector<int> TokenizeForCache(const std::string &) const override {
+      return std::vector<int>(prompt_length, 7);
+    }
+    std::vector<UnifiedBatchOutput>
+    ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override {
+      if (!failure.empty()) {
+        if (failure == "cancel") {
+          cancellation->store(true);
+        }
+        return failure == "error"
+                   ? std::vector<UnifiedBatchOutput>(inputs.size())
+                   : std::vector<UnifiedBatchOutput>{};
+      }
+      return PositionCheckingBackend::ExecuteUnifiedBatch(inputs);
+    }
+  };
+  for (const int chunk : {16, 512}) {
+    for (const std::string failure : {"empty", "error", "cancel"}) {
+      for (const bool retry : {false, true}) {
+        CAPTURE(chunk, failure, retry);
+        SimpleTokenizer tokenizer;
+        auto cache = std::make_shared<PagedKVCache>(
+            32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+        auto router = std::make_shared<SingleModelRouter>();
+        auto backend = std::make_shared<WarmFailureBackend>();
+        backend->defer_prefill = true;
+        backend->cancellation = std::make_shared<std::atomic<bool>>(false);
+        ModelInfo info;
+        info.id = "warm-failure";
+        info.backend = "cpu";
+        REQUIRE(router->RegisterModel(info, backend));
+        std::vector<int> recycled;
+        {
+          Scheduler::Config config;
+          config.session_handles.enabled = true;
+          config.chunked_prefill_tokens = chunk;
+          Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(),
+                              cache, router, nullptr, nullptr, {}, {}, {},
+                              config);
+          auto request = [&] {
+            InferenceRequest req;
+            req.prompt = "warm extension";
+            req.prompt_tokens = backend->TokenizeForCache(req.prompt);
+            req.session_id = "warm-failure-session";
+            req.cancellation_flag = backend->cancellation;
+            req.max_tokens = 1;
+            return req;
+          };
+          REQUIRE(scheduler.Generate(request()).get().completion_tokens == 1);
+          REQUIRE(cache->NumFreeBlocks() == 28);
+          backend->prompt_length = 64;
+          backend->failure = failure;
+          REQUIRE(scheduler.Generate(request()).get().cached_prompt_tokens ==
+                  0);
+          REQUIRE(cache->NumFreeBlocks() == 32);
+          if (retry) {
+            backend->failure.clear();
+            backend->cancellation->store(false);
+            const auto next = scheduler.Generate(request()).get();
+            REQUIRE_FALSE(next.no_backend);
+            REQUIRE(next.completion_tokens == 1);
+            REQUIRE(next.cached_prompt_tokens == 0);
+            REQUIRE(backend->generate_calls == 0);
+            REQUIRE(cache->NumFreeBlocks() == 27);
+          } else {
+            // Recycle all freed pages before session-manager teardown. A stale
+            // retained table must not release another owner's references.
+            recycled = cache->ReserveBlocks(32);
+          }
+        }
+        REQUIRE(cache->NumFreeBlocks() == (retry ? 32 : 0));
+        cache->ReleaseBlocksRef(recycled);
+        REQUIRE(cache->NumFreeBlocks() == 32);
+      }
+    }
+  }
+}

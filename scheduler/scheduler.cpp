@@ -3244,6 +3244,10 @@ void Scheduler::FinalizeSessionLease(PendingRequest *pending,
 
   if (inference.sequence_id >= 0) {
     LogSequenceSlotEvent("session_release", inference, inference.session_id);
+    // AcquireLease copied the retained table into this active request. Once
+    // these references are retired, the manager must not keep its stale copy
+    // for a later restore, expiry, or drain after the pages have been recycled.
+    session_handle_manager_->DiscardLeasedState(inference.session_id);
     if (cache_ && !inference.block_table.empty()) {
       cache_->ReleaseBlocksRef(inference.block_table);
     }
