@@ -514,7 +514,9 @@ void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
   req->execution.initialized = true;
   req->execution.result.model_id = ResolveResultModelId(*req);
   req->execution.result.prompt_tokens =
-      static_cast<int>(req->prompt_tokens.size());
+      req->fairness.reported_prompt_tokens >= 0
+          ? req->fairness.reported_prompt_tokens
+          : static_cast<int>(req->prompt_tokens.size());
   req->execution.result.completion = req->accumulated_output;
 
   const int prior_completion_tokens =
@@ -2057,6 +2059,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         if (inf.bpe_prompt_tokens.empty()) {
           inf.bpe_prompt_tokens =
               pending->resolved_backend->TokenizeForCache(inf.prompt);
+        }
+        // Usage and prefix reuse must count the same backend tokens (including
+        // BOS). Keep the scheduler's admission/distributed token vector intact.
+        // Text tokenization cannot measure image embeddings; retain the
+        // existing multimodal fallback until the backend exposes that
+        // accounting.
+        if (!inf.has_images && !inf.bpe_prompt_tokens.empty()) {
+          inf.fairness.reported_prompt_tokens =
+              static_cast<int>(inf.bpe_prompt_tokens.size());
         }
         // Keep logprobs/structured-output requests on the full Generate()
         // path so the backend can apply a single consistent sampler/grammar

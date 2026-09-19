@@ -363,6 +363,13 @@ public:
     return static_cast<int>(text.size());
   }
 
+  std::vector<int> TokenizeForCache(const std::string &) const override {
+    ++tokenize_calls;
+    return std::vector<int>(40, 7);
+  }
+
+  mutable int tokenize_calls = 0;
+
   const std::vector<std::string> &SeenPrompts() const { return seen_prompts_; }
 
 private:
@@ -675,6 +682,8 @@ TEST_CASE("Scheduler stub response with no backend", "[scheduler]") {
   // no prefix cache is attached so the cache split reports an explicit 0.
   REQUIRE(resp.duration_ms >= 0.0);
   REQUIRE(resp.cached_prompt_tokens == 0);
+  REQUIRE(resp.prompt_tokens ==
+          static_cast<int>(tokenizer.Encode(req.prompt).size()));
 }
 
 TEST_CASE("Scheduler with empty SingleModelRouter returns no_backend",
@@ -1551,9 +1560,11 @@ TEST_CASE("Scheduler fairness requeue does not mutate prompt between slices",
   FairnessConfig fairness_config;
   fairness_config.max_timeslice_tokens = 1;
 
+  MetricsRegistry metrics;
   Scheduler::Config scheduler_config;
   scheduler_config.max_batch_size = 1;
   scheduler_config.max_batch_tokens = 8;
+  scheduler_config.metrics = &metrics;
 
   Scheduler scheduler(tokenizer, device, cache, router, nullptr, nullptr,
                       fairness_config, DisaggregatedConfig{},
@@ -1563,10 +1574,18 @@ TEST_CASE("Scheduler fairness requeue does not mutate prompt between slices",
   req.model = info.id;
   req.prompt = "seed prompt";
   req.max_tokens = 3;
+  req.collect_logprobs = true; // Keep every slice on the full Generate path.
 
   auto result = scheduler.Generate(std::move(req)).get();
   REQUIRE_FALSE(result.no_backend);
   REQUIRE(result.completion == "ABC");
+  REQUIRE(result.prompt_tokens == 40);
+  REQUIRE(result.completion_tokens == 3);
+  REQUIRE(backend->tokenize_calls == 1);
+  // The original prompt is charged once across three one-token slices.
+  REQUIRE(metrics.RenderPrometheus().find(
+              "inferflux_fairness_tokens_total{priority=\"0\"} 43\n") !=
+          std::string::npos);
   REQUIRE(backend->SeenPrompts() == std::vector<std::string>{"seed prompt",
                                                              "seed prompt",
                                                              "seed prompt"});
@@ -2523,6 +2542,7 @@ public:
   std::map<int, int> pos_max; // seq -> last resident position (-1 = empty)
   bool hybrid_trim_fails = false;
   bool defer_prefill = false;
+  bool split_decode = false;
   bool fail_phased_prefill = false;
   bool fail_full_prefill = false;
   int full_prefill_calls = 0;
@@ -2544,6 +2564,9 @@ public:
   }
   int UnifiedBatchTokenCapacity() const override { return 512; }
   bool SupportsAsyncUnifiedBatch() const override { return defer_prefill; }
+  bool SupportsSplitPrefillDecodeHandoff() const override {
+    return split_decode;
+  }
 
   PrefillResult PrefillPartial(const std::string &, int, int) override {
     return {}; // Exercise the final full-prompt recovery when phased fails.
@@ -2730,21 +2753,24 @@ TEST_CASE("Scheduler falls back to full phased prefill when the hybrid prefix "
 
 TEST_CASE("Scheduler reports only accepted cache reuse",
           "[scheduler][cache_usage]") {
-  for (const bool deferred : {false, true}) {
-    for (const std::string scenario : {"exact", "copy_failure", "no_donor",
-                                       "full_recovery", "full_generate"}) {
+  for (const std::string mode : {"synchronous", "deferred", "split_decode"}) {
+    const bool deferred = mode == "deferred";
+    for (const std::string scenario :
+         {"exact", "copy_failure", "no_donor", "full_recovery", "full_generate",
+          "logprobs", "structured"}) {
       // Full recovery is synchronous; deferred failures terminate the request.
       if (deferred &&
           (scenario == "full_recovery" || scenario == "full_generate")) {
         continue;
       }
-      CAPTURE(deferred, scenario);
+      CAPTURE(mode, scenario);
       SimpleTokenizer tokenizer;
       auto cache = std::make_shared<PagedKVCache>(
           32, 1024, PagedKVCache::EvictionPolicy::kLRU);
       auto router = std::make_shared<SingleModelRouter>();
       auto backend = std::make_shared<PositionCheckingBackend>();
       backend->defer_prefill = deferred;
+      backend->split_decode = mode == "split_decode";
       backend->hybrid_trim_fails = scenario == "copy_failure";
       backend->fail_phased_prefill =
           scenario == "full_recovery" || scenario == "full_generate";
@@ -2765,17 +2791,23 @@ TEST_CASE("Scheduler reports only accepted cache reuse",
       MetricsRegistry metrics;
       Scheduler::Config config;
       config.metrics = &metrics;
+      DisaggregatedConfig disagg;
+      disagg.decode_pool_size = backend->split_decode ? 1 : 0;
+      FairnessConfig fairness;
+      fairness.max_timeslice_tokens = 1;
       Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(),
-                          cache, router, nullptr, prefix_cache, {}, {}, {},
-                          config);
+                          cache, router, nullptr, prefix_cache, fairness,
+                          disagg, {}, config);
       InferenceRequest request;
       request.prompt = "cache usage";
       request.client_request_id = "cache-usage-" + scenario;
-      request.prompt_tokens = backend->TokenizeForCache(request.prompt);
+      request.collect_logprobs = scenario == "logprobs";
+      request.response_format.has_format = scenario == "structured";
       request.max_tokens = 2;
       const auto result = scheduler.Generate(std::move(request)).get();
       REQUIRE_FALSE(result.no_backend);
       REQUIRE(result.completion_tokens > 0);
+      CHECK(result.prompt_tokens == 40);
       REQUIRE(result.cached_prompt_tokens == (scenario == "exact" ? 39 : 0));
       const auto rendered = metrics.RenderPrometheus();
       REQUIRE(rendered.find("inferflux_kv_prefix_reuse_tokens_total " +
@@ -2785,6 +2817,10 @@ TEST_CASE("Scheduler reports only accepted cache reuse",
                             std::to_string(scenario == "exact" ? 1 : 0) +
                             "\n") != std::string::npos);
       REQUIRE(backend->position_violations == 0);
+      if (scenario == "logprobs" || scenario == "structured") {
+        REQUIRE(backend->generate_calls > 0);
+        REQUIRE(backend->unified_calls == 0);
+      }
       if (scenario == "full_recovery" || scenario == "full_generate") {
         REQUIRE(backend->full_prefill_calls == 1);
       }
