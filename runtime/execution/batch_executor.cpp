@@ -453,7 +453,10 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   {
     ExecutionTimer prefill_timer;
     if (backend_ready) {
-      response.prompt_tokens = backend->TokenCount(inference.prompt);
+      response.prompt_tokens =
+          !inference.has_images && !inference.bpe_prompt_tokens.empty()
+              ? static_cast<int>(inference.bpe_prompt_tokens.size())
+              : backend->TokenCount(inference.prompt);
     }
     if (inference.fairness.total_completion_tokens == 0) {
       inference.fairness.reported_prompt_tokens = response.prompt_tokens;
@@ -748,7 +751,9 @@ BatchExecutor::ExecuteBatchDecodePhased(
     req->fairness.yielded = false;
     out.model_id =
         req->resolved_model.empty() ? req->model : req->resolved_model;
-    out.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
+    out.prompt_tokens = req->fairness.reported_prompt_tokens >= 0
+                            ? req->fairness.reported_prompt_tokens
+                            : static_cast<int>(req->prompt_tokens.size());
 
     // Compute per-request decode limit respecting fairness timeslice.
     int limit = req->max_tokens;
@@ -947,7 +952,9 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     req->fairness.yielded = false;
     out.model_id =
         req->resolved_model.empty() ? req->model : req->resolved_model;
-    out.prompt_tokens = static_cast<int>(req->prompt_tokens.size());
+    out.prompt_tokens = req->fairness.reported_prompt_tokens >= 0
+                            ? req->fairness.reported_prompt_tokens
+                            : static_cast<int>(req->prompt_tokens.size());
 
     int limit = req->max_tokens;
     if (req->fairness.remaining_decode_tokens >= 0) {
