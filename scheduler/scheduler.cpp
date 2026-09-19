@@ -71,12 +71,11 @@ void LogCacheDecision(const InferenceRequest &req,
       {"client_request_id", req.client_request_id},
       {"model", req.resolved_model},
       {"backend", backend ? backend->Name() : "unresolved"},
-      {"path", req.collect_logprobs || req.response_format.has_format
-                   ? "full_generate"
-                   : "phased"},
+      {"path", req.cache_execution_path},
       {"logprobs", req.collect_logprobs},
       {"structured", req.response_format.has_format},
       {"session_sha256", hash(req.session_id)},
+      {"session_handles_enabled", req.cache_session_handles_enabled},
       {"session_lease_acquired", req.session_lease_acquired},
       {"prompt_tokens", req.bpe_prompt_tokens.size()},
       {"tokens_sha256", hash(tokens)},
@@ -570,13 +569,17 @@ void SyncUnifiedDecodeStepProgress(InferenceRequest *req) {
 // clamped to the reported prompt length so a stale radix match can never
 // exceed the prompt it is reported against.
 void FillResultUsageTelemetry(const InferenceRequest &req,
-                              InferenceResult *result,
-                              MetricsRegistry *metrics) {
+                              InferenceResult *result, MetricsRegistry *metrics,
+                              const BackendInterface *backend) {
   result->cached_prompt_tokens =
       std::clamp(req.cache_reused_tokens, 0, result->prompt_tokens);
   if (result->cached_prompt_tokens > 0) {
-    metrics->RecordKVPrefixReuse(result->cached_prompt_tokens);
+    metrics->RecordKVPrefixReuse(result->cached_prompt_tokens,
+                                 ResolveResultModelId(req),
+                                 backend ? backend->Name() : "unknown");
   }
+  LogCacheDecision(req, backend, "completed", req.cache_matched_tokens,
+                   result->cached_prompt_tokens);
   const auto epoch = std::chrono::steady_clock::time_point{};
   if (req.accept_time == epoch) {
     return; // Accept time unavailable; timings stay "not measured".
@@ -1345,7 +1348,8 @@ void Scheduler::DecodeWorkerLoop() {
           }
 
           FinalizeUnifiedDecodeStepResult(inference, &result);
-          FillResultUsageTelemetry(*inference, &result, metrics_);
+          FillResultUsageTelemetry(*inference, &result, metrics_,
+                                   pending->resolved_backend.get());
           {
             std::lock_guard<std::mutex> lock(queue_mutex_);
             if (inference->session_lease_acquired &&
@@ -1585,7 +1589,8 @@ void Scheduler::DecodeWorkerLoop() {
         if (!use_stepwise_decode) {
           inference->phase = RequestPhase::kFinished;
         }
-        FillResultUsageTelemetry(*inference, &result, metrics_);
+        FillResultUsageTelemetry(*inference, &result, metrics_,
+                                 pending->resolved_backend.get());
         pending->promise.set_value(std::move(result));
       }
 
@@ -1636,6 +1641,8 @@ std::future<InferenceResult> Scheduler::Generate(InferenceRequest request) {
   pending->inference.id = pending->sequence;
   pending->inference.phase = RequestPhase::kPending;
   pending->inference.session_lease_acquired = false;
+  pending->inference.cache_session_handles_enabled =
+      config_.session_handles.enabled;
   pending->inference.enqueue_time = pending->enqueue_time;
   pending->inference.accept_time = pending->enqueue_time;
   if (pending->inference.max_tokens <= 0) {
@@ -2014,6 +2021,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         continue;
       }
       if (pending->resolved_backend && pending->resolved_backend->IsReady()) {
+        inf.cache_execution_path = "phased";
         // Compute BPE tokens for prefix matching (INF-7).  We do this once per
         // request: if bpe_prompt_tokens is already populated (e.g., a retry
         // after channel-full rejection), reuse the cached result.
@@ -2026,6 +2034,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // state. Phased prefill + Decode() would split sampler state across
         // phases and force sequence-state handoff between heterogeneous paths.
         if (inf.collect_logprobs || inf.response_format.has_format) {
+          inf.cache_execution_path = "full_generate";
           inf.cache_reused_tokens = 0;
           inf.cache_reuse_pending_tokens = 0;
           LogCacheDecision(inf, pending->resolved_backend.get(),
@@ -2060,6 +2069,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           if (lease.status ==
               scheduler::SessionHandleManager::LeaseResult::Status::kAcquired) {
             inf.session_lease_acquired = true;
+            LogCacheDecision(inf, pending->resolved_backend.get(),
+                             lease.has_state ? "session_warm" : "session_cold");
             if (lease.has_state) {
               const std::string resolved_model =
                   inf.resolved_model.empty() ? inf.model : inf.resolved_model;
@@ -2078,10 +2089,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                     static_cast<int>(lease.state.prompt_tokens.size());
                 cached_blocks = lease.state.block_table;
               } else {
+                LogCacheDecision(inf, pending->resolved_backend.get(),
+                                 "session_incompatible");
                 ReleaseSessionState(lease.state, pending->resolved_backend);
                 session_handle_manager_->DiscardLeasedState(inf.session_id);
               }
             }
+          } else {
+            LogCacheDecision(inf, pending->resolved_backend.get(),
+                             "session_busy");
           }
         } else if (!RequestUsesSessionHandle(inf)) {
           inf.session_lease_acquired = false;
@@ -2185,6 +2201,12 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // (no paged cache configured OR new blocks were successfully reserved).
         bool can_admit = (seq_id >= 0) && (!cache_ || new_blocks_needed == 0 ||
                                            !new_blocks.empty());
+        if (!can_admit) {
+          LogCacheDecision(inf, pending->resolved_backend.get(),
+                           seq_id < 0 ? "admission_failed_no_sequence"
+                                      : "admission_failed_no_blocks",
+                           matched_tokens, 0, cached_seq_id);
+        }
         bool queued_via_unified_prefill = false;
 
         if (can_admit) {
@@ -2269,6 +2291,9 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             inf.first_piece.clear();
             SyncSequenceSlotProgress(inf);
             inf.cache_reuse_pending_tokens = copied_prefix ? prefill_start : 0;
+            LogCacheDecision(inf, pending->resolved_backend.get(),
+                             "prefill_deferred", matched_tokens, 0,
+                             cached_seq_id);
             staged_decode_local.push_back(pending);
             queued_via_unified_prefill = true;
           } else {
@@ -2764,7 +2789,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       ResetSequenceLease(inference);
     }
     inference->phase = RequestPhase::kFinished;
-    FillResultUsageTelemetry(*inference, &result, metrics_);
+    FillResultUsageTelemetry(*inference, &result, metrics_,
+                             pending->resolved_backend.get());
     pending->promise.set_value(std::move(result));
     LogSequenceSlotEvent("promise_completed", *inference);
   }

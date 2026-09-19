@@ -2770,6 +2770,7 @@ TEST_CASE("Scheduler reports only accepted cache reuse",
                           config);
       InferenceRequest request;
       request.prompt = "cache usage";
+      request.client_request_id = "cache-usage-" + scenario;
       request.prompt_tokens = backend->TokenizeForCache(request.prompt);
       request.max_tokens = 2;
       const auto result = scheduler.Generate(std::move(request)).get();

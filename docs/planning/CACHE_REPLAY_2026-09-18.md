@@ -54,10 +54,29 @@ Use Victor's `scripts/validation/multiagent_gateway_live.py --mixed` from merged
 commit `27c63afa1f640a24a1548420a7be1ff3a395322f`
 ([Victor PR 1115](https://github.com/anvai-labs/victor/pull/1115)). The harness
 requires the retained Sandhi gateway state and a working Victor environment.
-The aiserver1 Victor checkout lacks the harness; an isolated copy of the merged
-source was extracted into `/tmp/inferflux-wse-source`. Its local `.venv` cannot
-import Pydantic. The original Mac gateway is not aiserver1's loopback address.
-Full mixed replay and Sandhi ledger reconciliation are still pending.
+After fetching both repositories, the local writer member was replayed from
+Victor `609aaf5fb` through an isolated Sandhi `91a08d1` gateway built locally.
+The replay used the WS-E writer goal, provider/model, tools, reasoning effort,
+and budgets in a one-member pipeline. It is a local-member reproduction, not the
+original six-member/ZAI concurrency run. No ZAI credential is configured here.
+
+Run `inferflux-member-5430646e95` passed its writer deliverables and independent
+pytest check. Four successive same-session requests used three tools and neither
+structured output nor logprobs. Their inclusive input/output/cache usage was
+1731/55/0, 1785/65/0, 1839/67/0, and 1961/110/0. Sandhi SQLite reconciled every
+row exactly: fresh + cached = upstream prompt, and output counts matched.
+Evidence, ephemeral gateway state, and generated test files are under
+`/tmp/inferflux-member-5430646e95`; the gateway was stopped afterward.
+
+At the post-run snapshot, the unchanged serving process had only 24 free paged
+blocks out of 4096, versus 34 blocks retained by one live prefix sequence. The
+aggregate KV reuse counters were still 28 requests / 50747 tokens, unchanged from
+the earlier handoff. This establishes resource pressure and a current reproduction;
+it does not retrospectively identify the cause of the original 40 calls. The
+wire observer hashed messages and measured serialized-message common-prefix
+bytes (2499, 2961, 3478); **these are not tokenized common-prefix lengths**.
+Tokenized comparisons and exact allocation/copy decisions require the diagnostic
+build, which has not been deployed to the shared GPU service.
 
 For a separately scheduled deployment of the diagnostic build, set
 `INFERFLUX_CACHE_DIAGNOSTIC_REQUEST_PREFIX` to the correlation prefix of one local

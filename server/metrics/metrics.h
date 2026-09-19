@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <map>
 #include <mutex>
 #include <string>
 #include <string_view>
@@ -54,9 +55,10 @@ public:
   void RecordPrefixLookup(bool hit);
   void RecordPrefixMatchedTokens(int tokens);
   void RecordPartialPrefixHit();
-  // KV prefix reuse (§ Item 5): called when CopySequencePrefix+PrefillPartial
-  // replaces a full Prefill.  tokens_saved = number of prefix tokens skipped.
-  void RecordKVPrefixReuse(int tokens_saved);
+  // One finalized execution event drives both legacy aggregates and per-model
+  // counters. Zero/negative values are not reuse events.
+  void RecordKVPrefixReuse(int tokens_saved, const std::string &model = "",
+                           const std::string &backend = "");
   void RecordStreamTokens(std::size_t tokens);
   void RecordStreamCacheHit();
   void RecordFairnessTokens(int priority_level, std::size_t tokens);
@@ -364,6 +366,10 @@ private:
   std::atomic<uint64_t> prefix_partial_hits_{0};
   std::atomic<uint64_t> kv_prefix_reuse_count_{0};
   std::atomic<uint64_t> kv_prefix_reuse_tokens_{0};
+  mutable std::mutex cache_reuse_mutex_;
+  // (model, backend) -> (requests, accepted tokens)
+  std::map<std::pair<std::string, std::string>, std::pair<uint64_t, uint64_t>>
+      cache_reuse_;
   std::atomic<uint64_t> stream_tokens_{0};
   std::atomic<uint64_t> stream_cache_hits_{0};
   std::atomic<uint64_t> fairness_preemptions_{0};

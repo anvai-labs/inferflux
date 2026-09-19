@@ -545,10 +545,14 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
                             decode_limit, chunk_cb, should_stop, logprob_top_n,
                             lp_out, inference.first_token, inference.stop);
       } else if (inference.has_images && backend->SupportsVision()) {
+        inference.cache_execution_path = "full_generate_images";
+        inference.cache_reused_tokens = 0;
         text = backend->GenerateWithImages(inference.prompt, inference.images,
                                            decode_limit, chunk_cb, should_stop,
                                            inference.stop);
       } else {
+        inference.cache_execution_path = "full_generate";
+        inference.cache_reused_tokens = 0;
         text = backend->Generate(inference.prompt, decode_limit, chunk_cb,
                                  should_stop, logprob_top_n, lp_out,
                                  inference.stop);
