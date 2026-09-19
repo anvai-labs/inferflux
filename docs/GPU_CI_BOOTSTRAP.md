@@ -229,3 +229,89 @@ Both GPUs can run InferFlux simultaneously on different ports for multi-model se
 ## Bifurcation Note
 
 The X870E AORUS MASTER does **not** support PCIe x16 -> x8/x8 bifurcation for dual GPU in the top slot. The second and third slots are hardwired x4 from the chipset. If M2B_CPU or M2C_CPU M.2 slots are populated, the top x16 GPU slot drops to x8, but those freed lanes go to M.2 storage, not to another GPU slot.
+
+## Optional frozen Qwen cache acceptance
+
+The trusted `gpu-gates.yml` workflow has an opt-in `frozen_cache_acceptance`
+dispatch input. Its default is false. The additional step runs inside the CUDA
+job, after its ordinary TinyLlama gate and before the ROCm job, under the existing
+`inferflux-dual-gpu` concurrency group. A shell launched outside Actions cannot
+participate in that GitHub concurrency group and is not equivalent release
+evidence under ADR-0005.
+
+Promote the reviewed harness and workflow to `main` first. Configure these
+repository variables with an operator-verified source/build relationship and
+approved asset hashes; the paths and hashes are not credentials:
+
+| Variable | Meaning |
+|---|---|
+| `INFERFLUX_GPU_CACHE_BUNDLE_SHA256` | SHA-256 of the approved bundle's `SHA256SUMS` |
+| `INFERFLUX_GPU_CACHE_MANIFEST_SHA256` | SHA-256 of its `manifest.json` |
+| `INFERFLUX_GPU_CACHE_MODEL_PATH` | Absolute runner-local Qwen GGUF path |
+| `INFERFLUX_GPU_CACHE_MODEL_SHA256` | SHA-256 of that GGUF |
+| `INFERFLUX_GPU_CACHE_SANDHI_BINARY` | Absolute path of the independently reviewed Sandhi executable |
+| `INFERFLUX_GPU_CACHE_SANDHI_SHA256` | SHA-256 of that executable |
+| `INFERFLUX_GPU_CACHE_SANDHI_SOURCE` | Full reviewed Sandhi source commit used to build it |
+
+The approved capture lives at the fixed runner-local path
+`/tmp/victor-member-replay-63ad80a3f502`. The harness verifies the pinned checksum
+inventory, every listed file, the separately pinned manifest, ordered request
+paths, and request hashes. It reads this bundle as **data only**: its `replay.py`,
+writer code, captured shell commands, and returned tool calls are never executed.
+A different capture requires a reviewed update of the fixed path and approval
+pins. Keep the model and capture outside the repository; do not upload either as
+workflow artifacts.
+
+```bash
+gh workflow run gpu-gates.yml --ref main -f frozen_cache_acceptance=true
+```
+
+The main-owned `scripts/frozen_gpu_cache_acceptance.py` launches only the CUDA
+binary built by that job and the pinned Sandhi executable. The origin listens on
+`127.0.0.1:28084`, and Sandhi on `127.0.0.1:18793`; occupied ports fail preflight.
+The generated private configuration explicitly selects `llama_cpp_cuda`, disables
+backend fallback and session handles, allocates 32,768 context tokens across two
+sequences, and offloads eight layers. The historically named `runtime.mps_layers`
+setting feeds `LlamaBackendConfig.gpu_layers` for this explicit CUDA backend.
+Startup logs must confirm the eight-layer placement, and model metadata must
+confirm the backend and 16,384-token per-sequence capacity. CPU-resident layers
+make this partial CUDA execution, not full GPU offload.
+
+Preflight requires at least 6 GiB of NVIDIA free memory and 24 GiB of available
+host memory. These conservative admission checks are not a guarantee of model
+allocation success. Failure leaves the shared ROCm service on port 8080 intact.
+Only unauthenticated health probes touch that shared service, before and after
+acceptance and every five seconds while owned services run. An unhealthy probe
+terminates only the owned test processes. The harness never stops, reloads,
+reconfigures, or flushes the shared service or its cache.
+
+The frozen five requests each run directly and through Sandhi, preserving their
+payload values and per-arm order. The limits are ten inference calls, 128 KiB per
+payload, 4,096 requested completion tokens per call, and a 30-minute overall
+deadline. The two arms share the isolated origin cache and execute direct first;
+no cold-cache or independent-cache claim is made. Generated responses do not feed
+later requests. Zero reported cache tokens are acceptable if all observations
+reconcile.
+
+Origin and admin credentials and the minted replay virtual key are ephemeral.
+Sandhi's existing loopback-only environment bootstrap also registers its local
+demo virtual key for this instance; the harness uses the minted scoped key.
+Private configuration, policy state, SQLite files, and bounded process logs stay
+in a private temporary directory or memory and are removed at cleanup. The
+workflow uploads only `cache-acceptance.json`, containing provenance hashes,
+request identifiers generated during this run, token counts, execution paths,
+and health/cleanup outcomes. It verifies wire → SQLite → bounded C4 export →
+dashboard conservation, then reconciles wire prompt counts and accepted cache
+reuse against the executing backend's final diagnostics. Diagnostic prompt-token
+hashes must agree between each pair of identical payloads.
+
+This acceptance covers this frozen member on the updated partial CUDA runtime.
+It does not establish the original 40-call WS-E cause, exact completion-tokenizer
+accounting, a full mixed-provider team run, or Qwen ROCm acceptance. The ordinary
+serialized ROCm gate still follows and remains required for the workflow result.
+CPU-only contract validation for the new harness is registered with CTest as
+`FrozenGpuCacheAcceptanceContractTests` and can also run directly:
+
+```bash
+python3 tests/integration/frozen_gpu_cache_acceptance_test.py
+```

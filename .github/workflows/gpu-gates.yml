@@ -16,6 +16,12 @@ on:
       - 'config/server.cuda.yaml'
       - 'config/server.rocm.yaml'
   workflow_dispatch:
+    inputs:
+      frozen_cache_acceptance:
+        description: 'Replay the pinned five-request Qwen DATA bundle on isolated CUDA'
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: read
@@ -106,6 +112,28 @@ jobs:
             --max-cuda-attention-fallbacks 0 \
             --server-log-path build-ci-cuda/gpu-gate-server.log \
             --server-env "INFERFLUX_MODELS=id=gpu-ci-model,path=${GPU_MODEL_PATH},backend=cuda,default=true"
+
+      - name: Run optional frozen Qwen cache acceptance
+        if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.frozen_cache_acceptance }}
+        timeout-minutes: 35
+        env:
+          CACHE_BUNDLE_SHA256: ${{ vars.INFERFLUX_GPU_CACHE_BUNDLE_SHA256 }}
+          CACHE_MANIFEST_SHA256: ${{ vars.INFERFLUX_GPU_CACHE_MANIFEST_SHA256 }}
+          CACHE_MODEL_PATH: ${{ vars.INFERFLUX_GPU_CACHE_MODEL_PATH }}
+          CACHE_MODEL_SHA256: ${{ vars.INFERFLUX_GPU_CACHE_MODEL_SHA256 }}
+          CACHE_SANDHI_BINARY: ${{ vars.INFERFLUX_GPU_CACHE_SANDHI_BINARY }}
+          CACHE_SANDHI_SHA256: ${{ vars.INFERFLUX_GPU_CACHE_SANDHI_SHA256 }}
+          CACHE_SANDHI_SOURCE: ${{ vars.INFERFLUX_GPU_CACHE_SANDHI_SOURCE }}
+        run: python3 scripts/frozen_gpu_cache_acceptance.py
+
+      - name: Upload frozen cache acceptance evidence
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.frozen_cache_acceptance }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: cuda-cache-acceptance-${{ github.sha }}
+          path: build-ci-cuda/cache-acceptance.json
+          if-no-files-found: error
+          retention-days: 30
 
       - name: Upload CUDA evidence
         if: always()
