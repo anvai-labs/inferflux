@@ -13,6 +13,7 @@ import importlib.util
 import http.server
 import json
 import os
+import re
 from pathlib import Path
 import sqlite3
 import socketserver
@@ -202,6 +203,14 @@ class AccountingTests(unittest.TestCase):
                 with self.assertRaises(gate.AcceptanceError):
                     gate.reconcile_row({**rows[0], **change}, call, "s")
 
+    def cuda_backend_name(self):
+        source = (ROOT / "runtime/backends/cuda/cuda_backend.h").read_text()
+        match = re.search(
+            r'Name\(\) const override\s*\{\s*return "([^"]+)";\s*\}', source
+        )
+        self.assertIsNotNone(match, "Read the actual CUDABackend::Name() contract")
+        return match.group(1)
+
     def events(self):
         calls, events = [], []
         sessions = {"direct": "session-direct", "gateway": "session-gateway"}
@@ -219,7 +228,7 @@ class AccountingTests(unittest.TestCase):
                 calls.append(call)
                 event = dict(
                     client_request_id=request_id,
-                    backend="llama_cuda",
+                    backend=self.cuda_backend_name(),
                     model=gate.MODEL,
                     session_sha256=gate.digest(sessions[arm].encode()),
                     prompt_tokens=40,
@@ -235,6 +244,94 @@ class AccountingTests(unittest.TestCase):
                     ]
                 )
         return events, calls, sessions
+
+    def test_cuda_runtime_backend_name_reconciles_all_ten_calls(self):
+        events, calls, sessions = self.events()
+        self.assertEqual(len(gate.reconcile_diagnostics(events, calls, sessions)), 10)
+        for event in events:
+            event["backend"] = "llama_cuda"
+        with self.assertRaisesRegex(gate.AcceptanceError, "backend_execution_identity"):
+            gate.reconcile_diagnostics(events, calls, sessions)
+
+    def test_failed_reconciliation_retains_bounded_safe_observations(self):
+        events, calls, sessions = self.events()
+        events[2]["backend"] = "unresolved"
+        events[2].update(
+            prompt="private-prompt", api_key="private-key", response="private-response"
+        )
+        report = {"passed": False}
+        with self.assertRaisesRegex(gate.AcceptanceError, "backend_execution_identity"):
+            gate.finalize_diagnostics(report, events, calls, sessions)
+        self.assertFalse(report["passed"])
+        self.assertEqual(report["calls"], calls)
+        evidence = report["backend_diagnostics"]
+        self.assertEqual(len(evidence["records"]), 30)
+        self.assertFalse(evidence["truncated"])
+        self.assertEqual(evidence["records"][2]["backend"], "unresolved")
+        self.assertEqual(evidence["records"][2]["prompt_tokens"], 40)
+        self.assertNotIn("private-", json.dumps(report))
+        events[2]["backend"] = self.cuda_backend_name()
+        gate.finalize_diagnostics(report, events, calls, sessions)
+        self.assertTrue(report["passed"])
+        self.assertEqual(len(report["calls"]), 10)
+
+    def test_projection_preserves_scheduler_decisions_and_cpu_backend_name(self):
+        source = (ROOT / "scheduler/scheduler.cpp").read_text()
+        calls_in_source = re.findall(
+            r"LogCacheDecision\((?:inf|req),.*?\);", source, re.DOTALL
+        )
+        stages = sorted(set(re.findall(r'"([a-z_]+)"', " ".join(calls_in_source))))
+        self.assertTrue({"capacity_eviction", "copy_failed"}.issubset(stages))
+        source = (ROOT / "runtime/backends/llama/llama_cpp_backend.cpp").read_text()
+        backend = re.search(
+            r'LlamaCppBackend::Name\(\) const\s*\{\s*return "([^"]+)";\s*\}', source
+        )
+        self.assertIsNotNone(backend)
+        events, calls, _ = self.events()
+        decisions = [
+            {**events[2], "stage": stage, "backend": backend.group(1)}
+            for stage in stages
+        ]
+        rows = gate.diagnostic_evidence(decisions, calls)["records"]
+        self.assertEqual([row["stage"] for row in rows], stages)
+        self.assertTrue(all(row["backend"] == backend.group(1) for row in rows))
+
+    def test_diagnostic_projection_rejects_unknown_values_and_bounds_rows(self):
+        events, calls, _ = self.events()
+        dirty = {
+            **events[2],
+            "backend": "private-backend",
+            "model": "private-model",
+            "path": "private-path",
+            "stage": "private-stage",
+            "tokens_sha256": "private-tokens",
+            "session_sha256": "private-session",
+            "prompt_tokens": True,
+            "reused_tokens": -1,
+            "matched_tokens": 2**64,
+            "session_handles_enabled": "private-setting",
+            "sequence_id": -2,
+        }
+        evidence = gate.diagnostic_evidence(
+            [{**dirty, "client_request_id": "private-unrelated"}] + [dirty] * 70, calls
+        )
+        self.assertEqual(len(evidence["records"]), 64)
+        self.assertTrue(evidence["truncated"])
+        self.assertNotIn("private-", json.dumps(evidence))
+        for field in (
+            "backend",
+            "model",
+            "path",
+            "stage",
+            "tokens_sha256",
+            "session_sha256",
+            "prompt_tokens",
+            "reused_tokens",
+            "matched_tokens",
+            "session_handles_enabled",
+            "sequence_id",
+        ):
+            self.assertIsNone(evidence["records"][0][field])
 
     def test_backend_finalization_uses_accepted_tokens_not_lookup(self):
         events, calls, sessions = self.events()
