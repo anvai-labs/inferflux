@@ -1,6 +1,6 @@
 # Cache replay and implementation evidence
 
-Current status: [September 19 acceptance addendum](CACHE_ACCEPTANCE_HANDOFF_2026-09-19.md#september-19-cache-acceptance-addendum--current-acceptance). The historical evidence below retains its original provenance and limitations. The deployed frozen replay passed; C5 gateway streaming accounting remains open pending the Sandhi fix and rerun.
+Current status: [September 19 acceptance addendum](CACHE_ACCEPTANCE_HANDOFF_2026-09-19.md#september-19-cache-acceptance-addendum--current-acceptance). The historical evidence below retains its original provenance and limitations. The deployed frozen replay passed; Sandhi #274 and the unchanged five-call oracle resolved the scoped terminal-stream accounting finding. C5/#184 remains open for the originating Mac six-Qwen/one-ZAI verdict and explicit broader limitations.
 
 The original WS-E zero-cache workload remains **unattributed**. Its original
 upstream bodies were not retained. A controlled wire probe is not an exact replay
