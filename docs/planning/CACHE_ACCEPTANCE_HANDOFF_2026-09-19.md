@@ -153,14 +153,15 @@ client-side closure or late gateway usage.
 
 This addendum records the current verified scope. Earlier sections remain historical.
 The trusted-main GPU gate, isolated deployment and frozen-member replay passed.
-**C5 streaming accounting remains open:** terminal wire output does not match
-Sandhi's persisted output counts. Final acceptance requires the Sandhi repair and
-streaming rerun. The bounded disconnect/recovery result is independently clean.
+**The scoped gateway streaming-accounting finding is resolved:** Sandhi #274 and
+the unchanged five-call oracle reconcile wire, SQLite, C4 and dashboard counts.
+**C5/#184 remains open for the originating Mac six-Qwen/one-ZAI verdict.** The
+bounded disconnect/recovery result remains separate from full lifecycle acceptance.
 Historical and failed attempts retain their original scope.
 
 | Activity | Status |
 |---|---|
-| Prompt-token accounting #194/#195 | Merged: develop `930f580e0`, main `9edab96b4`; issue #193 remains open for its remaining acceptance scope. |
+| Prompt-token accounting #194/#195 | Merged: develop `930f580e0`, main `9edab96b4`; [issue #193 is closed](https://github.com/anvai-labs/inferflux/issues/193#issuecomment-5740884917) after scoped backend-token acceptance. |
 | Trusted-runner PATH #196/#197 | Merged: develop `d33494c06`, main `67689ef4b`. |
 | Ordinary serialized CUDA → ROCm gates | Passed at [9edab96b4 / 35420962763](https://github.com/anvai-labs/inferflux/actions/runs/35420962763) and [67689ef4b / 35425803441](https://github.com/anvai-labs/inferflux/actions/runs/35425803441). Small-model gates do not establish Qwen deployment acceptance. |
 | Frozen five-payload direct/Sandhi CPU acceptance | Passed: ten responses and five gateway rows reconciled; instances now stopped. |
@@ -172,9 +173,9 @@ Historical and failed attempts retain their original scope.
 | Updated Qwen GPU serving target | Ready on `aiserver1:8081`, PID 2254917, instance `c527a7a4d4eb`, from accepted main `c5d4eb89f71dcfb3064b974d63b88c4ce88f42a1`. Identical-binary rollback/relaunch was rehearsed; shared 8080 remained unchanged. |
 | Deployed frozen-member acceptance | Retry `6ge9ssew` passed and independent review is clean: ten wire calls, 36 diagnostics and five SQLite/C4/wire/dashboard joins. Gateway cache total was zero; six explicit capacity evictions explain this run. The earlier `zf2anjr6` timeout remains a preserved failed attempt. |
 | Deployed 24-case matrix | Passed; independent audit is clean. Twelve streaming and twelve non-streaming cases, four positive-cache responses and 1,906 cached tokens match global and per-model counter deltas. |
-| Gateway streaming accounting / C5 | **Open:** all five wire streams completed validly, but SQLite output totals were 14,387 versus 288 reported on wire. Sandhi owns the repair and regression; repeat deployed streaming acceptance after its reviewed fix. |
+| Gateway streaming accounting | **Passed after Sandhi #274:** unchanged five-call oracle reports 120 prompt/fresh, 288 output and zero cache tokens across wire/SQLite/C4/dashboard, with reported coverage 5/5. Original 14,387-versus-288 failure remains preserved. |
 | Deployed disconnect/recovery | Four-call probe passed for observed early client closure and successful recovery; independent review is clean. No origin-cancellation claim. |
-| Full six-Qwen/one-ZAI run | Mac engineering can resume using its approved connection and the ready sidecar. Final acceptance still requires the Sandhi streaming fix/rerun and completed full-team evidence. |
+| Full six-Qwen/one-ZAI run | **Open, Mac-owned:** deploy Sandhi `eb38ff4` or a verified descendant containing #274, record the buffered-timeout policy, then collect strict correlation/accounting and member-deliverable evidence. |
 
 ### Failed first GPU attempt and correction
 
@@ -274,7 +275,7 @@ also observing positive direct reuse. The retained capacity-eviction decisions
 explain this run's zeros; they do not establish the original forty-call cause.
 Lookup candidates were not counted as accepted reuse.
 
-### Deployed matrix and open streaming-accounting defect
+### Deployed matrix and preserved streaming-accounting failure
 
 The deployed 24-case matrix passed at
 `/tmp/inferflux-deployed-cache-matrix-5oosv1hs/summary.json`; independent audit is
@@ -309,16 +310,71 @@ explanation: terminal usage and DONE are forwarded before transport EOF finalize
 metering. Closing at DONE can retain a partial raw-SSE-byte output estimate; all
 five persisted values match that estimate. This remains a **strong inference**,
 since no physical-attempt EOF trace was retained. The originating Sandhi session
-owns the fix and deterministic fake-upstream regression: emit known terminal
-usage and DONE, delay EOF, then compare immediate client close with draining EOF
-across chunk boundaries. Preserve real preterminal-disconnect semantics.
+subsequently reproduced that path deterministically and repaired it, as recorded
+below. This does not retroactively add physical-attempt tracing to the failed run.
 The finding and regression handoff were posted to the
 [originating Sandhi session](https://github.com/anvai-labs/sandhi/pull/272#issuecomment-5740849386).
 
-**C5 streaming accounting remains open.** Merge the independently reviewed Sandhi
-repair after green CI, then rerun this five-call deployed oracle and reconcile
-wire, persisted rows, C4 and dashboard before closing that acceptance dependency.
-Do not relax the accounting comparison to make the current failure pass.
+The failure is retained with its original provenance. The unchanged accounting
+oracle subsequently passed; its assertions were not relaxed to obtain acceptance.
+
+### Sandhi repair and strict deployed streaming acceptance
+
+[Sandhi #274](https://github.com/anvai-labs/sandhi/pull/274) merged to develop
+`eb38ff4b4c90121ac3f2e2e033ac5d5b2d057e2d` after clean independent review before
+push and [substantive PR CI](https://github.com/anvai-labs/sandhi/actions/runs/35437781469).
+[Post-merge CI](https://github.com/anvai-labs/sandhi/actions/runs/35438787466) also
+passed. Its 687 passing tests include delayed-EOF regressions for close-at-DONE,
+drain-to-EOF, chunk boundaries, missing usage and genuine preterminal cancellation.
+Authoritative observed usage is captured before forwarding the OpenAI-compatible
+DONE data line; final accounting no longer waits for transport EOF. Missing usage
+and preterminal cancellation retain partial semantics. This is not a general SSE
+parser or a repair of every legacy `MeteredProvider` lifecycle path.
+
+The binary built from that clean merged source has SHA-256
+`ac5ace8bcc767c5e99646dd7429d4bbb962880dbbc383a022b1fa04f753ecb80`, at
+`/tmp/sandhi-terminal-stream-accounting/target/debug/sandhi-proxy`.
+An independently reviewed wrapper changed only the Sandhi executable path/hash in
+the original oracle, SHA-256
+`433684dab19515ab060e8f81f2dab191039e43eaba6949ae986232eb4a7307ab`.
+The five requests, order, token limits, close-at-DONE behavior and assertions were
+unchanged. The later local failure-evidence preparation was not used for this run.
+
+Run `req_stream_overlap_e6eeb367a55a` passed against the same accepted InferFlux
+`c5d4eb89f71dcfb3064b974d63b88c4ce88f42a1`, PID 2254917, ready Qwen8081:
+
+| Projection | Calls | Inclusive prompt / fresh input | Cache read / creation | Output |
+|---|---:|---:|---:|---:|
+| Wire terminal usage | 5 | 120 / 120 | 0 / 0 | 288 |
+| SQLite | 5 | 120 / 120 | 0 / 0 | 288 |
+| C4 diagnostics | 5 | 120 / 120 | 0 / 0 | 288 |
+| Dashboard | 5 | 120 / 120 | 0 / 0 | 288 |
+
+Every stream delivered finish, exactly one terminal usage and DONE. Five unique
+request/session/run/step/model joins match; cache observations explicitly report
+`reported/origin_usage`, coverage 5/5, with no warnings or truncation. Independent
+review directly reconciled the read-only SQLite rows and all projections.
+Same/different-session outstanding requests overlapped 6,055.836/4,969.208 ms;
+content delivery was serialized, with no claim of concurrent GPU execution.
+
+Report: `/tmp/inferflux-deployed-stream-overlap-j2x2_dmh/report.json`, SHA-256
+`7a28ea786175efe0c81f9c15bb3ee6cb6fd4b9813be24fbba1c10fe6eb16426b`.
+[Sandhi #275](https://github.com/anvai-labs/sandhi/pull/275) merged documentation
+and a [byte-identical durable report](https://github.com/anvai-labs/sandhi/blob/24cce2499fbc03a543db6685f0b9c5dce8f8384e/docs/upstream/evidence/stream-c5-2026-09-19.json)
+at `24cce2499fbc03a543db6685f0b9c5dce8f8384e`, after clean review and green
+[PR](https://github.com/anvai-labs/sandhi/actions/runs/35443884707) and
+[post-merge CI](https://github.com/anvai-labs/sandhi/actions/runs/35443951169).
+The isolated gateway and workers stopped cleanly. Both Qwen services retained
+their process/binary identities and health; no cache clear, restart or credential
+transfer occurred. This handoff reconciliation does not repeat the live replay.
+
+**Only the scoped raw-gateway terminal-accounting finding is closed.** Optional
+backend completed-cache diagnostics were unavailable for all five requests.
+Reported zero cache tokens are verified; missing diagnostics do not prove zero
+executed reuse or establish its cause. The run does not newly certify backend
+tokenizer accuracy, positive reuse, enabled-session leases, origin cancellation,
+exact completion units or full lifecycle acceptance. C4 completeness/basis/outcome/
+physical-attempt fields remain unavailable. **C5/#184 stays open for the Mac run.**
 
 The separate four-call deployed disconnect/recovery probe passed at
 `/tmp/inferflux-deployed-cancellation-8jvdiobs/report.json`; independent review is
@@ -384,7 +440,7 @@ contracts; the reviewed correction above passes 19. All required hosted CI passe
 for all merged changes, including #202/#203. Accepted GPU evidence is recorded
 above; the deployed frozen replay passed independently reviewed acceptance.
 The matrix and bounded deployed disconnect/recovery result are independently
-clean; C5 streaming accounting remains open.
+clean; the later scoped streaming-accounting repair passed as recorded above.
 
 ### Remaining runtime coverage
 
@@ -394,11 +450,11 @@ checks do not validate active leases. GPU copy-failure and model-swap fault
 injection remain untested. The disconnect checks do not prove backend/provider
 cancellation; origin TTFT provenance and exact completion-token accounting also
 remain unverified. Gateway terminal SSE protocol and same/different-session
-submitted-request overlap were observed, but persisted streaming output accounting
-failed and remains open. Delivered-stream overlap is optional; valid serialization
+submitted-request overlap and persisted streaming output accounting passed after
+the Sandhi repair. Delivered-stream overlap is optional; valid serialization
 is not a failure. The full six-Qwen/one-ZAI mixed team still requires the originating
-Mac session's approved connection and cannot close final acceptance before the
-Sandhi repair and streaming rerun.
+Mac session's approved connection and its own strict acceptance verdict. Do not
+extend the scoped streaming result to the broader unverified behaviors above.
 
 ### Durable evidence location
 
@@ -436,14 +492,22 @@ and [Sandhi #272 follow-up](https://github.com/anvai-labs/sandhi/pull/272#issuec
 Sandhi #272 (`566f8199a79c64495fbacc18c169581d996d5c08`) documents the new baseline;
 its runtime-relative changes are documentation only. The accepted GPU serving
 identity, endpoint and deployment/rollback record are available above. Mac
-engineering may resume, but final acceptance remains blocked on the Sandhi
-streaming repair/rerun and full-team evidence.
+engineering may resume with the completed [Sandhi acceptance handback](https://github.com/anvai-labs/inferflux/issues/184#issuecomment-5742000139)
+and [merged evidence update](https://github.com/anvai-labs/inferflux/issues/184#issuecomment-5742023753).
+Full-team evidence remains the next owner dependency; no Mac deployment occurred
+as part of the WSL repair or this documentation reconciliation.
 
 The former missing-new-payload dependency is resolved by the available bundle.
 The original forty upstream bodies were not retained and historical causality
-remains unproven. The Mac session can use the accepted sidecar for its approved
-member replay, then execute Victor's
-`scripts/validation/multiagent_gateway_live.py --mixed` for six Qwen/one ZAI.
+remains unproven. The Mac session must build/deploy Sandhi `eb38ff4` or a verified
+descendant containing #274 into its existing gateway, preserving state and private
+configuration. The WSL binary is not a Mac artifact. Then execute Victor's
+`scripts/validation/multiagent_gateway_live.py --mixed` for six Qwen/one ZAI with
+strict request/session/run/member correlation, wire/SQLite/C4/dashboard usage
+conservation and generated-deliverable tests. Record actual member outcomes,
+source/binary pins, timeout policy and unavailable evidence; keep #184 open until
+that verdict is recorded. Do not repeat the completed five-call replay merely to
+reproduce this handoff.
 Historical Mac locations to verify: gateway `127.0.0.1:18788`, state
 `/Users/vijaysingh/code/codingagent/var/sandhi-zai/`, tunnel `127.0.0.1:18080` →
 `aiserver1:8080`. That tunnel still targets the old service; do not label its runs
@@ -457,6 +521,33 @@ ssh -N -L 18081:127.0.0.1:8081 aiserver1
 Set the local Sandhi InferFlux upstream to `http://127.0.0.1:18081/v1`, reusing the
 original private InferFlux key already held in that session. Do not copy credentials
 into the handoff. Keep the original `18080` tunnel available for rollback to 8080.
+
+### Buffered-timeout policy for the Mac acceptance run
+
+The handback policy is to **retain stock Sandhi's 120-second buffered upstream
+deadline and treat timeout responses as acceptance failures**, recording affected
+members and request/session correlations. Do not silently change task/output
+budgets, retry policy or timeout settings to turn a failed run into a pass. No
+timeout configuration was changed on WSL, and the Mac owner must verify and record
+its actual gateway construction before starting the mixed-team run.
+
+The deadline includes upstream request and response-body consumption. A 900-second
+replay-client allowance does not override it; a gateway timeout maps to HTTP 504.
+The stock standalone provider configuration has no upstream-timeout knob.
+`SANDHI_HEADER_READ_TIMEOUT_SECS` controls incoming headers only. Runtime/bindings
+support `timeout_secs`, but using that path or adding a standalone configuration
+option requires a supported, reviewed and validated deployment change before a
+longer-deadline acceptance run. Do not assume an unknown config field takes effect.
+
+If the Mac owner requires a longer deadline, explicitly revise this policy and
+coordinate that Sandhi change first. Account for client limits, all retry attempts
+and settlement margin below the 900-second reservation TTL; setting every timeout
+to 900 seconds is not a valid plan. Streaming is not an automatic workaround:
+setup remains 30 seconds and inter-chunk idle remains 90 seconds. See the pinned
+[Sandhi timeout assessment](https://github.com/anvai-labs/sandhi/blob/24cce2499fbc03a543db6685f0b9c5dce8f8384e/docs/td/TD-0028-cache-accounting-availability.md#buffered-timeout-assessment-for-the-mac-mixed-team-run).
+
+### Accepted-sidecar rollback
+
 To stop only the accepted sidecar on aiserver1:
 
 ```bash
