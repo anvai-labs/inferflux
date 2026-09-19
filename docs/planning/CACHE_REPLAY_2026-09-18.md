@@ -77,3 +77,19 @@ setting or revert the diagnostic commit to remove capture.
 GPU runtime evidence must be collected on trusted main through the serialized
 `aiserver1-dual-gpu` gates; do not run pull-request code on that runner. CPU tests
 and production-server wire probes do not certify a modified GPU binary.
+
+## Execution accounting increment
+
+Usage now reads the accepted prefill reuse extent, independently of the radix
+lookup candidate. Exact hits replay one token for logits and report one fewer
+cached token. Failed copies, unavailable donors, full-prefill recovery, and
+fallback to full Generate report zero. Deferred prefill checks copy success and
+commits the pending reuse extent only after its last successful prefill chunk.
+The scheduler records the aggregate KV reuse counters from the same finalized
+value as response usage, once per completed request, excluding zero-token reuse.
+
+Deterministic scheduler cases cover synchronous/deferred exact hits and failed
+copies, matches without donors, full-prefill recovery, and Generate fallback.
+The CPU test build is `build-cpu-ci`; these tests use deterministic backends and
+do not claim GPU coverage. Rollback is a revert of the accounting commit; no
+model, config, grammar, or wire-field removal is involved.

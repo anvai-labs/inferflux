@@ -731,7 +731,7 @@ TEST_CASE("on_token callback fires on prefix cache hit", "[scheduler]") {
   REQUIRE(resp.duration_ms >= 0.0);
 }
 
-TEST_CASE("Scheduler reports radix prefix hits as cached prompt tokens",
+TEST_CASE("Scheduler does not report lookup hits after full prefill fallback",
           "[scheduler]") {
   SimpleTokenizer tokenizer;
   auto device = std::make_shared<CPUDeviceContext>();
@@ -763,9 +763,9 @@ TEST_CASE("Scheduler reports radix prefix hits as cached prompt tokens",
   auto resp = scheduler.Generate(std::move(req)).get();
 
   REQUIRE_FALSE(resp.no_backend);
-  // ReadyStubBackend::TokenizeForCache yields {1,2,3}; the trie holds that
-  // exact sequence, so the whole BPE prompt counts as cache-reused.
-  REQUIRE(resp.cached_prompt_tokens == 3);
+  // This stub cannot copy or execute a phased prefill. Its full Prefill
+  // fallback succeeds, so the exact lookup must not be reported as reuse.
+  REQUIRE(resp.cached_prompt_tokens == 0);
   REQUIRE(resp.cached_prompt_tokens <= resp.prompt_tokens);
   REQUIRE(resp.duration_ms >= 0.0);
 }
@@ -2522,6 +2522,10 @@ class PositionCheckingBackend : public LlamaCppBackend {
 public:
   std::map<int, int> pos_max; // seq -> last resident position (-1 = empty)
   bool hybrid_trim_fails = false;
+  bool defer_prefill = false;
+  bool fail_phased_prefill = false;
+  bool fail_full_prefill = false;
+  int full_prefill_calls = 0;
   int position_violations = 0;
   int unified_calls = 0;
   int generate_calls = 0;
@@ -2539,6 +2543,25 @@ public:
     return std::vector<int>(40, 7);
   }
   int UnifiedBatchTokenCapacity() const override { return 512; }
+  bool SupportsAsyncUnifiedBatch() const override { return defer_prefill; }
+
+  PrefillResult PrefillPartial(const std::string &, int, int) override {
+    return {}; // Exercise the final full-prompt recovery when phased fails.
+  }
+
+  PrefillResult Prefill(const std::string &, int sequence) override {
+    ++full_prefill_calls;
+    if (fail_full_prefill) {
+      return {};
+    }
+    pos_max[sequence] = 39;
+    PrefillResult out;
+    out.ok = true;
+    out.n_past = 40;
+    out.first_token = 42;
+    out.first_piece = "x";
+    return out;
+  }
 
   bool CopySequencePrefix(int, int dst_seq, int n_tokens) override {
     if (hybrid_trim_fails) {
@@ -2566,6 +2589,9 @@ public:
     ++unified_calls;
     std::vector<UnifiedBatchOutput> outputs;
     for (const auto &in : inputs) {
+      if (fail_phased_prefill && in.tokens.size() > 1) {
+        return {};
+      }
       const int xmax =
           pos_max.count(in.sequence_id) ? pos_max[in.sequence_id] : -1;
       if (in.n_past != xmax + 1) {
@@ -2700,4 +2726,67 @@ TEST_CASE("Scheduler falls back to full phased prefill when the hybrid prefix "
   REQUIRE(backend->position_violations == 0);
   REQUIRE(backend->generate_calls == 0);
   REQUIRE(backend->unified_calls > 0);
+}
+
+TEST_CASE("Scheduler reports only accepted cache reuse",
+          "[scheduler][cache_usage]") {
+  for (const bool deferred : {false, true}) {
+    for (const std::string scenario : {"exact", "copy_failure", "no_donor",
+                                       "full_recovery", "full_generate"}) {
+      // Full recovery is synchronous; deferred failures terminate the request.
+      if (deferred &&
+          (scenario == "full_recovery" || scenario == "full_generate")) {
+        continue;
+      }
+      CAPTURE(deferred, scenario);
+      SimpleTokenizer tokenizer;
+      auto cache = std::make_shared<PagedKVCache>(
+          32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+      auto router = std::make_shared<SingleModelRouter>();
+      auto backend = std::make_shared<PositionCheckingBackend>();
+      backend->defer_prefill = deferred;
+      backend->hybrid_trim_fails = scenario == "copy_failure";
+      backend->fail_phased_prefill =
+          scenario == "full_recovery" || scenario == "full_generate";
+      backend->fail_full_prefill = scenario == "full_generate";
+      ModelInfo info;
+      info.id = "cache-usage";
+      info.backend = "cpu";
+      REQUIRE(router->RegisterModel(info, backend));
+      auto prefix_cache = std::make_shared<RadixPrefixCache>(
+          cache, [](int, std::shared_ptr<BackendInterface>) {},
+          RadixPrefixCacheLimits{1024, 12});
+      auto tokens = backend->TokenizeForCache("seed");
+      if (scenario == "full_recovery" || scenario == "full_generate") {
+        tokens.resize(32); // A suffix chunk must fail before full recovery.
+      }
+      REQUIRE(prefix_cache->Insert(tokens, {10, 11, 12},
+                                   scenario == "no_donor" ? -1 : 7, backend));
+      MetricsRegistry metrics;
+      Scheduler::Config config;
+      config.metrics = &metrics;
+      Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(),
+                          cache, router, nullptr, prefix_cache, {}, {}, {},
+                          config);
+      InferenceRequest request;
+      request.prompt = "cache usage";
+      request.prompt_tokens = backend->TokenizeForCache(request.prompt);
+      request.max_tokens = 2;
+      const auto result = scheduler.Generate(std::move(request)).get();
+      REQUIRE_FALSE(result.no_backend);
+      REQUIRE(result.completion_tokens > 0);
+      REQUIRE(result.cached_prompt_tokens == (scenario == "exact" ? 39 : 0));
+      const auto rendered = metrics.RenderPrometheus();
+      REQUIRE(rendered.find("inferflux_kv_prefix_reuse_tokens_total " +
+                            std::to_string(result.cached_prompt_tokens) +
+                            "\n") != std::string::npos);
+      REQUIRE(rendered.find("inferflux_kv_prefix_reuse_total " +
+                            std::to_string(scenario == "exact" ? 1 : 0) +
+                            "\n") != std::string::npos);
+      REQUIRE(backend->position_violations == 0);
+      if (scenario == "full_recovery" || scenario == "full_generate") {
+        REQUIRE(backend->full_prefill_calls == 1);
+      }
+    }
+  }
 }
