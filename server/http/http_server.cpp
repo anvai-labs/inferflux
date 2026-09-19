@@ -2116,7 +2116,12 @@ void HttpServer::HandleClient(ClientSession &session) {
     payload["default_model"] = default_id;
     payload["models"] = json::array();
     for (const auto &info : models) {
-      payload["models"].push_back(BuildAdminModelJson(info, default_id));
+      auto model = BuildAdminModelJson(info, default_id);
+      const auto backend = router->GetBackend(info.id);
+      model["runtime"] = BuildModelRuntimeJson(
+          info, backend.get(), scheduler_->PrefixReuseEnabled(),
+          scheduler_->SessionHandlesEnabled());
+      payload["models"].push_back(std::move(model));
     }
     SendAll(session, BuildResponse(payload.dump()));
     return;
@@ -2581,7 +2586,12 @@ void HttpServer::HandleClient(ClientSession &session) {
     if (path == "/v1/models") {
       json data = json::array();
       for (const auto &m : models) {
-        data.push_back(BuildOpenAIModelJson(m, created_ts));
+        auto model = BuildOpenAIModelJson(m, created_ts);
+        const auto backend = router->GetBackend(m.id);
+        model["runtime"] = BuildModelRuntimeJson(
+            m, backend.get(), scheduler_->PrefixReuseEnabled(),
+            scheduler_->SessionHandlesEnabled());
+        data.push_back(std::move(model));
       }
       SendAll(session,
               BuildResponse(json({{"object", "list"}, {"data", data}}).dump()));
@@ -2591,8 +2601,12 @@ void HttpServer::HandleClient(ClientSession &session) {
     // /v1/models/{id}
     std::string model_id = path.substr(kV1ModelsPrefixLen); // strip prefix
     if (const ModelInfo *model = FindModelById(models, model_id)) {
-      SendAll(session,
-              BuildResponse(BuildOpenAIModelJson(*model, created_ts).dump()));
+      auto payload = BuildOpenAIModelJson(*model, created_ts);
+      const auto backend = router->GetBackend(model->id);
+      payload["runtime"] = BuildModelRuntimeJson(
+          *model, backend.get(), scheduler_->PrefixReuseEnabled(),
+          scheduler_->SessionHandlesEnabled());
+      SendAll(session, BuildResponse(payload.dump()));
       return;
     }
     SendAll(session, BuildModelNotFoundResponse());

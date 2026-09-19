@@ -925,6 +925,16 @@ bool NativeGpuBackend::IsReady() const {
   return false;
 }
 
+int NativeGpuBackend::SequenceCapacity() const {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+  return runtime_ ? runtime_->NativeSequenceCapacity() : 0;
+}
+
+int NativeGpuBackend::SequenceContextCapacity() const {
+  std::lock_guard<std::recursive_mutex> lock(runtime_mutex_);
+  return runtime_ ? runtime_->NativeSequenceContextCapacity() : 0;
+}
+
 // --- Logprobs / Embeddings ---
 
 std::vector<TopLogitEntry> NativeGpuBackend::TopLogitsForParity(int top_n) {

@@ -10,6 +10,29 @@
 
 using namespace inferflux;
 
+TEST_CASE("Radix donations release all blocks after a shared edge splits",
+          "[radix_cache][cache_ownership]") {
+  auto pages = std::make_shared<PagedKVCache>(
+      32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  RadixPrefixCache cache(
+      pages, [](int, std::shared_ptr<BackendInterface>) {},
+      RadixPrefixCacheLimits{64, 8});
+  std::vector<int> first(40, 1);
+  auto second = first;
+  second[20] = 2; // Shared prefix crosses a block boundary before divergence.
+  for (int sequence = 0; sequence < 2; ++sequence) {
+    const auto blocks = pages->ReserveBlocks(4);
+    pages->AcquireBlocks(blocks); // Scheduler donates its full block table.
+    REQUIRE(cache.Insert(sequence == 0 ? first : second, blocks, sequence, {}));
+    pages->ReleaseBlocksRef(blocks); // Scheduler releases its own reference.
+  }
+  REQUIRE(pages->NumFreeBlocks() == 24);
+  REQUIRE(cache.MemorySnapshot().unique_retained_blocks == 8);
+  REQUIRE(cache.EvictOneSequence());
+  REQUIRE(cache.EvictOneSequence());
+  REQUIRE(pages->NumFreeBlocks() == 32);
+}
+
 TEST_CASE("RadixPrefixCache: miss on empty cache", "[radix_cache]") {
   RadixPrefixCache cache(
       nullptr, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
@@ -78,9 +101,9 @@ TEST_CASE("RadixPrefixCache: deep radix tree with progressive prefixes",
   REQUIRE(lookup.sequence_id == 2);
 }
 
-TEST_CASE(
-    "RadixPrefixCache: reinserting existing node keeps suffix blocks only",
-    "[radix_cache]") {
+TEST_CASE("RadixPrefixCache: reinserting existing node selects the complete "
+          "donor table",
+          "[radix_cache]") {
   RadixPrefixCache cache(
       nullptr, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
       RadixPrefixCacheLimits{64, 12});

@@ -545,10 +545,16 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
                             decode_limit, chunk_cb, should_stop, logprob_top_n,
                             lp_out, inference.first_token, inference.stop);
       } else if (inference.has_images && backend->SupportsVision()) {
+        inference.cache_execution_path = "full_generate_images";
+        inference.cache_reused_tokens = 0;
+        inference.cache_prefill_complete = false;
         text = backend->GenerateWithImages(inference.prompt, inference.images,
                                            decode_limit, chunk_cb, should_stop,
                                            inference.stop);
       } else {
+        inference.cache_execution_path = "full_generate";
+        inference.cache_reused_tokens = 0;
+        inference.cache_prefill_complete = false;
         text = backend->Generate(inference.prompt, decode_limit, chunk_cb,
                                  should_stop, logprob_top_n, lp_out,
                                  inference.stop);
@@ -1195,6 +1201,10 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
         if (req->prefill_offset >=
             static_cast<int>(req->bpe_prompt_tokens.size())) {
           states[i].in_prefill = false;
+          if (res.ok) {
+            req->cache_reused_tokens = req->cache_reuse_pending_tokens;
+            req->cache_prefill_complete = true;
+          }
           // After final chunk, the 'res' contains the first generated token.
           if (!res.ok || res.token < 0) {
             states[i].active = false;
@@ -1657,6 +1667,10 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
       if (req->prefill_offset >=
           static_cast<int>(req->bpe_prompt_tokens.size())) {
         req->execution.in_prefill = false;
+        if (res.ok) {
+          req->cache_reused_tokens = req->cache_reuse_pending_tokens;
+          req->cache_prefill_complete = true;
+        }
         if (!res.ok || res.token < 0) {
           req->execution.active = false;
           continue;

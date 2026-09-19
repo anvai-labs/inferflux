@@ -3,6 +3,7 @@
 #include "runtime/backends/llama/llama_cpp_backend.h"
 #include "scheduler/model_router.h"
 #include "scheduler/single_model_router.h"
+#include "server/http/model_json.h"
 
 #include <memory>
 
@@ -17,6 +18,50 @@ std::shared_ptr<LlamaCppBackend> ReadyBackend() {
 }
 
 } // namespace
+
+TEST_CASE("Model runtime diagnostics report backend capacity and mode policy",
+          "[model_identity][cache_usage]") {
+  class CapacityBackend : public LlamaCppBackend {
+  public:
+    bool IsReady() const override { return true; }
+    int SequenceCapacity() const override { return 2; }
+    int SequenceContextCapacity() const override { return 32768; }
+  } backend;
+  for (const auto *label : {"llama_cpp_rocm", "cpu", "inferflux_cuda"}) {
+    ModelInfo info;
+    info.backend = label;
+    info.capabilities.supports_kv_prefix_transfer = true;
+    info.gguf.context_length = 262144;
+    auto runtime = BuildModelRuntimeJson(info, &backend, true, false);
+    REQUIRE(runtime["sequence_capacity"] == 2);
+    REQUIRE(runtime["context_tokens_per_sequence"] == 32768);
+    REQUIRE(runtime["cache_reuse"]["phased"]["prefix"] == true);
+    REQUIRE(runtime["cache_reuse"]["phased"]["session"] == false);
+    REQUIRE(runtime["cache_reuse"]["full_generate"]["prefix"] == false);
+    REQUIRE(runtime["cache_reuse"]["full_generate"]["session"] == false);
+    runtime = BuildModelRuntimeJson(info, &backend, false, true);
+    REQUIRE(runtime["cache_reuse"]["phased"]["prefix"] == false);
+    REQUIRE(runtime["cache_reuse"]["phased"]["session"] == true);
+    info.capabilities.supports_kv_prefix_transfer = false;
+    runtime = BuildModelRuntimeJson(info, &backend, true, true);
+    REQUIRE(runtime["cache_reuse"]["phased"]["prefix"] == false);
+    REQUIRE(runtime["cache_reuse"]["phased"]["session"] == false);
+  }
+}
+
+TEST_CASE("Model runtime diagnostics distinguish unknown from zero capacity",
+          "[model_identity][cache_usage]") {
+  ModelInfo info;
+  info.capabilities.supports_kv_prefix_transfer = true;
+  auto runtime = BuildModelRuntimeJson(info, nullptr, true, true);
+  REQUIRE(runtime["sequence_capacity"].is_null());
+  REQUIRE(runtime["context_tokens_per_sequence"].is_null());
+  REQUIRE(runtime["cache_reuse"]["phased"]["prefix"] == false);
+  REQUIRE(runtime["cache_reuse"]["phased"]["session"] == false);
+  runtime = BuildModelRuntimeJson(info, ReadyBackend().get(), true, false);
+  REQUIRE(runtime["sequence_capacity"].is_null());
+  REQUIRE(runtime["context_tokens_per_sequence"].is_null());
+}
 
 TEST_CASE("SingleModelRouter preserves source and effective load paths",
           "[model_paths]") {
