@@ -1100,6 +1100,13 @@ if(Python3_Interpreter_FOUND)
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 30)
 
+  add_test(
+    NAME FrozenGpuCacheAcceptanceContractTests
+    COMMAND ${Python3_EXECUTABLE} -u tests/integration/frozen_gpu_cache_acceptance_test.py -v)
+  set_tests_properties(FrozenGpuCacheAcceptanceContractTests PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 30)
+
   # Throughput-gate failure message contract tests.
   add_test(
     NAME ThroughputGateFailureContractTests
