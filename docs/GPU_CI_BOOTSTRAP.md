@@ -66,7 +66,7 @@ listener must be started again after each host restart:
 
 ```bash
 cd /home/vsingh/actions-runner-inferflux-gpu
-./run.sh
+PATH="/usr/lib/wsl/lib:/usr/local/cuda/bin:/opt/rocm/bin:$PATH" ./run.sh
 ```
 
 Keep that command in a durable host terminal. Confirm GitHub reports the runner
@@ -76,6 +76,18 @@ online before enabling a gate:
 gh api orgs/anvai-labs/actions/runners/9054 \
   --jq '{name,status,busy,labels:[.labels[].name]}'
 ```
+
+The listener inherits its launch environment. A minimal non-login PATH may omit
+WSL's `nvidia-smi` even though the driver and models are present; `.path` alone does
+not repair an already-running interactive listener. The GPU workflow adds existing
+WSL/CUDA/ROCm tool directories to `GITHUB_PATH` before device checks, so each job can
+resolve the installed tools without a privileged system-wide symlink.
+Wait until the existing listener is idle before restarting it; preserve its registration.
+
+Keep unrelated local acceptance servers away from integration-test ports. In
+addition to the model-backed gate's 18081/18082, stub/native-metrics tests use 18083.
+A temporary CPU acceptance server can use a verified-free port such as 28083.
+Never stop or reconfigure the serving Qwen listener on 8080 to free a test port.
 
 Do not rerun `config.sh` during ordinary startup. Recovery registration requires
 a fresh token from `POST /orgs/anvai-labs/actions/runners/registration-token`
@@ -217,4 +229,3 @@ Both GPUs can run InferFlux simultaneously on different ports for multi-model se
 ## Bifurcation Note
 
 The X870E AORUS MASTER does **not** support PCIe x16 -> x8/x8 bifurcation for dual GPU in the top slot. The second and third slots are hardwired x4 from the chipset. If M2B_CPU or M2C_CPU M.2 slots are populated, the top x16 GPU slot drops to x8, but those freed lanes go to M.2 storage, not to another GPU slot.
-
