@@ -1,10 +1,35 @@
 #include "server/http/model_json.h"
 
 #include "runtime/backends/backend_factory.h"
+#include "runtime/backends/common/backend_interface.h"
 
 using json = nlohmann::json;
 
 namespace inferflux {
+
+json BuildModelRuntimeJson(const ModelInfo &info,
+                           const BackendInterface *backend,
+                           bool prefix_cache_enabled,
+                           bool session_handles_enabled) {
+  const bool ready = backend && backend->IsReady();
+  const bool reusable = ready && info.capabilities.supports_kv_prefix_transfer;
+  auto capacity = [](int value) -> json {
+    return value > 0 ? json(value) : json(nullptr);
+  };
+  return {
+      {"sequence_capacity", capacity(ready ? backend->SequenceCapacity() : 0)},
+      {"context_tokens_per_sequence",
+       capacity(ready ? backend->SequenceContextCapacity() : 0)},
+      {"session_handles_enabled", session_handles_enabled},
+      {"cache_reuse",
+       {{"phased",
+         {{"prefix", reusable && prefix_cache_enabled},
+          {"session", reusable && session_handles_enabled}}},
+        {"full_generate",
+         {{"prefix", false},
+          {"session", false},
+          {"reason", "sampler_grammar_continuity"}}}}}};
+}
 
 json BuildCapabilitiesJson(const BackendCapabilities &capabilities) {
   return json{

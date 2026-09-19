@@ -114,6 +114,8 @@ public:
   virtual bool SupportsSplitPrefillDecodeHandoff() const { return false; }
   // Addressable sequence ids are [0, capacity); zero means unspecified.
   virtual int SequenceCapacity() const { return 0; }
+  // Configured tokens per sequence; zero means unknown, not unlimited.
+  virtual int SequenceContextCapacity() const { return 0; }
   virtual bool SupportsProcessLocalSequenceTransfer() const { return false; }
 
   virtual PrefillResult Prefill(const std::string &prompt, int sequence_id) {

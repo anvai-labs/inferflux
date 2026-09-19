@@ -16,6 +16,13 @@ namespace inferflux {
 /// Build capabilities JSON from BackendCapabilities.
 nlohmann::json BuildCapabilitiesJson(const BackendCapabilities &capabilities);
 
+/// Effective runtime capacities and scheduler reuse policy, independent of
+/// training metadata and process-wide CUDA gauges. Unknown capacity is null.
+nlohmann::json BuildModelRuntimeJson(const ModelInfo &info,
+                                     const BackendInterface *backend,
+                                     bool prefix_cache_enabled,
+                                     bool session_handles_enabled);
+
 /// Return the user-facing source path for a model.
 std::string ModelSourcePath(const ModelInfo &info);
 

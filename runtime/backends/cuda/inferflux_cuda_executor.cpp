@@ -3987,6 +3987,22 @@ int InferfluxCudaExecutor::NativeTokenCount(const std::string &text) const {
 
 bool InferfluxCudaExecutor::NativeIsReady() const { return model_loaded_; }
 
+int InferfluxCudaExecutor::NativeSequenceCapacity() const {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  return kv_cache_ ? kv_cache_->MaxBatchSize() : 0;
+#else
+  return 0;
+#endif
+}
+
+int InferfluxCudaExecutor::NativeSequenceContextCapacity() const {
+#ifdef INFERFLUX_NATIVE_KERNELS_READY
+  return kv_cache_ ? kv_cache_->MaxSeqLen() : 0;
+#else
+  return 0;
+#endif
+}
+
 void InferfluxCudaExecutor::NativeFreeSequence(int sequence_id) {
 #ifdef INFERFLUX_NATIVE_KERNELS_READY
   if (!kv_cache_ || sequence_id < 0) {

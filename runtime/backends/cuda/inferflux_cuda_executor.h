@@ -241,6 +241,8 @@ public:
   std::vector<int> NativeTokenize(const std::string &prompt) const override;
   int NativeTokenCount(const std::string &text) const override;
   bool NativeIsReady() const override;
+  int NativeSequenceCapacity() const override;
+  int NativeSequenceContextCapacity() const override;
   void NativeFreeSequence(int sequence_id) override;
   LlamaCppBackend::SequenceReleaseFence
   NativeBeginFreeSequence(int sequence_id) override;

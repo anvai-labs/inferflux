@@ -37,3 +37,38 @@ traces; configure an OTEL collector explicitly if one is required.
 
 This document is a policy clarification, with no backend, sampler, API, or
 configuration behavior change. Reverting it rolls back the clarification only.
+
+## Effective capacity and policy
+
+`GET /v1/models`, `GET /v1/models/{id}`, and `GET /v1/admin/models` include a
+`runtime` object for each loaded model:
+
+```json
+{
+  "sequence_capacity": 2,
+  "context_tokens_per_sequence": 32768,
+  "session_handles_enabled": false,
+  "cache_reuse": {
+    "phased": {"prefix": true, "session": false},
+    "full_generate": {
+      "prefix": false,
+      "session": false,
+      "reason": "sampler_grammar_continuity"
+    }
+  }
+}
+```
+
+This example illustrates a configured two-sequence llama.cpp backend. Capacity
+comes from that model's active backend: llama.cpp context/sequence APIs for
+CPU/ROCm/CUDA wrappers, and the allocated native KV cache for native CUDA. A
+missing, unloaded, or non-reporting backend produces `null` capacity, never a
+guessed CUDA default. `details.context_length` remains training/model metadata.
+Sequence capacity is a configured limit, not a live count of free slots.
+
+The phased policy combines backend transfer support with configured radix/session
+availability. It describes eligibility, not guaranteed reuse for an individual
+request. Structured/logprob requests use `full_generate`. Native per-model
+sequence capacity also bounds admission; no model-global CUDA gauge is used to
+invent another backend's capacity. Revert the capability commit to remove these
+additive fields and restore the previous admission-capacity source.

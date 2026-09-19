@@ -125,6 +125,8 @@ public:
   ModelRouter *Router() const { return router_.get(); }
   RadixPrefixCache *PrefixCache() const { return prefix_cache_.get(); }
   PagedKVCache *Cache() const { return cache_.get(); }
+  bool SessionHandlesEnabled() const { return config_.session_handles.enabled; }
+  bool PrefixReuseEnabled() const;
 
   // Sequence slot allocator for §2.5 phased prefill/decode.
   // Slots are borrowed during Prefill() and returned after full request

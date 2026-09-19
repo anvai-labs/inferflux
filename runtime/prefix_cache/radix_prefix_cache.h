@@ -75,6 +75,7 @@ public:
               const std::shared_ptr<BackendInterface> &backend);
 
   std::size_t Capacity() const { return capacity_; }
+  bool ReuseEnabled() const { return capacity_ > 0 && max_sequences_ > 0; }
   std::size_t Size() const; // total nodes in tree
   std::size_t LiveSequences() const;
   RadixPrefixMemorySnapshot MemorySnapshot() const;

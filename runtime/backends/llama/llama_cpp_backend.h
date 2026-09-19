@@ -103,6 +103,7 @@ public:
       std::vector<UnifiedBatchOutput> *outputs) override;
   int UnifiedBatchTokenCapacity() const override;
   int SequenceCapacity() const override;
+  int SequenceContextCapacity() const override;
   bool SupportsSplitPrefillDecodeHandoff() const override { return false; }
   bool SupportsProcessLocalSequenceTransfer() const override { return false; }
   PrefillResult Prefill(const std::string &prompt, int sequence_id) override;
