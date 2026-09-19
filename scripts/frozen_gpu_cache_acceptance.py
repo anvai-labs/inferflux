@@ -207,7 +207,7 @@ def reconcile_diagnostics(events, calls, sessions):
         require(len(completed) == 1, "backend_finalization_count")
         final = completed[0]
         require(
-            final.get("backend") == "llama_cuda" and final.get("model") == MODEL,
+            final.get("backend") == "llama_cpp_cuda" and final.get("model") == MODEL,
             "backend_execution_identity",
         )
         require(
@@ -248,6 +248,87 @@ def reconcile_diagnostics(events, calls, sessions):
             "paired_tokenization",
         )
     return result
+
+
+def diagnostic_evidence(events, calls):
+    """Project only bounded known identities, hashes and counts, even on failure."""
+    request_ids = {call["request_id"] for call in calls}
+    records = []
+    matched = 0
+    for event in events:
+        if event.get("client_request_id") not in request_ids:
+            continue
+        matched += 1
+        if len(records) == 64:
+            continue
+        row = {"client_request_id": event["client_request_id"]}
+        for field, allowed in (
+            (
+                "stage",
+                (
+                    "lookup",
+                    "policy_bypass",
+                    "prefill_accepted",
+                    "completed",
+                    "capacity_eviction",
+                    "copy_failed",
+                    "partial_prefill_failed",
+                    "prefill_deferred",
+                    "admission_failed_no_sequence",
+                    "admission_failed_no_blocks",
+                    "session_warm",
+                    "session_cold",
+                    "session_incompatible",
+                    "session_busy",
+                ),
+            ),
+            (
+                "backend",
+                (
+                    "llama_cpp_cuda",
+                    "llama_cpp_rocm",
+                    "llama_cpu",
+                    "inferflux_cuda",
+                    "unresolved",
+                ),
+            ),
+            ("model", (MODEL,)),
+            ("path", ("phased", "full_generate")),
+        ):
+            value = event.get(field)
+            row[field] = value if value in allowed else None
+        for field in ("session_sha256", "tokens_sha256"):
+            value = event.get(field)
+            row[field] = (
+                value if isinstance(value, str) and HEX256.fullmatch(value) else None
+            )
+        for field in (
+            "prompt_tokens",
+            "matched_tokens",
+            "reused_tokens",
+            "previous_request_common_prefix_tokens",
+            "sequence_generation",
+            "evicted_sequences",
+        ):
+            value = event.get(field)
+            row[field] = value if type(value) is int and 0 <= value < 2**64 else None
+        for field in ("source_sequence", "sequence_id"):
+            value = event.get(field)
+            row[field] = value if type(value) is int and -1 <= value < 2**63 else None
+        for field in ("session_handles_enabled", "session_lease_acquired"):
+            value = event.get(field)
+            row[field] = value if type(value) is bool else None
+        records.append(row)
+    return {"records": records, "truncated": matched > len(records)}
+
+
+def finalize_diagnostics(report, events, calls, sessions):
+    # Preserve completed wire calls and the safe projection before validation can
+    # fail; retaining these observations does not make a failed run accepted.
+    report["calls"] = calls
+    report["backend_diagnostics"] = diagnostic_evidence(events, calls)
+    report["calls"] = reconcile_diagnostics(events, calls, sessions)
+    report["passed"] = True
 
 
 class Http:
@@ -623,6 +704,7 @@ def execute(repo, private, report, children, monitors):
     run = "req_cachegpu_" + secrets.token_hex(8)
     sessions = {arm: run + "_" + arm for arm in ("direct", "gateway")}
     calls = []
+    report["calls"] = calls
     for ordinal, payload in enumerate(payloads):
         for arm in ("direct", "gateway"):
             shared_health(http)
@@ -717,6 +799,8 @@ def execute(repo, private, report, children, monitors):
         and total["cache_read_coverage"]["unknown"] == 0,
         "dashboard_reporting_availability",
     )
+    report["gateway_rows"] = 5
+    report["gateway_accounting_reconciled"] = True
     model_ready(http, key)
     shared_health(http)
     report["shared_health_after"] = True
@@ -729,11 +813,7 @@ def execute(repo, private, report, children, monitors):
     for line in bytes(origin.raw).splitlines():
         if b"cache_decision" in line and b"{" in line:
             events.append(json.loads(line[line.index(b"{") :]))
-    report.update(
-        calls=reconcile_diagnostics(events, calls, sessions),
-        gateway_rows=5,
-        passed=True,
-    )
+    finalize_diagnostics(report, events, calls, sessions)
 
 
 def main():

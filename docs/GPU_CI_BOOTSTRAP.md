@@ -285,6 +285,14 @@ acceptance and every five seconds while owned services run. An unhealthy probe
 terminates only the owned test processes. The harness never stops, reloads,
 reconfigures, or flushes the shared service or its cache.
 
+Failure artifacts retain completed wire-call counts and, when backend
+reconciliation is reached, at most 64 allowlisted diagnostic records (known
+backend/model/stage identities, hashes, token counts and sequence/lease fields).
+Unknown diagnostic values are null; raw process logs, prompts, responses and
+credentials are never exported. Retained observations do not mark a failed gate
+accepted. Backend identity is checked against `CUDABackend::Name()` in CPU
+contracts before GPU execution.
+
 The frozen five requests each run directly and through Sandhi, preserving their
 payload values and per-arm order. The limits are ten inference calls, 128 KiB per
 payload, 4,096 requested completion tokens per call, and a 30-minute overall
