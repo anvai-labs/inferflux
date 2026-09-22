@@ -150,3 +150,25 @@ TEST_CASE("SingleModelRouter admin identity operations reject unknown ids",
   REQUIRE(router.ResolveExact("model-b") == nullptr);
   REQUIRE(router.DefaultModelId() == "model-a");
 }
+
+TEST_CASE("Device discovery alone is not reported as verified placement",
+          "[model_identity][placement]") {
+  ModelInfo info;
+  info.backend = "llama_cpp_cuda";
+  info.ready = true;
+  auto model = BuildModelIdentityJson(info);
+  REQUIRE(model["placement"]["state"] == "unverified");
+  REQUIRE(model["placement"]["gpu_weight_bytes"] == 0);
+  REQUIRE(model["placement"]["stable_id"].is_null());
+  info.placement.requested = "cuda:1";
+  info.placement.effective = "cuda:1";
+  info.placement.vendor = "cuda";
+  info.placement.state = "verified_weights";
+  info.placement.gpu_weight_bytes = 4096;
+  info.placement.cpu_weight_bytes = 1024;
+  info.placement.stable_id = "0000:01:00.0";
+  model = BuildModelIdentityJson(info);
+  REQUIRE(model["placement"]["gpu_weight_bytes"] == 4096);
+  REQUIRE(model["placement"]["cpu_weight_bytes"] == 1024);
+  REQUIRE(model["placement"]["stable_id"] == "0000:01:00.0");
+}

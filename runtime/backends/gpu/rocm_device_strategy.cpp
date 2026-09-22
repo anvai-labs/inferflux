@@ -29,28 +29,23 @@ bool RocmDeviceStrategy::SupportsFlashAttentionForArch(
   return false;
 }
 
-bool RocmDeviceStrategy::Initialize() {
+bool RocmDeviceStrategy::Initialize() { return Initialize(0); }
+
+bool RocmDeviceStrategy::Initialize(int ordinal) {
 #ifdef INFERFLUX_HAS_ROCM
-  if (initialized_) {
+  if (initialized_ && info_.device_id == ordinal) {
     return true;
   }
 
   int device_count = 0;
   hipError_t err = hipGetDeviceCount(&device_count);
-  if (err != hipSuccess || device_count == 0) {
+  if (err != hipSuccess || ordinal < 0 || ordinal >= device_count) {
     log::Error("rocm_strategy", "No HIP devices found");
     return false;
   }
 
-  err = hipSetDevice(0);
-  if (err != hipSuccess) {
-    log::Error("rocm_strategy", "Failed to set HIP device: " +
-                                    std::to_string(static_cast<int>(err)));
-    return false;
-  }
-
   hipDeviceProp_t prop;
-  err = hipGetDeviceProperties(&prop, 0);
+  err = hipGetDeviceProperties(&prop, ordinal);
   if (err != hipSuccess) {
     log::Error("rocm_strategy", "Failed to get HIP device properties");
     return false;
@@ -63,7 +58,7 @@ bool RocmDeviceStrategy::Initialize() {
   info_.device_name = prop.name;
   info_.arch = arch;
   info_.total_memory_mb = prop.totalGlobalMem / (1024 * 1024);
-  info_.device_id = 0;
+  info_.device_id = ordinal;
   info_.supports_flash_attention = SupportsFlashAttentionForArch(arch);
   info_.flash_attention_version =
       info_.supports_flash_attention ? "fa2" : "none";
@@ -78,6 +73,7 @@ bool RocmDeviceStrategy::Initialize() {
 
   return true;
 #else
+  (void)ordinal;
   log::Error("rocm_strategy", "ROCm support not compiled in");
   return false;
 #endif

@@ -3,11 +3,18 @@
 #include "runtime/backends/gpu/backend_config_extensions.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace inferflux {
 
 struct LlamaBackendConfig {
+  std::optional<int> cuda_device_id;
+  std::optional<int> rocm_device_id;
+  bool device_explicit{false};
+  std::string device; // vendor-qualified single-device placement
+  bool gpu_layers_explicit{false};
+  bool kv_cache_type_explicit{false};
   int32_t ctx_size = 2048;
   int32_t batch_size = 512;
   int gpu_layers = 0;

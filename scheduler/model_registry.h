@@ -16,12 +16,7 @@ namespace inferflux {
 
 // ── Registry entry ──────────────────────────────────────────────────────────
 // Represents one model entry in registry.yaml.
-struct RegistryEntry {
-  std::string id;   // Requested model ID (auto-derived from filename if empty).
-  std::string path; // Path to weights file or directory.
-  std::string format{"auto"}; // auto|gguf|safetensors|hf
-  std::string backend;        // "cpu", "cuda", "mps", or "" for auto-detect.
-};
+using RegistryEntry = ModelLoadSpec;
 
 // ── ModelRegistry ────────────────────────────────────────────────────────────
 // Loads a YAML registry file and hot-reloads it when the file changes on disk.
@@ -95,6 +90,7 @@ private:
   mutable std::mutex managed_mutex_;
   // path → assigned_id (as returned by router_->LoadModel())
   std::map<std::string, std::string> path_to_id_;
+  std::map<std::string, RegistryEntry> specifications_;
 };
 
 } // namespace inferflux

@@ -50,7 +50,7 @@ LlamaBackendTarget ParseLlamaBackendTarget(const std::string &hint) {
   if (lowered == "mps") {
     return LlamaBackendTarget::kMps;
   }
-  if (lowered == "rocm") {
+  if (lowered == "rocm" || lowered == "llama_cpp_rocm") {
     return LlamaBackendTarget::kRocm;
   }
   if (lowered == "vulkan") {
@@ -110,7 +110,7 @@ LlamaBackendConfig TuneLlamaBackendConfig(LlamaBackendTarget target,
     tuned.gpu_layers = 0;
     tuned.use_flash_attention = false;
   } else {
-    if (tuned.gpu_layers <= 0) {
+    if (!tuned.gpu_layers_explicit && tuned.gpu_layers <= 0) {
       tuned.gpu_layers = 99;
     }
     if (!traits.supports_flash_attention) {
@@ -132,7 +132,7 @@ LlamaBackendConfig TuneLlamaBackendConfig(LlamaBackendTarget target,
   }();
   if ((kv_type_lower == "q8_0" || kv_type_lower == "q8" ||
        kv_type_lower == "q4_0" || kv_type_lower == "q4") &&
-      !tuned.use_flash_attention) {
+      !tuned.use_flash_attention && !tuned.kv_cache_type_explicit) {
     log::Warn("llama_backend",
               "KV cache type " + tuned.llama_kv_cache_type +
                   " requires FlashAttention; falling back to f16");

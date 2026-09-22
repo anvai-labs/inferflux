@@ -44,13 +44,7 @@
 #include <vector>
 #include <yaml-cpp/yaml.h>
 
-struct ModelConfig {
-  std::string id;
-  std::string path;
-  std::string format{"auto"};
-  std::string backend;
-  bool make_default{false};
-};
+using ModelConfig = inferflux::ModelLoadSpec;
 
 namespace {
 using inferflux::ParseBool;
@@ -73,37 +67,21 @@ std::vector<ModelConfig> ParseModelsEnv(const std::string &raw) {
   std::stringstream ss(raw);
   std::string segment;
   while (std::getline(ss, segment, ';')) {
-    ModelConfig cfg;
+    YAML::Node node(YAML::NodeType::Map);
     std::stringstream kv_stream(segment);
     std::string pair;
     while (std::getline(kv_stream, pair, ',')) {
       auto eq = pair.find('=');
-      if (eq == std::string::npos) {
+      if (eq == std::string::npos)
         continue;
-      }
       auto key = Trim(pair.substr(0, eq));
       auto value = Trim(pair.substr(eq + 1));
-      if (key == "id") {
-        cfg.id = value;
-      } else if (key == "path") {
-        cfg.path = value;
-      } else if (key == "format") {
-        auto normalized = inferflux::NormalizeModelFormat(value);
-        if (!normalized.empty()) {
-          cfg.format = normalized;
-        } else {
-          cfg.format = "auto";
-          inferflux::log::Warn("server",
-                               "Invalid model format in INFERFLUX_MODELS "
-                               "entry; defaulting to auto",
-                               value);
-        }
-      } else if (key == "backend") {
-        cfg.backend = ToLower(value);
-      } else if (key == "default") {
-        cfg.make_default = ParseBool(value);
-      }
+      if (key == "default")
+        node[key] = ParseBool(value);
+      else
+        node[key] = key == "backend" ? ToLower(value) : value;
     }
+    ModelConfig cfg = inferflux::ParseModelLoadSpec(node);
     if (!cfg.path.empty()) {
       entries.push_back(cfg);
     }
@@ -213,6 +191,8 @@ int main(int argc, char **argv) {
   std::string model_path;
   std::string legacy_model_format{"auto"};
   int mps_layers = 0;
+  std::optional<int> cuda_device_id;
+  std::optional<int> rocm_device_id;
   int rate_limit_per_minute = 0;
   std::string audit_log_path;
   std::vector<std::string> guard_blocklist;
@@ -303,26 +283,7 @@ int main(int argc, char **argv) {
       // Models config
       if (config["models"] && config["models"].IsSequence()) {
         for (const auto &model_node : config["models"]) {
-          ModelConfig mc;
-          if (model_node["id"])
-            mc.id = model_node["id"].as<std::string>();
-          if (model_node["path"])
-            mc.path = model_node["path"].as<std::string>();
-          if (model_node["format"]) {
-            auto normalized = inferflux::NormalizeModelFormat(
-                model_node["format"].as<std::string>());
-            if (!normalized.empty()) {
-              mc.format = normalized;
-            } else {
-              inferflux::log::Warn("server",
-                                   "Invalid model format; defaulting to auto",
-                                   model_node["format"].as<std::string>());
-            }
-          }
-          if (model_node["backend"])
-            mc.backend = ToLower(model_node["backend"].as<std::string>());
-          if (model_node["default"])
-            mc.make_default = model_node["default"].as<bool>();
+          ModelConfig mc = inferflux::ParseModelLoadSpec(model_node);
           if (!mc.path.empty()) {
             configured_models.push_back(mc);
           }
@@ -357,6 +318,17 @@ int main(int argc, char **argv) {
               config["runtime"]["backend_priority"].as<std::string>());
           if (!parsed_priority.empty()) {
             backend_priority = std::move(parsed_priority);
+          }
+        }
+        for (const char *vendor : {"cuda", "rocm"}) {
+          const auto device = config["runtime"][vendor]["device_id"];
+          if (device) {
+            const int ordinal = device.as<int>();
+            if (ordinal < 0)
+              throw YAML::RepresentationException(
+                  device.Mark(), "device_id must be nonnegative");
+            (std::string(vendor) == "cuda" ? cuda_device_id : rocm_device_id) =
+                ordinal;
           }
         }
         if (config["runtime"]["mps_layers"])
@@ -668,6 +640,7 @@ int main(int argc, char **argv) {
     } catch (const YAML::Exception &e) {
       inferflux::log::Error("server", "Error parsing config file",
                             config_path + ": " + e.what());
+      return 1;
     }
   }
 
@@ -1037,7 +1010,14 @@ int main(int argc, char **argv) {
     }
   }
   if (const char *env_models = std::getenv("INFERFLUX_MODELS")) {
-    auto parsed = ParseModelsEnv(env_models);
+    std::vector<ModelConfig> parsed;
+    try {
+      parsed = ParseModelsEnv(env_models);
+    } catch (const YAML::Exception &error) {
+      inferflux::log::Error(
+          "server", std::string("Invalid INFERFLUX_MODELS: ") + error.what());
+      return 1;
+    }
     if (!parsed.empty()) {
       configured_models = parsed;
     }
@@ -1167,6 +1147,8 @@ int main(int argc, char **argv) {
   std::string backend_label = "stub";
   std::string primary_model_id;
   inferflux::LlamaBackendConfig primary_cfg;
+  primary_cfg.cuda_device_id = cuda_device_id;
+  primary_cfg.rocm_device_id = rocm_device_id;
   primary_cfg.gpu_layers = mps_layers;
   // Llama-wrapper FlashAttention: the CUDA flag keeps its historical
   // cuda_enabled gate; ROCm opts in via runtime.rocm.flash_attention (the
@@ -1344,8 +1326,7 @@ int main(int argc, char **argv) {
   std::string resolved_default_path = model_path;
   if (!configured_models.empty()) {
     for (auto &cfg : configured_models) {
-      auto assigned_id =
-          router->LoadModel(cfg.path, cfg.backend, cfg.id, cfg.format);
+      auto assigned_id = router->LoadModel(cfg);
       if (assigned_id.empty()) {
         const std::string load_error = router->LastLoadError();
         if (!load_error.empty()) {
@@ -1354,6 +1335,8 @@ int main(int argc, char **argv) {
         } else {
           inferflux::log::Error("server", "Failed to load model", cfg.path);
         }
+        if (cfg.HasOverrides() || load_error.rfind("model_conflict:", 0) == 0)
+          return 1;
         continue;
       }
       cfg.id = assigned_id;

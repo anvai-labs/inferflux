@@ -25,11 +25,13 @@ public:
   const GpuDeviceInfo &DeviceInfo() const { return device_info_; }
 
   std::string Name() const override;
+  std::string LoadError() const override;
 
 protected:
   std::unique_ptr<GpuDeviceStrategy> strategy_;
   GpuDeviceInfo device_info_;
   bool device_initialized_{false};
+  std::string device_error_;
 };
 
 } // namespace inferflux

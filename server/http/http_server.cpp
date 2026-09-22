@@ -1,4 +1,5 @@
 #include "server/http/http_server.h"
+#include <yaml-cpp/yaml.h>
 
 #include "server/http/completion_payload.h"
 #include "server/http/model_json.h"
@@ -28,6 +29,7 @@ inline int inferflux_close_socket(int fd) { return ::closesocket(fd); }
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -2205,40 +2207,25 @@ void HttpServer::HandleClient(ClientSession &session) {
                                      "Service Unavailable"));
       return;
     }
-    std::string path_value;
-    std::string backend_hint;
-    std::string requested_id;
-    std::string requested_format = "auto";
+    ModelLoadSpec spec;
     bool set_default = false;
     try {
       auto j = json::parse(body);
-      if (j.contains("path") && j["path"].is_string()) {
-        path_value = j["path"].get<std::string>();
+      // JSON is a YAML subset. Both ingress paths use the same typed parser.
+      if (j.contains("format") &&
+          (!j["format"].is_string() ||
+           NormalizeModelFormat(j["format"].get<std::string>()).empty())) {
+        throw std::invalid_argument("invalid model format");
       }
-      if (j.contains("backend") && j["backend"].is_string()) {
-        backend_hint = j["backend"].get<std::string>();
-      }
-      if (j.contains("id") && j["id"].is_string()) {
-        requested_id = j["id"].get<std::string>();
-      }
-      if (j.contains("format") && j["format"].is_string()) {
-        requested_format = j["format"].get<std::string>();
-      }
-      if (j.contains("default")) {
-        if (j["default"].is_boolean()) {
-          set_default = j["default"].get<bool>();
-        } else if (j["default"].is_string()) {
-          std::string val = j["default"].get<std::string>();
-          for (auto &ch : val) {
-            ch =
-                static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-          }
-          set_default = (val == "true" || val == "1" || val == "yes");
-        }
-      }
-    } catch (const json::exception &ex) {
-      LogJsonParseFailure("admin.models.post", ex);
+      spec = ParseModelLoadSpec(YAML::Load(j.dump()));
+      set_default = spec.make_default;
+    } catch (const std::exception &ex) {
+      SendAll(session,
+              BuildResponse(BuildErrorBody(ex.what()), 400, "Bad Request"));
+      return;
     }
+    const auto &path_value = spec.path;
+    const auto &requested_format = spec.format;
     if (path_value.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody("path is required"), 400,
                                      "Bad Request"));
@@ -2250,10 +2237,20 @@ void HttpServer::HandleClient(ClientSession &session) {
                                      400, "Bad Request"));
       return;
     }
-    auto id = router->LoadModel(path_value, backend_hint, requested_id,
-                                requested_format);
+    auto id = router->LoadModel(spec);
     if (id.empty()) {
       const std::string load_error = router->LastLoadError();
+      if (HasPrefix(load_error, "model_conflict:") ||
+          HasPrefix(load_error, "placement_")) {
+        const bool conflict = HasPrefix(load_error, "model_conflict:");
+        SendAll(session,
+                BuildResponse(
+                    json({{"error", "load_rejected"}, {"reason", load_error}})
+                        .dump(),
+                    conflict ? 409 : 422,
+                    conflict ? "Conflict" : "Unprocessable Entity"));
+        return;
+      }
       if (HasPrefix(load_error, "backend_policy_violation:")) {
         const std::string reason =
             StripPrefix(load_error, "backend_policy_violation:");
@@ -2710,9 +2707,10 @@ void HttpServer::HandleClient(ClientSession &session) {
     } catch (const json::exception &ex) {
       LogJsonParseFailure("embeddings.post", ex);
     }
-    if (inputs.empty()) {
-      SendAll(session, BuildResponse(BuildErrorBody("input is required"), 400,
-                                     "Bad Request"));
+    if (inputs.empty() || inputs.size() > 4096) {
+      SendAll(session,
+              BuildResponse(BuildErrorBody("input requires 1 to 4096 strings"),
+                            400, "Bad Request"));
       return;
     }
 
@@ -2782,22 +2780,50 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
 
-    // Generate embeddings for each input.
-    json data = json::array();
-    int total_tokens = 0;
-    for (std::size_t idx = 0; idx < inputs.size(); ++idx) {
-      std::vector<float> emb = embed_backend->Embed(inputs[idx]);
-      if (emb.empty()) {
-        SendAll(session, BuildResponse(BuildErrorBody(
-                                           "model_does_not_support_embeddings"),
-                                       422, "Unprocessable Entity"));
+    // Join the same scheduler as generation. It yields large arrays between
+    // bounded embedding batches, retaining model ownership across slices.
+    InferenceRequest request;
+    request.model = resolved_model;
+    request.embedding_inputs = inputs;
+    request.client_request_id =
+        GetHeaderValue(headers, "x-inferflux-client-request-id");
+    request.cancellation_flag = std::make_shared<std::atomic<bool>>(false);
+    auto cancellation = request.cancellation_flag;
+    const auto request_context = tracing::ChildContext(
+        tracing::ParseTraceparent(GetHeaderValue(headers, "traceparent")));
+    request.trace_id = request_context.trace_id;
+    auto future = scheduler_->Embed(std::move(request));
+    while (future.wait_for(std::chrono::milliseconds(50)) !=
+           std::future_status::ready) {
+#ifndef _WIN32
+      // Read-side EOF may be a valid HTTP half-close. Darwin also reports
+      // POLLHUP for SHUT_WR, so only Linux's stronger hangup indication is
+      // usable here. Other POSIX platforms cancel on socket errors; a clean
+      // peer close may remain undetectable until the response write.
+      pollfd socket{session.fd, POLLIN, 0};
+      short cancelled_events = POLLERR | POLLNVAL;
+#ifdef __linux__
+      cancelled_events |= POLLHUP;
+#endif
+      if (::poll(&socket, 1, 0) > 0 && (socket.revents & cancelled_events)) {
+        cancellation->store(true);
         return;
       }
-      total_tokens += embed_backend->TokenCount(inputs[idx]);
-      json entry = {{"object", "embedding"},
-                    {"embedding", emb},
-                    {"index", static_cast<int>(idx)}};
-      data.push_back(std::move(entry));
+#endif
+    }
+    const auto result = future.get();
+    if (result.no_backend) {
+      SendAll(session, BuildResponse(BuildErrorBody(result.completion), 503,
+                                     "Service Unavailable"));
+      return;
+    }
+    json data = json::array();
+    const int total_tokens = result.prompt_tokens;
+    resolved_model = result.model_id;
+    for (std::size_t idx = 0; idx < result.embeddings.size(); ++idx) {
+      data.push_back({{"object", "embedding"},
+                      {"embedding", result.embeddings[idx]},
+                      {"index", static_cast<int>(idx)}});
     }
 
     json resp = {
@@ -2806,7 +2832,21 @@ void HttpServer::HandleClient(ClientSession &session) {
         {"model", resolved_model},
         {"usage",
          {{"prompt_tokens", total_tokens}, {"total_tokens", total_tokens}}}};
-    SendAll(session, BuildResponse(resp.dump()));
+    const auto correlation =
+        GetHeaderValue(headers, "x-inferflux-client-request-id");
+    if (!correlation.empty()) {
+      resp["client_request_id"] = correlation;
+    }
+    std::string response_headers;
+    if (request_context.valid()) {
+      response_headers =
+          "traceparent: " + request_context.ToTraceparent() + "\r\n";
+    }
+    if (!correlation.empty()) {
+      response_headers +=
+          "x-inferflux-client-request-id: " + correlation + "\r\n";
+    }
+    SendAll(session, BuildResponse(resp.dump(), 200, "OK", response_headers));
     return;
   }
 

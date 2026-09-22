@@ -103,6 +103,7 @@ public:
 
   // Non-blocking admission: adds request to queue and returns a future result.
   std::future<InferenceResult> Generate(InferenceRequest request);
+  std::future<InferenceResult> Embed(InferenceRequest request);
 
   // Update fairness policy at runtime.
   void UpdateFairnessConfig(const FairnessConfig &config);

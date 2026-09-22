@@ -7,6 +7,7 @@
 #include "server/metrics/metrics.h"
 #include <cctype>
 
+#include "runtime/backends/llama/llama_device_placement.h"
 #include <llama.h>
 
 #include <algorithm>
@@ -50,6 +51,11 @@ struct BatchSeqTokenInput {
   llama_seq_id seq_id;
   bool logits{false};
 };
+
+// Batched-embedding geometry: concurrent sequences per decode and the
+// per-sequence context (bge-small class models train at 512 tokens).
+constexpr int kEmbedBatchMaxSeqs = 32;
+constexpr std::size_t kEmbedBatchCtxPerSeq = 512;
 
 // Each context owns its sequence capacity. A process-wide last-loaded model
 // bound can permit an out-of-range id into a smaller model's KV cache.
@@ -321,6 +327,10 @@ LlamaCppBackend::~LlamaCppBackend() {
     llama_free(embed_ctx_);
     embed_ctx_ = nullptr;
   }
+  if (embed_batch_ctx_ != nullptr) {
+    llama_free(embed_batch_ctx_);
+    embed_batch_ctx_ = nullptr;
+  }
   if (context_ != nullptr) {
     llama_free(context_);
     context_ = nullptr;
@@ -335,6 +345,24 @@ LlamaCppBackend::~LlamaCppBackend() {
   }
 }
 
+DevicePlacement LlamaCppBackend::Placement() const {
+  BackendStateLock lock(backend_state_mutex_);
+  return placement_;
+}
+
+BackendCapabilities LlamaCppBackend::ReportCapabilities() const {
+  BackendStateLock lock(backend_state_mutex_);
+  BackendCapabilities capabilities;
+  // Encoder-only GGUFs (for example BGE/BERT) cannot execute generation.
+  capabilities.supports_generation =
+      !model_ || LlamaModelSupportsGeneration(model_);
+  return capabilities;
+}
+std::string LlamaCppBackend::LoadError() const {
+  BackendStateLock lock(backend_state_mutex_);
+  return load_error_;
+}
+
 bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
                                 const LlamaBackendConfig &config) {
   BackendStateLock lock(backend_state_mutex_);
@@ -345,13 +373,49 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
     return false;
   }
   llama_model_params model_params = llama_model_default_params();
-  model_params.n_gpu_layers = config.gpu_layers;
+  load_error_.clear();
+  placement_ = {};
+  placement_.requested = config.device;
+  placement_.requested_gpu_layers = config.gpu_layers;
+  placement_.context_size = config.ctx_size;
+  placement_.max_parallel_sequences = config.max_parallel_sequences;
+  placement_.kv_cache_type = config.llama_kv_cache_type;
+  model_params.n_gpu_layers = config.gpu_layers == -1
+                                  ? std::numeric_limits<int>::max()
+                                  : config.gpu_layers;
+  std::array<ggml_backend_dev_t, 2> devices{nullptr, nullptr};
+  if (!config.device.empty()) {
+    devices[0] = ResolveLlamaDevice(config.device, &load_error_);
+    if (!devices[0]) {
+      log::Error("llama_backend", load_error_);
+      return false;
+    }
+    model_params.devices = devices.data();
+    model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+    model_params.main_gpu = 0; // index in the explicitly restricted device list
+  } else if (config.gpu_layers == 0) {
+    model_params.devices = devices.data(); // empty list: CPU only
+  }
+  if (config.kv_cache_type_explicit && config.llama_kv_cache_type != "f16" &&
+      !config.use_flash_attention) {
+    load_error_ = "placement_invalid: quantized KV requires flash attention";
+    return false;
+  }
 
   model_ =
       llama_model_load_from_file(model_path.string().c_str(), model_params);
   if (!model_) {
     log::Error("llama_backend",
                "failed to load model from " + model_path.string());
+    return false;
+  }
+
+  if (!ObserveLlamaWeightPlacement(model_, devices[0], &placement_,
+                                   &load_error_)) {
+    log::Error("llama_backend", load_error_);
+    llama_model_free(model_);
+    model_ = nullptr;
+    placement_.state = "error";
     return false;
   }
 
@@ -384,6 +448,9 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
   context_ = llama_init_from_model(model_, ctx_params);
   if (!context_) {
     log::Error("llama_backend", "failed to create context");
+    llama_model_free(model_);
+    model_ = nullptr;
+    placement_.state = "error";
     return false;
   }
   vocab_ = llama_model_get_vocab(model_);
@@ -392,6 +459,11 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
     return false;
   }
   n_vocab_ = llama_vocab_n_tokens(vocab_);
+  placement_.context_size = static_cast<int>(llama_n_ctx(context_));
+  placement_.max_parallel_sequences =
+      static_cast<int>(llama_n_seq_max(context_));
+  if (!config.device_explicit)
+    placement_.requested.clear();
   config_ = config;
 
   // Scheduler admission reads each backend's SequenceCapacity(), rather than
@@ -1931,16 +2003,39 @@ bool LlamaCppBackend::EnsureEmbedCtx() {
     return false;
   auto ep = llama_context_default_params();
   ep.embeddings = true;
-  ep.pooling_type = LLAMA_POOLING_TYPE_MEAN;
+  // Honor the model's own pooling type (e.g. CLS for BGE-family embedding
+  // models, declared in GGUF metadata) instead of forcing MEAN, which
+  // silently changes the embedding semantics vs the reference runtime.
+  ep.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
   ep.n_ctx = 512;
   embed_ctx_ = llama_init_from_model(model_, ep);
   return embed_ctx_ != nullptr;
+}
+
+bool LlamaCppBackend::EnsureEmbedBatchCtx() {
+  if (embed_batch_ctx_)
+    return true;
+  if (!model_)
+    return false;
+  auto ep = llama_context_default_params();
+  ep.embeddings = true;
+  ep.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
+  ep.n_seq_max = kEmbedBatchMaxSeqs;
+  ep.n_ctx = kEmbedBatchMaxSeqs * kEmbedBatchCtxPerSeq;
+  ep.n_batch = kEmbedBatchMaxSeqs * kEmbedBatchCtxPerSeq;
+  ep.n_ubatch = kEmbedBatchMaxSeqs * kEmbedBatchCtxPerSeq;
+  embed_batch_ctx_ = llama_init_from_model(model_, ep);
+  return embed_batch_ctx_ != nullptr;
 }
 
 int LlamaCppBackend::EmbedDims() const {
   if (!model_)
     return 0;
   return llama_model_n_embd(model_);
+}
+
+int LlamaCppBackend::EmbeddingTokenCount(const std::string &text) const {
+  return std::min(TokenCount(text), static_cast<int>(kEmbedBatchCtxPerSeq));
 }
 
 std::vector<float> LlamaCppBackend::Embed(const std::string &text) {
@@ -1987,6 +2082,89 @@ std::vector<float> LlamaCppBackend::Embed(const std::string &text) {
   // Clear KV state for the sequence so the context can be reused.
   llama_memory_seq_rm(llama_get_memory(embed_ctx_), 0, -1, -1);
   return result;
+}
+
+std::vector<std::vector<float>>
+LlamaCppBackend::EmbedBatch(const std::vector<std::string> &texts) {
+  std::vector<std::vector<float>> results(texts.size());
+  BackendStateLock lock(backend_state_mutex_);
+  if (!EnsureEmbedBatchCtx() || !vocab_)
+    return results;
+
+  const int n_embd = llama_model_n_embd(model_);
+  const std::size_t group_token_cap =
+      static_cast<std::size_t>(kEmbedBatchMaxSeqs) * kEmbedBatchCtxPerSeq;
+  std::size_t idx = 0;
+  while (idx < texts.size()) {
+    // Assemble the next group: up to kEmbedBatchMaxSeqs sequences bounded by
+    // per-sequence and whole-batch token budgets. `orig` tracks the result
+    // index of each sequence so empty-token inputs can be skipped without
+    // shifting the output mapping.
+    std::vector<std::vector<llama_token>> group;
+    std::vector<std::size_t> orig;
+    std::size_t group_tokens = 0;
+    while (idx < texts.size() &&
+           static_cast<int>(group.size()) < kEmbedBatchMaxSeqs) {
+      auto tokens = Tokenize(texts[idx], /*add_bos=*/false);
+      if (tokens.size() > kEmbedBatchCtxPerSeq) {
+        tokens.resize(kEmbedBatchCtxPerSeq);
+      }
+      if (tokens.empty()) {
+        ++idx; // leave results[idx] empty; caller reports unsupported input
+        continue;
+      }
+      if (!group.empty() && group_tokens + tokens.size() > group_token_cap) {
+        break; // flush current group before starting a new one
+      }
+      group_tokens += tokens.size();
+      orig.push_back(idx);
+      group.push_back(std::move(tokens));
+      ++idx;
+    }
+    if (group.empty())
+      continue;
+
+    llama_batch batch = llama_batch_init(static_cast<int32_t>(group_tokens),
+                                         /*embd=*/0, /*n_seq_max=*/1);
+    struct BatchCleanup {
+      llama_batch &batch;
+      llama_memory_t memory;
+      ~BatchCleanup() {
+        llama_batch_free(batch);
+        if (memory)
+          llama_memory_clear(memory, false);
+      }
+    } cleanup{batch, llama_get_memory(embed_batch_ctx_)};
+    bool decode_ok = true;
+    try {
+      for (std::size_t s = 0; s < group.size(); ++s) {
+        const auto &tokens = group[s];
+        for (std::size_t i = 0; i < tokens.size(); ++i) {
+          BatchAddSeq(batch, embed_batch_ctx_,
+                      {tokens[i], static_cast<llama_pos>(i),
+                       static_cast<llama_seq_id>(s),
+                       /*logits=*/i == tokens.size() - 1});
+        }
+      }
+    } catch (const std::exception &ex) {
+      log::Error("llama_backend", std::string("EmbedBatch: ") + ex.what());
+      decode_ok = false;
+    }
+    if (decode_ok && llama_decode(embed_batch_ctx_, batch) != 0) {
+      log::Error("llama_backend", "EmbedBatch: llama_decode failed");
+      decode_ok = false;
+    }
+    if (decode_ok) {
+      for (std::size_t s = 0; s < group.size(); ++s) {
+        float *emb = llama_get_embeddings_seq(embed_batch_ctx_,
+                                              static_cast<llama_seq_id>(s));
+        if (emb) {
+          results[orig[s]].assign(emb, emb + n_embd);
+        }
+      }
+    }
+  }
+  return results;
 }
 
 std::string LlamaCppBackend::Name() const { return "llama_cpu"; }

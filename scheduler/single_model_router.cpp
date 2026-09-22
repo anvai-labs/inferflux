@@ -41,6 +41,8 @@ BuildModelCapabilities(const BackendCapabilities &base,
                        BackendProvider provider,
                        const std::shared_ptr<BackendInterface> &backend) {
   BackendCapabilities caps = base;
+  caps.supports_generation =
+      backend && backend->ReportCapabilities().supports_generation;
   caps.supports_vision = backend && backend->SupportsVision();
 
   // When the backend reports its own capabilities (native or any future
@@ -79,6 +81,13 @@ BuildModelCapabilities(const BackendCapabilities &base,
     }
   }
 
+  if (!caps.supports_generation) {
+    caps.supports_streaming = false;
+    caps.supports_logprobs = false;
+    caps.supports_structured_output = false;
+    caps.supports_speculative_decoding = false;
+    caps.supports_kv_prefix_transfer = false;
+  }
   return caps;
 }
 
@@ -171,6 +180,17 @@ bool SingleModelRouter::RegisterModel(
     return false;
   }
   std::lock_guard<std::mutex> lock(mutex_);
+  if (backend->SequenceCapacity() > 0 &&
+      backend->SequenceCapacity() < minimum_sequence_capacity_) {
+    last_load_error_ = "placement_invalid: model sequence capacity is below "
+                       "the running scheduler slot bound";
+    return false;
+  }
+  if (!info.id.empty() &&
+      (models_.count(info.id) || retired_ids_.count(info.id))) {
+    last_load_error_ = "model_conflict: ID already used in this process";
+    return false;
+  }
   Entry entry;
   entry.info = info;
   entry.info.path = info.path;
@@ -253,11 +273,53 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
                                          const std::string &backend_hint,
                                          const std::string &requested_id,
                                          const std::string &model_format) {
+  ModelLoadSpec spec;
+  spec.path = path;
+  spec.backend = backend_hint;
+  spec.id = requested_id;
+  spec.format = model_format;
+  return LoadModel(spec);
+}
+
+std::string SingleModelRouter::LoadModel(const ModelLoadSpec &spec) {
+  std::lock_guard<std::mutex> admission(load_mutex_);
+  const auto &path = spec.path;
+  const auto &requested_id = spec.id;
+  const auto &model_format = spec.format;
+  std::string backend_hint = spec.backend;
+  if (spec.device && (backend_hint.empty() || backend_hint == "auto")) {
+    const auto selector = ParseDeviceSelector(*spec.device);
+    if (selector)
+      backend_hint = "llama_cpp_" + selector->vendor;
+  }
   const auto set_last_load_error = [&](const std::string &error) {
     std::lock_guard<std::mutex> lock(mutex_);
     last_load_error_ = error;
   };
   set_last_load_error("");
+  if (const auto error = spec.Validate(); !error.empty()) {
+    set_last_load_error("placement_invalid: " + error);
+    return "";
+  }
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (retired_ids_.count(requested_id)) {
+      last_load_error_ = "model_conflict: retired ID cannot be reused; use a "
+                         "new ID to isolate cached sessions";
+      return "";
+    }
+    for (const auto &[id, entry] : models_) {
+      std::error_code ec;
+      if ((!requested_id.empty() && requested_id == id) ||
+          entry.info.path == path ||
+          std::filesystem::equivalent(entry.info.path, path, ec)) {
+        last_load_error_ =
+            "model_conflict: duplicate ID or artifact; remove the existing "
+            "model before changing its specification";
+        return "";
+      }
+    }
+  }
 
   std::string normalized_requested_format = NormalizeModelFormat(model_format);
   if (normalized_requested_format.empty()) {
@@ -282,6 +344,22 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
 
   auto backend_candidates = BuildBackendCandidates(backend_hint);
   MaybePrependMlxCandidate(&backend_candidates, backend_hint, resolved_format);
+  auto placement_request = spec.device;
+  if (!placement_request) {
+    const auto hint = backend_hint.empty() || backend_hint == "auto"
+                          ? default_backend_hint_
+                          : backend_hint;
+    const auto target = ParseLlamaBackendTarget(hint);
+    const auto ordinal = target == LlamaBackendTarget::kCuda
+                             ? default_backend_config_.cuda_device_id
+                         : target == LlamaBackendTarget::kRocm
+                             ? default_backend_config_.rocm_device_id
+                             : std::nullopt;
+    if (ordinal)
+      placement_request =
+          (target == LlamaBackendTarget::kCuda ? "cuda:" : "rocm:") +
+          std::to_string(*ordinal);
+  }
   BackendFactoryResult selection;
   std::string selected_requested_backend;
   std::string selected_path = path;
@@ -304,6 +382,36 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
       continue;
     }
 
+    if (placement_request) {
+      const auto selector = ParseDeviceSelector(*placement_request);
+      if (!selector) {
+        failure_reason = "placement_invalid: invalid runtime device ordinal";
+        continue;
+      }
+      const auto expected = selector->vendor == "cuda"
+                                ? LlamaBackendTarget::kCuda
+                                : LlamaBackendTarget::kRocm;
+      if (candidate_selection.target != expected ||
+          candidate_selection.used_fallback ||
+          candidate_selection.provider != BackendProvider::kLlamaCpp) {
+        failure_reason =
+            "placement_unsupported: explicit device requires the matching "
+            "llama_cpp CUDA or ROCm backend; native placement is not supported";
+        continue;
+      }
+    }
+    if (candidate_selection.provider == BackendProvider::kNative &&
+        (spec.gpu_layers || spec.kv_cache_type)) {
+      failure_reason = "placement_unsupported: native backend does not support "
+                       "llama offload or KV type overrides";
+      continue;
+    }
+    if (spec.gpu_layers && *spec.gpu_layers != 0 &&
+        !candidate_selection.traits.gpu_accelerated) {
+      failure_reason =
+          "placement_unsupported: GPU layer override requires a GPU backend";
+      continue;
+    }
     std::string candidate_path = path;
     std::string candidate_format = resolved_format;
 
@@ -346,7 +454,34 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
       }
     }
 
-    auto cfg = MergeBackendConfig(default_backend_config_, candidate_selection);
+    auto cfg = MergeBackendConfig(spec.Apply(default_backend_config_),
+                                  candidate_selection);
+    if (placement_request) {
+      cfg.device = *placement_request;
+      cfg.device_explicit = true;
+    }
+    if (!cfg.device.empty() &&
+        candidate_selection.provider != BackendProvider::kLlamaCpp) {
+      failure_reason = "placement_unsupported: native backend does not support "
+                       "explicit device selection";
+      continue;
+    }
+    if (cfg.ctx_size < cfg.max_parallel_sequences ||
+        (cfg.kv_cache_type_explicit && cfg.llama_kv_cache_type != "f16" &&
+         !cfg.use_flash_attention)) {
+      failure_reason = "placement_invalid: context must cover sequences and "
+                       "quantized KV requires flash attention";
+      continue;
+    }
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (cfg.max_parallel_sequences < minimum_sequence_capacity_) {
+        failure_reason =
+            "placement_invalid: sequence capacity below running scheduler "
+            "bound; restart with all model capacities configured";
+        continue;
+      }
+    }
     bool loaded = false;
     for (const auto &attempt : load_attempts) {
       if (!BackendSupportsModelFormat(candidate_selection, attempt.format)) {
@@ -371,9 +506,11 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
             continue;
           }
         }
-        failure_reason = "backend candidate '" + candidate +
-                         "' failed to load model from path '" + attempt.path +
-                         "'";
+        failure_reason = candidate_selection.backend->LoadError();
+        if (failure_reason.empty())
+          failure_reason = "backend candidate '" + candidate +
+                           "' failed to load model from path '" + attempt.path +
+                           "'";
         continue;
       }
       selected_path = attempt.path;
@@ -442,6 +579,7 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
       !selected_native_executor_fallback_reason.empty()) {
     info.backend_fallback_reason = selected_native_executor_fallback_reason;
   }
+  info.placement = selection.backend->Placement();
   info.ready = selection.backend->IsReady();
   info.capabilities = BuildModelCapabilities(
       selection.capabilities, selection.provider, selection.backend);
@@ -489,7 +627,7 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
   entry.backend = std::move(selection.backend);
   entry.load_time = load_finished;
   models_[info.id] = entry;
-  if (default_model_id_.empty()) {
+  if (default_model_id_.empty() || spec.make_default) {
     default_model_id_ = info.id;
   }
   last_load_error_.clear();
@@ -501,13 +639,22 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
   return info.id;
 }
 
+void SingleModelRouter::SetMinimumSequenceCapacity(int capacity) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  minimum_sequence_capacity_ = std::max(minimum_sequence_capacity_, capacity);
+}
+
 bool SingleModelRouter::UnloadModel(const std::string &id) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = models_.find(id);
   if (it == models_.end()) {
     return false;
   }
+  // A pending/running request or retained owner holds a shared backend lease.
+  if (it->second.backend && it->second.backend.use_count() > 1)
+    return false;
   RecordModelReadyLocked(it->second, false);
+  retired_ids_.insert(id);
   models_.erase(it);
   if (default_model_id_ == id) {
     default_model_id_.clear();
@@ -610,7 +757,8 @@ SingleModelRouter::EnsureUniqueIdLocked(const std::string &preferred) const {
   std::string base = preferred.empty() ? "model" : preferred;
   std::string candidate = base;
   int suffix = 1;
-  while (models_.find(candidate) != models_.end()) {
+  while (models_.find(candidate) != models_.end() ||
+         retired_ids_.count(candidate)) {
     candidate = base + "-" + std::to_string(suffix++);
   }
   return candidate;
