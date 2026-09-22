@@ -1,7 +1,6 @@
-# One endpoint: two chat models and one embedding model. Mixed CUDA + ROCm build required.
-# Replace artifact paths and supply existing local INFERFLUX_API_KEYS.
-# NVIDIA chat uses deliberate partial offload; measure VRAM before tuning it.
-# This prepared configuration is not hardware-accepted.
+# One endpoint: two chat models and BGE embeddings. CUDA + ROCm required.
+# Request all layers on each assigned GPU; validate total VRAM under mixed load.
+# Use existing local authentication. This configuration is not hardware-accepted.
 server:
   host: 127.0.0.1
   http_port: 8080
@@ -20,7 +19,7 @@ models:
   backend: llama_cpp_cuda
   device: cuda:0
   context_size: 32768
-  gpu_layers: 8
+  gpu_layers: -1
   max_parallel_sequences: 2
   kv_cache_type: f16
 - id: bge-small-en-v1.5

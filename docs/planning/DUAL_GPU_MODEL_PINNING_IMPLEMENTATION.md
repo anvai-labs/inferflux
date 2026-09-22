@@ -83,6 +83,13 @@ rollback. Restarting loses in-memory cache warmth.
 | Correlation | Unique `x-inferflux-client-request-id` for each call |
 | Sessions | `x-inferflux-session-id`; use distinct IDs for Victor members and model histories |
 
+The launch specification requests all layers on each assigned GPU. Qwen3 uses
+65536 total context tokens across two sequences (32768 each); Qwen2.5 uses 32768
+across two sequences (16384 each). The artifact metadata implies approximately
+6 GiB of f16 KV storage per chat model at these capacities, in addition to weights,
+compute buffers and embedding allocations. This estimate is not a VRAM measurement;
+actual startup and mixed-load memory validation are required before cutover.
+
 The model IDs above match the example configuration. Exact artifact hashes and
 resource settings must be recorded before migration;
 clients must not infer model identity from a port or a GPU vendor. Strict routing
