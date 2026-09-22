@@ -237,5 +237,16 @@ TEST_CASE("OIDCValidator rejects malformed token", "[oidc]") {
                      TestSignatureB64();
     REQUIRE_FALSE(validator.Validate(jwt, nullptr));
   }
-  REQUIRE_FALSE(validator.Validate(std::string(16385, 'a'), nullptr));
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+  json payload = {{"iss", "https://iss.example.com"},
+                  {"aud", "aud"},
+                  {"sub", "user-123"},
+                  {"exp", now + 3600}};
+  REQUIRE(validator.Validate(MakeSignedJWT(payload), nullptr));
+  payload["padding"] = std::string(16385, 'a');
+  const auto oversized = MakeSignedJWT(payload);
+  REQUIRE(oversized.size() > 16384);
+  REQUIRE_FALSE(validator.Validate(oversized, nullptr));
 }
