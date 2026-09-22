@@ -15,6 +15,23 @@ import dual_gpu_acceptance as gate
 
 
 class DualGpuAcceptanceTests(unittest.TestCase):
+    def test_shared_service_baseline_preserves_stopped_and_running_ports(self):
+        baseline = {port: False for port in gate.SHARED}
+        with mock.patch.object(
+            gate.socket, "create_connection", side_effect=ConnectionRefusedError
+        ), mock.patch.object(gate, "request") as request:
+            self.assertEqual(gate.shared_health(), baseline)
+            self.assertEqual(gate.shared_health(baseline), baseline)
+            request.assert_not_called()
+            with self.assertRaises(gate.AcceptanceError):
+                gate.shared_health({port: True for port in gate.SHARED})
+        with mock.patch.object(gate.socket, "create_connection"), mock.patch.object(
+            gate, "request", return_value=({"model_ready": True}, None)
+        ):
+            with self.assertRaises(gate.AcceptanceError):
+                gate.shared_health(baseline)
+            self.assertEqual(gate.shared_health(), {port: True for port in gate.SHARED})
+
     def test_monitor_timeout_still_stops_owned_children_and_preserves_failure(self):
         for execution_fails in (False, True):
             with self.subTest(
@@ -42,7 +59,7 @@ class DualGpuAcceptanceTests(unittest.TestCase):
                 ), mock.patch.object(
                     gate, "execute", side_effect=execute
                 ), mock.patch.object(
-                    gate, "shared_health"
+                    gate, "shared_health", return_value={}
                 ), mock.patch.object(
                     gate.signal, "signal"
                 ), mock.patch.object(

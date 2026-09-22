@@ -9,6 +9,7 @@ instead of raw os.setsid/os.killpg calls.
 import os
 import platform
 import signal
+import socket
 import subprocess
 import sys
 
@@ -32,6 +33,27 @@ def start_server_process(cmd, env=None, cwd=None, text=False,
     Returns:
         subprocess.Popen instance
     """
+    effective_env = os.environ if env is None else env
+    port = int(effective_env.get("INFERFLUX_PORT_OVERRIDE", "0"))
+    if port:
+        host = effective_env.get("INFERFLUX_HOST_OVERRIDE", "127.0.0.1")
+        family = socket.AF_INET6 if ":" in host else socket.AF_INET
+        # Never probe readiness or send admin requests to an existing listener.
+        # Bind rather than connect, so even the guard sends no traffic to it.
+        with socket.socket(family, socket.SOCK_STREAM) as reservation:
+            if IS_WINDOWS:
+                reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                # Match the server's restart behavior without SO_REUSEPORT:
+                # TIME_WAIT is harmless, but an active listener is rejected.
+                reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                reservation.bind((host, port))
+            except OSError as error:
+                raise RuntimeError(
+                    f"integration port {host}:{port} already in use or unavailable"
+                ) from error
+
     kwargs = {
         "env": env,
         "cwd": cwd,

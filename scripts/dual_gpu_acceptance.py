@@ -228,10 +228,20 @@ def request(port, path, key="", payload=None, headers=None, stream=False):
         conn.close()
 
 
-def shared_health():
+def shared_health(expected=None):
+    states = {}
     for port in SHARED:
-        payload, _ = request(port, "/healthz")
-        require(payload.get("model_ready") is True, "preserved_service_health")
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                states[port] = True
+        except ConnectionRefusedError:
+            states[port] = False
+        if states[port]:
+            payload, _ = request(port, "/healthz")
+            require(payload.get("model_ready") is True, "preserved_service_health")
+    if expected is not None:
+        require(states == expected, "shared_service_state_changed")
+    return states
 
 
 def wait_ready(child, port, path, key):
@@ -320,7 +330,7 @@ def execute(repo, private, report, children):
     for port in (ORIGIN, GATEWAY):
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", port))
-    shared_health()
+    shared_health(report["shared_service_baseline"])
     report["shared_health_before"] = True
     key, admin = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
     config = private / "origin.json"
@@ -416,7 +426,7 @@ def execute(repo, private, report, children):
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
                 calls.extend(pool.map(call, MODELS))
-            shared_health()
+            shared_health(report["shared_service_baseline"])
             origin.check()
             gateway.check()
     gateway_calls = [call for call in calls if call["arm"] == "gateway"]
@@ -488,7 +498,7 @@ def main():
     def monitor():
         while not stop_monitor.wait(5):
             try:
-                shared_health()
+                shared_health(report["shared_service_baseline"])
             except Exception:
                 health_failed.set()
                 for child in list(children):
@@ -506,6 +516,7 @@ def main():
     try:
         with tempfile.TemporaryDirectory(prefix="inferflux-dual-gate-") as folder:
             try:
+                report["shared_service_baseline"] = shared_health()
                 watcher.start()
                 execute(repo, Path(folder), report, children)
                 require(not health_failed.is_set(), "shared_health_during_run")
@@ -540,7 +551,7 @@ def main():
         )
         if children:
             try:
-                shared_health()
+                shared_health(report["shared_service_baseline"])
                 report["shared_health_after"] = True
             except Exception:
                 report["shared_health_after"] = False

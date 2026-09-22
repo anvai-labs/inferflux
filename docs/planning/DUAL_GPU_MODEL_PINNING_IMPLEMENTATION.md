@@ -67,8 +67,8 @@ configured reachable address. The isolated acceptance harness uses 28085 to avoi
 replacing a running service. That test port is not part of the application contract.
 The user selected Qwen3-Coder-30B on AMD, Qwen2.5-Coder-14B on NVIDIA and the
 existing BGE embedding model on the same origin. Replacement of 8080/8081/8090 is
-authorized for consolidation; retain the old services until the replacement passes
-validation. Preserve their launch configurations, credentials and disk state for
+authorized for consolidation; the user subsequently authorized stopping all three
+for the co-design test window to release VRAM. Preserve their launch configurations, credentials and disk state for
 rollback. Restarting loses in-memory cache warmth.
 
 | Application setting | Contract |
@@ -233,8 +233,10 @@ It clean-builds one server plus both modules. Configure two distinct small GGUFs
 existing pinned `INFERFLUX_GPU_CACHE_SANDHI_{BINARY,SHA256,SOURCE}` variables.
 The harness checks exact source, submodule, model, binary and module identities;
 requires at least 2 GiB free on each GPU; and uses private credentials/state on
-loopback 28085 and 18794. It monitors preserved services on 8080/8081/8090 and
-stops only owned processes. It never clears shared caches or edits existing keys.
+loopback 28085 and 18794. It records the initial listening state of 8080/8081/8090
+and requires it to remain unchanged, including intentionally stopped origins.
+Any initially running origin must remain healthy. It stops only owned processes
+and never clears shared caches or edits existing keys.
 
 The supplemental scenario checks both models' weight residency before requests,
 concurrent plain/SSE calls directly and through one isolated Sandhi origin,
@@ -268,12 +270,31 @@ Finally, a monitor shutdown timeout no longer skips owned-server cleanup; cleanu
 failures are reported separately without replacing the original execution failure.
 These are model-free checks and do not constitute hardware acceptance.
 
+The broader Mac stub integration run exposed a separate isolation defect: its
+fixed port 18081 overlapped the preserved CUDA SSH tunnel, and startup readiness
+accepted the existing listener. Those results are invalid as stub or acceptance
+evidence. The test issued completion, embedding, tokenization, cache-warm and
+admin requests to the retained runtime. Routing settings were checked afterward
+against its preserved configuration and matched; the scope is `any_compatible`.
+The cache-warm request used tokens `[1,2,3]` and block table `[100]`; there is no
+scoped removal API, so no shared cache was cleared to undo it. Treat that runtime's
+subsequent in-memory cache state as potentially contaminated, retaining earlier
+evidence separately. No service was restarted and no credentials were changed.
+The process helper now rejects an occupied configured port before launching or
+contacting a listener. `INFERFLUX_TEST_PORT_BASE` permits isolated stub ports;
+the Mac rerun uses 28091-28094. This bind preflight does not reserve the port
+through child startup, so exclusive test-port ownership remains required.
+
 ## Migration and rollback
 
-1. Keep current 8080 ROCm, accepted 8081 CUDA and 8090 embeddings processes,
-   binaries/configs, caches, credentials and dirty worktrees unchanged.
+1. The user authorized stopping 8080 ROCm, accepted 8081 CUDA and 8090 embeddings
+   before replacement testing. All three stopped cleanly on September 22.
+   Their private launch/environment/config snapshots and binary copies are in
+   `/home/vsingh/.local/state/inferflux-consolidation-20260922` on aiserver1.
+   Persisted caches and dirty worktrees remain untouched. Old in-memory cache
+   warmth is lost on shutdown; earlier evidence remains preserved.
 2. Review/promote the implementation and obtain exact-main setup evidence using
-   small isolated models without reclaiming another owner's VRAM.
+   small isolated models in the authorized test window.
 3. The user authorized consolidating all three services on 8080 with the model IDs
    above. Cut over only after artifacts and placement/concurrency/tracing evidence
    are reviewable under the trusted-main process. Preserve original

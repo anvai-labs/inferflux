@@ -1122,6 +1122,10 @@ option(ENABLE_SBOM "Generate SBOM after build" ON)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+  add_test(NAME IntegrationProcessOwnership
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/process_helper_test.py)
+endif()
+if(Python3_Interpreter_FOUND)
   add_test(NAME ModelLoadSpecStartupTests
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/model_load_spec_startup_test.py $<TARGET_FILE:inferfluxd>)
   add_test(NAME DualGpuAcceptanceContractTests
