@@ -41,6 +41,8 @@ BuildModelCapabilities(const BackendCapabilities &base,
                        BackendProvider provider,
                        const std::shared_ptr<BackendInterface> &backend) {
   BackendCapabilities caps = base;
+  caps.supports_generation =
+      backend && backend->ReportCapabilities().supports_generation;
   caps.supports_vision = backend && backend->SupportsVision();
 
   // When the backend reports its own capabilities (native or any future
@@ -79,6 +81,13 @@ BuildModelCapabilities(const BackendCapabilities &base,
     }
   }
 
+  if (!caps.supports_generation) {
+    caps.supports_streaming = false;
+    caps.supports_logprobs = false;
+    caps.supports_structured_output = false;
+    caps.supports_speculative_decoding = false;
+    caps.supports_kv_prefix_transfer = false;
+  }
   return caps;
 }
 

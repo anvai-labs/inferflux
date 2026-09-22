@@ -4,6 +4,7 @@
 #include <string>
 struct llama_model;
 namespace inferflux {
+bool LlamaModelSupportsGeneration(const llama_model *model);
 ggml_backend_dev_t ResolveLlamaDevice(const std::string &selector,
                                       std::string *error);
 bool ObserveLlamaWeightPlacement(const llama_model *model,

@@ -311,6 +311,11 @@ TEST_CASE("HTTP embeddings use scheduler slices and report evaluated tokens",
           "[http_server][embeddings_admission]") {
   class EmbeddingBackend : public BackendInterface {
   public:
+    BackendCapabilities ReportCapabilities() const override {
+      BackendCapabilities caps;
+      caps.supports_generation = false;
+      return caps;
+    }
     std::vector<std::size_t> sizes;
     bool LoadModel(const std::filesystem::path &,
                    const LlamaBackendConfig &) override {
@@ -346,6 +351,13 @@ TEST_CASE("HTTP embeddings use scheduler slices and report evaluated tokens",
   HttpServer server("127.0.0.1", 0, &scheduler, auth, &metrics, nullptr,
                     nullptr, nullptr, nullptr, nullptr, nullptr,
                     HttpServer::TlsConfig{}, 1);
+  auto rejected = SelectModelForRequest(
+      router.get(), info.id,
+      BuildGenerationFeatureRequirements(false, false, false, false),
+      ModelSelectionOptions{});
+  REQUIRE(rejected.status == ModelSelectionStatus::kUnsupported);
+  REQUIRE(rejected.missing_feature == "generation");
+  REQUIRE_FALSE(router->ResolveExact(info.id)->capabilities.supports_streaming);
   const auto payload = json({{"model", info.id},
                              {"input", std::vector<std::string>(33, "text")}})
                            .dump();

@@ -1681,6 +1681,8 @@ std::future<InferenceResult> Scheduler::Embed(InferenceRequest request) {
     return future;
   }
   request.embedding_request = true;
+  request.embedding_backend.reset();
+  request.resolved_model.clear();
   request.embedding_offset = 0;
   request.embedding_results.clear();
   request.embedding_prompt_tokens = 0;

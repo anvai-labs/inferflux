@@ -204,9 +204,7 @@ public:
     static const std::string empty_reason;
     return empty_reason;
   }
-  BackendCapabilities ReportCapabilities() const override {
-    return BackendCapabilities{};
-  }
+  BackendCapabilities ReportCapabilities() const override;
 
 protected:
   explicit LlamaCppBackend(bool acquire_backend);

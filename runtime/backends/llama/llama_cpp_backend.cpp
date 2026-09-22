@@ -349,6 +349,15 @@ DevicePlacement LlamaCppBackend::Placement() const {
   BackendStateLock lock(backend_state_mutex_);
   return placement_;
 }
+
+BackendCapabilities LlamaCppBackend::ReportCapabilities() const {
+  BackendStateLock lock(backend_state_mutex_);
+  BackendCapabilities capabilities;
+  // Encoder-only GGUFs (for example BGE/BERT) cannot execute generation.
+  capabilities.supports_generation =
+      !model_ || LlamaModelSupportsGeneration(model_);
+  return capabilities;
+}
 std::string LlamaCppBackend::LoadError() const {
   BackendStateLock lock(backend_state_mutex_);
   return load_error_;

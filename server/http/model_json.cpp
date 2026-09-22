@@ -33,6 +33,7 @@ json BuildModelRuntimeJson(const ModelInfo &info,
 
 json BuildCapabilitiesJson(const BackendCapabilities &capabilities) {
   return json{
+      {"generation", capabilities.supports_generation},
       {"streaming", capabilities.supports_streaming},
       {"logprobs", capabilities.supports_logprobs},
       {"structured_output", capabilities.supports_structured_output},

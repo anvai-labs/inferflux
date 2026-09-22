@@ -6,6 +6,11 @@
 #include <set>
 
 namespace inferflux {
+bool LlamaModelSupportsGeneration(const llama_model *model) {
+  // In this pinned revision BERT still uses llama_decode(), so has_decoder()
+  // alone is insufficient. Use the loaded model's causal-attention contract.
+  return model && model->hparams.causal_attn && llama_model_has_decoder(model);
+}
 ggml_backend_dev_t ResolveLlamaDevice(const std::string &value,
                                       std::string *error) {
   const auto selector = ParseDeviceSelector(value);

@@ -102,7 +102,9 @@ Cache token reporting alone does not establish executed backend reuse.
 Embedding requests use `{"model":"bge-small-en-v1.5","input":["text"]}`.
 Their response reports `usage.prompt_tokens` and `usage.total_tokens` (equal input
 counts); there are no generated completion tokens or SSE generation chunks.
-Do not apply the chat usage schema to embedding responses.
+Do not apply the chat usage schema to embedding responses. Encoder-only models
+report `capabilities.generation=false`; chat/completion requests naming them fail
+capability admission before reaching backend generation.
 
 Embedding work now enters the existing scheduler and yields between slices of at
 most 32 inputs (reduced for the scheduler token budget). Arrays contain at most

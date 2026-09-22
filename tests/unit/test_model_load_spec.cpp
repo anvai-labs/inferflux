@@ -1,7 +1,9 @@
+#include "external/llama.cpp/src/llama-model.h"
 #include "model/model_load_spec.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 #include "runtime/backends/llama/llama_device_placement.h"
 #include <catch2/catch_amalgamated.hpp>
+#include <memory>
 #include <yaml-cpp/yaml.h>
 using namespace inferflux;
 
@@ -67,4 +69,22 @@ TEST_CASE("Unavailable vendor-qualified devices never resolve to CPU",
   std::string error;
   REQUIRE(ResolveLlamaDevice(value, &error) == nullptr);
   REQUIRE(error.find("placement_") == 0);
+}
+
+TEST_CASE("Pinned BERT decode API is not a text generation capability",
+          "[placement][embeddings_admission]") {
+  std::unique_ptr<llama_model> bert(
+      llama_model_create(LLM_ARCH_BERT, llama_model_default_params()));
+  REQUIRE(bert);
+  bert->arch = LLM_ARCH_BERT;
+  bert->hparams.causal_attn = false;
+  REQUIRE(llama_model_has_decoder(bert.get()));
+  REQUIRE_FALSE(LlamaModelSupportsGeneration(bert.get()));
+  std::unique_ptr<llama_model> qwen(
+      llama_model_create(LLM_ARCH_QWEN2, llama_model_default_params()));
+  REQUIRE(qwen);
+  qwen->arch = LLM_ARCH_QWEN2;
+  qwen->hparams.causal_attn = true;
+  REQUIRE(LlamaModelSupportsGeneration(qwen.get()));
+  REQUIRE_FALSE(LlamaModelSupportsGeneration(nullptr));
 }
