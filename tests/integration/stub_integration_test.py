@@ -12,9 +12,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 from process_helper import start_server_process, stop_server_process
 
 SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 18081
-SERVER_FAIL_PORT = 18082
-SERVER_STRICT_PORT = 18083
+SERVER_PORT = int(os.environ.get("INFERFLUX_TEST_PORT_BASE", "18081"))
+SERVER_FAIL_PORT = SERVER_PORT + 1
+SERVER_STRICT_PORT = SERVER_PORT + 2
 SERVER_BIN = os.environ.get("INFERFLUX_SERVER_BIN", "./build/inferfluxd")
 INFERCTL_BIN = os.environ.get("INFERCTL_BIN", "./build/inferctl")
 
@@ -1088,7 +1088,7 @@ class StubIntegrationReasoningTests(unittest.TestCase):
         if not os.environ.get("INFERFLUX_STUB_COMPLETION"):
             raise unittest.SkipTest("INFERFLUX_STUB_COMPLETION not set")
         cls.host = "127.0.0.1"
-        cls.port = 18084
+        cls.port = SERVER_PORT + 3
         env = os.environ.copy()
         env["INFERFLUX_HOST_OVERRIDE"] = cls.host
         env["INFERFLUX_PORT_OVERRIDE"] = str(cls.port)

@@ -17,6 +17,7 @@
 #include "runtime/text/incremental_utf8.h"
 
 namespace inferflux {
+class BackendInterface;
 
 // Per-request sampling parameters (OpenAI-compatible).
 // UINT32_MAX is used for seed because llama.cpp defines
@@ -41,6 +42,7 @@ inline constexpr std::string_view kBackendEmptyResponseText =
     "[backend returned empty response]";
 
 struct InferenceResult {
+  std::vector<std::vector<float>> embeddings;
   std::string model_id;
   std::string completion;
   int completion_tokens{0};
@@ -136,6 +138,15 @@ struct FairnessState {
 };
 
 struct InferenceRequest {
+  // Embedding work shares scheduler admission but never generation KV/session
+  // state. Large input arrays yield between bounded backend calls.
+  bool embedding_request{false};
+  std::shared_ptr<BackendInterface> embedding_backend;
+  std::vector<std::string> embedding_inputs;
+  std::size_t embedding_offset{0};
+  std::size_t embedding_slice_size{32};
+  std::vector<std::vector<float>> embedding_results;
+  int embedding_prompt_tokens{0};
   uint64_t id{0};
   std::string model;          // Requested model ID (empty = default).
   std::string resolved_model; // Assigned model ID after router resolution.

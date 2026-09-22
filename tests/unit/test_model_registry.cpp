@@ -26,10 +26,12 @@ public:
     std::string format;
   };
 
+  std::vector<ModelLoadSpec> specifications;
   std::vector<LoadCall> load_calls;
   std::vector<std::string> unload_calls;
   int next_id_suffix{0};
   bool fail_load{false};
+  bool fail_unload{false};
 
   std::vector<ModelInfo> ListModels() const override { return {}; }
 
@@ -42,9 +44,14 @@ public:
     return id.empty() ? ("auto-id-" + std::to_string(next_id_suffix++)) : id;
   }
 
+  std::string LoadModel(const ModelLoadSpec &spec) override {
+    specifications.push_back(spec);
+    return LoadModel(spec.path, spec.backend, spec.id, spec.format);
+  }
+
   bool UnloadModel(const std::string &id) override {
     unload_calls.push_back(id);
-    return true;
+    return !fail_unload;
   }
 
   ModelInfo *Resolve(const std::string &) override { return nullptr; }
@@ -275,4 +282,77 @@ TEST_CASE("ModelRegistry LoadAndWatch is idempotent (second call is no-op)",
 
   REQUIRE(n2 == 0);
   REQUIRE(router->load_calls.size() == 1u); // loaded only once
+}
+
+TEST_CASE("ModelRegistry rejects duplicate identities before loading",
+          "[model_registry][placement]") {
+  auto router = std::make_shared<StubRouter>();
+  ModelRegistry reg(router);
+  const bool same_path = GENERATE(true, false);
+  auto path = WriteTempRegistry(
+      "models:\n  - id: amd\n    path: /a.gguf\n  - id: " +
+      std::string(same_path ? "nvidia" : "amd") +
+      "\n    path: " + std::string(same_path ? "/a.gguf" : "/b.gguf") + "\n");
+  const int loaded = reg.LoadAndWatch(path, 99999);
+  reg.Stop();
+  fs::remove(path);
+  REQUIRE(loaded == 0);
+  REQUIRE(router->load_calls.empty());
+}
+
+TEST_CASE("ModelRegistry retains ownership when removal is refused",
+          "[model_registry][placement]") {
+  auto router = std::make_shared<StubRouter>();
+  ModelRegistry reg(router);
+  auto path = WriteTempRegistry("models:\n  - id: busy\n    path: /a.gguf\n");
+  REQUIRE(reg.LoadAndWatch(path, 99999) == 1);
+  reg.Stop();
+  router->fail_unload = true;
+  WriteTempRegistry("models: []\n");
+  REQUIRE(reg.Reload() == 0);
+  REQUIRE(reg.ManagedIds().count("busy") == 1);
+  router->fail_unload = false;
+  REQUIRE(reg.Reload() == -1);
+  REQUIRE(reg.ManagedIds().empty());
+  fs::remove(path);
+}
+
+TEST_CASE("ModelRegistry carries resources through the typed router contract",
+          "[model_registry][placement]") {
+  auto router = std::make_shared<StubRouter>();
+  ModelRegistry reg(router);
+  auto path =
+      WriteTempRegistry("models:\n  - id: amd\n    path: /a.gguf\n    device: "
+                        "rocm:0\n    context_size: 8192\n    gpu_layers: 8\n   "
+                        " max_parallel_sequences: 2\n    kv_cache_type: f16\n");
+  REQUIRE(reg.LoadAndWatch(path, 99999) == 1);
+  reg.Stop();
+  fs::remove(path);
+  REQUIRE(router->specifications.size() == 1);
+  const auto &spec = router->specifications.front();
+  REQUIRE(spec.device == "rocm:0");
+  REQUIRE(spec.context_size == 8192);
+  REQUIRE(spec.gpu_layers == 8);
+  REQUIRE(spec.max_parallel_sequences == 2);
+  REQUIRE(spec.kv_cache_type == "f16");
+}
+
+TEST_CASE("ModelRegistry refuses live specification changes atomically",
+          "[model_registry][placement]") {
+  auto router = std::make_shared<StubRouter>();
+  ModelRegistry reg(router);
+  auto path = WriteTempRegistry(
+      "models:\n  - id: a\n    path: /a.gguf\n  - id: b\n    path: /b.gguf\n");
+  REQUIRE(reg.LoadAndWatch(path, 99999) == 2);
+  reg.Stop();
+  const auto change = GENERATE(
+      "backend: rocm", "device: cuda:0", "context_size: 4096", "gpu_layers: 8",
+      "max_parallel_sequences: 2", "kv_cache_type: q8_0");
+  WriteTempRegistry(std::string("models:\n  - id: a\n    path: /a.gguf\n    ") +
+                    change + "\n");
+  REQUIRE(reg.Reload() == 0);
+  REQUIRE(router->unload_calls.empty());
+  REQUIRE(router->load_calls.size() == 2);
+  REQUIRE(reg.ManagedIds().size() == 2);
+  fs::remove(path);
 }

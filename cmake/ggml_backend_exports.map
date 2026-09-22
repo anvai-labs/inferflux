@@ -1,0 +1,10 @@
+/* Dynamic ggml modules are entered through these two upstream loader symbols.
+ * Hide shared CUDA/HIP implementation globals, including GNU-unique template
+ * statics which can otherwise escape RTLD_LOCAL symbol isolation. */
+{
+  global:
+    ggml_backend_init;
+    ggml_backend_score;
+  local:
+    *;
+};

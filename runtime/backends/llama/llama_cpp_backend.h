@@ -139,6 +139,9 @@ public:
   std::vector<int> TokenizeForCache(const std::string &prompt) const override;
   std::vector<TopLogitEntry> TopLogitsForParity(int top_n) override;
   std::vector<float> Embed(const std::string &text) override;
+  int EmbeddingTokenCount(const std::string &text) const override;
+  std::vector<std::vector<float>>
+  EmbedBatch(const std::vector<std::string> &texts) override;
   int EmbedDims() const override;
 
   // Execute one shared decode step for N sequences simultaneously.
@@ -172,6 +175,8 @@ public:
                                const std::string &root);
   void DisableGrammarConstraint();
 
+  DevicePlacement Placement() const override;
+  std::string LoadError() const override;
   bool IsReady() const override { return context_ != nullptr || test_ready_; }
   int ContextSize() const override {
     return context_ ? static_cast<int>(llama_n_ctx(context_)) : 0;
@@ -199,9 +204,7 @@ public:
     static const std::string empty_reason;
     return empty_reason;
   }
-  BackendCapabilities ReportCapabilities() const override {
-    return BackendCapabilities{};
-  }
+  BackendCapabilities ReportCapabilities() const override;
 
 protected:
   explicit LlamaCppBackend(bool acquire_backend);
@@ -223,11 +226,15 @@ private:
   const struct llama_vocab *vocab_{nullptr};
   int32_t n_vocab_{0};
   LlamaBackendConfig config_;
+  DevicePlacement placement_;
+  std::string load_error_;
   bool test_ready_{false};
   bool llama_backend_acquired_{false};
   PerfSnapshot last_perf_{};
   llama_context *embed_ctx_{nullptr};
   bool EnsureEmbedCtx();
+  llama_context *embed_batch_ctx_{nullptr};
+  bool EnsureEmbedBatchCtx();
   mutable std::mutex async_results_mutex_;
   UnifiedBatchHandle next_async_handle_{1};
   std::unordered_map<UnifiedBatchHandle, std::vector<UnifiedBatchOutput>>

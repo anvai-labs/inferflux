@@ -1,4 +1,5 @@
 #pragma once
+#include "runtime/backends/common/device_placement.h"
 
 #include "backend_config.h"
 #include "backend_types.h"
@@ -259,7 +260,24 @@ public:
     return {};
   }
 
+  // Batched embedding. Returns one vector per input (same order); an empty
+  // vector at index i means that input could not be embedded. Backends that
+  // can amortize tokenizer/setup cost across inputs should override this.
+  virtual std::vector<std::vector<float>>
+  EmbedBatch(const std::vector<std::string> &texts) {
+    std::vector<std::vector<float>> results;
+    results.reserve(texts.size());
+    for (const auto &text : texts) {
+      results.push_back(Embed(text));
+    }
+    return results;
+  }
+
   virtual int EmbedDims() const { return 0; }
+  // Tokens actually evaluated by EmbedBatch, including any backend truncation.
+  virtual int EmbeddingTokenCount(const std::string &text) const {
+    return TokenCount(text);
+  }
 
   // ========================================================================
   // Capabilities & Diagnostics
@@ -274,6 +292,8 @@ public:
     return empty_reason;
   }
 
+  virtual DevicePlacement Placement() const { return {}; }
+  virtual std::string LoadError() const { return ""; }
   virtual bool IsReady() const { return false; }
 
   virtual bool SupportsVision() const { return false; }

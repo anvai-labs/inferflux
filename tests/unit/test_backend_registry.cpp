@@ -95,6 +95,43 @@ TEST_CASE("GpuDeviceInfo default values are sensible",
   REQUIRE(info.flash_attention_version.empty());
 }
 
+TEST_CASE(
+    "GPU initialization preserves omitted placement and explicit selectors",
+    "[backend_registry][device_placement]") {
+  class Strategy final : public GpuDeviceStrategy {
+  public:
+    explicit Strategy(LlamaBackendTarget target) : target_(target) {}
+    bool Initialize() override { return true; }
+    bool Initialize(int ordinal) override {
+      ordinal_ = ordinal;
+      return true;
+    }
+    bool IsAvailable() const override { return true; }
+    GpuDeviceInfo GetDeviceInfo() const override {
+      GpuDeviceInfo info;
+      info.device_id = ordinal_;
+      return info;
+    }
+    LlamaBackendTarget Target() const override { return target_; }
+    void RecordMetrics(const LlamaBackendConfig &) override {}
+    LlamaBackendTarget target_;
+    int ordinal_{0};
+  };
+  const auto target =
+      GENERATE(LlamaBackendTarget::kCuda, LlamaBackendTarget::kRocm);
+  const bool explicit_device = GENERATE(false, true);
+  GpuAcceleratedBackend backend(std::make_unique<Strategy>(target));
+  LlamaBackendConfig config;
+  config.gpu_layers = 8;
+  if (explicit_device)
+    config.device = target == LlamaBackendTarget::kCuda ? "cuda:1" : "rocm:1";
+  LlamaBackendConfig tuned;
+  REQUIRE(backend.InitializeDevice(config, &tuned));
+  REQUIRE(tuned.device == config.device);
+  REQUIRE(tuned.gpu_layers == 8);
+  REQUIRE(backend.DeviceInfo().device_id == (explicit_device ? 1 : 0));
+}
+
 TEST_CASE("LlamaBackendTarget kOpenCL parses and describes correctly",
           "[backend_registry]") {
   REQUIRE(ParseLlamaBackendTarget("opencl") == LlamaBackendTarget::kOpenCL);

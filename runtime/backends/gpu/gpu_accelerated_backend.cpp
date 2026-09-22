@@ -1,4 +1,5 @@
 #include "runtime/backends/gpu/gpu_accelerated_backend.h"
+#include "model/model_load_spec.h"
 #include "runtime/backends/llama/llama_backend_traits.h"
 #include "server/logging/logger.h"
 
@@ -20,7 +21,20 @@ bool GpuAcceleratedBackend::InitializeDevice(const LlamaBackendConfig &config,
     return false;
   }
 
-  if (!strategy_->Initialize()) {
+  int ordinal = 0;
+  if (!config.device.empty()) {
+    const auto selector = ParseDeviceSelector(config.device);
+    const auto target = strategy_->Target();
+    if (!selector ||
+        (selector->vendor == "cuda" && target != LlamaBackendTarget::kCuda) ||
+        (selector->vendor == "rocm" && target != LlamaBackendTarget::kRocm)) {
+      log::Error("gpu_backend",
+                 "Device selector does not match backend vendor");
+      return false;
+    }
+    ordinal = selector->ordinal;
+  }
+  if (!strategy_->Initialize(ordinal)) {
     log::Error("gpu_backend", "Device initialization failed");
     return false;
   }
@@ -43,8 +57,12 @@ bool GpuAcceleratedBackend::InitializeDevice(const LlamaBackendConfig &config,
 
 bool GpuAcceleratedBackend::LoadModel(const std::filesystem::path &model_path,
                                       const LlamaBackendConfig &config) {
+  device_error_.clear();
   LlamaBackendConfig tuned;
   if (!InitializeDevice(config, &tuned)) {
+    device_error_ =
+        "placement_unavailable: cannot initialize " + Name() +
+        (config.device.empty() ? " device 0" : " device " + config.device);
     return false;
   }
 
@@ -53,9 +71,14 @@ bool GpuAcceleratedBackend::LoadModel(const std::filesystem::path &model_path,
     return false;
   }
 
-  log::Info("gpu_backend", "Model loaded on " + device_info_.device_name +
+  log::Info("gpu_backend", "Model loaded with device strategy " +
+                               device_info_.device_name +
                                " (arch=" + device_info_.arch + ")");
   return true;
+}
+
+std::string GpuAcceleratedBackend::LoadError() const {
+  return device_error_.empty() ? LlamaCppBackend::LoadError() : device_error_;
 }
 
 bool GpuAcceleratedBackend::IsReady() const {
