@@ -281,7 +281,9 @@ scoped removal API, so no shared cache was cleared to undo it. Treat that runtim
 subsequent in-memory cache state as potentially contaminated, retaining earlier
 evidence separately. No service was restarted and no credentials were changed.
 The process helper now rejects an occupied configured port before launching or
-contacting a listener. `INFERFLUX_TEST_PORT_BASE` permits isolated stub ports;
+sending application data. A bounded TCP handshake catches Darwin wildcard
+listeners that a reuse-enabled bind alone misses; it sends no HTTP or credentials.
+Only connection refusal permits the bind preflight. `INFERFLUX_TEST_PORT_BASE` permits isolated stub ports;
 the Mac rerun uses 28091-28094. This bind preflight does not reserve the port
 through child startup, so exclusive test-port ownership remains required.
 

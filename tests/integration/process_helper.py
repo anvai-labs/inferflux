@@ -6,6 +6,7 @@ killpg) transparently. All integration tests should use these helpers
 instead of raw os.setsid/os.killpg calls.
 """
 
+import errno
 import os
 import platform
 import signal
@@ -38,8 +39,17 @@ def start_server_process(cmd, env=None, cwd=None, text=False,
     if port:
         host = effective_env.get("INFERFLUX_HOST_OVERRIDE", "127.0.0.1")
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
-        # Never probe readiness or send admin requests to an existing listener.
-        # Bind rather than connect, so even the guard sends no traffic to it.
+        # Darwin permits overlapping wildcard/specific SO_REUSEADDR binds.
+        # Detect active listeners with a bounded TCP handshake, sending no
+        # application payload, credentials, readiness or admin requests.
+        probe_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(host, host)
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
+            probe.settimeout(1)
+            status = probe.connect_ex((probe_host, port))
+        if status != errno.ECONNREFUSED:
+            raise RuntimeError(
+                f"integration port {host}:{port} already in use or unavailable"
+            )
         with socket.socket(family, socket.SOCK_STREAM) as reservation:
             if IS_WINDOWS:
                 reservation.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
