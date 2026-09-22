@@ -1,4 +1,5 @@
 #pragma once
+#include "runtime/backends/common/device_placement.h"
 
 #include "backend_config.h"
 #include "backend_types.h"
@@ -274,6 +275,8 @@ public:
     return empty_reason;
   }
 
+  virtual DevicePlacement Placement() const { return {}; }
+  virtual std::string LoadError() const { return ""; }
   virtual bool IsReady() const { return false; }
 
   virtual bool SupportsVision() const { return false; }

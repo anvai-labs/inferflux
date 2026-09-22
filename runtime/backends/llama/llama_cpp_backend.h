@@ -172,6 +172,8 @@ public:
                                const std::string &root);
   void DisableGrammarConstraint();
 
+  DevicePlacement Placement() const override;
+  std::string LoadError() const override;
   bool IsReady() const override { return context_ != nullptr || test_ready_; }
   int ContextSize() const override {
     return context_ ? static_cast<int>(llama_n_ctx(context_)) : 0;
@@ -223,6 +225,8 @@ private:
   const struct llama_vocab *vocab_{nullptr};
   int32_t n_vocab_{0};
   LlamaBackendConfig config_;
+  DevicePlacement placement_;
+  std::string load_error_;
   bool test_ready_{false};
   bool llama_backend_acquired_{false};
   PerfSnapshot last_perf_{};

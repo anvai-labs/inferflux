@@ -3055,3 +3055,40 @@ TEST_CASE("Scheduler retires warm session state after failed extension",
     }
   }
 }
+
+TEST_CASE("Scheduler never reuses one model's session KV in another model",
+          "[scheduler][placement][cache_ownership]") {
+  SimpleTokenizer tokenizer;
+  auto cache = std::make_shared<PagedKVCache>(
+      32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto amd = std::make_shared<PositionCheckingBackend>();
+  auto nvidia = std::make_shared<PositionCheckingBackend>();
+  for (const auto &[id, backend] : std::vector<
+           std::pair<std::string, std::shared_ptr<PositionCheckingBackend>>>{
+           {"amd", amd}, {"nvidia", nvidia}}) {
+    ModelInfo info;
+    info.id = id;
+    info.backend = "cpu";
+    REQUIRE(router->RegisterModel(info, backend));
+  }
+  Scheduler::Config config;
+  config.session_handles.enabled = true;
+  DisaggregatedConfig disagg;
+  disagg.decode_pool_size = 0;
+  Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(), cache,
+                      router, nullptr, nullptr, {}, disagg, {}, config);
+  for (const auto *model : {"amd", "nvidia", "amd"}) {
+    InferenceRequest request;
+    request.model = model;
+    request.session_id = "same-client-session";
+    request.prompt = "identical prefix across vendors";
+    request.max_tokens = 2;
+    const auto result = scheduler.Generate(std::move(request)).get();
+    REQUIRE_FALSE(result.no_backend);
+    REQUIRE(result.model_id == model);
+    REQUIRE(result.cached_prompt_tokens == 0);
+  }
+  REQUIRE(amd->position_violations == 0);
+  REQUIRE(nvidia->position_violations == 0);
+}

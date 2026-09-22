@@ -1,4 +1,5 @@
 #include "server/http/http_server.h"
+#include <yaml-cpp/yaml.h>
 
 #include "server/http/completion_payload.h"
 #include "server/http/model_json.h"
@@ -2205,40 +2206,25 @@ void HttpServer::HandleClient(ClientSession &session) {
                                      "Service Unavailable"));
       return;
     }
-    std::string path_value;
-    std::string backend_hint;
-    std::string requested_id;
-    std::string requested_format = "auto";
+    ModelLoadSpec spec;
     bool set_default = false;
     try {
       auto j = json::parse(body);
-      if (j.contains("path") && j["path"].is_string()) {
-        path_value = j["path"].get<std::string>();
+      // JSON is a YAML subset. Both ingress paths use the same typed parser.
+      if (j.contains("format") &&
+          (!j["format"].is_string() ||
+           NormalizeModelFormat(j["format"].get<std::string>()).empty())) {
+        throw std::invalid_argument("invalid model format");
       }
-      if (j.contains("backend") && j["backend"].is_string()) {
-        backend_hint = j["backend"].get<std::string>();
-      }
-      if (j.contains("id") && j["id"].is_string()) {
-        requested_id = j["id"].get<std::string>();
-      }
-      if (j.contains("format") && j["format"].is_string()) {
-        requested_format = j["format"].get<std::string>();
-      }
-      if (j.contains("default")) {
-        if (j["default"].is_boolean()) {
-          set_default = j["default"].get<bool>();
-        } else if (j["default"].is_string()) {
-          std::string val = j["default"].get<std::string>();
-          for (auto &ch : val) {
-            ch =
-                static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-          }
-          set_default = (val == "true" || val == "1" || val == "yes");
-        }
-      }
-    } catch (const json::exception &ex) {
-      LogJsonParseFailure("admin.models.post", ex);
+      spec = ParseModelLoadSpec(YAML::Load(j.dump()));
+      set_default = spec.make_default;
+    } catch (const std::exception &ex) {
+      SendAll(session,
+              BuildResponse(BuildErrorBody(ex.what()), 400, "Bad Request"));
+      return;
     }
+    const auto &path_value = spec.path;
+    const auto &requested_format = spec.format;
     if (path_value.empty()) {
       SendAll(session, BuildResponse(BuildErrorBody("path is required"), 400,
                                      "Bad Request"));
@@ -2250,10 +2236,20 @@ void HttpServer::HandleClient(ClientSession &session) {
                                      400, "Bad Request"));
       return;
     }
-    auto id = router->LoadModel(path_value, backend_hint, requested_id,
-                                requested_format);
+    auto id = router->LoadModel(spec);
     if (id.empty()) {
       const std::string load_error = router->LastLoadError();
+      if (HasPrefix(load_error, "model_conflict:") ||
+          HasPrefix(load_error, "placement_")) {
+        const bool conflict = HasPrefix(load_error, "model_conflict:");
+        SendAll(session,
+                BuildResponse(
+                    json({{"error", "load_rejected"}, {"reason", load_error}})
+                        .dump(),
+                    conflict ? 409 : 422,
+                    conflict ? "Conflict" : "Unprocessable Entity"));
+        return;
+      }
       if (HasPrefix(load_error, "backend_policy_violation:")) {
         const std::string reason =
             StripPrefix(load_error, "backend_policy_violation:");

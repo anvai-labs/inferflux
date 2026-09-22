@@ -7,6 +7,7 @@
 #include "server/metrics/metrics.h"
 #include <cctype>
 
+#include "runtime/backends/llama/llama_device_placement.h"
 #include <llama.h>
 
 #include <algorithm>
@@ -335,6 +336,15 @@ LlamaCppBackend::~LlamaCppBackend() {
   }
 }
 
+DevicePlacement LlamaCppBackend::Placement() const {
+  BackendStateLock lock(backend_state_mutex_);
+  return placement_;
+}
+std::string LlamaCppBackend::LoadError() const {
+  BackendStateLock lock(backend_state_mutex_);
+  return load_error_;
+}
+
 bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
                                 const LlamaBackendConfig &config) {
   BackendStateLock lock(backend_state_mutex_);
@@ -345,13 +355,49 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
     return false;
   }
   llama_model_params model_params = llama_model_default_params();
-  model_params.n_gpu_layers = config.gpu_layers;
+  load_error_.clear();
+  placement_ = {};
+  placement_.requested = config.device;
+  placement_.requested_gpu_layers = config.gpu_layers;
+  placement_.context_size = config.ctx_size;
+  placement_.max_parallel_sequences = config.max_parallel_sequences;
+  placement_.kv_cache_type = config.llama_kv_cache_type;
+  model_params.n_gpu_layers = config.gpu_layers == -1
+                                  ? std::numeric_limits<int>::max()
+                                  : config.gpu_layers;
+  std::array<ggml_backend_dev_t, 2> devices{nullptr, nullptr};
+  if (!config.device.empty()) {
+    devices[0] = ResolveLlamaDevice(config.device, &load_error_);
+    if (!devices[0]) {
+      log::Error("llama_backend", load_error_);
+      return false;
+    }
+    model_params.devices = devices.data();
+    model_params.split_mode = LLAMA_SPLIT_MODE_NONE;
+    model_params.main_gpu = 0; // index in the explicitly restricted device list
+  } else if (config.gpu_layers == 0) {
+    model_params.devices = devices.data(); // empty list: CPU only
+  }
+  if (config.kv_cache_type_explicit && config.llama_kv_cache_type != "f16" &&
+      !config.use_flash_attention) {
+    load_error_ = "placement_invalid: quantized KV requires flash attention";
+    return false;
+  }
 
   model_ =
       llama_model_load_from_file(model_path.string().c_str(), model_params);
   if (!model_) {
     log::Error("llama_backend",
                "failed to load model from " + model_path.string());
+    return false;
+  }
+
+  if (!ObserveLlamaWeightPlacement(model_, devices[0], &placement_,
+                                   &load_error_)) {
+    log::Error("llama_backend", load_error_);
+    llama_model_free(model_);
+    model_ = nullptr;
+    placement_.state = "error";
     return false;
   }
 
@@ -384,6 +430,9 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
   context_ = llama_init_from_model(model_, ctx_params);
   if (!context_) {
     log::Error("llama_backend", "failed to create context");
+    llama_model_free(model_);
+    model_ = nullptr;
+    placement_.state = "error";
     return false;
   }
   vocab_ = llama_model_get_vocab(model_);
@@ -392,6 +441,11 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
     return false;
   }
   n_vocab_ = llama_vocab_n_tokens(vocab_);
+  placement_.context_size = static_cast<int>(llama_n_ctx(context_));
+  placement_.max_parallel_sequences =
+      static_cast<int>(llama_n_seq_max(context_));
+  if (!config.device_explicit)
+    placement_.requested.clear();
   config_ = config;
 
   // Scheduler admission reads each backend's SequenceCapacity(), rather than

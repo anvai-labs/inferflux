@@ -83,6 +83,21 @@ json BuildModelIdentityJson(const ModelInfo &info) {
       {"ready", info.ready},
       {"capabilities", BuildCapabilitiesJson(info.capabilities)},
   };
+  const auto &p = info.placement;
+  model["placement"] = {
+      {"requested", p.requested},
+      {"effective", p.effective},
+      {"vendor", p.vendor},
+      {"device_name", p.name},
+      {"stable_id", p.stable_id.empty() ? json(nullptr) : json(p.stable_id)},
+      {"state", p.state},
+      {"gpu_weight_bytes", p.gpu_weight_bytes},
+      {"cpu_weight_bytes", p.cpu_weight_bytes},
+      {"gpu_layer_count", p.gpu_layer_count},
+      {"requested_gpu_layers", p.requested_gpu_layers},
+      {"context_size", p.context_size},
+      {"max_parallel_sequences", p.max_parallel_sequences},
+      {"kv_cache_type", p.kv_cache_type}};
   // GGUF metadata (Ollama-style model details).
   const auto &g = info.gguf;
   if (!g.architecture.empty() || g.parameter_count > 0) {

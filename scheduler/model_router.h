@@ -1,6 +1,8 @@
 #pragma once
 
+#include "model/model_load_spec.h"
 #include "runtime/backends/backend_capabilities.h"
+#include "runtime/backends/common/device_placement.h"
 
 #include <memory>
 #include <string>
@@ -34,6 +36,7 @@ struct ModelInfo {
   std::string backend_fallback_reason; // Optional fallback explanation.
   bool ready{false}; // True when the model is loaded and serving.
   BackendCapabilities capabilities{};
+  DevicePlacement placement;
   // Legacy alias kept for compatibility with older checks/callers.
   bool supports_structured_output{false};
 
@@ -46,15 +49,15 @@ struct ModelInfo {
   // GGUF model metadata (populated from GGUF KV during load).
   // Enables Ollama-style `show` with architecture, quantization, and context.
   struct GgufMetadata {
-    std::string architecture;      // "qwen2", "llama", "gemma", etc.
-    std::string quantization;      // "Q4_K_M", "Q6_K", "F16", etc.
-    int64_t parameter_count{0};    // Total parameters (approx).
-    int context_length{0};         // max_position_embeddings.
-    int embedding_length{0};       // hidden_size.
-    int num_layers{0};             // num_hidden_layers.
-    int num_heads{0};              // num_attention_heads.
-    int num_kv_heads{0};           // num_key_value_heads (GQA).
-    std::string chat_template;     // Jinja2 template from metadata.
+    std::string architecture;   // "qwen2", "llama", "gemma", etc.
+    std::string quantization;   // "Q4_K_M", "Q6_K", "F16", etc.
+    int64_t parameter_count{0}; // Total parameters (approx).
+    int context_length{0};      // max_position_embeddings.
+    int embedding_length{0};    // hidden_size.
+    int num_layers{0};          // num_hidden_layers.
+    int num_heads{0};           // num_attention_heads.
+    int num_kv_heads{0};        // num_key_value_heads (GQA).
+    std::string chat_template;  // Jinja2 template from metadata.
   };
   GgufMetadata gguf{};
 };
@@ -90,6 +93,13 @@ public:
                                 const std::string &backend_hint = "",
                                 const std::string &requested_id = "",
                                 const std::string &model_format = "auto") = 0;
+  virtual std::string LoadModel(const ModelLoadSpec &spec) {
+    // Legacy/test implementations must never silently discard new fields.
+    if (spec.HasOverrides())
+      return "";
+    return LoadModel(spec.path, spec.backend, spec.id, spec.format);
+  }
+  virtual void SetMinimumSequenceCapacity(int) {}
   virtual std::string LastLoadError() const { return ""; }
   virtual bool UnloadModel(const std::string &id) = 0;
   virtual bool SetDefaultModel(const std::string &model_id) = 0;

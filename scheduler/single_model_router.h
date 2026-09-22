@@ -7,6 +7,7 @@
 #include <chrono>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -44,6 +45,8 @@ public:
                         const std::string &backend_hint = "",
                         const std::string &requested_id = "",
                         const std::string &model_format = "auto") override;
+  std::string LoadModel(const ModelLoadSpec &spec) override;
+  void SetMinimumSequenceCapacity(int capacity) override;
   bool UnloadModel(const std::string &id) override;
   ModelInfo *Resolve(const std::string &requested_model) override;
   ModelInfo *ResolveExact(const std::string &model_id) override;
@@ -71,10 +74,13 @@ private:
   std::vector<std::string>
   BuildBackendCandidates(const std::string &backend_hint) const;
 
+  std::mutex load_mutex_; // serialize admission and duplicate checks
   mutable std::mutex mutex_;
   std::unordered_map<std::string, Entry> models_;
   std::string default_model_id_;
   std::string last_load_error_;
+  int minimum_sequence_capacity_{0};
+  std::set<std::string> retired_ids_;
   LlamaBackendConfig default_backend_config_{};
   std::string default_backend_hint_{"cpu"};
   std::vector<std::string> backend_priority_{"cpu"};

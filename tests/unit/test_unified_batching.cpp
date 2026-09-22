@@ -3,8 +3,11 @@
 #include "scheduler/single_model_router.h"
 #include "server/metrics/metrics.h"
 #include <catch2/catch_amalgamated.hpp>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -1432,4 +1435,74 @@ TEST_CASE(
   REQUIRE(results[0].completion_tokens == 0);
   REQUIRE(req.accumulated_output.empty());
   REQUIRE(ReadEmptyGenerationsTotal() - empty_before == 1);
+}
+
+TEST_CASE("Distinct verified devices execute concurrently and isolate failure",
+          "[unified_batch][placement]") {
+  struct Rendezvous {
+    std::mutex mutex;
+    std::condition_variable cv;
+    int entered{0};
+    bool overlapped{false};
+  } rendezvous;
+  class PlacedBackend : public MockUnifiedBackend {
+  public:
+    PlacedBackend(Rendezvous &r, std::string device, bool fail)
+        : rendezvous_(r), device_(std::move(device)), fail_(fail) {}
+    DevicePlacement Placement() const override {
+      DevicePlacement p;
+      p.effective = device_;
+      p.state = "verified_weights";
+      return p;
+    }
+    std::vector<UnifiedBatchOutput>
+    ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override {
+      if (!entered_) {
+        entered_ = true;
+        std::unique_lock<std::mutex> lock(rendezvous_.mutex);
+        ++rendezvous_.entered;
+        rendezvous_.cv.notify_all();
+        if (rendezvous_.cv.wait_for(lock, std::chrono::milliseconds(500), [&] {
+              return rendezvous_.overlapped || rendezvous_.entered == 2;
+            }))
+          rendezvous_.overlapped = true;
+        --rendezvous_.entered;
+        rendezvous_.cv.notify_all();
+      }
+      if (fail_)
+        throw std::runtime_error("simulated device allocation failure");
+      return MockUnifiedBackend::ExecuteUnifiedBatch(inputs);
+    }
+
+  private:
+    Rendezvous &rendezvous_;
+    std::string device_;
+    bool fail_;
+    bool entered_{false};
+  };
+  const bool fail_amd = GENERATE(false, true);
+  auto amd = std::make_shared<PlacedBackend>(rendezvous, "rocm:0", fail_amd);
+  auto nvidia = std::make_shared<PlacedBackend>(rendezvous, "cuda:0", false);
+  SimpleTokenizer tokenizer;
+  BatchExecutor executor(&tokenizer, std::make_shared<CPUDeviceContext>(),
+                         nullptr, nullptr, nullptr);
+  InferenceRequest a, b;
+  int id = 0;
+  for (auto *req : {&a, &b}) {
+    req->model = std::to_string(id);
+    req->sequence_id = id++;
+    req->phase = RequestPhase::kPrefill;
+    req->n_past = 0;
+    req->bpe_prompt_tokens = {1, 2, 3};
+    req->max_tokens = 2;
+  }
+  RequestBatch batch;
+  batch.requests = {&a, &b};
+  const auto results = executor.ExecuteBatch(batch, {amd, nvidia});
+  REQUIRE(rendezvous.overlapped);
+  REQUIRE(results.size() == 2);
+  REQUIRE(results[0].no_backend == fail_amd);
+  REQUIRE_FALSE(results[1].no_backend);
+  REQUIRE(results[1].model_id == "1");
+  REQUIRE_FALSE(results[1].completion.empty());
 }

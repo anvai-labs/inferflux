@@ -3,6 +3,8 @@
 #include "runtime/backends/llama/llama_cpp_backend.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
+#include <future>
+#include <map>
 
 #include <nlohmann/json.hpp>
 
@@ -315,6 +317,93 @@ BatchExecutor::BatchExecutor(
 std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     const RequestBatch &batch,
     const std::vector<std::shared_ptr<LlamaCppBackend>> &backend_overrides) {
+  // Keep the existing per-backend execution path, but run independent verified
+  // devices concurrently within an admitted batch. One task per device keeps
+  // same-device models serialized; no process visibility settings are changed.
+  // SpeculativeDecoder is shared and has no cross-device concurrency contract.
+  struct DeviceBatch {
+    RequestBatch batch;
+    std::vector<std::shared_ptr<LlamaCppBackend>> backends;
+    std::vector<size_t> indices;
+  };
+  std::map<std::string, DeviceBatch> device_batches;
+  bool all_placed = !speculative_decoder_;
+  for (size_t i = 0; all_placed && i < batch.requests.size(); ++i) {
+    auto backend =
+        i < backend_overrides.size() ? backend_overrides[i] : nullptr;
+    if (!backend)
+      backend = ResolveBackend(batch.requests[i]->model, nullptr);
+    const auto placement = backend ? backend->Placement() : DevicePlacement{};
+    if (!backend || placement.state != "verified_weights" ||
+        placement.effective.empty()) {
+      all_placed = false;
+      break;
+    }
+    auto &group = device_batches[placement.effective];
+    group.batch.batch_id = batch.batch_id;
+    group.batch.requests.push_back(batch.requests[i]);
+    group.backends.push_back(std::move(backend));
+    group.indices.push_back(i);
+  }
+  if (all_placed && device_batches.size() > 1) {
+    std::vector<std::future<std::vector<InferenceResult>>> tasks;
+    for (auto &[device, group] : device_batches) {
+      tasks.push_back(std::async(std::launch::async, [this, group, device] {
+        const auto started = std::chrono::steady_clock::now();
+        struct Diagnostic {
+          std::function<void()> emit;
+          ~Diagnostic() { emit(); }
+        } diagnostic{[&] {
+          const char *enabled = std::getenv("INFERFLUX_PLACEMENT_DIAGNOSTICS");
+          if (!enabled || std::string(enabled) != "1")
+            return;
+          json ids = json::array();
+          for (const auto *request : group.batch.requests)
+            ids.push_back(request->client_request_id);
+          const auto ended = std::chrono::steady_clock::now();
+          log::Info("placement_execution",
+                    json({{"scope", "host_backend_call"},
+                          {"device", device},
+                          {"request_ids", ids},
+                          {"start_ns",
+                           std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               started.time_since_epoch())
+                               .count()},
+                          {"end_ns",
+                           std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               ended.time_since_epoch())
+                               .count()}})
+                        .dump());
+        }};
+        try {
+          return ExecuteBatch(group.batch, group.backends);
+        } catch (const std::exception &) {
+          std::vector<InferenceResult> failed(group.batch.requests.size());
+          for (size_t i = 0; i < failed.size(); ++i) {
+            auto &request = *group.batch.requests[i];
+            failed[i].no_backend = true;
+            failed[i].model_id = request.resolved_model.empty()
+                                     ? request.model
+                                     : request.resolved_model;
+            failed[i].completion = "backend execution failed";
+            request.phase = RequestPhase::kFinished;
+            request.fairness.yielded = false;
+            request.cache_prefill_complete = false;
+            request.cache_reused_tokens = 0;
+          }
+          return failed;
+        }
+      }));
+    }
+    std::vector<InferenceResult> results(batch.requests.size());
+    size_t task = 0;
+    for (const auto &[device, group] : device_batches) {
+      auto responses = tasks[task++].get();
+      for (size_t j = 0; j < group.indices.size(); ++j)
+        results[group.indices[j]] = std::move(responses[j]);
+    }
+    return results;
+  }
   std::size_t n = batch.requests.size();
   std::vector<InferenceResult> results(n);
   std::vector<bool> handled(n, false);

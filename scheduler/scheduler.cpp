@@ -738,6 +738,9 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
         std::min<size_t>(kMaxSequenceSlots, static_cast<size_t>(kv_capacity));
   }
 
+  if (router_)
+    router_->SetMinimumSequenceCapacity(static_cast<int>(slot_capacity));
+
   BatchExecutor::UnifiedBatchTuning tuning;
   tuning.decode_burst_tokens = config_.decode_burst_tokens;
   tuning.chunked_prefill_tokens = config_.chunked_prefill_tokens;
