@@ -49,12 +49,14 @@ add_library(inferflux_core STATIC
   runtime/backends/cpu/cpu_backend.cpp
   runtime/backends/cpu/cpu_backend.h
   runtime/backends/cpu/llama_cpp_backend.h
+  runtime/backends/llama/llama_device_placement.cpp
   runtime/backends/llama/llama_cpp_backend.cpp
   runtime/backends/llama/llama_cpp_backend.h
   runtime/backends/native/native_inference_runtime.h
   runtime/backends/cuda/native/dispatch_operator_health.cpp
   runtime/backends/cuda/native/dispatch_operator_health.h
   runtime/backends/cuda/native/native_bootstrap_config.cpp
+  model/model_load_spec.cpp
   model/tokenizer_factory.cpp
   model/tokenizer_factory.h
   runtime/backends/backend_capabilities.cpp
@@ -168,6 +170,7 @@ add_library(inferflux_core STATIC
   server/cpu_quantization_detector.h
   server/policy/guardrail.cpp
   server/policy/guardrail.h
+  server/startup_advisor_rocm.cpp
   server/startup_advisor.cpp
   server/startup_advisor.h
   policy/policy_store.cpp
@@ -526,7 +529,30 @@ set(GGML_ALL_WARNINGS OFF CACHE BOOL "" FORCE)
 # NOTE: LLAMA_CUDA, GGML_HIP, LLAMA_METAL, and LLAMA_BLAS are set by the
 # hardware-detection blocks above. Do not override them here; stale resets can
 # silently disable an otherwise detected accelerator.
+# The pinned CUDA and HIP implementations export the same registration symbol.
+# Use upstream's RTLD_LOCAL modules so both vendor registries remain distinct.
+if(ENABLE_CUDA AND CUDAToolkit_FOUND AND ENABLE_ROCM AND GGML_HIP)
+  set(GGML_NATIVE OFF CACHE BOOL "Portable CPU module in mixed builds" FORCE)
+  set(GGML_BACKEND_DL ON CACHE BOOL "Separate mixed-vendor backend modules" FORCE)
+  set(BUILD_SHARED_LIBS ON CACHE BOOL "Required by GGML_BACKEND_DL" FORCE)
+endif()
 add_subdirectory(external/llama.cpp EXCLUDE_FROM_ALL)
+if(GGML_BACKEND_DL)
+  foreach(_backend IN LISTS GGML_AVAILABLE_BACKENDS)
+    if(TARGET ${_backend})
+      set_target_properties(${_backend} PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+    endif()
+  endforeach()
+endif()
+if(ENABLE_CUDA AND CUDAToolkit_FOUND AND ENABLE_ROCM AND GGML_HIP
+   AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  foreach(_vendor_backend ggml-cuda ggml-hip)
+    target_link_options(${_vendor_backend} PRIVATE
+      "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml_backend_exports.map")
+    set_property(TARGET ${_vendor_backend} APPEND PROPERTY LINK_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml_backend_exports.map")
+  endforeach()
+endif()
 target_link_libraries(inferflux_core PUBLIC llama)
 target_include_directories(inferflux_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/include
@@ -730,6 +756,7 @@ add_executable(inferflux_tests
   tests/unit/test_http_server_admin_cache.cpp
   tests/unit/test_unified_batching.cpp
   tests/unit/test_lane_dispatcher.cpp
+  tests/unit/test_model_load_spec.cpp
   tests/unit/test_model_registry.cpp
   tests/unit/test_model_selection.cpp
   tests/unit/test_single_model_router.cpp
@@ -884,6 +911,8 @@ add_test(NAME LoggerTests COMMAND inferflux_tests "[logger]")
 set_tests_properties(LoggerTests PROPERTIES LABELS logger)
 add_test(NAME StructuredTests COMMAND inferflux_tests "[structured]")
 set_tests_properties(StructuredTests PROPERTIES LABELS structured)
+add_test(NAME ModelPlacementTests COMMAND inferflux_tests "[placement]")
+set_tests_properties(ModelPlacementTests PROPERTIES LABELS model_placement)
 add_test(NAME ModelRegistryTests COMMAND inferflux_tests "[model_registry]")
 set_tests_properties(ModelRegistryTests PROPERTIES LABELS model_registry)
 add_test(NAME ModelFormatTests COMMAND inferflux_tests "[model_format]")
@@ -894,6 +923,8 @@ add_test(NAME ModelIdentityTests COMMAND inferflux_tests "[model_identity]")
 set_tests_properties(ModelIdentityTests PROPERTIES LABELS model_identity)
 add_test(NAME EmbeddingsRoutingTests COMMAND inferflux_tests "[embeddings_routing]")
 set_tests_properties(EmbeddingsRoutingTests PROPERTIES LABELS embeddings_routing)
+add_test(NAME EmbeddingsAdmissionTests COMMAND inferflux_tests "[embeddings_admission]")
+set_tests_properties(EmbeddingsAdmissionTests PROPERTIES LABELS embeddings_admission)
 add_test(NAME StopSequenceTests COMMAND inferflux_tests "[stop_sequences]")
 set_tests_properties(StopSequenceTests PROPERTIES LABELS stop_sequences)
 if(ENABLE_CUDA AND CUDAToolkit_FOUND)
@@ -1029,6 +1060,11 @@ if(ENABLE_COVERAGE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
   endif()
   set(COVERAGE_FLAGS --coverage -O0 -fno-inline)
+  # Concurrent backend workers execute shared instrumented code. GCC's default
+  # non-atomic counters race and can produce negative gcov counts.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    list(APPEND COVERAGE_FLAGS -fprofile-update=atomic)
+  endif()
   target_compile_options(inferflux_core PUBLIC ${COVERAGE_FLAGS})
   target_compile_options(inferflux_tests PRIVATE ${COVERAGE_FLAGS})
   target_link_libraries(inferflux_core PUBLIC --coverage)
@@ -1086,6 +1122,15 @@ option(ENABLE_SBOM "Generate SBOM after build" ON)
 
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
+  add_test(NAME IntegrationProcessOwnership
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/process_helper_test.py)
+endif()
+if(Python3_Interpreter_FOUND)
+  add_test(NAME ModelLoadSpecStartupTests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/model_load_spec_startup_test.py $<TARGET_FILE:inferfluxd>)
+  add_test(NAME DualGpuAcceptanceContractTests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/dual_gpu_acceptance_test.py)
+
   # INFERFLUX_SERVER_BIN tells integration tests which binary to launch.
   # CMake always knows the correct path (CMAKE_BINARY_DIR/inferfluxd), so we
   # inject it as a ctest environment variable — this makes the tests work

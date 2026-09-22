@@ -8,6 +8,7 @@ namespace inferflux {
 // Keep this small and backend-agnostic so HTTP/scheduler code can gate
 // requests without depending on backend implementation details.
 struct BackendCapabilities {
+  bool supports_generation{true};
   bool supports_streaming{true};
   bool supports_logprobs{true};
   bool supports_structured_output{true};
@@ -20,6 +21,7 @@ struct BackendCapabilities {
 
 // Feature requirements extracted from a request.
 struct BackendFeatureRequirements {
+  bool needs_generation{false};
   bool needs_streaming{false};
   bool needs_logprobs{false};
   bool needs_structured_output{false};

@@ -7,6 +7,7 @@ namespace inferflux {
 class CudaDeviceStrategy : public GpuDeviceStrategy {
 public:
   bool Initialize() override;
+  bool Initialize(int ordinal) override;
   bool IsAvailable() const override;
   GpuDeviceInfo GetDeviceInfo() const override;
   LlamaBackendTarget Target() const override {

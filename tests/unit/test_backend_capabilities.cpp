@@ -68,3 +68,17 @@ TEST_CASE("CheckBackendCapabilities rejects unsupported vision",
   REQUIRE(result.missing_feature == "vision");
   REQUIRE(result.reason.find("image inputs") != std::string::npos);
 }
+
+TEST_CASE("Embedding-only models reject plain generation before execution",
+          "[backend_capabilities][embeddings_admission]") {
+  BackendCapabilities capabilities;
+  capabilities.supports_generation = false;
+  const auto generation = CheckBackendCapabilities(
+      capabilities,
+      BuildGenerationFeatureRequirements(false, false, false, false));
+  REQUIRE_FALSE(generation.supported);
+  REQUIRE(generation.missing_feature == "generation");
+  REQUIRE(CheckBackendCapabilities(capabilities,
+                                   BuildEmbeddingFeatureRequirements())
+              .supported);
+}

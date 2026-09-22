@@ -17,6 +17,11 @@ on:
       - 'config/server.rocm.yaml'
   workflow_dispatch:
     inputs:
+      same_process_dual_gpu:
+        description: 'Run isolated same-process CUDA/ROCm and Sandhi setup checks (not C5 acceptance)'
+        type: boolean
+        default: false
+        required: false
       frozen_cache_acceptance:
         description: 'Replay the pinned five-request Qwen DATA bundle on isolated CUDA'
         type: boolean
@@ -225,17 +230,63 @@ jobs:
           if-no-files-found: ignore
           retention-days: 30
 
+  same-process-dual-gpu:
+    name: Same-process CUDA and ROCm setup gate
+    needs: [rocm-runtime]
+    if: ${{ vars.INFERFLUX_ENABLE_DUAL_GPU_GATE == 'true' && github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.same_process_dual_gpu }}
+    runs-on: [self-hosted, linux, x64, gpu, cuda, rocm, dual-gpu]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          clean: true
+      - name: Configure clean mixed build
+        run: |
+          cmake -S . -B build-ci-dual \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CUDA_ARCHITECTURES=89 \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -DCMAKE_HIP_ARCHITECTURES=gfx1201 \
+            -DENABLE_CUDA=ON -DENABLE_ROCM=ON \
+            -DENABLE_MPS=OFF -DENABLE_VULKAN=OFF -DENABLE_BLAS=OFF \
+            -DENABLE_MTMD=OFF -DENABLE_SBOM=OFF
+      - name: Build both vendor modules and one server
+        run: cmake --build build-ci-dual -j4 --target inferfluxd
+      - name: Same-process placement, concurrency and gateway accounting
+        env:
+          DUAL_CUDA_MODEL_PATH: ${{ vars.INFERFLUX_DUAL_CUDA_MODEL_PATH }}
+          DUAL_CUDA_MODEL_SHA256: ${{ vars.INFERFLUX_DUAL_CUDA_MODEL_SHA256 }}
+          DUAL_ROCM_MODEL_PATH: ${{ vars.INFERFLUX_DUAL_ROCM_MODEL_PATH }}
+          DUAL_ROCM_MODEL_SHA256: ${{ vars.INFERFLUX_DUAL_ROCM_MODEL_SHA256 }}
+          DUAL_SANDHI_BINARY: ${{ vars.INFERFLUX_GPU_CACHE_SANDHI_BINARY }}
+          DUAL_SANDHI_SHA256: ${{ vars.INFERFLUX_GPU_CACHE_SANDHI_SHA256 }}
+          DUAL_SANDHI_SOURCE: ${{ vars.INFERFLUX_GPU_CACHE_SANDHI_SOURCE }}
+        run: |
+          export PATH="/usr/lib/wsl/lib:/usr/local/cuda/bin:/opt/rocm/bin:$PATH"
+          python3 scripts/dual_gpu_acceptance.py
+      - name: Preserve sanitized results on success or failure
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: same-process-dual-gpu-${{ github.sha }}
+          path: build-ci-dual/dual-gpu-acceptance.json
+          if-no-files-found: warn
+          retention-days: 30
+
   gpu-gate-result:
     name: Dual-GPU gate result
     if: always()
     runs-on: ubuntu-latest
-    needs: [cuda-runtime, rocm-runtime]
+    needs: [cuda-runtime, rocm-runtime, same-process-dual-gpu]
     steps:
       - name: Report staged or enforced state
         env:
           GATE_ENABLED: ${{ vars.INFERFLUX_ENABLE_DUAL_GPU_GATE }}
           CUDA_RESULT: ${{ needs.cuda-runtime.result }}
           ROCM_RESULT: ${{ needs.rocm-runtime.result }}
+          SAME_PROCESS_REQUESTED: ${{ inputs.same_process_dual_gpu }}
+          SAME_PROCESS_RESULT: ${{ needs.same-process-dual-gpu.result }}
         run: |
           set -euo pipefail
           if [ "${GATE_ENABLED}" != "true" ]; then
@@ -244,3 +295,6 @@ jobs:
           fi
           test "${CUDA_RESULT}" = "success"
           test "${ROCM_RESULT}" = "success"
+          if [ "${SAME_PROCESS_REQUESTED}" = "true" ]; then
+            test "${SAME_PROCESS_RESULT}" = "success"
+          fi

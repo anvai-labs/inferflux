@@ -8,21 +8,23 @@
 
 namespace inferflux {
 
-bool CudaDeviceStrategy::Initialize() {
+bool CudaDeviceStrategy::Initialize() { return Initialize(0); }
+
+bool CudaDeviceStrategy::Initialize(int ordinal) {
 #ifdef INFERFLUX_HAS_CUDA
-  if (initialized_) {
+  if (initialized_ && info_.device_id == ordinal) {
     return true;
   }
 
   int device_count = 0;
   cudaError_t err = cudaGetDeviceCount(&device_count);
-  if (err != cudaSuccess || device_count == 0) {
+  if (err != cudaSuccess || ordinal < 0 || ordinal >= device_count) {
     log::Error("cuda_strategy", "No CUDA devices found");
     return false;
   }
 
   cudaDeviceProp prop;
-  err = cudaGetDeviceProperties(&prop, 0);
+  err = cudaGetDeviceProperties(&prop, ordinal);
   if (err != cudaSuccess) {
     log::Error("cuda_strategy", "Failed to get CUDA device properties");
     return false;
@@ -31,7 +33,7 @@ bool CudaDeviceStrategy::Initialize() {
   info_.device_name = prop.name;
   info_.arch = "sm_" + std::to_string(prop.major * 10 + prop.minor);
   info_.total_memory_mb = prop.totalGlobalMem / (1024 * 1024);
-  info_.device_id = 0;
+  info_.device_id = ordinal;
   // SM 8.0+ supports FlashAttention-2
   info_.supports_flash_attention = (prop.major >= 8);
   info_.flash_attention_version =
@@ -45,6 +47,7 @@ bool CudaDeviceStrategy::Initialize() {
 
   return true;
 #else
+  (void)ordinal;
   log::Error("cuda_strategy", "CUDA support not compiled in");
   return false;
 #endif

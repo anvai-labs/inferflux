@@ -82,28 +82,10 @@ bool ModelRegistry::ParseYaml(const std::string &yaml_text,
     if (!root["models"] || !root["models"].IsSequence()) {
       log::Warn("model_registry",
                 "registry yaml has no 'models' sequence; nothing to load");
-      return true; // treat empty registry as valid
+      return false; // malformed snapshots must not remove managed models
     }
     for (const auto &node : root["models"]) {
-      RegistryEntry e;
-      if (node["path"])
-        e.path = node["path"].as<std::string>();
-      if (node["id"])
-        e.id = node["id"].as<std::string>();
-      if (node["backend"])
-        e.backend = node["backend"].as<std::string>();
-      if (node["format"]) {
-        const auto requested_format = node["format"].as<std::string>();
-        const auto normalized_format = NormalizeModelFormat(requested_format);
-        if (!normalized_format.empty()) {
-          e.format = normalized_format;
-        } else {
-          log::Warn("model_registry",
-                    "invalid model format in registry entry; defaulting to "
-                    "auto",
-                    requested_format);
-        }
-      }
+      RegistryEntry e = ParseModelLoadSpec(node);
       if (e.path.empty()) {
         log::Warn("model_registry", "skipping registry entry with no path");
         continue;
@@ -120,12 +102,32 @@ bool ModelRegistry::ParseYaml(const std::string &yaml_text,
 int ModelRegistry::ApplyEntries(const std::vector<RegistryEntry> &entries) {
   // Build the desired path set from new entries.
   std::map<std::string, RegistryEntry> desired; // path → entry
+  std::set<std::string> ids;
   for (const auto &e : entries) {
+    bool duplicate =
+        desired.count(e.path) || (!e.id.empty() && !ids.insert(e.id).second);
+    for (const auto &[path, previous] : desired) {
+      std::error_code ec;
+      duplicate = duplicate || std::filesystem::equivalent(path, e.path, ec);
+    }
+    if (duplicate) {
+      log::Error("model_registry",
+                 "duplicate model ID or artifact; reload rejected");
+      return 0;
+    }
     desired[e.path] = e;
   }
 
   std::lock_guard<std::mutex> lock(managed_mutex_);
   int net = 0;
+  for (const auto &[path, spec] : specifications_) {
+    if (desired.count(path) && desired.at(path) != spec) {
+      log::Error("model_registry", "model specification changed; explicitly "
+                                   "remove the model before replacement: " +
+                                       path);
+      return 0; // atomic rejection: do not unload unrelated models
+    }
+  }
 
   // Unload models whose paths are no longer in the registry.
   std::vector<std::string> to_remove;
@@ -140,10 +142,11 @@ int ModelRegistry::ApplyEntries(const std::vector<RegistryEntry> &entries) {
       log::Info("model_registry",
                 "hot-unloaded model id=" + id + " path=" + path);
       --net;
+      specifications_.erase(path);
+      path_to_id_.erase(path);
     } else {
       log::Warn("model_registry", "failed to unload model id=" + id);
     }
-    path_to_id_.erase(path);
   }
 
   // Load models whose paths are new.
@@ -151,8 +154,7 @@ int ModelRegistry::ApplyEntries(const std::vector<RegistryEntry> &entries) {
     if (path_to_id_.count(path))
       continue; // already managed
 
-    auto assigned_id =
-        router_->LoadModel(entry.path, entry.backend, entry.id, entry.format);
+    auto assigned_id = router_->LoadModel(entry);
     if (assigned_id.empty()) {
       const std::string load_error = router_->LastLoadError();
       if (!load_error.empty()) {
@@ -164,6 +166,7 @@ int ModelRegistry::ApplyEntries(const std::vector<RegistryEntry> &entries) {
       continue;
     }
     path_to_id_[path] = assigned_id;
+    specifications_[path] = entry;
     log::Info("model_registry",
               "hot-loaded model id=" + assigned_id + " path=" + path);
     ++net;

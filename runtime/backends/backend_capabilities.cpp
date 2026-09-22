@@ -20,6 +20,7 @@ BackendFeatureRequirements BuildGenerationFeatureRequirements(
     bool needs_vision, bool needs_speculative_decoding,
     bool needs_fairness_preemption) {
   BackendFeatureRequirements requirements;
+  requirements.needs_generation = true;
   requirements.needs_streaming = needs_streaming;
   requirements.needs_logprobs = needs_logprobs;
   requirements.needs_structured_output = needs_structured_output;
@@ -38,6 +39,10 @@ BackendFeatureRequirements BuildEmbeddingFeatureRequirements() {
 CapabilityCheckResult
 CheckBackendCapabilities(const BackendCapabilities &capabilities,
                          const BackendFeatureRequirements &requirements) {
+  if (requirements.needs_generation && !capabilities.supports_generation) {
+    return Missing("generation",
+                   "Selected model does not support text generation");
+  }
   if (requirements.needs_structured_output &&
       !capabilities.supports_structured_output) {
     return Missing(

@@ -75,6 +75,11 @@ NativeGpuBackend::~NativeGpuBackend() = default;
 
 bool NativeGpuBackend::LoadModel(const std::filesystem::path &model_path,
                                  const LlamaBackendConfig &config) {
+  if (!config.device.empty()) {
+    log::Error("native_backend",
+               "Explicit device placement is not supported by native CUDA");
+    return false;
+  }
   const bool strict_native_execution =
       ParseBoolEnv("INFERFLUX_CUDA_STRICT", false);
   loaded_model_path_ = model_path;

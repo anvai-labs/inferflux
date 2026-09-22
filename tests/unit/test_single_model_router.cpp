@@ -143,3 +143,66 @@ TEST_CASE("SingleModelRouter keeps llama.cpp capability defaults",
 }
 
 } // namespace inferflux
+
+namespace inferflux {
+
+TEST_CASE("SingleModelRouter rejects duplicate loads before allocating",
+          "[single_model_router][placement]") {
+  SingleModelRouter router;
+  auto backend = std::make_shared<LlamaCppBackend>();
+  backend->ForceReadyForTests();
+  ModelInfo info;
+  info.id = "resident";
+  info.path = "/models/resident.gguf";
+  REQUIRE(router.RegisterModel(info, backend));
+  ModelLoadSpec spec;
+  spec.id = GENERATE("resident", "replica");
+  spec.path = "/models/resident.gguf";
+  spec.device = "cuda:0";
+  REQUIRE(router.LoadModel(spec).empty());
+  REQUIRE(router.LastLoadError().find("model_conflict:") == 0);
+  REQUIRE(router.ListModels().size() == 1);
+}
+
+TEST_CASE("SingleModelRouter refuses unload while a backend lease is held",
+          "[single_model_router][placement]") {
+  SingleModelRouter router;
+  auto backend = std::make_shared<LlamaCppBackend>();
+  backend->ForceReadyForTests();
+  ModelInfo info;
+  info.id = "busy";
+  REQUIRE(router.RegisterModel(info, backend));
+  REQUIRE_FALSE(router.UnloadModel(info.id));
+  auto lease = router.GetBackend(info.id);
+  backend.reset();
+  REQUIRE_FALSE(router.UnloadModel(info.id));
+  lease.reset();
+  REQUIRE(router.UnloadModel(info.id));
+}
+
+TEST_CASE("SingleModelRouter rejects wrong vendor and native selectors",
+          "[single_model_router][placement]") {
+  SingleModelRouter router;
+  ModelLoadSpec spec;
+  spec.path = "/missing.gguf";
+  spec.device = "rocm:0";
+  spec.backend = GENERATE("cpu", "llama_cpp_cuda", "inferflux_cuda");
+  REQUIRE(router.LoadModel(spec).empty());
+  REQUIRE_FALSE(router.LastLoadError().empty());
+  REQUIRE(router.ListModels().empty());
+}
+
+TEST_CASE("Hot loads cannot shrink the live scheduler sequence bound",
+          "[single_model_router][placement]") {
+  SingleModelRouter router;
+  router.SetMinimumSequenceCapacity(8);
+  ModelLoadSpec spec;
+  spec.path = "/missing.gguf";
+  spec.backend = "cpu";
+  spec.max_parallel_sequences = 2;
+  REQUIRE(router.LoadModel(spec).empty());
+  REQUIRE(router.LastLoadError().find("sequence capacity") !=
+          std::string::npos);
+}
+
+} // namespace inferflux

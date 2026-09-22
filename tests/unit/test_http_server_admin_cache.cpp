@@ -252,6 +252,146 @@ TEST_CASE("HttpServer model endpoints expose effective runtime policy",
   }
 }
 
+TEST_CASE("HttpServer admin model load preserves placement and resources",
+          "[http_server][placement]") {
+  class CapturingRouter : public SingleModelRouter {
+  public:
+    std::vector<ModelLoadSpec> loads;
+    std::string LoadModel(const ModelLoadSpec &spec) override {
+      loads.push_back(spec);
+      return spec.id;
+    }
+  };
+  SimpleTokenizer tokenizer;
+  auto router = std::make_shared<CapturingRouter>();
+  Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(), nullptr,
+                      router);
+  MetricsRegistry metrics;
+  auto auth = std::make_shared<ApiKeyAuth>();
+  auth->AddKey("admin-key", {"admin"});
+  HttpServer server("127.0.0.1", 0, &scheduler, auth, &metrics, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, nullptr,
+                    HttpServer::TlsConfig{}, 1);
+  const bool invalid = GENERATE(false, true);
+  const std::string body =
+      invalid
+          ? R"({"id":"amd","path":"/a.gguf","device":"rocm:-1"})"
+          : R"({"id":"amd","path":"/a.gguf","backend":"rocm","device":"rocm:1","context_size":4096,"gpu_layers":8,"max_parallel_sequences":2,"kv_cache_type":"f16"})";
+  int fds[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+  const std::string request =
+      "POST /v1/admin/models HTTP/1.1\r\nHost: localhost\r\nAuthorization: "
+      "Bearer admin-key\r\nContent-Type: application/json\r\nContent-Length: " +
+      std::to_string(body.size()) + "\r\n\r\n" + body;
+  REQUIRE(::write(fds[0], request.data(), request.size()) ==
+          static_cast<ssize_t>(request.size()));
+  REQUIRE(::shutdown(fds[0], SHUT_WR) == 0);
+  HttpServer::ClientSession session;
+  session.fd = fds[1];
+  server.HandleClient(session);
+  ::close(fds[1]);
+  const auto response = ReadAll(fds[0]);
+  ::close(fds[0]);
+  REQUIRE(response.find(invalid ? "400 Bad Request" : "200 OK") !=
+          std::string::npos);
+  if (invalid) {
+    REQUIRE(router->loads.empty());
+  } else {
+    REQUIRE(router->loads.size() == 1);
+    const auto &spec = router->loads.front();
+    REQUIRE(spec.device == "rocm:1");
+    REQUIRE(spec.context_size == 4096);
+    REQUIRE(spec.gpu_layers == 8);
+    REQUIRE(spec.max_parallel_sequences == 2);
+    REQUIRE(spec.kv_cache_type == "f16");
+  }
+}
+
+TEST_CASE("HTTP embeddings use scheduler slices and report evaluated tokens",
+          "[http_server][embeddings_admission]") {
+  class EmbeddingBackend : public BackendInterface {
+  public:
+    BackendCapabilities ReportCapabilities() const override {
+      BackendCapabilities caps;
+      caps.supports_generation = false;
+      return caps;
+    }
+    std::vector<std::size_t> sizes;
+    bool LoadModel(const std::filesystem::path &,
+                   const LlamaBackendConfig &) override {
+      return true;
+    }
+    std::string Name() const override { return "embedding_test"; }
+    std::vector<UnifiedBatchOutput>
+    ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &) override {
+      return {};
+    }
+    bool IsReady() const override { return true; }
+    int TokenCount(const std::string &) const override { return 999; }
+    int EmbeddingTokenCount(const std::string &) const override { return 7; }
+    std::vector<std::vector<float>>
+    EmbedBatch(const std::vector<std::string> &inputs) override {
+      sizes.push_back(inputs.size());
+      // Exercise valid HTTP half-close while the handler awaits the result.
+      std::this_thread::sleep_for(std::chrono::milliseconds(60));
+      return std::vector<std::vector<float>>(inputs.size(), {0.5f, 1.0f});
+    }
+  };
+  SimpleTokenizer tokenizer;
+  auto backend = std::make_shared<EmbeddingBackend>();
+  ModelInfo info;
+  info.id = "bge-small-en-v1.5";
+  info.backend = "cpu";
+  auto router = std::make_shared<SingleModelRouter>(backend, info);
+  Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(), nullptr,
+                      router);
+  MetricsRegistry metrics;
+  auto auth = std::make_shared<ApiKeyAuth>();
+  auth->AddKey("embedding-test-key", {"read"});
+  HttpServer server("127.0.0.1", 0, &scheduler, auth, &metrics, nullptr,
+                    nullptr, nullptr, nullptr, nullptr, nullptr,
+                    HttpServer::TlsConfig{}, 1);
+  auto rejected = SelectModelForRequest(
+      router.get(), info.id,
+      BuildGenerationFeatureRequirements(false, false, false, false),
+      ModelSelectionOptions{});
+  REQUIRE(rejected.status == ModelSelectionStatus::kUnsupported);
+  REQUIRE(rejected.missing_feature == "generation");
+  REQUIRE_FALSE(router->ResolveExact(info.id)->capabilities.supports_streaming);
+  const auto payload = json({{"model", info.id},
+                             {"input", std::vector<std::string>(33, "text")}})
+                           .dump();
+  int fds[2];
+  REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
+  const auto request =
+      std::string("POST /v1/embeddings HTTP/1.1\r\n") +
+      "Host: localhost\r\nAuthorization: Bearer embedding-test-key\r\n" +
+      "traceparent: 00-0123456789abcdef0123456789abcdef-0123456789abcdef-01\r\n"
+      "x-inferflux-client-request-id: embed-request\r\nContent-Length: " +
+      std::to_string(payload.size()) + "\r\n\r\n" + payload;
+  REQUIRE(::write(fds[0], request.data(), request.size()) ==
+          static_cast<ssize_t>(request.size()));
+  REQUIRE(::shutdown(fds[0], SHUT_WR) == 0);
+  HttpServer::ClientSession session;
+  session.fd = fds[1];
+  server.HandleClient(session);
+  ::close(fds[1]);
+  const auto response = ReadAll(fds[0]);
+  ::close(fds[0]);
+  REQUIRE(response.find("200 OK") != std::string::npos);
+  const auto body = json::parse(response.substr(response.find("\r\n\r\n") + 4));
+  REQUIRE(body["model"] == info.id);
+  REQUIRE(body["data"].size() == 33);
+  REQUIRE(body["data"][32]["index"] == 32);
+  REQUIRE(body["usage"]["prompt_tokens"] == 231);
+  REQUIRE(body["usage"]["total_tokens"] == 231);
+  REQUIRE_FALSE(body["usage"].contains("completion_tokens"));
+  REQUIRE(body["client_request_id"] == "embed-request");
+  REQUIRE(response.find("traceparent: 00-0123456789abcdef0123456789abcdef-") !=
+          std::string::npos);
+  REQUIRE(backend->sizes == std::vector<std::size_t>{32, 1});
+}
+
 TEST_CASE("HttpServer admin cache endpoint includes memory payload",
           "[http_server]") {
   SimpleTokenizer tokenizer;

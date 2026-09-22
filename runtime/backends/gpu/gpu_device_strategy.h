@@ -21,6 +21,7 @@ class GpuDeviceStrategy {
 public:
   virtual ~GpuDeviceStrategy() = default;
   virtual bool Initialize() = 0;
+  virtual bool Initialize(int ordinal) { return ordinal == 0 && Initialize(); }
   virtual bool IsAvailable() const = 0;
   virtual GpuDeviceInfo GetDeviceInfo() const = 0;
   virtual LlamaBackendTarget Target() const = 0;
