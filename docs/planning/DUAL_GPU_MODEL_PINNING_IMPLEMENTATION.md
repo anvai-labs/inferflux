@@ -37,6 +37,65 @@ existing service is changed by this example. Container/Helm operators must deplo
 the mixed binary **and its backend modules**, then mount a config using this schema;
 single-vendor images cannot implement this recipe.
 
+## Contract for consuming applications
+
+The consolidated deployment uses **one InferFlux origin on port 8080**. The example
+binds loopback; remote consumers use an authenticated gateway or an explicitly
+configured reachable address. The isolated acceptance harness uses 28085 to avoid
+replacing a running service. That test port is not part of the application contract.
+The requested final topology also moves the existing embedding model behind this
+origin. Keep 8090 live until embedding compatibility and mixed-workload admission
+are validated; the two-model example alone does not complete that migration.
+
+| Application setting | Contract |
+|---|---|
+| OpenAI-compatible base URL | `http://127.0.0.1:8080/v1` on the server host |
+| Discovery | Authenticated `GET /v1/models`; use the exact returned model ID |
+| Generation | `POST /v1/chat/completions` with an explicit `model` |
+| Example AMD model ID | `amd-model`, pinned to `rocm:0` |
+| Example NVIDIA model ID | `nvidia-model`, pinned to `cuda:0` |
+| Existing embedding model ID | `bge-small-en-v1.5`; target route `/v1/embeddings` on the same origin |
+| Authentication | Existing locally managed bearer credentials; do not copy keys into this document |
+| Correlation | Unique `x-inferflux-client-request-id` for each call |
+| Sessions | `x-inferflux-session-id`; use distinct IDs for Victor members and model histories |
+
+The model IDs above match the example configuration. Production artifact selection
+and final IDs must be recorded in the deployment configuration before migration;
+clients must not infer model identity from a port or a GPU vendor. Strict routing
+rejects an unavailable requested model rather than silently choosing the default.
+Both plain and streaming calls use the same URL and model IDs. For streaming, send
+`"stream": true, "stream_options": {"include_usage": true}` and consume the final
+usage chunk before `[DONE]`.
+
+`usage.prompt_tokens` includes the cached portion. Read
+`usage.prompt_tokens_details.cached_tokens` explicitly, including zero on a miss;
+fresh input is `prompt_tokens - cached_tokens`. `completion_tokens` counts output,
+and `total_tokens = prompt_tokens + completion_tokens`. Attribute usage to the
+resolved response `model` and request/session identity, not the listener or device.
+An interrupted stream without final usage is incomplete accounting, not zero usage.
+Cache token reporting alone does not establish executed backend reuse.
+
+Embedding requests use `{"model":"bge-small-en-v1.5","input":["text"]}`.
+Their response reports `usage.prompt_tokens` and `usage.total_tokens` (equal input
+counts); there are no generated completion tokens or SSE generation chunks.
+Do not apply the chat usage schema to embedding responses.
+
+**Embedding migration gap:** the current embedding handler selects through the
+shared router but calls the backend directly, outside the generation scheduler.
+The existing 8090 deployment also includes batching and model-selected pooling
+from commit `f0789a242`, absent from the develop base used here. A one-port migration
+must preserve those semantics and add bounded embedding admission with chat
+fairness on a shared GPU, cancellation/error isolation and token-accounting
+validation. Loading a third model or forwarding 8090 through a proxy is not proof
+that these scheduling requirements are met. Do not replace the working embedding
+service with this two-model implementation until those gaps are resolved.
+
+Sandhi retains its existing client-facing gateway address and needs only one
+InferFlux origin/tunnel with both model IDs allowed. Victor members select their
+assigned ID through Sandhi; they do not select an origin port per GPU. Retain the
+120-second buffered gateway deadline. Preserve wire, SQLite, C4 and dashboard
+correlations during migration; request/session accounting is not an OTEL trace.
+
 ## Placement and failure semantics
 
 The loader resolves a vendor registry and ordinal to a llama.cpp device handle,

@@ -3,7 +3,7 @@
 # This example is not an accepted production configuration.
 server:
   host: 127.0.0.1
-  http_port: 28085
+  http_port: 8080
 models:
   - id: amd-model
     path: /models/amd-model.gguf

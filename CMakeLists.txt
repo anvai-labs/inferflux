@@ -1058,6 +1058,11 @@ if(ENABLE_COVERAGE)
     set(CMAKE_BUILD_TYPE Debug CACHE STRING "" FORCE)
   endif()
   set(COVERAGE_FLAGS --coverage -O0 -fno-inline)
+  # Concurrent backend workers execute shared instrumented code. GCC's default
+  # non-atomic counters race and can produce negative gcov counts.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    list(APPEND COVERAGE_FLAGS -fprofile-update=atomic)
+  endif()
   target_compile_options(inferflux_core PUBLIC ${COVERAGE_FLAGS})
   target_compile_options(inferflux_tests PRIVATE ${COVERAGE_FLAGS})
   target_link_libraries(inferflux_core PUBLIC --coverage)
