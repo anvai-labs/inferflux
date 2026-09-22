@@ -63,6 +63,8 @@ is null and fails the strict setup gate; a device label is never substituted.
 
 Mixed builds use upstream `GGML_BACKEND_DL` modules with local symbol scope:
 the pinned CUDA and HIP libraries otherwise export the same registration symbol.
+Linux mixed modules export only the upstream loader entry points. This also
+hides shared GNU-unique template statics, which can escape `RTLD_LOCAL` isolation.
 Modules are colocated with the build's executable, and upstream installs them in
 `bin`. Portable CPU-module compilation disables `GGML_NATIVE` in mixed builds.
 The CUDA and HIP startup-advisor probes are separate translation units because

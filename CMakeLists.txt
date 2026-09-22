@@ -544,6 +544,15 @@ if(GGML_BACKEND_DL)
     endif()
   endforeach()
 endif()
+if(ENABLE_CUDA AND CUDAToolkit_FOUND AND ENABLE_ROCM AND GGML_HIP
+   AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  foreach(_vendor_backend ggml-cuda ggml-hip)
+    target_link_options(${_vendor_backend} PRIVATE
+      "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml_backend_exports.map")
+    set_property(TARGET ${_vendor_backend} APPEND PROPERTY LINK_DEPENDS
+      "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ggml_backend_exports.map")
+  endforeach()
+endif()
 target_link_libraries(inferflux_core PUBLIC llama)
 target_include_directories(inferflux_core PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/external/llama.cpp/include
