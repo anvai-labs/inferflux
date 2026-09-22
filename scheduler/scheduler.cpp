@@ -793,7 +793,12 @@ Scheduler::Scheduler(SimpleTokenizer &tokenizer,
 
 Scheduler::~Scheduler() {
   // Stop eviction worker thread first.
-  eviction_running_ = false;
+  {
+    // Pair the predicate update with the waiter's mutex. An atomic flag alone
+    // can lose this notification between the predicate check and wait.
+    std::lock_guard<std::mutex> lock(eviction_mutex_);
+    eviction_running_ = false;
+  }
   eviction_cv_.notify_all();
   if (eviction_thread_.joinable()) {
     eviction_thread_.join();

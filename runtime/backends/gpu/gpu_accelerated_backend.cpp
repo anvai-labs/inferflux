@@ -44,12 +44,6 @@ bool GpuAcceleratedBackend::InitializeDevice(const LlamaBackendConfig &config,
 
   LlamaBackendConfig tuned =
       TuneLlamaBackendConfig(strategy_->Target(), config);
-  if (tuned.device.empty() && tuned.gpu_layers != 0) {
-    if (strategy_->Target() == LlamaBackendTarget::kCuda)
-      tuned.device = "cuda:" + std::to_string(ordinal);
-    if (strategy_->Target() == LlamaBackendTarget::kRocm)
-      tuned.device = "rocm:" + std::to_string(ordinal);
-  }
   strategy_->RecordMetrics(tuned);
 
   if (tuned_out) {

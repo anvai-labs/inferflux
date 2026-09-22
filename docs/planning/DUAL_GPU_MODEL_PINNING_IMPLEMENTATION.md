@@ -130,8 +130,10 @@ the evaluated tokens after truncation. The existing generation context is separa
 placement metadata does not measure the lazily allocated embedding context's VRAM.
 Allocation failure in an embedding slice returns an error without failing chat.
 Cancellation is checked between slices; an active GPU call is not interrupted.
-POSIX HTTP hangup/error detection cancels remaining work and preserves valid
-read-side half-closes. Windows disconnect detection and late accounting on failed
+POSIX socket errors cancel remaining work, as do Linux full-hangup indications.
+Darwin reports a hangup even for valid read-side half-closes, so that indication
+alone cannot cancel work there. A clean peer close may remain undetected until
+the response write; Windows disconnect detection and late accounting on failed
 or disconnected calls still need acceptance coverage. Request-ID and W3C trace
 headers work directly; neither requires Sandhi.
 
@@ -251,6 +253,20 @@ The setup harness always reports `c5_accepted=false` and `actual_victor_cohort=f
 Request correlations and usage records alone are not distributed OTEL traces.
 Run the multi-model Victor acceptance both directly against InferFlux and through
 Sandhi; direct acceptance must not depend on gateway-only headers or state.
+
+### Review corrections before promotion
+
+The September 22 review reproduced a macOS HTTP half-close cancellation error,
+unrequested default pinning, and acceptance-harness false positives for wrong
+response models and direct request IDs. Regressions now retain the returned model
+identity, check every SSE frame, and compare direct correlation exactly. Omitted
+selectors preserve upstream default placement; only explicit selectors constrain
+devices. The original HTTP half-close regression is reused rather than duplicated.
+The macOS CPU suite also exposed a 30-second eviction-worker shutdown delay:
+changing its stop predicate under the waiter's mutex prevents lost notifications.
+Finally, a monitor shutdown timeout no longer skips owned-server cleanup; cleanup
+failures are reported separately without replacing the original execution failure.
+These are model-free checks and do not constitute hardware acceptance.
 
 ## Migration and rollback
 

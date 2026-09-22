@@ -202,6 +202,9 @@ def request(port, path, key="", payload=None, headers=None, stream=False):
         raw = response.read(1024 * 1024 + 1)
         require(len(raw) <= 1024 * 1024, "response_bound")
         correlation = response.getheader("x-inferflux-client-request-id")
+        expected_correlation = outgoing.get("x-inferflux-client-request-id")
+        if expected_correlation is not None:
+            require(correlation == expected_correlation, "request_correlation_mismatch")
         if stream:
             frames = [
                 json.loads(line[6:])
@@ -212,8 +215,15 @@ def request(port, path, key="", payload=None, headers=None, stream=False):
             require(
                 len(usages) == 1 and b"data: [DONE]" in raw, "stream_terminal_usage"
             )
-            return {"usage": usages[0]}, correlation
-        return json.loads(raw), correlation
+            require(
+                all(frame.get("model") == payload["model"] for frame in frames),
+                "response_model_mismatch",
+            )
+            return {"model": frames[-1]["model"], "usage": usages[0]}, correlation
+        decoded = json.loads(raw)
+        if path == "/v1/chat/completions":
+            require(decoded.get("model") == payload["model"], "response_model_mismatch")
+        return decoded, correlation
     finally:
         conn.close()
 
@@ -501,16 +511,20 @@ def main():
                 require(not health_failed.is_set(), "shared_health_during_run")
             finally:
                 stop_monitor.set()
-                if watcher.ident is not None:
-                    watcher.join(timeout=20)
-                    require(not watcher.is_alive(), "health_monitor_cleanup")
-                cleanup_failed = False
-                for child in reversed(children):
-                    try:
-                        child.stop()
-                    except Exception:
-                        cleanup_failed = True
-                require(not cleanup_failed, "owned_cleanup")
+                cleanup_failures = report["cleanup_failures"] = []
+                try:
+                    if watcher.ident is not None:
+                        watcher.join(timeout=20)
+                        if watcher.is_alive():
+                            cleanup_failures.append("health_monitor_cleanup")
+                except Exception:
+                    cleanup_failures.append("health_monitor_cleanup")
+                finally:
+                    for child in reversed(children):
+                        try:
+                            child.stop()
+                        except Exception:
+                            cleanup_failures.append("owned_cleanup")
     except Exception as error:
         report["supplemental_gate_passed"] = False
         report["failure"] = (
@@ -518,6 +532,9 @@ def main():
         )
     finally:
         signal.alarm(0)
+        if report.get("cleanup_failures"):
+            report["supplemental_gate_passed"] = False
+            report.setdefault("failure", "cleanup_failed")
         report["owned_processes_stopped"] = all(
             child.process.poll() is not None for child in children
         )

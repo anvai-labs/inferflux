@@ -2,8 +2,10 @@
 """Model-free rejection tests for the trusted same-process setup gate."""
 
 import importlib.util
+import json
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 from unittest import mock
 
@@ -13,6 +15,106 @@ import dual_gpu_acceptance as gate
 
 
 class DualGpuAcceptanceTests(unittest.TestCase):
+    def test_monitor_timeout_still_stops_owned_children_and_preserves_failure(self):
+        for execution_fails in (False, True):
+            with self.subTest(
+                execution_fails=execution_fails
+            ), tempfile.TemporaryDirectory() as folder:
+                root = Path(folder)
+                child = mock.Mock()
+                child.process.poll.return_value = None
+                child.stop.side_effect = lambda: setattr(
+                    child.process.poll, "return_value", 0
+                )
+                watcher = mock.Mock(ident=1)
+                watcher.is_alive.return_value = True
+
+                def execute(repo, private, report, children):
+                    children.append(child)
+                    if execution_fails:
+                        raise gate.AcceptanceError("original_failure")
+                    report["supplemental_gate_passed"] = True
+
+                with mock.patch.object(
+                    gate, "__file__", str(root / "scripts/gate.py")
+                ), mock.patch.object(
+                    gate.threading, "Thread", return_value=watcher
+                ), mock.patch.object(
+                    gate, "execute", side_effect=execute
+                ), mock.patch.object(
+                    gate, "shared_health"
+                ), mock.patch.object(
+                    gate.signal, "signal"
+                ), mock.patch.object(
+                    gate.signal, "alarm"
+                ):
+                    self.assertEqual(gate.main(), 1)
+                child.stop.assert_called_once()
+                report = json.loads(
+                    (root / "build-ci-dual/dual-gpu-acceptance.json").read_text()
+                )
+                self.assertTrue(report["owned_processes_stopped"])
+                self.assertEqual(report["cleanup_failures"], ["health_monitor_cleanup"])
+                self.assertEqual(
+                    report["failure"],
+                    "original_failure" if execution_fails else "cleanup_failed",
+                )
+
+    def test_chat_wire_identity_and_direct_correlation_are_enforced(self):
+        usage = {
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "total_tokens": 12,
+            "prompt_tokens_details": {"cached_tokens": 0},
+        }
+        for streaming in (False, True):
+            for mutation in (None, "model", "missing_model", "correlation"):
+                with self.subTest(streaming=streaming, mutation=mutation):
+                    payload = {"model": "dual-amd", "usage": usage}
+                    if mutation == "model":
+                        payload["model"] = "dual-nvidia"
+                    elif mutation == "missing_model":
+                        del payload["model"]
+                    if streaming:
+                        # A correct terminal frame must not hide a wrong earlier frame.
+                        raw = (
+                            "data: "
+                            + json.dumps(dict(payload, usage=None))
+                            + "\n\n"
+                            + "data: "
+                            + json.dumps({"model": "dual-amd", "usage": usage})
+                            + "\n\ndata: [DONE]\n\n"
+                        ).encode()
+                    else:
+                        raw = json.dumps(payload).encode()
+                    response = mock.Mock(status=200)
+                    response.read.return_value = raw
+                    response.getheader.return_value = (
+                        "wrong-request"
+                        if mutation == "correlation"
+                        else "expected-request"
+                    )
+                    with mock.patch.object(
+                        gate.http.client, "HTTPConnection"
+                    ) as connection:
+                        connection.return_value.getresponse.return_value = response
+                        args = (
+                            gate.ORIGIN,
+                            "/v1/chat/completions",
+                            "test-key",
+                            {"model": "dual-amd"},
+                            {"x-inferflux-client-request-id": "expected-request"},
+                            streaming,
+                        )
+                        if mutation:
+                            with self.assertRaises(gate.AcceptanceError):
+                                gate.request(*args)
+                        else:
+                            result, correlation = gate.request(*args)
+                            self.assertEqual(result["model"], "dual-amd")
+                            self.assertEqual(correlation, "expected-request")
+                        connection.return_value.close.assert_called_once()
+
     def test_pinned_llama_legacy_cuda_cache_is_validated(self):
         base = "ENABLE_CUDA:BOOL=ON\nENABLE_ROCM:BOOL=ON\nGGML_HIP:BOOL=ON\nGGML_BACKEND_DL:BOOL=ON\n"
         for cuda in ("LLAMA_CUDA:BOOL=ON", "GGML_CUDA:BOOL=ON"):

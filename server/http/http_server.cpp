@@ -2796,11 +2796,16 @@ void HttpServer::HandleClient(ClientSession &session) {
     while (future.wait_for(std::chrono::milliseconds(50)) !=
            std::future_status::ready) {
 #ifndef _WIN32
-      // Read-side EOF alone may be a valid HTTP half-close; only a full hangup
-      // or socket error cancels queued work.
+      // Read-side EOF may be a valid HTTP half-close. Darwin also reports
+      // POLLHUP for SHUT_WR, so only Linux's stronger hangup indication is
+      // usable here. Other POSIX platforms cancel on socket errors; a clean
+      // peer close may remain undetectable until the response write.
       pollfd socket{session.fd, POLLIN, 0};
-      if (::poll(&socket, 1, 0) > 0 &&
-          (socket.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+      short cancelled_events = POLLERR | POLLNVAL;
+#ifdef __linux__
+      cancelled_events |= POLLHUP;
+#endif
+      if (::poll(&socket, 1, 0) > 0 && (socket.revents & cancelled_events)) {
         cancellation->store(true);
         return;
       }
