@@ -236,6 +236,27 @@ def wait_ready(child, port, path, key):
     raise AcceptanceError("startup_timeout")
 
 
+def verify_mixed_flags(cache):
+    require(
+        all(
+            flag in cache
+            for flag in (
+                "ENABLE_CUDA:BOOL=ON",
+                "ENABLE_ROCM:BOOL=ON",
+                "GGML_HIP:BOOL=ON",
+                "GGML_BACKEND_DL:BOOL=ON",
+            )
+        ),
+        "mixed_build_flags",
+    )
+    # The pinned llama revision maps the legacy option without creating a
+    # GGML_CUDA cache entry. Accept either spelling, not a missing CUDA flag.
+    require(
+        "GGML_CUDA:BOOL=ON" in cache or "LLAMA_CUDA:BOOL=ON" in cache,
+        "mixed_cuda_build_flag",
+    )
+
+
 def execute(repo, private, report, children):
     report["source"] = trusted_source(repo)
     report["llama_source"] = subprocess.check_output(
@@ -243,19 +264,7 @@ def execute(repo, private, report, children):
     ).strip()
     build = repo / "build-ci-dual"
     cache = (build / "CMakeCache.txt").read_text()
-    require(
-        all(
-            flag in cache
-            for flag in (
-                "ENABLE_CUDA:BOOL=ON",
-                "ENABLE_ROCM:BOOL=ON",
-                "GGML_CUDA:BOOL=ON",
-                "GGML_HIP:BOOL=ON",
-                "GGML_BACKEND_DL:BOOL=ON",
-            )
-        ),
-        "mixed_build_flags",
-    )
+    verify_mixed_flags(cache)
     report["build_sha256"] = {
         name: file_digest(build / name)
         for name in (

@@ -13,6 +13,18 @@ import dual_gpu_acceptance as gate
 
 
 class DualGpuAcceptanceTests(unittest.TestCase):
+    def test_pinned_llama_legacy_cuda_cache_is_validated(self):
+        base = "ENABLE_CUDA:BOOL=ON\nENABLE_ROCM:BOOL=ON\nGGML_HIP:BOOL=ON\nGGML_BACKEND_DL:BOOL=ON\n"
+        for cuda in ("LLAMA_CUDA:BOOL=ON", "GGML_CUDA:BOOL=ON"):
+            gate.verify_mixed_flags(base + cuda)
+        with self.assertRaises(gate.AcceptanceError):
+            gate.verify_mixed_flags(base + "LLAMA_CUDA:BOOL=OFF")
+        with self.assertRaises(gate.AcceptanceError):
+            gate.verify_mixed_flags(
+                base.replace("GGML_HIP:BOOL=ON", "GGML_HIP:BOOL=OFF")
+                + "LLAMA_CUDA:BOOL=ON"
+            )
+
     def test_feature_branch_cannot_run_trusted_gate(self):
         with mock.patch.dict(
             gate.os.environ,
