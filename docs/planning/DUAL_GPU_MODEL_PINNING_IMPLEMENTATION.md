@@ -30,7 +30,7 @@ default selectors; per-model `device` takes precedence. A model-level bare
 `device_id` is rejected. Existing native configurations containing the previously
 ignored runtime selector must remove it or choose the llama.cpp provider.
 
-Use [the two-model example](../../config/server.dual-gpu.yaml). Both clients send
+Use [the two-model example](https://github.com/anvai-labs/inferflux/blob/develop/config/server.dual-gpu.yaml). Both clients send
 requests to the same `/v1/chat/completions`, changing only `model`. Sandhi needs one
 origin with both IDs in its virtual-key allowlist. No deployment manifest or
 existing service is changed by this example. Container/Helm operators must deploy
