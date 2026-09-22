@@ -30,7 +30,7 @@ default selectors; per-model `device` takes precedence. A model-level bare
 `device_id` is rejected. Existing native configurations containing the previously
 ignored runtime selector must remove it or choose the llama.cpp provider.
 
-Use [the two-model example](https://github.com/anvai-labs/inferflux/blob/develop/config/server.dual-gpu.yaml). Both clients send
+Use [the three-model example](https://github.com/anvai-labs/inferflux/blob/develop/config/server.dual-gpu.yaml). Both clients send
 requests to the same `/v1/chat/completions`, changing only `model`. Sandhi needs one
 origin with both IDs in its virtual-key allowlist. No deployment manifest or
 existing service is changed by this example. Container/Helm operators must deploy
@@ -46,7 +46,7 @@ contains a GPU selector or a vendor-specific port. Configure placement, offload,
 context and sequence capacity only through InferFlux's operator load contract.
 Placement diagnostics may be inspected operationally, but consumers must not use
 them to decide request destinations. Public IDs should describe model identity
-rather than device placement; the example's `amd-model`/`nvidia-model` are placeholders.
+rather than device placement. The chosen public IDs below identify models only.
 
 | Responsibility | Owner |
 |---|---|
@@ -65,24 +65,26 @@ The consolidated deployment uses **one InferFlux origin on port 8080**. The exam
 binds loopback; remote consumers use an authenticated gateway or an explicitly
 configured reachable address. The isolated acceptance harness uses 28085 to avoid
 replacing a running service. That test port is not part of the application contract.
-The requested final topology also moves the existing embedding model behind this
-origin. Keep 8090 live until embedding compatibility and mixed-workload admission
-are validated; the two-model example alone does not complete that migration.
+The user selected Qwen3-Coder-30B on AMD, Qwen2.5-Coder-14B on NVIDIA and the
+existing BGE embedding model on the same origin. Replacement of 8080/8081/8090 is
+authorized for consolidation; retain the old services until the replacement passes
+validation. Preserve their launch configurations, credentials and disk state for
+rollback. Restarting loses in-memory cache warmth.
 
 | Application setting | Contract |
 |---|---|
 | OpenAI-compatible base URL | `http://127.0.0.1:8080/v1` on the server host |
 | Discovery | Authenticated `GET /v1/models`; use the exact returned model ID |
 | Generation | `POST /v1/chat/completions` with an explicit `model` |
-| Example AMD model ID | `amd-model`, pinned to `rocm:0` |
-| Example NVIDIA model ID | `nvidia-model`, pinned to `cuda:0` |
+| Chat model ID | `qwen3-coder-30b` |
+| Chat model ID | `qwen2.5-coder-14b` |
 | Existing embedding model ID | `bge-small-en-v1.5`; target route `/v1/embeddings` on the same origin |
 | Authentication | Existing locally managed bearer credentials; do not copy keys into this document |
 | Correlation | Unique `x-inferflux-client-request-id` for each call |
 | Sessions | `x-inferflux-session-id`; use distinct IDs for Victor members and model histories |
 
-The model IDs above match the example configuration. Production artifact selection
-and final IDs must be recorded in the deployment configuration before migration;
+The model IDs above match the example configuration. Exact artifact hashes and
+resource settings must be recorded before migration;
 clients must not infer model identity from a port or a GPU vendor. Strict routing
 rejects an unavailable requested model rather than silently choosing the default.
 Both plain and streaming calls use the same URL and model IDs. For streaming, send
@@ -102,18 +104,36 @@ Their response reports `usage.prompt_tokens` and `usage.total_tokens` (equal inp
 counts); there are no generated completion tokens or SSE generation chunks.
 Do not apply the chat usage schema to embedding responses.
 
-**Embedding migration gap:** the current embedding handler selects through the
-shared router but calls the backend directly, outside the generation scheduler.
-The existing 8090 deployment also includes batching and model-selected pooling
-from commit `f0789a242`, absent from the develop base used here. A one-port migration
-must preserve those semantics and add bounded embedding admission with chat
-fairness on a shared GPU, cancellation/error isolation and token-accounting
-validation. Loading a third model or forwarding 8090 through a proxy is not proof
-that these scheduling requirements are met. Do not replace the working embedding
-service with this two-model implementation until those gaps are resolved.
+Embedding work now enters the existing scheduler and yields between slices of at
+most 32 inputs (reduced for the scheduler token budget). Arrays contain at most
+4096 strings. Queued chat work can run between slices; model ownership remains
+leased across them, and embedding work never borrows generation session/KV state.
+Unified scheduler mode (`decode_pool_size: 0`) is required; split decode mode
+returns an explicit service error for embeddings. Vendor-separated admitted batches
+retain the independent-device execution path. This is bounded cooperative service,
+not kernel preemption or a promise of independent per-device admission quotas.
+
+Batching and model-selected pooling from the existing embedding deployment's
+commit `f0789a242` are preserved. Its dedicated embedding context remains 32 × 512
+tokens; the BGE example explicitly records that geometry. Inputs longer than 512
+backend tokens retain that deployment's truncation behavior, and usage now counts
+the evaluated tokens after truncation. The existing generation context is separate;
+placement metadata does not measure the lazily allocated embedding context's VRAM.
+Allocation failure in an embedding slice returns an error without failing chat.
+Cancellation is checked between slices; an active GPU call is not interrupted.
+POSIX HTTP hangup/error detection cancels remaining work and preserves valid
+read-side half-closes. Windows disconnect detection and late accounting on failed
+or disconnected calls still need acceptance coverage. Request-ID and W3C trace
+headers work directly; neither requires Sandhi.
+
+Model-free regression coverage checks interleaved chat, successful array ordering,
+zero generation/cache usage for embeddings, cancellation, simulated allocation
+failure, a generic embedding backend, evaluated-token counts and HTTP half-closes.
+Actual BGE vector compatibility, shared-GPU memory and latency under mixed traffic,
+and direct/gateway Victor cohorts remain hardware acceptance requirements.
 
 Sandhi retains its existing client-facing gateway address and needs only one
-InferFlux origin/tunnel with both model IDs allowed. Victor members select their
+InferFlux origin/tunnel with the required model IDs allowed. Victor members select their
 assigned ID through Sandhi; they do not select an origin port per GPU. Retain the
 120-second buffered gateway deadline. Preserve wire, SQLite, C4 and dashboard
 correlations during migration; request/session accounting is not an OTEL trace.
@@ -229,8 +249,9 @@ Sandhi; direct acceptance must not depend on gateway-only headers or state.
    binaries/configs, caches, credentials and dirty worktrees unchanged.
 2. Review/promote the implementation and obtain exact-main setup evidence using
    small isolated models without reclaiming another owner's VRAM.
-3. Coordinate any production-model unload/restart with owners only after artifacts
-   and placement/concurrency/tracing evidence are reviewable. Preserve original
+3. The user authorized consolidating all three services on 8080 with the model IDs
+   above. Cut over only after artifacts and placement/concurrency/tracing evidence
+   are reviewable under the trusted-main process. Preserve original
    successful and failed Victor evidence. Provision the one-origin Sandhi route
    with local credentials and explicit model allowlists.
 4. Roll back by removing only the new route/tunnel and stopping only the new owned

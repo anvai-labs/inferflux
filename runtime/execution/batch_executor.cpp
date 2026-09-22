@@ -331,10 +331,15 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
   for (size_t i = 0; all_placed && i < batch.requests.size(); ++i) {
     auto backend =
         i < backend_overrides.size() ? backend_overrides[i] : nullptr;
-    if (!backend)
+    if (!backend && !batch.requests[i]->embedding_backend)
       backend = ResolveBackend(batch.requests[i]->model, nullptr);
-    const auto placement = backend ? backend->Placement() : DevicePlacement{};
-    if (!backend || placement.state != "verified_weights" ||
+    const auto placement_backend =
+        batch.requests[i]->embedding_backend
+            ? batch.requests[i]->embedding_backend
+            : std::static_pointer_cast<BackendInterface>(backend);
+    const auto placement =
+        placement_backend ? placement_backend->Placement() : DevicePlacement{};
+    if (!placement_backend || placement.state != "verified_weights" ||
         placement.effective.empty()) {
       all_placed = false;
       break;
@@ -427,10 +432,10 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = batch.requests[i];
     auto be = (i < backend_overrides.size()) ? backend_overrides[i] : nullptr;
-    if (!be) {
+    if (!be && !req->embedding_request) {
       be = ResolveBackend(req->model, nullptr);
     }
-    if (HasValidUnifiedPhasedState(*req) &&
+    if (!req->embedding_request && HasValidUnifiedPhasedState(*req) &&
         !req->response_format.constraint.has_grammar &&
         !req->collect_logprobs && !req->response_format.has_format && be &&
         be->IsReady()) {
@@ -503,7 +508,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
 
   std::string resolved_model = inference.resolved_model;
   auto backend = std::move(backend_override);
-  if (!backend) {
+  if (!backend && !inference.embedding_backend) {
     backend = ResolveBackend(inference.model, &resolved_model);
     inference.resolved_model = resolved_model;
   }
@@ -513,6 +518,46 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   response.model_id = resolved_model;
 
   bool backend_ready = backend && backend->IsReady();
+  if (inference.embedding_request) {
+    const auto embed_backend =
+        inference.embedding_backend
+            ? inference.embedding_backend
+            : std::static_pointer_cast<BackendInterface>(backend);
+    try {
+      if (!embed_backend || !embed_backend->IsReady() ||
+          inference.embedding_offset >= inference.embedding_inputs.size()) {
+        throw std::runtime_error("embedding backend unavailable");
+      }
+      const auto end =
+          std::min(inference.embedding_inputs.size(),
+                   inference.embedding_offset + inference.embedding_slice_size);
+      std::vector<std::string> inputs(inference.embedding_inputs.begin() +
+                                          inference.embedding_offset,
+                                      inference.embedding_inputs.begin() + end);
+      response.embeddings = embed_backend->EmbedBatch(inputs);
+      if (response.embeddings.size() != inputs.size() ||
+          std::any_of(response.embeddings.begin(), response.embeddings.end(),
+                      [](const auto &value) { return value.empty(); })) {
+        throw std::runtime_error("embedding execution failed");
+      }
+      response.prompt_tokens = 0;
+      for (const auto &input : inputs) {
+        response.prompt_tokens += embed_backend->EmbeddingTokenCount(input);
+      }
+    } catch (const std::exception &error) {
+      response.no_backend = true;
+      response.completion = error.what();
+      response.embeddings.clear();
+      response.prompt_tokens = 0;
+    } catch (...) {
+      response.no_backend = true;
+      response.completion = "embedding execution failed";
+      response.embeddings.clear();
+      response.prompt_tokens = 0;
+    }
+    inference.phase = RequestPhase::kFinished;
+    return outcome;
+  }
   bool backend_empty_generation = false;
   int slice_limit = inference.fairness.timeslice_tokens;
   inference.fairness.last_timeslice_tokens = slice_limit;

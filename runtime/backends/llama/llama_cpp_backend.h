@@ -139,6 +139,9 @@ public:
   std::vector<int> TokenizeForCache(const std::string &prompt) const override;
   std::vector<TopLogitEntry> TopLogitsForParity(int top_n) override;
   std::vector<float> Embed(const std::string &text) override;
+  int EmbeddingTokenCount(const std::string &text) const override;
+  std::vector<std::vector<float>>
+  EmbedBatch(const std::vector<std::string> &texts) override;
   int EmbedDims() const override;
 
   // Execute one shared decode step for N sequences simultaneously.
@@ -232,6 +235,8 @@ private:
   PerfSnapshot last_perf_{};
   llama_context *embed_ctx_{nullptr};
   bool EnsureEmbedCtx();
+  llama_context *embed_batch_ctx_{nullptr};
+  bool EnsureEmbedBatchCtx();
   mutable std::mutex async_results_mutex_;
   UnifiedBatchHandle next_async_handle_{1};
   std::unordered_map<UnifiedBatchHandle, std::vector<UnifiedBatchOutput>>

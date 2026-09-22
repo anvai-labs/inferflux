@@ -29,6 +29,7 @@ inline int inferflux_close_socket(int fd) { return ::closesocket(fd); }
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -2706,9 +2707,10 @@ void HttpServer::HandleClient(ClientSession &session) {
     } catch (const json::exception &ex) {
       LogJsonParseFailure("embeddings.post", ex);
     }
-    if (inputs.empty()) {
-      SendAll(session, BuildResponse(BuildErrorBody("input is required"), 400,
-                                     "Bad Request"));
+    if (inputs.empty() || inputs.size() > 4096) {
+      SendAll(session,
+              BuildResponse(BuildErrorBody("input requires 1 to 4096 strings"),
+                            400, "Bad Request"));
       return;
     }
 
@@ -2778,22 +2780,45 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
 
-    // Generate embeddings for each input.
-    json data = json::array();
-    int total_tokens = 0;
-    for (std::size_t idx = 0; idx < inputs.size(); ++idx) {
-      std::vector<float> emb = embed_backend->Embed(inputs[idx]);
-      if (emb.empty()) {
-        SendAll(session, BuildResponse(BuildErrorBody(
-                                           "model_does_not_support_embeddings"),
-                                       422, "Unprocessable Entity"));
+    // Join the same scheduler as generation. It yields large arrays between
+    // bounded embedding batches, retaining model ownership across slices.
+    InferenceRequest request;
+    request.model = resolved_model;
+    request.embedding_inputs = inputs;
+    request.client_request_id =
+        GetHeaderValue(headers, "x-inferflux-client-request-id");
+    request.cancellation_flag = std::make_shared<std::atomic<bool>>(false);
+    auto cancellation = request.cancellation_flag;
+    const auto request_context = tracing::ChildContext(
+        tracing::ParseTraceparent(GetHeaderValue(headers, "traceparent")));
+    request.trace_id = request_context.trace_id;
+    auto future = scheduler_->Embed(std::move(request));
+    while (future.wait_for(std::chrono::milliseconds(50)) !=
+           std::future_status::ready) {
+#ifndef _WIN32
+      // Read-side EOF alone may be a valid HTTP half-close; only a full hangup
+      // or socket error cancels queued work.
+      pollfd socket{session.fd, POLLIN, 0};
+      if (::poll(&socket, 1, 0) > 0 &&
+          (socket.revents & (POLLHUP | POLLERR | POLLNVAL))) {
+        cancellation->store(true);
         return;
       }
-      total_tokens += embed_backend->TokenCount(inputs[idx]);
-      json entry = {{"object", "embedding"},
-                    {"embedding", emb},
-                    {"index", static_cast<int>(idx)}};
-      data.push_back(std::move(entry));
+#endif
+    }
+    const auto result = future.get();
+    if (result.no_backend) {
+      SendAll(session, BuildResponse(BuildErrorBody(result.completion), 503,
+                                     "Service Unavailable"));
+      return;
+    }
+    json data = json::array();
+    const int total_tokens = result.prompt_tokens;
+    resolved_model = result.model_id;
+    for (std::size_t idx = 0; idx < result.embeddings.size(); ++idx) {
+      data.push_back({{"object", "embedding"},
+                      {"embedding", result.embeddings[idx]},
+                      {"index", static_cast<int>(idx)}});
     }
 
     json resp = {
@@ -2802,7 +2827,21 @@ void HttpServer::HandleClient(ClientSession &session) {
         {"model", resolved_model},
         {"usage",
          {{"prompt_tokens", total_tokens}, {"total_tokens", total_tokens}}}};
-    SendAll(session, BuildResponse(resp.dump()));
+    const auto correlation =
+        GetHeaderValue(headers, "x-inferflux-client-request-id");
+    if (!correlation.empty()) {
+      resp["client_request_id"] = correlation;
+    }
+    std::string response_headers;
+    if (request_context.valid()) {
+      response_headers =
+          "traceparent: " + request_context.ToTraceparent() + "\r\n";
+    }
+    if (!correlation.empty()) {
+      response_headers +=
+          "x-inferflux-client-request-id: " + correlation + "\r\n";
+    }
+    SendAll(session, BuildResponse(resp.dump(), 200, "OK", response_headers));
     return;
   }
 

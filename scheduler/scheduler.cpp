@@ -1666,6 +1666,35 @@ void Scheduler::DecodeWorkerLoop() {
   }
 }
 
+std::future<InferenceResult> Scheduler::Embed(InferenceRequest request) {
+  if (request.embedding_inputs.empty() ||
+      request.embedding_inputs.size() > 4096 || use_decode_workers_) {
+    std::promise<InferenceResult> promise;
+    auto future = promise.get_future();
+    InferenceResult result;
+    result.no_backend = true;
+    result.completion =
+        use_decode_workers_
+            ? "embeddings require unified scheduler mode"
+            : "embedding input count must be between 1 and 4096";
+    promise.set_value(std::move(result));
+    return future;
+  }
+  request.embedding_request = true;
+  request.embedding_offset = 0;
+  request.embedding_results.clear();
+  request.embedding_prompt_tokens = 0;
+  request.embedding_slice_size = static_cast<std::size_t>(
+      std::clamp(config_.max_batch_tokens / 512, 1, 32));
+  request.session_id.clear();
+  request.max_tokens = 1;
+  request.prompt_tokens.assign(
+      std::min(request.embedding_slice_size, request.embedding_inputs.size()) *
+          512,
+      0);
+  return Generate(std::move(request));
+}
+
 std::future<InferenceResult> Scheduler::Generate(InferenceRequest request) {
   auto pending = std::make_shared<PendingRequest>();
   pending->inference = std::move(request);
@@ -1869,7 +1898,8 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
       batch_policy_->UsesPrefixAffinity() && prefix_cache_ != nullptr;
   if (prefix_affinity_enabled) {
     for (auto &item : queue_items) {
-      if (item.from_decode || !item.pending) {
+      if (item.from_decode || !item.pending ||
+          item.pending->inference.embedding_request) {
         continue;
       }
       auto &inf = item.pending->inference;
@@ -2036,6 +2066,10 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
   std::vector<std::shared_ptr<PendingRequest>> decode_ready;
   decode_ready.reserve(selection.pending.size());
   for (auto &pending : selection.pending) {
+    if (pending->inference.embedding_request) {
+      decode_ready.push_back(pending);
+      continue;
+    }
     if (pending->inference.phase == RequestPhase::kPrefill) {
       // Option A phased prefill: run prompt evaluation on the local backend now
       // so that the decode slice (ExecuteRequest) can call Decode() from n_past
@@ -2781,6 +2815,44 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
     if (i < responses.size()) {
       result = std::move(responses[i]);
     }
+    if (inference->embedding_request) {
+      if (!result.no_backend) {
+        inference->embedding_prompt_tokens += result.prompt_tokens;
+        for (auto &embedding : result.embeddings) {
+          inference->embedding_results.push_back(std::move(embedding));
+        }
+        inference->embedding_offset = inference->embedding_results.size();
+      }
+      if (!result.no_backend &&
+          inference->embedding_offset < inference->embedding_inputs.size()) {
+        pending->enqueue_time = std::chrono::steady_clock::now();
+        inference->phase = RequestPhase::kPending;
+        inference->prompt_tokens.assign(
+            std::min(inference->embedding_slice_size,
+                     inference->embedding_inputs.size() -
+                         inference->embedding_offset) *
+                512,
+            0);
+        {
+          std::lock_guard<std::mutex> lock(queue_mutex_);
+          pending_prefill_.push_back(pending);
+          UpdateQueueDepthLocked();
+        }
+        prefill_cv_.notify_one();
+        continue;
+      }
+      if (!result.no_backend) {
+        result.embeddings = std::move(inference->embedding_results);
+      } else {
+        result.embeddings.clear();
+      }
+      result.prompt_tokens = inference->embedding_prompt_tokens;
+      inference->phase = RequestPhase::kFinished;
+      FillResultUsageTelemetry(*inference, &result, metrics_,
+                               pending->resolved_backend.get());
+      pending->promise.set_value(std::move(result));
+      continue;
+    }
     if (inference->fairness.yielded) {
       const int slice_tokens = result.completion_tokens;
       auto now = std::chrono::steady_clock::now();
@@ -3334,7 +3406,9 @@ void Scheduler::ResolveBackends(
   }
   ModelSelectionOptions selection_options = ModelSelectionOptionsSnapshot();
   for (auto &pending : batch) {
-    if (HasBoundDecodeBackend(pending->inference, pending->resolved_backend)) {
+    if ((pending->inference.embedding_request &&
+         pending->inference.embedding_backend) ||
+        HasBoundDecodeBackend(pending->inference, pending->resolved_backend)) {
       continue;
     }
     pending->resolved_backend.reset();
@@ -3343,12 +3417,15 @@ void Scheduler::ResolveBackends(
     pending->inference.response_format.error.clear();
 
     BackendFeatureRequirements requirements =
-        BuildGenerationFeatureRequirements(
-            pending->inference.stream, pending->inference.collect_logprobs,
-            pending->inference.response_format.has_format,
-            pending->inference.has_images,
-            speculative_decoder_ && speculative_decoder_->Enabled() &&
-                !pending->inference.response_format.has_format);
+        pending->inference.embedding_request
+            ? BuildEmbeddingFeatureRequirements()
+            : BuildGenerationFeatureRequirements(
+                  pending->inference.stream,
+                  pending->inference.collect_logprobs,
+                  pending->inference.response_format.has_format,
+                  pending->inference.has_images,
+                  speculative_decoder_ && speculative_decoder_->Enabled() &&
+                      !pending->inference.response_format.has_format);
 
     auto selection =
         SelectModelForRequest(router_.get(), pending->inference.model,
@@ -3383,8 +3460,14 @@ void Scheduler::ResolveBackends(
     }
 
     if (selection.backend && selection.backend->IsReady()) {
-      pending->resolved_backend =
-          std::static_pointer_cast<LlamaCppBackend>(selection.backend);
+      if (pending->inference.embedding_request) {
+        pending->inference.embedding_backend = selection.backend;
+        pending->resolved_backend =
+            std::dynamic_pointer_cast<LlamaCppBackend>(selection.backend);
+      } else {
+        pending->resolved_backend =
+            std::static_pointer_cast<LlamaCppBackend>(selection.backend);
+      }
       pending->inference.resolved_model = selection.info.id;
       metrics_->RecordModelRoute(selection.info.id, selection.info.backend,
                                  true);

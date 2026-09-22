@@ -3092,3 +3092,106 @@ TEST_CASE("Scheduler never reuses one model's session KV in another model",
   REQUIRE(amd->position_violations == 0);
   REQUIRE(nvidia->position_violations == 0);
 }
+
+TEST_CASE("Embedding slices share admission with chat and preserve usage",
+          "[scheduler][embeddings_admission]") {
+  class EmbeddingBackend : public PositionCheckingBackend {
+  public:
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool first_started{false};
+    bool release{false};
+    bool fail{false};
+    std::vector<std::size_t> batch_sizes;
+    std::vector<std::string> order;
+    std::vector<std::vector<float>>
+    EmbedBatch(const std::vector<std::string> &texts) override {
+      std::unique_lock<std::mutex> lock(mutex);
+      batch_sizes.push_back(texts.size());
+      order.push_back("embedding");
+      if (!first_started) {
+        first_started = true;
+        cv.notify_all();
+        cv.wait_for(lock, std::chrono::seconds(3), [&] { return release; });
+      }
+      if (fail)
+        throw std::runtime_error("simulated embedding allocation failure");
+      return std::vector<std::vector<float>>(texts.size(), {1.0f, 2.0f});
+    }
+    int EmbeddingTokenCount(const std::string &) const override { return 7; }
+    std::vector<UnifiedBatchOutput>
+    ExecuteUnifiedBatch(const std::vector<UnifiedBatchInput> &inputs) override {
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        order.push_back("chat");
+      }
+      return PositionCheckingBackend::ExecuteUnifiedBatch(inputs);
+    }
+  };
+  const std::string mode = GENERATE("ok", "cancel", "failure");
+  const bool cancel = mode == "cancel";
+  const bool fail = mode == "failure";
+  SimpleTokenizer tokenizer;
+  auto cache = std::make_shared<PagedKVCache>(
+      32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<EmbeddingBackend>();
+  backend->fail = fail;
+  ModelInfo info;
+  info.id = "shared-model";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  Scheduler::Config config;
+  config.max_batch_size = 1;
+  config.batch_accumulation_ms = 0;
+  config.session_handles.enabled = true;
+  Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(), cache,
+                      router, nullptr, nullptr, {}, {}, {}, config);
+  InferenceRequest embedding;
+  embedding.model = info.id;
+  embedding.embedding_inputs.assign(33, "input");
+  embedding.session_id = "same-session-as-chat";
+  auto cancellation = std::make_shared<std::atomic<bool>>(false);
+  embedding.cancellation_flag = cancellation;
+  auto embedded = scheduler.Embed(std::move(embedding));
+  {
+    std::unique_lock<std::mutex> lock(backend->mutex);
+    REQUIRE(backend->cv.wait_for(lock, std::chrono::seconds(2),
+                                 [&] { return backend->first_started; }));
+  }
+  InferenceRequest chat;
+  chat.model = info.id;
+  chat.prompt = "chat";
+  chat.session_id = "same-session-as-chat";
+  chat.max_tokens = 1;
+  auto generated = scheduler.Generate(std::move(chat));
+  cancellation->store(cancel);
+  {
+    std::lock_guard<std::mutex> lock(backend->mutex);
+    backend->release = true;
+  }
+  backend->cv.notify_all();
+  REQUIRE(embedded.wait_for(std::chrono::seconds(3)) ==
+          std::future_status::ready);
+  REQUIRE(generated.wait_for(std::chrono::seconds(3)) ==
+          std::future_status::ready);
+  const auto result = embedded.get();
+  REQUIRE_FALSE(generated.get().no_backend);
+  REQUIRE(result.no_backend == (cancel || fail));
+  REQUIRE(result.completion_tokens == 0);
+  REQUIRE(result.cached_prompt_tokens == 0);
+  if (!cancel && !fail) {
+    REQUIRE(result.model_id == info.id);
+    REQUIRE(result.embeddings.size() == 33);
+    REQUIRE(result.prompt_tokens == 33 * 7);
+    REQUIRE(backend->batch_sizes == std::vector<std::size_t>{32, 1});
+    REQUIRE(backend->order.front() == "embedding");
+    REQUIRE(backend->order.back() == "embedding");
+    REQUIRE(std::find(backend->order.begin(), backend->order.end(), "chat") !=
+            backend->order.end());
+  } else {
+    REQUIRE(result.embeddings.empty());
+    REQUIRE(backend->batch_sizes == std::vector<std::size_t>{32});
+  }
+  REQUIRE(backend->position_violations == 0);
+}
