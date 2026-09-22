@@ -39,6 +39,28 @@ single-vendor images cannot implement this recipe.
 
 ## Contract for consuming applications
 
+Victor and other OpenAI-compatible clients can use InferFlux directly or through
+Sandhi. Sandhi is optional, not a requirement for multi-model serving. In either
+case clients select a public model ID and the appropriate API path; no request
+contains a GPU selector or a vendor-specific port. Configure placement, offload,
+context and sequence capacity only through InferFlux's operator load contract.
+Placement diagnostics may be inspected operationally, but consumers must not use
+them to decide request destinations. Public IDs should describe model identity
+rather than device placement; the example's `amd-model`/`nvidia-model` are placeholders.
+
+| Responsibility | Owner |
+|---|---|
+| Choose a model for a task; send chat/embedding requests | Victor or consuming application |
+| Optional gateway policy, authentication, quotas, retries, caching, routing and accounting | Sandhi, according to its configured capabilities |
+| Model loading, GPU placement, memory budgets, execution scheduling and backend token usage | InferFlux |
+
+Direct clients set their base URL to InferFlux's `/v1`; gateway clients set it to
+Sandhi's compatible API and use its locally managed credentials. Both paths must
+preserve model selection, response model identity and usage accounting. Sandhi
+maps public model IDs to an InferFlux origin (or an explicit configured alias),
+not to CUDA/ROCm devices. InferFlux must provide correct model selection and usage
+without gateway involvement; gateway-specific features remain optional additions.
+
 The consolidated deployment uses **one InferFlux origin on port 8080**. The example
 binds loopback; remote consumers use an authenticated gateway or an explicitly
 configured reachable address. The isolated acceptance harness uses 28085 to avoid
@@ -198,6 +220,8 @@ cohorts (deliverables, pytest, numeric oracle, structured decisions, distinct me
 sessions and per-model attribution). Retain the 120-second buffered gateway deadline.
 The setup harness always reports `c5_accepted=false` and `actual_victor_cohort=false`.
 Request correlations and usage records alone are not distributed OTEL traces.
+Run the multi-model Victor acceptance both directly against InferFlux and through
+Sandhi; direct acceptance must not depend on gateway-only headers or state.
 
 ## Migration and rollback
 
