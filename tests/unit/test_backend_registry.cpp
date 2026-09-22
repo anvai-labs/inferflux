@@ -98,11 +98,15 @@ TEST_CASE("GpuDeviceInfo default values are sensible",
 TEST_CASE(
     "GPU initialization preserves omitted placement and explicit selectors",
     "[backend_registry][device_placement]") {
-  class Strategy final : public GpuDeviceStrategy {
+  class Strategy : public GpuDeviceStrategy {
   public:
     explicit Strategy(LlamaBackendTarget target) : target_(target) {}
-    bool Initialize() override { return true; }
+    bool Initialize() override {
+      ++default_calls;
+      return true;
+    }
     bool Initialize(int ordinal) override {
+      ++ordinal_calls;
       ordinal_ = ordinal;
       return true;
     }
@@ -116,11 +120,26 @@ TEST_CASE(
     void RecordMetrics(const LlamaBackendConfig &) override {}
     LlamaBackendTarget target_;
     int ordinal_{0};
+    int default_calls{0};
+    int ordinal_calls{0};
+  };
+  // Native CUDA specializes the no-argument initialization in a derived
+  // strategy while inheriting the vendor strategy's ordinal overload.
+  class SpecializedStrategy final : public Strategy {
+  public:
+    using Strategy::Strategy;
+    bool Initialize() override {
+      ++specialized_calls;
+      return Strategy::Initialize();
+    }
+    int specialized_calls{0};
   };
   const auto target =
       GENERATE(LlamaBackendTarget::kCuda, LlamaBackendTarget::kRocm);
   const bool explicit_device = GENERATE(false, true);
-  GpuAcceleratedBackend backend(std::make_unique<Strategy>(target));
+  auto strategy = std::make_unique<SpecializedStrategy>(target);
+  auto *observed = strategy.get();
+  GpuAcceleratedBackend backend(std::move(strategy));
   LlamaBackendConfig config;
   config.gpu_layers = 8;
   if (explicit_device)
@@ -130,6 +149,9 @@ TEST_CASE(
   REQUIRE(tuned.device == config.device);
   REQUIRE(tuned.gpu_layers == 8);
   REQUIRE(backend.DeviceInfo().device_id == (explicit_device ? 1 : 0));
+  REQUIRE(observed->default_calls == (explicit_device ? 0 : 1));
+  REQUIRE(observed->specialized_calls == (explicit_device ? 0 : 1));
+  REQUIRE(observed->ordinal_calls == (explicit_device ? 1 : 0));
 }
 
 TEST_CASE("LlamaBackendTarget kOpenCL parses and describes correctly",

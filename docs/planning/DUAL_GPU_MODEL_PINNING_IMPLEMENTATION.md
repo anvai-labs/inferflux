@@ -287,6 +287,23 @@ Only connection refusal permits the bind preflight. `INFERFLUX_TEST_PORT_BASE` p
 the Mac rerun uses 28091-28094. This bind preflight does not reserve the port
 through child startup, so exclusive test-port ownership remains required.
 
+### Trusted-main native initialization regression
+
+PR #208 landed on develop as `b8455de63`; promotion #209 produced main
+`062df25a9`. Its trusted GPU run `35715630289` passed all 67 CUDA CTests and
+the ROCm gate, but failed the CUDA model-backed provider assertions. All CUDA
+requests succeeded through llama.cpp rather than the required native provider.
+The preserved server log reports `Cannot create runtime before Initialize()`.
+The ordinal initializer bypassed the native strategy's no-argument override even
+when no device selector was supplied. Omitted placement now retains that virtual
+entry point; explicit selectors retain the vendor/ordinal path. The existing
+parameterized initialization test now distinguishes both overloads and a derived
+strategy override, reproducing the two omitted-placement failures without a GPU.
+No duplicate test case is added. A fresh promoted-main GPU verdict is still
+required; the original failed artifact remains evidence. The observed load-time
+fallback reported `fallback=false`, so provider identity and native execution
+counters remain mandatory checks rather than relying on that flag alone.
+
 ## Migration and rollback
 
 1. The user authorized stopping 8080 ROCm, accepted 8081 CUDA and 8090 embeddings

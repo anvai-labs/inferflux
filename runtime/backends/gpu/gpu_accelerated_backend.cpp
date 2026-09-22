@@ -34,7 +34,12 @@ bool GpuAcceleratedBackend::InitializeDevice(const LlamaBackendConfig &config,
     }
     ordinal = selector->ordinal;
   }
-  if (!strategy_->Initialize(ordinal)) {
+  // Preserve specialized no-argument initialization when placement is omitted.
+  // An inherited ordinal overload may bypass native-backend initialization.
+  const bool initialized = config.device.empty()
+                               ? strategy_->Initialize()
+                               : strategy_->Initialize(ordinal);
+  if (!initialized) {
     log::Error("gpu_backend", "Device initialization failed");
     return false;
   }
