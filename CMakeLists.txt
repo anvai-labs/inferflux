@@ -902,6 +902,9 @@ find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
   add_executable(inferflux_http_client_tls_probe
     tests/integration/http_client_tls_probe.cpp net/http_client.cpp)
+  # Targeted contract builds must also build the executable used by CTest.
+  # Keep this dependency here so every backend's test build includes it.
+  add_dependencies(inferflux_tests inferflux_http_client_tls_probe)
   target_include_directories(inferflux_http_client_tls_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(inferflux_http_client_tls_probe PRIVATE OpenSSL::SSL OpenSSL::Crypto)
   if(WIN32)
