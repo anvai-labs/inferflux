@@ -37,6 +37,10 @@ std::string ApiKeyAuth::HashKey(const std::string &key) {
   return hex.str();
 }
 
+std::string ApiKeyAuth::SubjectFromHash(const std::string &hash) {
+  return "api-key:" + hash;
+}
+
 void ApiKeyAuth::AddKey(const std::string &key,
                         const std::vector<std::string> &scopes) {
   AddKeyHashed(HashKey(key), scopes);

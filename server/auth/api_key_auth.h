@@ -28,6 +28,9 @@ public:
   // Hash a plaintext key to its storage representation.
   static std::string HashKey(const std::string &key);
 
+  // Nonsecret identity for an already-derived storage hash; never a bearer key.
+  static std::string SubjectFromHash(const std::string &hash);
+
 private:
   // Keys are stored by their SHA-256 hex hash.
   mutable std::shared_mutex mutex_;
