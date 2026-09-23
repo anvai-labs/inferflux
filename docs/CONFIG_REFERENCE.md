@@ -422,3 +422,16 @@ The startup advisor evaluates config quality at boot and emits recommendations f
 - [Admin Guide](AdminGuide.md)
 - [Architecture](Architecture.md)
 - [ARCHIVE_INDEX](ARCHIVE_INDEX.md)
+
+### API-key audit identity
+
+Authenticated API-key requests use `api-key:<SHA-256 storage hash>` as their stable
+subject for audit and per-subject rate limiting. Key insertion/removal events use
+the same nonsecret identifier for the affected key. Bearer credentials must never
+be used as audit subjects or key-management event messages. This changes audit
+consumer identifiers; it does not change scopes, key validity or token validation.
+
+Existing logs are not rewritten. Protect historical audit data and assess any
+previously exposed credentials separately; this fix does not claim retroactive
+redaction or credential rotation. Use high-entropy production keys, since a stable
+hash does not protect guessable development credentials against offline guessing.

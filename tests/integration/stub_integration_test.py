@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import json
+import hashlib
+import tempfile
+from pathlib import Path
 import os
 import signal
 import subprocess
@@ -25,6 +28,12 @@ class StubIntegrationTests(unittest.TestCase):
         env["INFERFLUX_HOST_OVERRIDE"] = SERVER_HOST
         env["INFERFLUX_PORT_OVERRIDE"] = str(SERVER_PORT)
         env["INFERFLUX_MODEL_PATH"] = ""
+        cls.state_dir = tempfile.TemporaryDirectory(prefix="inferflux-stub-audit-")
+        cls.addClassCleanup(cls.state_dir.cleanup)
+        cls.audit_path = Path(cls.state_dir.name) / "audit.jsonl"
+        env["INFERFLUX_AUDIT_LOG"] = str(cls.audit_path)
+        env["INFERFLUX_POLICY_STORE"] = str(Path(cls.state_dir.name) / "policy.enc")
+        env["INFERFLUX_POLICY_PASSPHRASE"] = "disposable-test-passphrase"
         # We assume the binary is in the build directory and we are in the project root.
         cls.server_proc = start_server_process(
             [SERVER_BIN, "--config", "config/server.yaml"], env=env
@@ -120,6 +129,37 @@ class StubIntegrationTests(unittest.TestCase):
             msg=f"rc={result.returncode} stdout={result.stdout} stderr={result.stderr}",
         )
         return json.loads(result.stdout)
+
+    def test_api_key_audit_uses_nonsecret_identity(self):
+        key = "disposable-audit-identity-key"
+        resp, body = self._post("/v1/admin/api_keys", {"key": key, "scopes": ["read"]})
+        self.assertEqual(resp.status, 200, body)
+        conn = http.client.HTTPConnection(SERVER_HOST, SERVER_PORT, timeout=10)
+        try:
+            conn.request("GET", "/audit-identity-probe", headers={"Authorization": "Bearer " + key})
+            resp = conn.getresponse()
+            resp.read()
+            self.assertEqual(resp.status, 404)
+        finally:
+            conn.close()
+            resp, body = self._delete("/v1/admin/api_keys", {"key": key})
+            self.assertEqual(resp.status, 200, body)
+        deadline = time.monotonic() + 2
+        while True:
+            text = self.audit_path.read_text()
+            if '"api_key_remove"' in text or time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        self.assertNotIn(key, text)
+        self.assertNotIn("dev-key-123", text)
+        events = [json.loads(line) for line in text.splitlines()]
+        identity = "api-key:" + hashlib.sha256(key.encode()).hexdigest()
+        admin = "api-key:" + hashlib.sha256(b"dev-key-123").hexdigest()
+        for status in ("api_key_upsert", "api_key_remove"):
+            event = next(e for e in events if e["status"] == status and e["message"] == identity)
+            self.assertEqual(event["subject"], admin)
+        event = next(e for e in events if e["status"] == "not_found" and e["message"] == "/audit-identity-probe")
+        self.assertEqual(event["subject"], identity)
 
     def test_health(self):
         # /healthz might require auth depending on config
