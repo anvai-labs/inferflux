@@ -9,6 +9,7 @@
 #include <openssl/rsa.h>
 
 #include <chrono>
+#include <limits>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -157,11 +158,14 @@ bool OIDCValidator::AudienceMatches(const json &payload) const {
     return aud_field.get<std::string>() == audience_;
   }
   if (aud_field.is_array()) {
+    bool matches = false;
     for (const auto &entry : aud_field) {
-      if (entry.is_string() && entry.get<std::string>() == audience_) {
-        return true;
+      if (!entry.is_string()) {
+        return false;
       }
+      matches = matches || entry.get<std::string>() == audience_;
     }
+    return matches;
   }
   return false;
 }
@@ -263,13 +267,17 @@ std::string OIDCValidator::JwksUrl() const {
 
 bool OIDCValidator::Validate(const std::string &token,
                              std::string *subject_out) const {
-  if (!Enabled()) {
+  if (subject_out) {
+    subject_out->clear();
+  }
+  if (!Enabled() || token.size() > 16384) {
     return false;
   }
   auto first_dot = token.find('.');
   auto second_dot =
       token.find('.', first_dot == std::string::npos ? 0 : first_dot + 1);
-  if (first_dot == std::string::npos || second_dot == std::string::npos) {
+  if (first_dot == std::string::npos || second_dot == std::string::npos ||
+      token.find('.', second_dot + 1) != std::string::npos) {
     return false;
   }
   std::string header_str = Base64UrlDecode(token.substr(0, first_dot));
@@ -288,7 +296,12 @@ bool OIDCValidator::Validate(const std::string &token,
     return false;
   }
 
-  if (header.value("alg", "") != "RS256") {
+  if (!header.is_object() || !payload.is_object() || !header.contains("alg") ||
+      !header["alg"].is_string() || header["alg"] != "RS256" ||
+      (header.contains("kid") && !header["kid"].is_string()) ||
+      !payload.contains("iss") || !payload["iss"].is_string() ||
+      !payload.contains("sub") || !payload["sub"].is_string() ||
+      payload["sub"].get_ref<const std::string &>().empty()) {
     return false;
   }
 
@@ -302,17 +315,19 @@ bool OIDCValidator::Validate(const std::string &token,
   auto now = std::chrono::duration_cast<std::chrono::seconds>(
                  std::chrono::system_clock::now().time_since_epoch())
                  .count();
-  if (payload.contains("exp") && payload["exp"].is_number()) {
-    int64_t exp = payload["exp"].get<int64_t>();
-    if (now > exp) {
-      return false;
-    }
+  const auto valid_timestamp = [](const json &value) {
+    return value.is_number_integer() &&
+           (!value.is_number_unsigned() ||
+            value.get<uint64_t>() <=
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()));
+  };
+  if (!payload.contains("exp") || !valid_timestamp(payload["exp"]) ||
+      payload["exp"].get<int64_t>() <= now) {
+    return false;
   }
-  if (payload.contains("nbf") && payload["nbf"].is_number()) {
-    int64_t nbf = payload["nbf"].get<int64_t>();
-    if (now < nbf) {
-      return false;
-    }
+  if (payload.contains("nbf") && (!valid_timestamp(payload["nbf"]) ||
+                                  payload["nbf"].get<int64_t>() > now)) {
+    return false;
   }
 
   std::string kid = header.value("kid", "");
@@ -338,8 +353,7 @@ bool OIDCValidator::Validate(const std::string &token,
   }
 
   if (subject_out) {
-    std::string sub = payload.value("sub", "");
-    *subject_out = sub.empty() ? "oidc-user" : sub;
+    *subject_out = payload["sub"].get<std::string>();
   }
   return true;
 }
