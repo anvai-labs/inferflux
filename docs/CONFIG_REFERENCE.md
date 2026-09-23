@@ -305,6 +305,17 @@ INFERFLUX_HTTP_WORKERS=8 ./build/inferfluxd --config config/server.yaml
 | Guardrails | `guardrails.blocklist` | non-empty blocklist baseline |
 | OPA | `guardrails.opa_endpoint` | set when external policy engine is required |
 
+OIDC validation requires a nonempty string subject, exact issuer and audience, and
+an integer expiration strictly later than the current time. Optional `nbf` must
+also be an integer and must not be in the future. Missing, malformed, overflowing
+or expired claims fail authentication; no shared fallback subject is created.
+Tokens above 16 KiB and malformed header/payload structures are rejected without
+propagating JSON type exceptions. Failed validation clears the output identity.
+
+These claim checks do not establish Kanidm deployment acceptance. Discovery/JWKS
+compatibility, ES256 support, TLS hostname verification, explicit OIDC-only policy
+and safe API-key audit identity remain separate co-design work before cutover.
+
 Scope contract:
 
 | Scope | Allows |
