@@ -1553,7 +1553,7 @@ bool HttpServer::ResolveSubject(const std::string &headers,
   if (auth_ && auth_->HasKeys()) {
     auto hash = ApiKeyAuth::HashKey(token);
     if (auth_->IsAllowedByHash(hash)) {
-      ctx->subject = token;
+      ctx->subject = ApiKeyAuth::SubjectFromHash(hash);
       auto scopes = auth_->ScopesByHash(hash);
       ctx->scopes.insert(scopes.begin(), scopes.end());
       return true;
@@ -2067,10 +2067,10 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
     auto start = std::chrono::steady_clock::now();
+    const std::string key_hash = ApiKeyAuth::HashKey(key);
     {
       std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
       std::optional<std::vector<std::string>> previous_scopes;
-      const std::string key_hash = ApiKeyAuth::HashKey(key);
       for (const auto &entry : policy_store_->ApiKeys()) {
         if (entry.key == key_hash) {
           previous_scopes = entry.scopes;
@@ -2103,7 +2103,8 @@ void HttpServer::HandleClient(ClientSession &session) {
               << " ms" << std::endl;
     SendAll(session, BuildResponse(json({{"status", "ok"}}).dump()));
     if (audit_logger_) {
-      audit_logger_->Log(auth_ctx.subject, "", "api_key_upsert", key);
+      audit_logger_->Log(auth_ctx.subject, "", "api_key_upsert",
+                         ApiKeyAuth::SubjectFromHash(key_hash));
     }
     return;
   }
@@ -2132,10 +2133,10 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
     auto start = std::chrono::steady_clock::now();
+    const std::string key_hash = ApiKeyAuth::HashKey(key);
     {
       std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
       std::optional<std::vector<std::string>> previous_scopes;
-      const std::string key_hash = ApiKeyAuth::HashKey(key);
       for (const auto &entry : policy_store_->ApiKeys()) {
         if (entry.key == key_hash) {
           previous_scopes = entry.scopes;
@@ -2165,7 +2166,8 @@ void HttpServer::HandleClient(ClientSession &session) {
               << " ms" << std::endl;
     SendAll(session, BuildResponse(json({{"status", "ok"}}).dump()));
     if (audit_logger_) {
-      audit_logger_->Log(auth_ctx.subject, "", "api_key_remove", key);
+      audit_logger_->Log(auth_ctx.subject, "", "api_key_remove",
+                         ApiKeyAuth::SubjectFromHash(key_hash));
     }
     return;
   }

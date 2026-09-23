@@ -5,7 +5,9 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <limits>
 #include <string>
+#include <vector>
 
 using json = nlohmann::json;
 
@@ -38,52 +40,6 @@ std::string Base64UrlEncode(const std::string &input) {
     out.pop_back();
   }
   return out;
-}
-
-std::string Base64UrlDecode(const std::string &input) {
-  std::string normalized = input;
-  for (char &c : normalized) {
-    if (c == '-')
-      c = '+';
-    if (c == '_')
-      c = '/';
-  }
-  while (normalized.size() % 4 != 0) {
-    normalized.push_back('=');
-  }
-  std::string output;
-  output.reserve(normalized.size() * 3 / 4);
-  auto decode_char = [](char c) -> int {
-    if (c >= 'A' && c <= 'Z')
-      return c - 'A';
-    if (c >= 'a' && c <= 'z')
-      return c - 'a' + 26;
-    if (c >= '0' && c <= '9')
-      return c - '0' + 52;
-    if (c == '+')
-      return 62;
-    if (c == '/')
-      return 63;
-    return -1;
-  };
-  for (std::size_t i = 0; i < normalized.size(); i += 4) {
-    int b0 = decode_char(normalized[i]);
-    int b1 = decode_char(normalized[i + 1]);
-    int b2 = normalized[i + 2] == '=' ? -1 : decode_char(normalized[i + 2]);
-    int b3 = normalized[i + 3] == '=' ? -1 : decode_char(normalized[i + 3]);
-    if (b0 < 0 || b1 < 0 || (normalized[i + 2] != '=' && b2 < 0) ||
-        (normalized[i + 3] != '=' && b3 < 0)) {
-      return {};
-    }
-    output.push_back(static_cast<char>((b0 << 2) | (b1 >> 4)));
-    if (b2 >= 0) {
-      output.push_back(static_cast<char>(((b1 & 0xF) << 4) | (b2 >> 2)));
-    }
-    if (b3 >= 0) {
-      output.push_back(static_cast<char>(((b2 & 0x3) << 6) | b3));
-    }
-  }
-  return output;
 }
 
 const std::string &TestJwksJson() {
@@ -161,6 +117,7 @@ TEST_CASE("OIDCValidator rejects wrong issuer", "[oidc]") {
   json payload = {
       {"iss", "https://wrong.example.com"},
       {"aud", "aud"},
+      {"sub", "user-123"},
       {"exp", now + 3600},
   };
   REQUIRE(!validator.Validate(MakeSignedJWT(payload), nullptr));
@@ -175,6 +132,7 @@ TEST_CASE("OIDCValidator rejects wrong audience", "[oidc]") {
   json payload = {
       {"iss", "https://iss.example.com"},
       {"aud", "wrong-aud"},
+      {"sub", "user-123"},
       {"exp", now + 3600},
   };
   REQUIRE(!validator.Validate(MakeSignedJWT(payload), nullptr));
@@ -186,6 +144,7 @@ TEST_CASE("OIDCValidator rejects expired token", "[oidc]") {
   json payload = {
       {"iss", "https://iss.example.com"},
       {"aud", "aud"},
+      {"sub", "user-123"},
       {"exp", 1000},
   };
   REQUIRE(!validator.Validate(MakeSignedJWT(payload), nullptr));
@@ -200,26 +159,51 @@ TEST_CASE("OIDCValidator rejects not-yet-valid token", "[oidc]") {
   json payload = {
       {"iss", "https://iss.example.com"},
       {"aud", "aud"},
+      {"sub", "user-123"},
       {"exp", now + 3600},
       {"nbf", now + 7200},
   };
   REQUIRE(!validator.Validate(MakeSignedJWT(payload), nullptr));
 }
 
-TEST_CASE("OIDCValidator defaults subject to oidc-user", "[oidc]") {
+TEST_CASE("OIDCValidator rejects missing or malformed identity claims",
+          "[oidc]") {
   inferflux::OIDCValidator validator("https://iss.example.com", "aud");
   ConfigureValidator(&validator);
-  auto now = std::chrono::duration_cast<std::chrono::seconds>(
-                 std::chrono::system_clock::now().time_since_epoch())
-                 .count();
-  json payload = {
-      {"iss", "https://iss.example.com"},
-      {"aud", "aud"},
-      {"exp", now + 3600},
-  };
-  std::string subject;
-  REQUIRE(validator.Validate(MakeSignedJWT(payload), &subject));
-  REQUIRE(subject == "oidc-user");
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+  const json valid = {{"iss", "https://iss.example.com"},
+                      {"aud", "aud"},
+                      {"sub", "user-123"},
+                      {"exp", now + 3600}};
+  for (const auto &field : {"sub", "exp"}) {
+    CAPTURE(field);
+    auto payload = valid;
+    payload.erase(field);
+    std::string subject = "previous-user";
+    REQUIRE_FALSE(validator.Validate(MakeSignedJWT(payload), &subject));
+    REQUIRE(subject.empty());
+  }
+  for (const auto &change : std::vector<std::pair<std::string, json>>{
+           {"sub", ""},
+           {"sub", 42},
+           {"iss", 42},
+           {"exp", nullptr},
+           {"exp", "later"},
+           {"exp", now},
+           {"exp", now + 0.5},
+           {"exp", std::numeric_limits<uint64_t>::max()},
+           {"nbf", "later"},
+           {"nbf", nullptr},
+           {"aud", json::array({"aud", 42})}}) {
+    CAPTURE(change.first, change.second);
+    auto payload = valid;
+    payload[change.first] = change.second;
+    std::string subject = "previous-user";
+    REQUIRE_FALSE(validator.Validate(MakeSignedJWT(payload), &subject));
+    REQUIRE(subject.empty());
+  }
 }
 
 TEST_CASE("OIDCValidator rejects invalid signature via override", "[oidc]") {
@@ -231,6 +215,7 @@ TEST_CASE("OIDCValidator rejects invalid signature via override", "[oidc]") {
   json payload = {
       {"iss", "https://iss.example.com"},
       {"aud", "aud"},
+      {"sub", "user-123"},
       {"exp", now + 3600},
   };
   auto bad_signature = Base64UrlEncode("different-signature");
@@ -242,4 +227,26 @@ TEST_CASE("OIDCValidator rejects malformed token", "[oidc]") {
   ConfigureValidator(&validator);
   REQUIRE(!validator.Validate("not-a-jwt", nullptr));
   REQUIRE(!validator.Validate("only.one.dot", nullptr));
+  for (const auto &header :
+       std::vector<json>{json::array(),
+                         nullptr,
+                         {{"alg", 42}},
+                         {{"alg", "RS256"}, {"kid", 42}}}) {
+    const auto jwt = Base64UrlEncode(header.dump()) + "." +
+                     Base64UrlEncode(json::object().dump()) + "." +
+                     TestSignatureB64();
+    REQUIRE_FALSE(validator.Validate(jwt, nullptr));
+  }
+  const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                       std::chrono::system_clock::now().time_since_epoch())
+                       .count();
+  json payload = {{"iss", "https://iss.example.com"},
+                  {"aud", "aud"},
+                  {"sub", "user-123"},
+                  {"exp", now + 3600}};
+  REQUIRE(validator.Validate(MakeSignedJWT(payload), nullptr));
+  payload["padding"] = std::string(16385, 'a');
+  const auto oversized = MakeSignedJWT(payload);
+  REQUIRE(oversized.size() > 16384);
+  REQUIRE_FALSE(validator.Validate(oversized, nullptr));
 }

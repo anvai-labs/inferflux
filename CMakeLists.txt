@@ -897,6 +897,21 @@ add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
 set_tests_properties(FlashAttnTests PROPERTIES LABELS flash_attn)
 add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
 set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
+# Isolated real-TLS fixture; no model or GPU runtime is needed.
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_Interpreter_FOUND)
+  add_executable(inferflux_http_client_tls_probe
+    tests/integration/http_client_tls_probe.cpp net/http_client.cpp)
+  target_include_directories(inferflux_http_client_tls_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(inferflux_http_client_tls_probe PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+  if(WIN32)
+    target_link_libraries(inferflux_http_client_tls_probe PRIVATE ws2_32)
+  endif()
+  add_test(NAME HttpClientTlsTests COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/http_client_tls_test.py
+    $<TARGET_FILE:inferflux_http_client_tls_probe>)
+  set_tests_properties(HttpClientTlsTests PROPERTIES LABELS "http_client;tls;integration" TIMEOUT 90)
+endif()
 add_test(NAME HttpServerTests COMMAND inferflux_tests "[http_server]")
 set_tests_properties(HttpServerTests PROPERTIES LABELS http_server)
 add_test(NAME HttpGenerationAdmissionIntegrationTests

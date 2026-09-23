@@ -305,6 +305,17 @@ INFERFLUX_HTTP_WORKERS=8 ./build/inferfluxd --config config/server.yaml
 | Guardrails | `guardrails.blocklist` | non-empty blocklist baseline |
 | OPA | `guardrails.opa_endpoint` | set when external policy engine is required |
 
+OIDC validation requires a nonempty string subject, exact issuer and audience, and
+an integer expiration strictly later than the current time. Optional `nbf` must
+also be an integer and must not be in the future. Missing, malformed, overflowing
+or expired claims fail authentication; no shared fallback subject is created.
+Tokens above 16 KiB and malformed header/payload structures are rejected without
+propagating JSON type exceptions. Failed validation clears the output identity.
+
+These claim checks do not establish Kanidm deployment acceptance. Discovery/JWKS
+compatibility, ES256 support, TLS hostname verification, explicit OIDC-only policy
+and safe API-key audit identity remain separate co-design work before cutover.
+
 Scope contract:
 
 | Scope | Allows |
@@ -411,3 +422,30 @@ The startup advisor evaluates config quality at boot and emits recommendations f
 - [Admin Guide](AdminGuide.md)
 - [Architecture](Architecture.md)
 - [ARCHIVE_INDEX](ARCHIVE_INDEX.md)
+
+### API-key audit identity
+
+Authenticated API-key requests use `api-key:<SHA-256 storage hash>` as their stable
+subject for audit and per-subject rate limiting. Key insertion/removal events use
+the same nonsecret identifier for the affected key. Bearer credentials must never
+be used as audit subjects or key-management event messages. This changes audit
+consumer identifiers; it does not change scopes, key validity or token validation.
+
+Existing logs are not rewritten. Protect historical audit data and assess any
+previously exposed credentials separately; this fix does not claim retroactive
+redaction or credential rotation. Use high-entropy production keys, since a stable
+hash does not protect guessable development credentials against offline guessing.
+
+### Outbound HTTPS peer identity
+
+The built-in HTTP client checks certificate chain trust and the requested peer
+identity on both buffered and streaming paths. DNS requests require a matching DNS
+certificate identity and send SNI; IPv4 requests require a matching IP subject
+alternative name. Identity configuration failures abort before sending HTTP data.
+Private issuers require a trusted CA (for example via OpenSSL's `SSL_CERT_FILE`);
+disabling certificate verification is not a supported deployment workaround.
+
+This transport fix does not add issuer discovery, ES256, authorization roles or a
+total DNS/connect/read deadline. The existing URL parser does not support bracketed
+IPv6 authorities; those remain a separate compatibility task. These limitations
+must remain visible during OIDC deployment acceptance.

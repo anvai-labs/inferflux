@@ -58,6 +58,20 @@ ParsedUrl ParseUrl(const std::string &url) {
   return parsed;
 }
 
+// DNS names and IP literals have different certificate identity rules. Use
+// the same verification setup for buffered and streaming requests.
+bool ConfigureTlsIdentity(SSL *ssl, const std::string &host) {
+  unsigned char address[16];
+  if (inet_pton(AF_INET, host.c_str(), address) == 1 ||
+      inet_pton(AF_INET6, host.c_str(), address) == 1) {
+    return X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(ssl), host.c_str()) ==
+           1;
+  }
+  SSL_set_hostflags(ssl, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+  return SSL_set1_host(ssl, host.c_str()) == 1 &&
+         SSL_set_tlsext_host_name(ssl, host.c_str()) == 1;
+}
+
 int CreateSocket(const ParsedUrl &parsed) {
   addrinfo hints{};
   hints.ai_family = AF_UNSPEC;
@@ -183,11 +197,10 @@ HttpClient::SendRaw(const std::string &method, const std::string &url,
     if (!conn.ssl) {
       close_connection("failed to allocate TLS context");
     }
-    SSL_set_tlsext_host_name(conn.ssl, parsed.host.c_str());
-#if defined(SSL_set1_host)
-    SSL_set1_host(conn.ssl, parsed.host.c_str());
-#endif
-    SSL_set_fd(conn.ssl, conn.sock);
+    if (!ConfigureTlsIdentity(conn.ssl, parsed.host) ||
+        SSL_set_fd(conn.ssl, conn.sock) != 1) {
+      close_connection("failed to configure TLS peer identity");
+    }
     if (SSL_connect(conn.ssl) != 1) {
       close_connection("TLS handshake failed");
     }
@@ -294,11 +307,11 @@ HttpClient::Send(const std::string &method, const std::string &url,
       close_socket();
       throw std::runtime_error("failed to allocate TLS context");
     }
-    SSL_set_tlsext_host_name(ssl, parsed.host.c_str());
-#if defined(SSL_set1_host)
-    SSL_set1_host(ssl, parsed.host.c_str());
-#endif
-    SSL_set_fd(ssl, sock);
+    if (!ConfigureTlsIdentity(ssl, parsed.host) || SSL_set_fd(ssl, sock) != 1) {
+      SSL_free(ssl);
+      close_socket();
+      throw std::runtime_error("failed to configure TLS peer identity");
+    }
     if (SSL_connect(ssl) != 1) {
       SSL_free(ssl);
       close_socket();
