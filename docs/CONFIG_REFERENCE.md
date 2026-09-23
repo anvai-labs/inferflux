@@ -411,3 +411,17 @@ The startup advisor evaluates config quality at boot and emits recommendations f
 - [Admin Guide](AdminGuide.md)
 - [Architecture](Architecture.md)
 - [ARCHIVE_INDEX](ARCHIVE_INDEX.md)
+
+### Outbound HTTPS peer identity
+
+The built-in HTTP client checks certificate chain trust and the requested peer
+identity on both buffered and streaming paths. DNS requests require a matching DNS
+certificate identity and send SNI; IPv4 requests require a matching IP subject
+alternative name. Identity configuration failures abort before sending HTTP data.
+Private issuers require a trusted CA (for example via OpenSSL's `SSL_CERT_FILE`);
+disabling certificate verification is not a supported deployment workaround.
+
+This transport fix does not add issuer discovery, ES256, authorization roles or a
+total DNS/connect/read deadline. The existing URL parser does not support bracketed
+IPv6 authorities; those remain a separate compatibility task. These limitations
+must remain visible during OIDC deployment acceptance.
