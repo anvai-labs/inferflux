@@ -406,13 +406,14 @@ async function refreshStatus() {
     }
   }
 }
+function serializeHistory(packet) { return JSON.stringify(packet); }
 function validateHistory(packet) {
   if (!packet || packet.version !== 1 || Object.keys(packet).sort().join() !== "entries,version"
       || !Array.isArray(packet.entries) || packet.entries.length > 200
       || packet.entries.some(entry => !entry || Object.keys(entry).sort().join() !== "role,text"
         || !["user", "assistant", "completion"].includes(entry.role)
         || typeof entry.text !== "string" || entry.text.length > 65536)
-      || new TextEncoder().encode(JSON.stringify(packet)).length > maxHistoryBytes)
+      || new TextEncoder().encode(serializeHistory(packet)).length > maxHistoryBytes)
     throw new Error("Expected version 1 history JSON with at most 200 role/text entries (1 MiB total, 65536 characters per entry).");
   return packet.entries.map(entry => ({role: entry.role, text: entry.text}));
 }
@@ -441,7 +442,7 @@ async function sendChat() {
   } catch (error) { showError("Request failed: ", error); }
 }
 function exportHistory() {
-  const blob = new Blob([JSON.stringify({version: 1, entries: history}, null, 2)], {type: "application/json"});
+  const blob = new Blob([serializeHistory({version: 1, entries: history})], {type: "application/json"});
   const link = document.createElement("a");
   const url = URL.createObjectURL(blob);
   link.href = url;
@@ -482,6 +483,8 @@ function unloadModel() {
 function setDefaultModel() {
   if (modelSelect.value) modelAction("/v1/admin/models/default", "PUT", {id: modelSelect.value});
 }
+// A page retained in the back-forward cache must not retain bearer access.
+window.addEventListener("pagehide", clearCredential);
 window.addEventListener("DOMContentLoaded", () => refreshStatus());
 )JS";
   return kJs;

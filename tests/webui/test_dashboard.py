@@ -116,12 +116,14 @@ def test_legacy_html_and_credentials_never_restore(page, gateway):
     assert gateway.requests == [], "no default/development credential may be sent"
 
 
-def test_history_json_is_inert_and_roundtrips(page, gateway, tmp_path):
+@pytest.mark.parametrize("near_limit", [False, True])
+def test_history_json_is_inert_and_roundtrips(page, gateway, tmp_path, near_limit):
     page.goto(gateway.url)
-    packet = {"version": 1, "entries": [{"role": "user", "text": PAYLOAD}]}
+    text = "x" * 5200 if near_limit else PAYLOAD
+    packet = {"version": 1, "entries": [{"role": "user", "text": text}] * (200 if near_limit else 1)}
     page.locator("#importFile").set_input_files({"name": "history.json", "mimeType": "application/json",
-                                               "buffer": json.dumps(packet).encode()})
-    expect(page.locator("#history")).to_contain_text(PAYLOAD)
+                                               "buffer": json.dumps(packet, separators=(",", ":")).encode()})
+    expect(page.locator("#history")).to_contain_text(text)
     expect(page.locator("#history img")).to_have_count(0)
     assert page.evaluate("window.historyExecuted !== true")
     with page.expect_download() as downloaded:
@@ -129,6 +131,10 @@ def test_history_json_is_inert_and_roundtrips(page, gateway, tmp_path):
     output = tmp_path / "history.json"
     downloaded.value.save_as(output)
     assert json.loads(output.read_text()) == packet
+    assert output.stat().st_size <= 1024 * 1024
+    page.get_by_role("button", name="Clear History", exact=True).click()
+    page.locator("#importFile").set_input_files(str(output))
+    expect(page.locator("#history li")).to_have_count(len(packet["entries"]))
     page.reload()
     expect(page.locator("#history li")).to_have_count(0)
 
@@ -177,7 +183,8 @@ def test_accessible_responsive_shell(page, gateway, width):
     expect(page.locator("#output")).to_have_attribute("aria-live", "polite")
 
 
-def test_clear_discards_an_inflight_model_response(page, gateway):
+@pytest.mark.parametrize("leave_page", [False, True])
+def test_clear_discards_an_inflight_model_response(page, gateway, leave_page):
     connect(page, gateway)
     page.evaluate("""() => {
       const originalFetch = window.fetch;
@@ -191,7 +198,10 @@ def test_clear_discards_an_inflight_model_response(page, gateway):
     }""")
     page.get_by_role("button", name="Refresh models", exact=True).click()
     page.wait_for_function("typeof window.releaseModels === 'function'")
-    page.get_by_role("button", name="Clear credential", exact=True).click()
+    if leave_page:
+        page.evaluate("window.dispatchEvent(new PageTransitionEvent('pagehide', {persisted: true}))")
+    else:
+        page.get_by_role("button", name="Clear credential", exact=True).click()
     page.evaluate("async () => { window.releaseModels(); await new Promise(r => setTimeout(r, 0)); }")
     expect(page.locator("#modelSelect option")).to_have_count(0)
     expect(page.locator("#output")).to_be_empty()
