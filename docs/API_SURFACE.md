@@ -61,7 +61,7 @@ graph TD
 | `/readyz` | `GET` | none | Readiness + role/state |
 | `/healthz` | `GET` | none | General health snapshot |
 | `/metrics` | `GET` | none | Prometheus metrics |
-| `/ui` | `GET` | none | Optional embedded web UI (if built with `ENABLE_WEBUI=ON`) |
+| `/ui` | `GET` | none | Optional [embedded web UI](WEBUI.md) (if built with `ENABLE_WEBUI=ON`) |
 
 ## 4) CLI ↔ API Map
 

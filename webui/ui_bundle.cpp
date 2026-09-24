@@ -11,6 +11,7 @@ const std::string &UiHtml() {
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>InferFlux WebUI</title>
     <style>{{css}}</style>
   </head>
@@ -19,12 +20,13 @@ const std::string &UiHtml() {
       <header>
         <div>
           <h1>InferFlux WebUI</h1>
-          <p class="subtitle">Serving model: <strong>{{backend}}</strong></p>
+          <p class="subtitle">Model serving and runtime status</p>
         </div>
         <div class="api-key">
-          <label for="apiKey">API Key</label>
-          <input id="apiKey" placeholder="Bearer dev-key-123" />
-          <button onclick="saveApiKey()">Save</button>
+          <label for="apiKey">Access token or API key</label>
+          <input id="apiKey" type="password" autocomplete="off" placeholder="Enter bearer credential" aria-describedby="authStatus" />
+          <div class="btn-row"><button onclick="saveApiKey()">Use credential</button><button class="secondary" onclick="clearCredential()">Clear credential</button></div>
+          <p id="authStatus" role="status">Credentials stay in this page only. Browser SSO sign-in is not available in this UI.</p>
         </div>
       </header>
       <section class="split">
@@ -32,41 +34,42 @@ const std::string &UiHtml() {
           <label for="modelSelect">Models</label>
           <select id="modelSelect"></select>
           <div class="btn-row">
-            <button class="secondary" onclick="refreshModels()">Refresh</button>
+            <button class="secondary" onclick="refreshModels()">Refresh models</button>
             <button class="secondary" onclick="setDefaultModel()">Set Default</button>
             <button class="secondary" onclick="unloadModel()">Unload</button>
           </div>
+          <p class="subtitle">Model actions require server-granted admin scope. Configure advanced GPU placement through the server configuration or CLI.</p>
           <label for="loadModelPath">Load Model (path)</label>
           <input id="loadModelPath" placeholder="/models/llama3.gguf" />
           <label for="loadModelBackend">Backend</label>
-          <input id="loadModelBackend" placeholder="cpu/cuda" />
+          <input id="loadModelBackend" placeholder="cpu / cuda / rocm" />
           <button onclick="loadModel()">Load Model</button>
           <label for="prompt">Prompt</label>
           <textarea id="prompt" rows="6">Hello, InferFlux!</textarea>
           <div class="btn-row">
-            <button onclick="sendCompletion()">Completion</button>
-            <button onclick="sendChat()">Chat</button>
+            <button onclick="sendChat()">Send prompt</button>
           </div>
         </div>
         <div class="card right">
-          <label>Output</label>
-          <pre id="output"></pre>
+          <h2>Output</h2>
+          <pre id="output" aria-live="polite" aria-label="Request output"></pre>
         </div>
       </section>
       <section class="card status-card">
         <div class="status-header">
           <div>
             <h2>Status</h2>
-            <p id="statusText">Loading...</p>
+            <p id="statusText" role="status">Loading...</p>
           </div>
           <div class="btn-row">
-            <button class="secondary" onclick="refreshStatus()">Refresh</button>
+            <button class="secondary" onclick="refreshStatus()">Refresh status</button>
             <button class="secondary" onclick="exportHistory()">Export History</button>
             <label class="file-btn">
-              Import<input type="file" id="importFile" onchange="importHistory(event)" />
+              Import<input type="file" id="importFile" accept=".json,application/json" onchange="importHistory(event)" />
             </label>
           </div>
         </div>
+        <p id="metricsStatus" role="status">Enter a credential to load metrics.</p>
         <div class="metrics-grid">
           <div class="metric-card">
             <h3>Queue Depth</h3>
@@ -87,6 +90,7 @@ const std::string &UiHtml() {
           <h2>Chat History</h2>
           <button class="secondary" onclick="clearHistory()">Clear History</button>
         </div>
+        <p class="subtitle">History stays in this page. Export/import uses versioned JSON; HTML history is not accepted.</p>
         <ul id="history"></ul>
       </section>
     </div>
@@ -99,6 +103,7 @@ const std::string &UiHtml() {
 
 const std::string &UiCss() {
   static const std::string kCss = R"CSS(
+* { box-sizing: border-box; }
 body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   margin: 0;
@@ -124,7 +129,8 @@ header {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  min-width: 260px;
+  width: min(100%, 420px);
+  min-width: 0;
 }
 .split {
   display: flex;
@@ -140,7 +146,7 @@ header {
 }
 .left,
 .right {
-  min-width: 320px;
+  min-width: min(100%, 320px);
 }
 .status-card .btn-row {
   justify-content: flex-end;
@@ -179,6 +185,7 @@ button.secondary {
 }
 pre {
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
   background: #020617;
   border-radius: 8px;
   padding: 16px;
@@ -232,7 +239,7 @@ ul#history li:last-child {
 }
 .metric-card {
   flex: 1;
-  min-width: 160px;
+  min-width: min(100%, 160px);
   background: #020617;
   border-radius: 10px;
   padding: 12px;
@@ -248,6 +255,20 @@ ul#history li:last-child {
   font-size: 24px;
   font-weight: 600;
 }
+label { display: block; margin-block: 12px 6px; }
+.card { min-width: 0; }
+.container > .card { margin-top: 24px; }
+#authStatus, #metricsStatus, .subtitle { color: #cbd5e1; line-height: 1.5; }
+#authStatus { max-width: 42ch; }
+#history li { white-space: pre-wrap; overflow-wrap: anywhere; }
+:focus-visible { outline: 3px solid #38bdf8; outline-offset: 3px; }
+@media (max-width: 600px) {
+  body { padding: 16px; }
+  .split { display: block; }
+  .split .card + .card { margin-top: 16px; }
+  .history-header, .status-header { flex-wrap: wrap; gap: 12px; }
+  h1 { font-size: 1.6rem; }
+}
 )CSS";
   return kCss;
 }
@@ -258,206 +279,210 @@ const apiKeyInput = document.getElementById("apiKey");
 const historyList = document.getElementById("history");
 const promptBox = document.getElementById("prompt");
 const modelSelect = document.getElementById("modelSelect");
+const output = document.getElementById("output");
+let credential = "";
+let revision = 0;
+let controller = new AbortController();
+let history = [];
+const maxHistoryBytes = 1024 * 1024;
 
-function headers() {
-  const token =
-    localStorage.getItem("inferflux_api_key") ||
-    apiKeyInput.value ||
-    "Bearer dev-key-123";
-  return { "Content-Type": "application/json", Authorization: token };
+// Retire this UI's old persistent secrets/HTML without reading or rendering them.
+try {
+  for (const key of ["inferflux_api_key", "inferflux_history", "inferflux_prompt", "inferflux_model"])
+    localStorage.removeItem(key);
+} catch { document.getElementById("authStatus").textContent = "Browser storage could not be cleared; clear site data to remove legacy saved credentials."; }
+
+function resetCredential() {
+  revision++;
+  controller.abort();
+  controller = new AbortController();
+  credential = "";
+  apiKeyInput.value = "";
+  modelSelect.replaceChildren();
+  output.textContent = "";
+  promptBox.value = "";
+  clearHistory();
+  clearMetrics();
+}
+function clearCredential() {
+  resetCredential();
+  document.getElementById("authStatus").textContent = "Credential cleared. Protected data was removed.";
+  document.getElementById("metricsStatus").textContent = "Enter a credential to load metrics.";
 }
 function saveApiKey() {
-  localStorage.setItem("inferflux_api_key", apiKeyInput.value);
+  const token = apiKeyInput.value.trim().replace(/^Bearer\s+/i, "");
+  resetCredential();
+  if (!token || !/^[\x21-\x7e]+$/.test(token)) {
+    document.getElementById("authStatus").textContent = "Enter a valid access token or API key.";
+    return;
+  }
+  credential = token;
+  document.getElementById("authStatus").textContent = "Credential held in memory. The server checks each request's permissions.";
+  refreshModels();
+  refreshStatus();
 }
-function saveHistory() {
-  localStorage.setItem("inferflux_history", historyList.innerHTML);
+async function request(path, options = {}, format = "json", authenticated = true) {
+  if (authenticated && !credential) throw new Error("Enter a credential first.");
+  const current = revision;
+  const headers = { "Content-Type": "application/json" };
+  if (authenticated) headers.Authorization = "Bearer " + credential;
+  const response = await fetch(path, { ...options, headers, signal: controller.signal });
+  if (current !== revision) throw new DOMException("Credential changed", "AbortError");
+  if (!response.ok) {
+    if (response.status === 401 && authenticated) {
+      clearCredential();
+      document.getElementById("authStatus").textContent = "Credential rejected or expired. Enter a new credential.";
+    }
+    throw new Error(`${path}: HTTP ${response.status}`);
+  }
+  const value = format === "text" ? await response.text() : await response.json();
+  if (current !== revision) throw new DOMException("Credential changed", "AbortError");
+  return value;
 }
-function restoreHistory() {
-  const saved = localStorage.getItem("inferflux_history");
-  if (saved) historyList.innerHTML = saved;
-}
-function clearHistory() {
-  historyList.innerHTML = "";
-  saveHistory();
-}
-function persistPrompt() {
-  localStorage.setItem("inferflux_prompt", promptBox.value);
+function showError(prefix, error) {
+  if (error.name !== "AbortError") output.textContent = prefix + error.message;
 }
 async function refreshModels() {
-  modelSelect.innerHTML = "";
+  const selected = modelSelect.value;
+  modelSelect.replaceChildren();
   try {
-    const res = await fetch("/v1/models", { headers: headers() });
-    const data = await res.json();
-    data.data.forEach((model) => {
-      const opt = document.createElement("option");
-      opt.value = model.id;
-      opt.textContent = `${model.id} ${model.ready ? '✅' : '⏳'}`;
-      modelSelect.appendChild(opt);
-    });
-    const saved = localStorage.getItem("inferflux_model");
-    if (saved) modelSelect.value = saved;
-  } catch (err) {
-    document.getElementById("output").textContent =
-      "Failed to load models: " + err;
+    const data = await request("/v1/models");
+    if (!Array.isArray(data.data) || data.data.some(model => typeof model.id !== "string"))
+      throw new Error("Invalid models response.");
+    for (const model of data.data) {
+      const option = document.createElement("option");
+      option.value = model.id;
+      option.textContent = model.id + (model.ready === true ? " — ready" : " — readiness not confirmed");
+      modelSelect.appendChild(option);
+    }
+    if (data.data.some(model => model.id === selected)) modelSelect.value = selected;
+  } catch (error) { showError("Models unavailable: ", error); }
+}
+function clearMetrics() {
+  for (const id of ["metricQueue", "metricRequests", "metricErrors"])
+    document.getElementById(id).textContent = "--";
+}
+function metricValue(text, name) {
+  // These are the server's documented Prometheus series, including backend labels.
+  const rows = text.split("\n").filter(line => line.startsWith(name + " ") || line.startsWith(name + "{"));
+  if (!rows.length) throw new Error(`Missing metric ${name}.`);
+  let total = 0;
+  for (const row of rows) {
+    const match = row.match(new RegExp("^" + name + '(?:\\{(?:[^"}\\\\]|\\\\.|"(?:[^"\\\\]|\\\\.)*")*\\})?\\s+([0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)\\s*$'));
+    if (!match || !Number.isFinite(Number(match[1])) || Number(match[1]) < 0)
+      throw new Error(`Invalid metric ${name}.`);
+    total += Number(match[1]);
   }
+  if (!Number.isFinite(total)) throw new Error(`Invalid metric ${name}.`);
+  return String(total);
 }
 async function refreshStatus() {
+  const status = document.getElementById("statusText");
   try {
-    const health = await fetch("/healthz").then((r) => r.json());
-    const ready = await fetch("/readyz").then((r) => r.json());
-    document.getElementById("statusText").textContent =
-      `Health: ${health.status} | Ready: ${ready.status}`;
-  } catch (err) {
-    document.getElementById("statusText").textContent =
-      "Status error: " + err;
+    const health = await request("/healthz", {}, "json", false);
+    const ready = await request("/readyz", {}, "json", false);
+    if (typeof health.status !== "string" || typeof ready.status !== "string")
+      throw new Error("Invalid health response.");
+    status.textContent = `Health: ${health.status} | Ready: ${ready.status}`;
+  } catch (error) {
+    if (error.name !== "AbortError") status.textContent = "Status unavailable: " + error.message;
+  }
+  const metricsStatus = document.getElementById("metricsStatus");
+  if (!credential) {
+    clearMetrics();
+    metricsStatus.textContent = "Enter a credential to load metrics.";
+    return;
   }
   try {
-    const metrics = await fetch("/metrics").then((r) => r.text());
-    const queueMatch = metrics.match(/inferflux_scheduler_queue_depth\s+(\d+)/);
-    const reqMatch = metrics.match(/inferflux_requests_total\s+(\d+)/);
-    const errMatch = metrics.match(/inferflux_errors_total\s+(\d+)/);
-    document.getElementById("metricQueue").textContent =
-      queueMatch ? queueMatch[1] : "--";
-    document.getElementById("metricRequests").textContent =
-      reqMatch ? reqMatch[1] : "--";
-    document.getElementById("metricErrors").textContent =
-      errMatch ? errMatch[1] : "--";
-  } catch (err) {
-    document.getElementById("metricQueue").textContent = "--";
-    document.getElementById("metricRequests").textContent = "--";
-    document.getElementById("metricErrors").textContent = "--";
+    const metrics = await request("/metrics", {}, "text");
+    const values = ["inferflux_scheduler_queue_depth", "inferflux_requests_total", "inferflux_errors_total"]
+      .map(name => metricValue(metrics, name));
+    ["metricQueue", "metricRequests", "metricErrors"].forEach((id, i) => document.getElementById(id).textContent = values[i]);
+    metricsStatus.textContent = "Metrics loaded.";
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      clearMetrics();
+      metricsStatus.textContent = "Metrics unavailable: " + error.message;
+    }
   }
 }
-
-async function sendCompletion() {
-  const prompt = promptBox.value;
-  const model = modelSelect.value;
-  localStorage.setItem("inferflux_model", model);
-  persistPrompt();
-  const res = await fetch("/v1/chat/completions", {
-    method: "POST",
-    headers: headers(),
-    body: JSON.stringify({ messages: [{role: "user", content: prompt}], model, max_tokens: 128 }),
-  });
-  const data = await res.json();
-  const text = data.choices?.[0]?.message?.content ?? JSON.stringify(data);
-  document.getElementById("output").textContent = text;
-  appendHistory("completion", prompt, text);
+function validateHistory(packet) {
+  if (!packet || packet.version !== 1 || Object.keys(packet).sort().join() !== "entries,version"
+      || !Array.isArray(packet.entries) || packet.entries.length > 200
+      || packet.entries.some(entry => !entry || Object.keys(entry).sort().join() !== "role,text"
+        || !["user", "assistant", "completion"].includes(entry.role)
+        || typeof entry.text !== "string" || entry.text.length > 65536)
+      || new TextEncoder().encode(JSON.stringify(packet)).length > maxHistoryBytes)
+    throw new Error("Expected version 1 history JSON with at most 200 role/text entries (1 MiB total, 65536 characters per entry).");
+  return packet.entries.map(entry => ({role: entry.role, text: entry.text}));
 }
+function renderHistory() {
+  historyList.replaceChildren();
+  for (const entry of history) {
+    const item = document.createElement("li");
+    item.textContent = entry.role + ": " + entry.text;
+    historyList.appendChild(item);
+  }
+}
+function clearHistory() { history = []; renderHistory(); }
 async function sendChat() {
   const prompt = promptBox.value;
   const model = modelSelect.value;
-  localStorage.setItem("inferflux_model", model);
-  persistPrompt();
-  appendHistory("user", prompt);
-  const res = await fetch("/v1/chat/completions", {
-    method: "POST",
-    headers: headers(),
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "user", content: prompt }],
-      max_tokens: 128,
-    }),
-  });
-  const data = await res.json();
-  const choice = data.choices?.[0]?.message?.content || JSON.stringify(data);
-  appendHistory("assistant", choice);
-  document.getElementById("output").textContent = JSON.stringify(
-    data,
-    null,
-    2
-  );
+  if (!model) { output.textContent = "Select an available model first."; return; }
+  try {
+    const data = await request("/v1/chat/completions", {method: "POST",
+      body: JSON.stringify({model, messages: [{role: "user", content: prompt}], max_tokens: 128})});
+    const answer = data.choices?.[0]?.message?.content;
+    if (typeof answer !== "string") throw new Error("Invalid chat response: missing message content.");
+    output.textContent = answer;
+    // Never silently truncate or partially replace history when a bound is exceeded.
+    history = validateHistory({version: 1, entries: [{role: "assistant", text: answer}, {role: "user", text: prompt}, ...history]});
+    renderHistory();
+  } catch (error) { showError("Request failed: ", error); }
 }
-function appendHistory(role, text, raw = "") {
-  const li = document.createElement("li");
-  li.textContent =
-    role === "assistant"
-      ? "Assistant: " + text
-      : role === "completion"
-      ? "Completion:\n" + raw
-      : "User: " + text;
-  historyList.prepend(li);
-  saveHistory();
-}
-window.addEventListener("DOMContentLoaded", () => {
-  const savedKey = localStorage.getItem("inferflux_api_key");
-  if (savedKey) apiKeyInput.value = savedKey;
-  const savedPrompt = localStorage.getItem("inferflux_prompt");
-  if (savedPrompt) promptBox.value = savedPrompt;
-  restoreHistory();
-  refreshModels();
-  refreshStatus();
-});
-promptBox.addEventListener("change", persistPrompt);
-
 function exportHistory() {
-  const blob = new Blob([historyList.innerHTML], { type: "text/html" });
+  const blob = new Blob([JSON.stringify({version: 1, entries: history}, null, 2)], {type: "application/json"});
   const link = document.createElement("a");
-  link.href = URL.createObjectURL(blob);
-  link.download = "inferflux-history.html";
+  const url = URL.createObjectURL(blob);
+  link.href = url;
+  link.download = "inferflux-history.json";
   link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
-
-function importHistory(event) {
+async function importHistory(event) {
   const file = event.target.files[0];
   if (!file) return;
-  const reader = new FileReader();
-  reader.onload = (e) => {
-    historyList.innerHTML = e.target.result;
-    saveHistory();
-  };
-  reader.readAsText(file);
+  const current = revision;
+  try {
+    if (file.size > maxHistoryBytes) throw new Error("History file exceeds 1 MiB.");
+    const text = await file.text();
+    if (current !== revision) return;
+    const next = validateHistory(JSON.parse(text));
+    history = next;
+    renderHistory();
+    output.textContent = "History imported as plain text. Nothing was sent to a model.";
+  } catch (error) { if (current === revision) showError("History import failed: ", error); }
+  finally { event.target.value = ""; }
 }
-
-async function loadModel() {
+async function modelAction(path, method, payload) {
+  try {
+    output.textContent = await request(path, {method, body: JSON.stringify(payload)}, "text");
+    await refreshModels();
+  } catch (error) { showError("Model action failed: ", error); }
+}
+function loadModel() {
   const path = document.getElementById("loadModelPath").value.trim();
-  if (!path) return;
   const backend = document.getElementById("loadModelBackend").value.trim();
-  const payload = { path };
-  if (backend) payload.backend = backend;
-  try {
-    const res = await fetch("/v1/admin/models", {
-      method: "POST",
-      headers: headers(),
-      body: JSON.stringify(payload),
-    });
-    document.getElementById("output").textContent = await res.text();
-    refreshModels();
-  } catch (err) {
-    document.getElementById("output").textContent = err;
-  }
+  if (!path) { output.textContent = "Enter a model path."; return; }
+  modelAction("/v1/admin/models", "POST", {path, ...(backend ? {backend} : {})});
 }
-
-async function unloadModel() {
-  const model = modelSelect.value;
-  if (!model) return;
-  try {
-    const res = await fetch("/v1/admin/models", {
-      method: "DELETE",
-      headers: headers(),
-      body: JSON.stringify({ id: model }),
-    });
-    document.getElementById("output").textContent = await res.text();
-    refreshModels();
-  } catch (err) {
-    document.getElementById("output").textContent = err;
-  }
+function unloadModel() {
+  if (modelSelect.value) modelAction("/v1/admin/models", "DELETE", {id: modelSelect.value});
 }
-
-async function setDefaultModel() {
-  const model = modelSelect.value;
-  if (!model) return;
-  try {
-    const res = await fetch("/v1/admin/models/default", {
-      method: "PUT",
-      headers: headers(),
-      body: JSON.stringify({ id: model }),
-    });
-    document.getElementById("output").textContent = await res.text();
-  } catch (err) {
-    document.getElementById("output").textContent = err;
-  }
+function setDefaultModel() {
+  if (modelSelect.value) modelAction("/v1/admin/models/default", "PUT", {id: modelSelect.value});
 }
+window.addEventListener("DOMContentLoaded", () => refreshStatus());
 )JS";
   return kJs;
 }

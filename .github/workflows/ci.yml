@@ -501,7 +501,6 @@ jobs:
   build-check-webui:
     name: Build check (WebUI)
     runs-on: ubuntu-24.04
-    continue-on-error: true   # Advisory — ENABLE_WEBUI ships in releases only
     needs: [changes]
     if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.shared == 'true'
 
@@ -535,6 +534,15 @@ jobs:
 
       - name: Build (compile-only)
         run: cmake --build build --target inferfluxd -j$(nproc)
+
+      - name: Install browser contract dependencies
+        run: |
+          python3 -m venv .venv-codesign
+          .venv-codesign/bin/python -m pip install 'pytest>=8,<10' 'playwright==1.58.0'
+          .venv-codesign/bin/python -m playwright install --with-deps chromium
+
+      - name: Verify compiled WebUI browser contracts
+        run: .venv-codesign/bin/python -m pytest tests/webui -q
 
   # ---------------------------------------------------------------------------
   # CUDA throughput gate (self-hosted GPU)
