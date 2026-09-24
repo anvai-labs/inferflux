@@ -122,3 +122,37 @@ all actual CI gates, and preserve shared cache, dirty files, rollback configurat
 prior failed evidence and private state. Keep #184/C5 open until the full verdict is
 reviewed. Do not repeat the preserved five-call streaming replay merely to recreate
 this handoff.
+
+
+## 2026-09-24 cancellation and embedding-memory findings
+
+The existing embedding admission test missed cancellation during the only or final
+native slice: its 33-input case cancelled the first slice and was caught on the next
+iteration. New single/final-slice scenarios reproduced a false successful result.
+The scheduler now checks cancellation at result publication, after retaining tokens
+measured for completed work and before requeueing or returning vectors. Cancelled
+results are aborted and contain no embedding vectors. This does not interrupt native
+GPU execution or promise an atomic cancellation acknowledgement after publication.
+It also does not make measured usage available on a disconnected HTTP transport.
+
+The regression extends the existing fixture, rather than adding a parallel suite.
+The failing cases were observed before the production fix; the updated admission
+suite passes 93 assertions in four cases, and all 54 configured CPU CTest targets
+pass. These are CPU results, not a GPU runtime or C5 acceptance claim.
+
+Source inspection also found that `EnsureEmbedBatchCtx` independently hardcodes
+32 sequences and 512 tokens per sequence for context, batch and microbatch. Changing
+model placement or the configured generation context does not bound this allocation.
+The recorded serving log includes a 13432 MiB CUDA embedding compute reservation;
+AMD model/KV/compute allocations already total approximately 23 GiB on a 32 GiB card.
+Moving BGE to AMD therefore needs measured capacity and bounded embedding geometry,
+not an assumption that its small weight file implies a small execution footprint.
+
+Follow-up: derive embedding execution geometry from one validated model-owned
+configuration, test bounds and defaults on CPU, and measure the accepted trusted-main
+runtime before changing placement. Preserve ordered batching, token accounting and
+pooling semantics. The cross-device executor also waits for all device-group futures
+before returning results to the scheduler; this is a possible source of shared
+head-of-line blocking, not a demonstrated diagnosis of the stalled live process.
+Neither the cancellation fix nor a same-binary restart closes origin liveness,
+embedding compatibility, executed reuse, session leases or #184/C5.

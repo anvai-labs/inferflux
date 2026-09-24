@@ -2830,6 +2830,15 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         }
         inference->embedding_offset = inference->embedding_results.size();
       }
+      // Cancellation may arrive inside the final native embedding call (or
+      // while another device finishes). Check at publication, after accounting
+      // for completed work, before either requeueing or returning vectors.
+      const bool cancelled =
+          inference->cancellation_flag && inference->cancellation_flag->load();
+      if (cancelled) {
+        result.no_backend = true;
+        result.completion = "[cancelled]";
+      }
       if (!result.no_backend &&
           inference->embedding_offset < inference->embedding_inputs.size()) {
         pending->enqueue_time = std::chrono::steady_clock::now();
@@ -2854,7 +2863,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         result.embeddings.clear();
       }
       result.prompt_tokens = inference->embedding_prompt_tokens;
-      inference->phase = RequestPhase::kFinished;
+      inference->phase =
+          cancelled ? RequestPhase::kAborted : RequestPhase::kFinished;
       FillResultUsageTelemetry(*inference, &result, metrics_,
                                pending->resolved_backend.get());
       pending->promise.set_value(std::move(result));
