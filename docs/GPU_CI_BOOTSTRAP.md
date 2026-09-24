@@ -49,11 +49,18 @@ administrators. Force pushes and branch deletion are disabled.
 | `Build & Test (ubuntu-latest)` | Complete model-free suite and contract assertions |
 | `Build & Test (macos-latest, MPS)` | macOS runtime and unit coverage |
 | `Build (macos-latest, MLX flag)` | MLX configuration compiles |
-| `CUDA compile check (ubuntu-latest)` | CUDA sources compile on a hosted runner |
+| `CUDA compile check (ubuntu-latest)` | Server and existing CUDA-enabled unit tests compile on a hosted runner; no GPU execution |
 | `Build check (Vulkan)` | Vulkan configuration compiles |
 | `GGUF & Quantization Tests (ubuntu-latest)` | Portable GGUF contracts pass |
 | `Coverage (ubuntu-latest)` | Coverage build, tests, and upload pass |
 | `clang-format check` | Touched C++ remains formatted |
+
+The hosted CUDA compile job builds both `inferfluxd` and `inferflux_tests`.
+CPU-only builds omit native GPU test translation units, so compiling the server
+alone cannot validate those tests. Run 36018825702 exposed an invalid readiness
+method in the existing native embedding-geometry fixture before CUDA runtime
+tests could start. The fixture is corrected in place; no duplicate test suite is
+added. Compilation remains distinct from exact-SHA model-backed GPU acceptance.
 
 `Dual-GPU gate result` is deliberately absent from pull-request requirements;
 it is required by the release process for the exact promoted SHA.

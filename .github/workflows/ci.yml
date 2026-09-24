@@ -451,9 +451,10 @@ jobs:
             -DENABLE_VULKAN=OFF \
             -DENABLE_MTMD=OFF
 
-      # Build only the server binary; unit tests can't run without a GPU.
+      # Compile the existing CUDA-enabled tests too; execution stays on trusted
+      # main's GPU runner. CPU builds omit native GPU test translation units.
       - name: Build (compile-only)
-        run: cmake --build build --target inferfluxd -j2
+        run: cmake --build build --target inferfluxd inferflux_tests -j2
 
   # ---------------------------------------------------------------------------
   # Vulkan compile-check — verifies GGML_VULKAN=ON builds clean.
