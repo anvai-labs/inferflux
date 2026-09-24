@@ -217,6 +217,44 @@ private:
   FakeNativeRuntime *runtime_raw_{nullptr};
 };
 
+TEST_CASE(
+    "Native loaders reject explicit embedding geometry before initialization",
+    "[native_gpu_backend][embedding_geometry]") {
+  FakeTokenizer tokenizer;
+  auto runtime = std::make_unique<FakeNativeRuntime>(&tokenizer);
+  auto *raw = runtime.get();
+  TestNativeGpuBackend backend(std::move(runtime));
+  LlamaBackendConfig config;
+  config.embedding_batch_size = 1;
+  REQUIRE_FALSE(backend.LoadModel("fake.gguf", config));
+  REQUIRE_FALSE(raw->IsReady());
+}
+
+TEST_CASE("Invalid embedding geometry does not initialize a GPU strategy",
+          "[native_gpu_backend][embedding_geometry]") {
+  class CountingStrategy : public GpuDeviceStrategy {
+  public:
+    int calls{0};
+    bool Initialize() override {
+      ++calls;
+      return true;
+    }
+    bool IsAvailable() const override { return true; }
+    GpuDeviceInfo GetDeviceInfo() const override { return {}; }
+    LlamaBackendTarget Target() const override {
+      return LlamaBackendTarget::kCuda;
+    }
+    void RecordMetrics(const LlamaBackendConfig &) override {}
+  };
+  auto strategy = std::make_unique<CountingStrategy>();
+  auto *raw = strategy.get();
+  GpuAcceleratedBackend backend(std::move(strategy));
+  LlamaBackendConfig config;
+  config.embedding_batch_size = 0;
+  REQUIRE_FALSE(backend.LoadModel("/must-not-load.gguf", config));
+  REQUIRE(raw->calls == 0);
+}
+
 TEST_CASE("NativeGpuBackend Decode uses burst path for eligible greedy decode",
           "[native_gpu_backend]") {
   test::ScopedEnvVar disable_parity("INFERFLUX_CUDA_DISABLE_PARITY_DELEGATE",

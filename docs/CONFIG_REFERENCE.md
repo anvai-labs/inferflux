@@ -449,3 +449,49 @@ This transport fix does not add issuer discovery, ES256, authorization roles or 
 total DNS/connect/read deadline. The existing URL parser does not support bracketed
 IPv6 authorities; those remain a separate compatibility task. These limitations
 must remain visible during OIDC deployment acceptance.
+
+
+## Per-model embedding batch geometry
+
+Startup/watched `models` entries and admin model-load JSON accept optional
+`embedding_batch_size`, an integer from 1 through 32. It is supported by explicit
+llama.cpp backends (`llama_cpp_cpu`, `llama_cpp_cuda`, `llama_cpp_rocm`, and other
+llama.cpp device wrappers). Native InferFlux and MLX loaders reject the explicit
+option before device/model initialization. The legacy name-only `BackendManager`
+rejects it; use immutable `ModelLoadSpec` routing instead. No environment-variable
+alias or second parser is added.
+
+Omitting the option retains the existing 32-sequence embedding batch geometry and
+omits new diagnostic fields. An explicit value resolves one geometry used for
+both input grouping and the lazy embedding context: maximum sequences = value,
+context/batch/microbatch tokens = value × 512. Generation context, generation
+sequence capacity, 512-token embedding truncation, pooling and output order are
+unchanged. Larger input arrays are processed in ordered groups; a smaller group
+is not an end-to-end deadline or native cancellation guarantee.
+
+For example, the BGE entry in `config/server.dual-gpu.yaml` opts into one sequence
+per group. This does not relocate the model or establish that it fits a particular
+GPU. Measure allocation and mixed traffic after trusted-main deployment. Model
+responses expose `placement.embedding_batch_limits` only when explicitly configured,
+with `max_sequences`, `tokens_per_sequence` and `max_batch_tokens`. These describe
+configured limits, not proof that the lazy context has allocated or completed work.
+
+Resource changes require an unloaded/new backend. Direct llama.cpp/GPU reloads
+involving existing or incoming explicit embedding geometry fail before changing
+state or initializing a device; a rejected reload preserves the old usable model.
+Legacy reload behavior with no explicit embedding geometry remains unchanged.
+
+CPU validation with an existing BGE-small GGUF asset can run the optional real-model
+regression (384-dimensional encoder required):
+
+```bash
+INFERFLUX_TEST_EMBEDDING_MODEL=/private/models/bge-small-en-v1.5.gguf \
+  ./build-cpu/inferflux_tests "[embedding_native]"
+```
+
+The CPU-only build verifies three ordered outputs across one-sequence groups,
+per-input parity and preserved outputs/readiness/metadata after rejected explicit
+or absent-setting reloads. Standard CPU tests cover defaults, YAML/JSON bounds,
+registry immutability, admin propagation, diagnostics and native/device rejection.
+Without the external model asset, that one optional test reports skipped; this is
+not GPU or full Victor/C5 acceptance.

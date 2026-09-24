@@ -25,16 +25,19 @@ std::optional<DeviceSelector> ParseDeviceSelector(const std::string &value) {
 
 bool ModelLoadSpec::HasOverrides() const {
   return device || context_size || gpu_layers || max_parallel_sequences ||
-         kv_cache_type;
+         embedding_batch_size || kv_cache_type;
 }
 bool ModelLoadSpec::operator==(const ModelLoadSpec &o) const {
   return std::tie(id, path, format, backend, make_default, device, context_size,
-                  gpu_layers, max_parallel_sequences, kv_cache_type) ==
+                  gpu_layers, max_parallel_sequences, embedding_batch_size,
+                  kv_cache_type) ==
          std::tie(o.id, o.path, o.format, o.backend, o.make_default, o.device,
                   o.context_size, o.gpu_layers, o.max_parallel_sequences,
-                  o.kv_cache_type);
+                  o.embedding_batch_size, o.kv_cache_type);
 }
 std::string ModelLoadSpec::Validate() const {
+  if (!EmbeddingBatchGeometry::Resolve(embedding_batch_size))
+    return "embedding_batch_size must be between 1 and 32";
   if (device && !ParseDeviceSelector(*device))
     return "device must be cuda:N or rocm:N";
   if (context_size && *context_size <= 0)
@@ -69,6 +72,8 @@ ModelLoadSpec::Apply(const LlamaBackendConfig &defaults) const {
   }
   if (max_parallel_sequences)
     config.max_parallel_sequences = *max_parallel_sequences;
+  if (embedding_batch_size)
+    config.embedding_batch_size = embedding_batch_size;
   if (kv_cache_type) {
     config.llama_kv_cache_type = *kv_cache_type;
     config.kv_cache_type_explicit = true;
@@ -104,6 +109,8 @@ ModelLoadSpec ParseModelLoadSpec(const YAML::Node &node) {
     out.gpu_layers = node["gpu_layers"].as<int>();
   if (node["max_parallel_sequences"])
     out.max_parallel_sequences = node["max_parallel_sequences"].as<int>();
+  if (node["embedding_batch_size"])
+    out.embedding_batch_size = node["embedding_batch_size"].as<int>();
   if (node["kv_cache_type"])
     out.kv_cache_type = node["kv_cache_type"].as<std::string>();
   const auto error = out.Validate();

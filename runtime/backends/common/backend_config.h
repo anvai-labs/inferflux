@@ -8,7 +8,25 @@
 
 namespace inferflux {
 
+// One validated geometry for the lazy llama.cpp embedding batch context and
+// input grouping. This is independent of generation context/sequence capacity.
+struct EmbeddingBatchGeometry {
+  static constexpr int kTokensPerSequence = 512;
+  static constexpr int kDefaultSequences = 32;
+  int max_sequences{kDefaultSequences};
+  int max_batch_tokens{kDefaultSequences * kTokensPerSequence};
+  static std::optional<EmbeddingBatchGeometry>
+  Resolve(std::optional<int> configured) {
+    const int sequences = configured.value_or(kDefaultSequences);
+    if (sequences < 1 || sequences > kDefaultSequences)
+      return std::nullopt;
+    return EmbeddingBatchGeometry{sequences, sequences * kTokensPerSequence};
+  }
+};
+
 struct LlamaBackendConfig {
+  std::optional<int> embedding_batch_size;
+
   std::optional<int> cuda_device_id;
   std::optional<int> rocm_device_id;
   bool device_explicit{false};

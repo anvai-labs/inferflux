@@ -3,6 +3,7 @@
 #include "runtime/backends/llama/llama_backend_traits.h"
 #include "runtime/backends/llama/llama_device_placement.h"
 #include <catch2/catch_amalgamated.hpp>
+#include <cstdlib>
 #include <memory>
 #include <yaml-cpp/yaml.h>
 using namespace inferflux;
@@ -11,6 +12,9 @@ TEST_CASE("Model load defaults remain inherited",
           "[model_load_spec][placement]") {
   const auto spec = ParseModelLoadSpec(YAML::Load("path: /a.gguf"));
   REQUIRE_FALSE(spec.HasOverrides());
+  REQUIRE_FALSE(spec.Apply({}).embedding_batch_size);
+  REQUIRE(EmbeddingBatchGeometry::Resolve({})->max_sequences == 32);
+  REQUIRE(EmbeddingBatchGeometry::Resolve({})->max_batch_tokens == 16384);
   LlamaBackendConfig defaults;
   defaults.ctx_size = 8192;
   defaults.gpu_layers = 8;
@@ -47,7 +51,9 @@ TEST_CASE("Model resource validation fails closed",
   const auto value = GENERATE(
       "context_size: 0", "gpu_layers: -2", "max_parallel_sequences: 257",
       "max_parallel_sequences: 0", "kv_cache_type: bogus", "device_id: 0",
-      "device: cpu:0", "device: cuda:0\ngpu_layers: 0");
+      "device: cpu:0", "device: cuda:0\ngpu_layers: 0",
+      "embedding_batch_size: 0", "embedding_batch_size: 33",
+      "embedding_batch_size: -1", "embedding_batch_size: 1.5");
   REQUIRE_THROWS(ParseModelLoadSpec(YAML::Load(value)));
 }
 
@@ -87,4 +93,77 @@ TEST_CASE("Pinned BERT decode API is not a text generation capability",
   qwen->hparams.causal_attn = true;
   REQUIRE(LlamaModelSupportsGeneration(qwen.get()));
   REQUIRE_FALSE(LlamaModelSupportsGeneration(nullptr));
+}
+
+TEST_CASE("Embedding batch geometry is explicit immutable and independent",
+          "[model_load_spec][embedding_geometry]") {
+  const int size = GENERATE(1, 2, 32);
+  const bool json = GENERATE(false, true);
+  const auto input =
+      json ? "{\"embedding_batch_size\":" + std::to_string(size) + "}"
+           : "embedding_batch_size: " + std::to_string(size);
+  const auto spec = ParseModelLoadSpec(YAML::Load(input));
+  REQUIRE(spec.HasOverrides());
+  const auto config =
+      TuneLlamaBackendConfig(LlamaBackendTarget::kRocm, spec.Apply({}));
+  REQUIRE(config.embedding_batch_size == size);
+  REQUIRE(config.ctx_size == LlamaBackendConfig{}.ctx_size);
+  REQUIRE(config.max_parallel_sequences ==
+          LlamaBackendConfig{}.max_parallel_sequences);
+  const auto geometry =
+      EmbeddingBatchGeometry::Resolve(config.embedding_batch_size);
+  REQUIRE(geometry);
+  REQUIRE(geometry->max_sequences == size);
+  REQUIRE(geometry->max_batch_tokens == size * 512);
+  auto changed = spec;
+  changed.embedding_batch_size = size == 1 ? 2 : 1;
+  REQUIRE(spec != changed);
+  REQUIRE(ParseModelLoadSpec(YAML::Load("path: /a.gguf"))
+              .Apply(config)
+              .embedding_batch_size == size);
+}
+
+TEST_CASE("Invalid direct embedding geometry fails before model or device load",
+          "[model_load_spec][embedding_geometry]") {
+  const int size = GENERATE(-1, 0, 33);
+  REQUIRE_FALSE(EmbeddingBatchGeometry::Resolve(size));
+  LlamaBackendConfig config;
+  config.embedding_batch_size = size;
+  LlamaCppBackend backend;
+  REQUIRE_FALSE(backend.LoadModel("/must-not-load.gguf", config));
+  REQUIRE(backend.LoadError() ==
+          "embedding_batch_size must be between 1 and 32");
+}
+
+TEST_CASE("Explicit embedding geometry survives rejected backend reloads",
+          "[model_load_spec][embedding_native]") {
+  const char *model = std::getenv("INFERFLUX_TEST_EMBEDDING_MODEL");
+  if (!model || !*model)
+    SKIP("Optional real encoder asset required; run on CPU before acceptance");
+  LlamaCppBackend backend;
+  LlamaBackendConfig config;
+  config.ctx_size = 512;
+  config.max_parallel_sequences = 1;
+  config.gpu_layers = 0;
+  config.embedding_batch_size = 1;
+  REQUIRE(backend.LoadModel(model, config));
+  const std::vector<std::string> inputs{"A red apple.", "A blue bicycle.",
+                                        "A green tree."};
+  const auto original = backend.EmbedBatch(inputs);
+  REQUIRE(original.size() == inputs.size());
+  for (std::size_t i = 0; i < inputs.size(); ++i) {
+    REQUIRE(original[i].size() == 384);
+    const auto single = backend.EmbedBatch({inputs[i]});
+    REQUIRE(single[0] == original[i]);
+  }
+  const bool absent = GENERATE(false, true);
+  auto changed = config;
+  changed.embedding_batch_size =
+      absent ? std::optional<int>{} : std::optional<int>{32};
+  REQUIRE_FALSE(backend.LoadModel("/must-not-load.gguf", changed));
+  REQUIRE(backend.LoadError() ==
+          "embedding geometry reload requires a fresh backend");
+  REQUIRE(backend.IsReady());
+  REQUIRE(backend.Placement().embedding_batch->max_sequences == 1);
+  REQUIRE(backend.EmbedBatch(inputs) == original);
 }

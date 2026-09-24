@@ -276,7 +276,7 @@ TEST_CASE("HttpServer admin model load preserves placement and resources",
   const std::string body =
       invalid
           ? R"({"id":"amd","path":"/a.gguf","device":"rocm:-1"})"
-          : R"({"id":"amd","path":"/a.gguf","backend":"rocm","device":"rocm:1","context_size":4096,"gpu_layers":8,"max_parallel_sequences":2,"kv_cache_type":"f16"})";
+          : R"({"id":"amd","path":"/a.gguf","backend":"rocm","device":"rocm:1","context_size":4096,"gpu_layers":8,"max_parallel_sequences":2,"embedding_batch_size":1,"kv_cache_type":"f16"})";
   int fds[2];
   REQUIRE(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds) == 0);
   const std::string request =
@@ -303,6 +303,7 @@ TEST_CASE("HttpServer admin model load preserves placement and resources",
     REQUIRE(spec.context_size == 4096);
     REQUIRE(spec.gpu_layers == 8);
     REQUIRE(spec.max_parallel_sequences == 2);
+    REQUIRE(spec.embedding_batch_size == 1);
     REQUIRE(spec.kv_cache_type == "f16");
   }
 }

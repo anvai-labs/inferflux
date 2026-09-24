@@ -208,6 +208,7 @@ public:
 
 protected:
   explicit LlamaCppBackend(bool acquire_backend);
+  std::string EmbeddingLoadError(const LlamaBackendConfig &config) const;
   struct llama_sampler *active_sampler_{nullptr};
   std::shared_ptr<EPDispatch> ep_dispatch_;
   int tp_rank_{0};
@@ -226,6 +227,7 @@ private:
   const struct llama_vocab *vocab_{nullptr};
   int32_t n_vocab_{0};
   LlamaBackendConfig config_;
+  EmbeddingBatchGeometry embedding_batch_geometry_;
   DevicePlacement placement_;
   std::string load_error_;
   bool test_ready_{false};

@@ -62,7 +62,12 @@ bool GpuAcceleratedBackend::InitializeDevice(const LlamaBackendConfig &config,
 
 bool GpuAcceleratedBackend::LoadModel(const std::filesystem::path &model_path,
                                       const LlamaBackendConfig &config) {
+  std::lock_guard<std::recursive_mutex> lock(backend_state_mutex_);
   device_error_.clear();
+  if (const auto error = EmbeddingLoadError(config); !error.empty()) {
+    device_error_ = error;
+    return false;
+  }
   LlamaBackendConfig tuned;
   if (!InitializeDevice(config, &tuned)) {
     device_error_ =
