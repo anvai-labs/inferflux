@@ -156,3 +156,23 @@ before returning results to the scheduler; this is a possible source of shared
 head-of-line blocking, not a demonstrated diagnosis of the stalled live process.
 Neither the cancellation fix nor a same-binary restart closes origin liveness,
 embedding compatibility, executed reuse, session leases or #184/C5.
+
+
+### Bounded embedding geometry implementation follow-up
+
+The opt-in `embedding_batch_size` model override now uses one validated geometry
+for the dedicated llama.cpp embedding context and input grouping. Omission retains
+32 sequences; values 1–32 select groups of up to 512 tokens per sequence. See
+[the configuration contract](../CONFIG_REFERENCE.md#per-model-embedding-batch-geometry).
+Native/MLX and the legacy name-only manager reject explicit geometry. Failed or
+rejected reloads involving explicit geometry preserve the prior backend state;
+model registry changes still require unload/new identity. Diagnostics describe
+configured limits, not allocated capacity or completed GPU execution.
+
+The existing model/parser/registry/HTTP/native test owners are extended. Invalid
+parser cases and rejected-reload behavior failed before their fixes. A real BGE
+GGUF regression on a CPU-only build checks ordered groups, per-input output parity
+and preserved output after reconfiguration rejection. Candidate code has not run
+on either GPU. The example BGE model opts into one-sequence groups but keeps its
+existing NVIDIA placement. Measure accepted-runtime GPU allocation, BGE compatibility
+and mixed traffic before considering AMD relocation or closing G52/G59 and C5.

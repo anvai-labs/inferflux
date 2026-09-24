@@ -2107,6 +2107,11 @@ bool InferfluxCudaExecutor::InitializeNativePipeline() {
 
 bool InferfluxCudaExecutor::LoadModel(const std::filesystem::path &model_path,
                                       const LlamaBackendConfig &config) {
+  if (config.embedding_batch_size) {
+    log::Error("inferflux_cuda_executor",
+               "embedding_batch_size requires a llama_cpp backend");
+    return false;
+  }
   log::Info("inferflux_cuda_executor",
             "Loading InferFlux CUDA model from: " + model_path.string());
   loaded_model_path_ = model_path;

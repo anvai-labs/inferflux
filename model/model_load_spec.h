@@ -24,6 +24,7 @@ struct ModelLoadSpec {
   std::optional<int> context_size;
   std::optional<int> gpu_layers;
   std::optional<int> max_parallel_sequences;
+  std::optional<int> embedding_batch_size;
   std::optional<std::string> kv_cache_type;
 
   bool HasOverrides() const;

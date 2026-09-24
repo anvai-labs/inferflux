@@ -99,6 +99,12 @@ json BuildModelIdentityJson(const ModelInfo &info) {
       {"context_size", p.context_size},
       {"max_parallel_sequences", p.max_parallel_sequences},
       {"kv_cache_type", p.kv_cache_type}};
+  if (p.embedding_batch) {
+    model["placement"]["embedding_batch_limits"] = {
+        {"max_sequences", p.embedding_batch->max_sequences},
+        {"tokens_per_sequence", EmbeddingBatchGeometry::kTokensPerSequence},
+        {"max_batch_tokens", p.embedding_batch->max_batch_tokens}};
+  }
   // GGUF metadata (Ollama-style model details).
   const auto &g = info.gguf;
   if (!g.architecture.empty() || g.parameter_count > 0) {

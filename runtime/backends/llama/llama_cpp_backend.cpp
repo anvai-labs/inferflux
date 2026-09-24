@@ -54,8 +54,8 @@ struct BatchSeqTokenInput {
 
 // Batched-embedding geometry: concurrent sequences per decode and the
 // per-sequence context (bge-small class models train at 512 tokens).
-constexpr int kEmbedBatchMaxSeqs = 32;
-constexpr std::size_t kEmbedBatchCtxPerSeq = 512;
+constexpr std::size_t kEmbedBatchCtxPerSeq =
+    inferflux::EmbeddingBatchGeometry::kTokensPerSequence;
 
 // Each context owns its sequence capacity. A process-wide last-loaded model
 // bound can permit an out-of-range id into a smaller model's KV cache.
@@ -363,10 +363,26 @@ std::string LlamaCppBackend::LoadError() const {
   return load_error_;
 }
 
+std::string
+LlamaCppBackend::EmbeddingLoadError(const LlamaBackendConfig &config) const {
+  BackendStateLock lock(backend_state_mutex_);
+  if (!EmbeddingBatchGeometry::Resolve(config.embedding_batch_size))
+    return "embedding_batch_size must be between 1 and 32";
+  if (model_ && (config_.embedding_batch_size || config.embedding_batch_size))
+    return "embedding geometry reload requires a fresh backend";
+  return {};
+}
+
 bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
                                 const LlamaBackendConfig &config) {
   BackendStateLock lock(backend_state_mutex_);
+  if (const auto error = EmbeddingLoadError(config); !error.empty()) {
+    load_error_ = error;
+    return false;
+  }
   test_ready_ = false;
+  const auto embedding_geometry =
+      EmbeddingBatchGeometry::Resolve(config.embedding_batch_size);
   if (!std::filesystem::exists(model_path)) {
     log::Error("llama_backend",
                "model path does not exist: " + model_path.string());
@@ -380,6 +396,7 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
   placement_.context_size = config.ctx_size;
   placement_.max_parallel_sequences = config.max_parallel_sequences;
   placement_.kv_cache_type = config.llama_kv_cache_type;
+
   model_params.n_gpu_layers = config.gpu_layers == -1
                                   ? std::numeric_limits<int>::max()
                                   : config.gpu_layers;
@@ -465,6 +482,9 @@ bool LlamaCppBackend::LoadModel(const std::filesystem::path &model_path,
   if (!config.device_explicit)
     placement_.requested.clear();
   config_ = config;
+  embedding_batch_geometry_ = *embedding_geometry;
+  if (config.embedding_batch_size)
+    placement_.embedding_batch = embedding_batch_geometry_;
 
   // Scheduler admission reads each backend's SequenceCapacity(), rather than
   // overwriting a process-global CUDA metric with the last llama model loaded.
@@ -2020,10 +2040,10 @@ bool LlamaCppBackend::EnsureEmbedBatchCtx() {
   auto ep = llama_context_default_params();
   ep.embeddings = true;
   ep.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
-  ep.n_seq_max = kEmbedBatchMaxSeqs;
-  ep.n_ctx = kEmbedBatchMaxSeqs * kEmbedBatchCtxPerSeq;
-  ep.n_batch = kEmbedBatchMaxSeqs * kEmbedBatchCtxPerSeq;
-  ep.n_ubatch = kEmbedBatchMaxSeqs * kEmbedBatchCtxPerSeq;
+  ep.n_seq_max = embedding_batch_geometry_.max_sequences;
+  ep.n_ctx = embedding_batch_geometry_.max_batch_tokens;
+  ep.n_batch = embedding_batch_geometry_.max_batch_tokens;
+  ep.n_ubatch = embedding_batch_geometry_.max_batch_tokens;
   embed_batch_ctx_ = llama_init_from_model(model_, ep);
   return embed_batch_ctx_ != nullptr;
 }
@@ -2093,18 +2113,18 @@ LlamaCppBackend::EmbedBatch(const std::vector<std::string> &texts) {
 
   const int n_embd = llama_model_n_embd(model_);
   const std::size_t group_token_cap =
-      static_cast<std::size_t>(kEmbedBatchMaxSeqs) * kEmbedBatchCtxPerSeq;
+      static_cast<std::size_t>(embedding_batch_geometry_.max_batch_tokens);
   std::size_t idx = 0;
   while (idx < texts.size()) {
-    // Assemble the next group: up to kEmbedBatchMaxSeqs sequences bounded by
+    // Assemble the next group using the resolved geometry, bounded by
     // per-sequence and whole-batch token budgets. `orig` tracks the result
     // index of each sequence so empty-token inputs can be skipped without
     // shifting the output mapping.
     std::vector<std::vector<llama_token>> group;
     std::vector<std::size_t> orig;
     std::size_t group_tokens = 0;
-    while (idx < texts.size() &&
-           static_cast<int>(group.size()) < kEmbedBatchMaxSeqs) {
+    while (idx < texts.size() && static_cast<int>(group.size()) <
+                                     embedding_batch_geometry_.max_sequences) {
       auto tokens = Tokenize(texts[idx], /*add_bos=*/false);
       if (tokens.size() > kEmbedBatchCtxPerSeq) {
         tokens.resize(kEmbedBatchCtxPerSeq);

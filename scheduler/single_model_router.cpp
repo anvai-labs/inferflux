@@ -460,6 +460,12 @@ std::string SingleModelRouter::LoadModel(const ModelLoadSpec &spec) {
       cfg.device = *placement_request;
       cfg.device_explicit = true;
     }
+    if (cfg.embedding_batch_size &&
+        candidate_selection.provider != BackendProvider::kLlamaCpp) {
+      set_last_load_error(
+          "embedding_batch_unsupported: select a llama_cpp backend");
+      return "";
+    }
     if (!cfg.device.empty() &&
         candidate_selection.provider != BackendProvider::kLlamaCpp) {
       failure_reason = "placement_unsupported: native backend does not support "

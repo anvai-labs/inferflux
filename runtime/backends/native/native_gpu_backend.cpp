@@ -75,6 +75,11 @@ NativeGpuBackend::~NativeGpuBackend() = default;
 
 bool NativeGpuBackend::LoadModel(const std::filesystem::path &model_path,
                                  const LlamaBackendConfig &config) {
+  if (config.embedding_batch_size) {
+    log::Error("native_backend",
+               "embedding_batch_size requires a llama_cpp backend");
+    return false;
+  }
   if (!config.device.empty()) {
     log::Error("native_backend",
                "Explicit device placement is not supported by native CUDA");

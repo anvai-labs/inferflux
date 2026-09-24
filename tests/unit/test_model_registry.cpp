@@ -324,7 +324,8 @@ TEST_CASE("ModelRegistry carries resources through the typed router contract",
   auto path =
       WriteTempRegistry("models:\n  - id: amd\n    path: /a.gguf\n    device: "
                         "rocm:0\n    context_size: 8192\n    gpu_layers: 8\n   "
-                        " max_parallel_sequences: 2\n    kv_cache_type: f16\n");
+                        " max_parallel_sequences: 2\n    embedding_batch_size: "
+                        "1\n    kv_cache_type: f16\n");
   REQUIRE(reg.LoadAndWatch(path, 99999) == 1);
   reg.Stop();
   fs::remove(path);
@@ -334,6 +335,7 @@ TEST_CASE("ModelRegistry carries resources through the typed router contract",
   REQUIRE(spec.context_size == 8192);
   REQUIRE(spec.gpu_layers == 8);
   REQUIRE(spec.max_parallel_sequences == 2);
+  REQUIRE(spec.embedding_batch_size == 1);
   REQUIRE(spec.kv_cache_type == "f16");
 }
 
@@ -345,9 +347,10 @@ TEST_CASE("ModelRegistry refuses live specification changes atomically",
       "models:\n  - id: a\n    path: /a.gguf\n  - id: b\n    path: /b.gguf\n");
   REQUIRE(reg.LoadAndWatch(path, 99999) == 2);
   reg.Stop();
-  const auto change = GENERATE(
-      "backend: rocm", "device: cuda:0", "context_size: 4096", "gpu_layers: 8",
-      "max_parallel_sequences: 2", "kv_cache_type: q8_0");
+  const auto change =
+      GENERATE("backend: rocm", "device: cuda:0", "context_size: 4096",
+               "gpu_layers: 8", "max_parallel_sequences: 2",
+               "embedding_batch_size: 1", "kv_cache_type: q8_0");
   WriteTempRegistry(std::string("models:\n  - id: a\n    path: /a.gguf\n    ") +
                     change + "\n");
   REQUIRE(reg.Reload() == 0);

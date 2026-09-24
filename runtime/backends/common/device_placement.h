@@ -1,4 +1,5 @@
 #pragma once
+#include "runtime/backends/common/backend_config.h"
 #include <cstdint>
 #include <string>
 namespace inferflux {
@@ -18,5 +19,6 @@ struct DevicePlacement {
   int context_size{0};
   int max_parallel_sequences{0};
   std::string kv_cache_type;
+  std::optional<EmbeddingBatchGeometry> embedding_batch;
 };
 } // namespace inferflux
