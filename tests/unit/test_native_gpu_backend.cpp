@@ -227,7 +227,7 @@ TEST_CASE(
   LlamaBackendConfig config;
   config.embedding_batch_size = 1;
   REQUIRE_FALSE(backend.LoadModel("fake.gguf", config));
-  REQUIRE_FALSE(raw->IsReady());
+  REQUIRE_FALSE(raw->NativeIsReady());
 }
 
 TEST_CASE("Invalid embedding geometry does not initialize a GPU strategy",
