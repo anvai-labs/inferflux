@@ -12,6 +12,11 @@ MlxBackend::MlxBackend() = default;
 
 bool MlxBackend::LoadModel(const std::filesystem::path &model_path,
                            const LlamaBackendConfig &config) {
+  if (config.embedding_batch_size) {
+    log::Error("mlx_backend",
+               "embedding_batch_size requires a llama_cpp backend");
+    return false;
+  }
 #if !INFERFLUX_HAS_MLX
   log::Error("mlx_backend",
              "backend requested but binary was built without ENABLE_MLX "
