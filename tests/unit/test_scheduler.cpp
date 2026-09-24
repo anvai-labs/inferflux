@@ -3100,6 +3100,7 @@ TEST_CASE("Embedding slices share admission with chat and preserve usage",
     std::mutex mutex;
     std::condition_variable cv;
     bool first_started{false};
+    std::size_t block_call{1};
     bool release{false};
     bool fail{false};
     std::vector<std::size_t> batch_sizes;
@@ -3109,7 +3110,7 @@ TEST_CASE("Embedding slices share admission with chat and preserve usage",
       std::unique_lock<std::mutex> lock(mutex);
       batch_sizes.push_back(texts.size());
       order.push_back("embedding");
-      if (!first_started) {
+      if (batch_sizes.size() == block_call) {
         first_started = true;
         cv.notify_all();
         cv.wait_for(lock, std::chrono::seconds(3), [&] { return release; });
@@ -3128,7 +3129,20 @@ TEST_CASE("Embedding slices share admission with chat and preserve usage",
       return PositionCheckingBackend::ExecuteUnifiedBatch(inputs);
     }
   };
-  const std::string mode = GENERATE("ok", "cancel", "failure");
+  // Keep one owner for admission, slice accounting and cancellation. The former
+  // 33-input/first-slice case hid cancellation in the final native call.
+  struct Scenario {
+    std::string mode;
+    std::size_t inputs;
+    std::size_t block_call;
+    int completed_tokens;
+  };
+  const auto scenario =
+      GENERATE(Scenario{"ok", 33, 1, 231}, Scenario{"cancel", 33, 1, 224},
+               Scenario{"failure", 33, 1, 0}, Scenario{"cancel", 1, 1, 7},
+               Scenario{"cancel", 33, 2, 231});
+  const auto &mode = scenario.mode;
+  CAPTURE(mode, scenario.inputs, scenario.block_call);
   const bool cancel = mode == "cancel";
   const bool fail = mode == "failure";
   SimpleTokenizer tokenizer;
@@ -3137,6 +3151,7 @@ TEST_CASE("Embedding slices share admission with chat and preserve usage",
   auto router = std::make_shared<SingleModelRouter>();
   auto backend = std::make_shared<EmbeddingBackend>();
   backend->fail = fail;
+  backend->block_call = scenario.block_call;
   ModelInfo info;
   info.id = "shared-model";
   info.backend = "cpu";
@@ -3149,7 +3164,7 @@ TEST_CASE("Embedding slices share admission with chat and preserve usage",
                       router, nullptr, nullptr, {}, {}, {}, config);
   InferenceRequest embedding;
   embedding.model = info.id;
-  embedding.embedding_inputs.assign(33, "input");
+  embedding.embedding_inputs.assign(scenario.inputs, "input");
   embedding.session_id = "same-session-as-chat";
   auto cancellation = std::make_shared<std::atomic<bool>>(false);
   embedding.cancellation_flag = cancellation;
@@ -3179,6 +3194,7 @@ TEST_CASE("Embedding slices share admission with chat and preserve usage",
   REQUIRE_FALSE(generated.get().no_backend);
   REQUIRE(result.no_backend == (cancel || fail));
   REQUIRE(result.completion_tokens == 0);
+  REQUIRE(result.prompt_tokens == scenario.completed_tokens);
   REQUIRE(result.cached_prompt_tokens == 0);
   if (!cancel && !fail) {
     REQUIRE(result.model_id == info.id);
@@ -3191,7 +3207,14 @@ TEST_CASE("Embedding slices share admission with chat and preserve usage",
             backend->order.end());
   } else {
     REQUIRE(result.embeddings.empty());
-    REQUIRE(backend->batch_sizes == std::vector<std::size_t>{32});
+    const auto expected = scenario.block_call == 2
+                              ? std::vector<std::size_t>{32, 1}
+                              : std::vector<std::size_t>{
+                                    std::min<std::size_t>(32, scenario.inputs)};
+    REQUIRE(backend->batch_sizes == expected);
+    if (cancel) {
+      REQUIRE(result.completion == "[cancelled]");
+    }
   }
   REQUIRE(backend->position_violations == 0);
 }

@@ -29,6 +29,8 @@ models:
   context_size: 16384
   gpu_layers: -1
   max_parallel_sequences: 32
+  # Opt-in bounded embedding groups; GPU memory/throughput still need acceptance.
+  embedding_batch_size: 1
   kv_cache_type: f16
 runtime:
   backend_exposure:

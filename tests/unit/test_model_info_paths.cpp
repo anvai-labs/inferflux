@@ -160,6 +160,7 @@ TEST_CASE("Device discovery alone is not reported as verified placement",
   REQUIRE(model["placement"]["state"] == "unverified");
   REQUIRE(model["placement"]["gpu_weight_bytes"] == 0);
   REQUIRE(model["placement"]["stable_id"].is_null());
+  REQUIRE_FALSE(model["placement"].contains("embedding_batch_limits"));
   info.placement.requested = "cuda:1";
   info.placement.effective = "cuda:1";
   info.placement.vendor = "cuda";
@@ -167,8 +168,13 @@ TEST_CASE("Device discovery alone is not reported as verified placement",
   info.placement.gpu_weight_bytes = 4096;
   info.placement.cpu_weight_bytes = 1024;
   info.placement.stable_id = "0000:01:00.0";
+  info.placement.embedding_batch = EmbeddingBatchGeometry::Resolve(2);
   model = BuildModelIdentityJson(info);
   REQUIRE(model["placement"]["gpu_weight_bytes"] == 4096);
   REQUIRE(model["placement"]["cpu_weight_bytes"] == 1024);
   REQUIRE(model["placement"]["stable_id"] == "0000:01:00.0");
+  const auto limits = model["placement"]["embedding_batch_limits"];
+  REQUIRE(limits["max_sequences"] == 2);
+  REQUIRE(limits["tokens_per_sequence"] == 512);
+  REQUIRE(limits["max_batch_tokens"] == 1024);
 }

@@ -9,6 +9,13 @@ BackendManager::LoadBackend(const std::string &name, const std::string &path,
                             const LlamaBackendConfig &config,
                             bool prefer_cuda) {
   std::lock_guard<std::mutex> lock(mutex_);
+  // This legacy cache is keyed only by name, not immutable ModelLoadSpec.
+  // Explicit embedding geometry must use the canonical model router.
+  if (config.embedding_batch_size) {
+    log::Error("backend_manager",
+               "embedding_batch_size requires ModelLoadSpec routing");
+    return nullptr;
+  }
   auto it = backends_.find(name);
   if (it != backends_.end() && it->second && it->second->IsReady()) {
     return it->second;
