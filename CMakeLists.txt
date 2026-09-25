@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(InferFlux VERSION 0.3.0 LANGUAGES CXX)
+project(InferFlux VERSION 0.4.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
@@ -155,6 +155,8 @@ add_library(inferflux_core STATIC
   server/auth/api_key_auth.h
   server/metrics/metrics.cpp
   server/metrics/metrics.h
+  server/auth/rate_limit_config.cpp
+  server/auth/rate_limit_config.h
   server/auth/rate_limiter.cpp
   server/auth/rate_limiter.h
   server/auth/oidc_validator.cpp

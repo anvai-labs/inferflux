@@ -126,6 +126,25 @@ Errors use the OpenAI envelope:
 preflight permits `x-inferflux-session-id`, `x-inferflux-client-request-id`,
 and `traceparent` alongside `Content-Type`/`Authorization`.
 
+When `auth.endpoint_limits` is configured, a 429 additionally includes
+`error.rate_limit = {scope, requests_per_minute, retry_after_seconds}` and
+`X-RateLimit-Scope`. Scope is `aggregate`, `generation` or `embeddings`.
+`Retry-After` is the ceiling in seconds of the longest applicable bucket deficit;
+it is guidance at the time of rejection, not a reservation for a later retry.
+Unconfigured responses retain their previous body and headers.
+
+`GET /v1/admin/rate_limit` keeps its legacy `tokens_per_minute` field (historically
+**requests**, not inference tokens). Only when endpoint policy is enabled, it also
+returns `requests_per_minute`, `aggregate_source` (`yaml`, `environment`,
+`policy_store`, or `admin_api` for the serving process), `endpoint_limits_source`
+(`startup_yaml`), and the configured `endpoint_limits` map of
+`{requests_per_minute, burst}` objects. Unconfigured responses remain unchanged.
+`PUT` still controls the shared ceiling only. An `endpoint_limits` payload returns
+400 `endpoint_limits_are_startup_only`; a shared limit outside the positive signed 32-bit range while endpoint
+policy is enabled returns 400 `tokens_per_minute_must_be_positive_int32`. Admin scope
+remains mandatory for reads and writes. See [CONFIG_REFERENCE](CONFIG_REFERENCE.md)
+for validation and precedence.
+
 `GET /v1/admin/pools` returns three top-level objects for automation symmetry:
 
 | Field | Meaning |
