@@ -35,8 +35,10 @@ flowchart LR
 Prepare the release branch from the agreed develop revision before candidate CI. Record its
 source SHA and independent review, then promote through the protected branch workflow.
 Rebasing or adding runtime fixes invalidates earlier exact-revision evidence for promotion.
-The [v0.3.0 candidate record](releases/v0.3.0.md) distinguishes completed local verification
-from the hosted/native gates still required for that release.
+The current [v0.4.0 candidate record](releases/v0.4.0.md) distinguishes reviewed
+endpoint-admission code from promotion, GPU, packaging and deployment gates. The
+[v0.3.0 candidate record](releases/v0.3.0.md) preserves its historical pre-release evidence;
+the published immutable tag and release artifacts are the release identity.
 
 1. Merge to `main` and wait for green `CI`.
 2. Confirm `Dual-GPU gate result` and both CUDA/ROCm runtime jobs actually succeeded for the same commit SHA; a disabled/skipped aggregate is insufficient.
