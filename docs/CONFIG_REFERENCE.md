@@ -107,6 +107,57 @@ auth:
   rate_limit_per_minute: 120
 ```
 
+### Optional endpoint request admission on one listener
+
+`auth.endpoint_limits` adds startup-only per-subject buckets to the existing
+shared request ceiling. It does not create another listener or change model/GPU
+placement. Omit the field to retain existing admission and response defaults.
+
+```yaml
+auth:
+  rate_limit_per_minute: 600
+  endpoint_limits:
+    generation: {requests_per_minute: 120, burst: 2}
+    embeddings: {requests_per_minute: 480, burst: 8}
+```
+
+These are illustrative policy values, **not measured model capacity**. Both exact
+POST routes `/v1/completions` and `/v1/chat/completions` share `generation`;
+`POST /v1/embeddings` uses `embeddings`. Other authenticated routes use only the
+shared bucket. Each admitted call costs one request from every applicable bucket;
+a rejection debits none. Invalid credentials are rejected before rate admission.
+An authenticated call with insufficient route scope or malformed input is still
+subject to admission, as before. Readiness/liveness and CORS preflight retain
+their existing exemption.
+
+A configured class requires integer `requests_per_minute` and `burst`, with
+`0 < burst <= requests_per_minute`. Unknown classes/fields, duplicate keys,
+empty/null mappings, missing fields and invalid values fail startup explicitly.
+Duplicate enclosing `auth`, `endpoint_limits`, or `rate_limit_per_minute` keys
+also fail when endpoint policy is present anywhere in the document.
+One class may be omitted; its requests still consume the shared bucket. With any
+endpoint policy, the effective shared limit must be positive; disabling it through
+the legacy admin API is rejected. Endpoint caps are never written to PolicyStore
+or changed through that API. Restart with an updated YAML to change them.
+
+The shared ceiling is per authenticated subject across endpoints, not an overall
+server/GPU ceiling. It retains the existing burst equal to its per-minute limit.
+An endpoint bucket refills at `requests_per_minute / 60` requests/s up to `burst`.
+Limits are in-memory and reset on restart; replicas have independent buckets.
+A gateway using one upstream identity shares that identity's origin allowance.
+
+For the shared ceiling, a positive persisted PolicyStore value overrides the
+YAML/environment setting; the environment overrides YAML. Inspect the effective
+admin response before sizing a test. A persisted shared limit of 120/minute still
+restricts combined sustained traffic to 2/s, even with a 480/minute embedding cap.
+Changing the shared ceiling preserves endpoint balances. Requests already admitted
+are unaffected by later policy updates.
+
+This increment controls request rate and burst only. Keep the existing scheduler,
+HTTP worker and queue controls; endpoint-specific concurrent execution limits and
+model overrides are not configured by this field. See
+[AdminGuide](AdminGuide.md#endpoint-admission-rollout) for capacity acceptance.
+
 ### NVIDIA CUDA + GGUF llama.cpp compatibility profile
 
 ```yaml

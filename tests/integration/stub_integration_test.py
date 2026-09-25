@@ -10,6 +10,10 @@ import sys
 import time
 import unittest
 import http.client
+import socket
+import threading
+from collections import deque
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.dirname(__file__))
 from process_helper import start_server_process, stop_server_process
@@ -900,8 +904,13 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
             env["INFERFLUX_POLICY_STORE"] = "Z:\\nonexistent_volume\\inferflux_policy_unwritable.conf"
         else:
             env["INFERFLUX_POLICY_STORE"] = "/proc/inferflux_policy_unwritable.conf"
+        cls.rate_config_dir = tempfile.TemporaryDirectory(prefix="inferflux-rate-rollback-")
+        cls.addClassCleanup(cls.rate_config_dir.cleanup)
+        rate_config = Path(cls.rate_config_dir.name) / "server.yaml"
+        rate_config.write_text(Path("config/server.yaml").read_text().replace(
+            "auth:\n", "auth:\n  endpoint_limits:\n    generation: {requests_per_minute: 1, burst: 1}\n", 1))
         cls.server_proc = start_server_process(
-            [SERVER_BIN, "--config", "config/server.yaml"], env=env
+            [SERVER_BIN, "--config", str(rate_config)], env=env
         )
         deadline = time.time() + 20.0
         ready = False
@@ -1011,6 +1020,9 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
         before = json.loads(body)
 
+        resp, body = self._post("/v1/completions", {})
+        self.assertEqual(resp.status, 400, body)
+
         resp, body = self._put("/v1/admin/rate_limit", {"tokens_per_minute": 999})
         self.assertEqual(resp.status, 500, msg=f"Status: {resp.status}, Body: {body}")
         payload = json.loads(body)
@@ -1019,7 +1031,11 @@ class StubIntegrationPolicyPersistenceFailureTests(unittest.TestCase):
         resp, body = self._get("/v1/admin/rate_limit")
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
         after = json.loads(body)
-        self.assertEqual(after.get("tokens_per_minute"), before.get("tokens_per_minute"))
+        self.assertEqual(after, before)
+        resp, body = self._post("/v1/chat/completions", {})
+        self.assertEqual(resp.status, 429, body)
+        self.assertEqual(json.loads(body)["error"]["rate_limit"]["scope"], "generation")
+
 
     def test_admin_api_key_upsert_returns_500_and_rolls_back(self):
         key = "persist-fail-temp-key"
@@ -1248,6 +1264,157 @@ class StubIntegrationReasoningTests(unittest.TestCase):
             "client-correlation-7",
         )
         self.assertEqual(payload["client_request_id"], "client-correlation-7")
+
+
+
+class StubIntegrationEndpointRateTests(unittest.TestCase):
+    # Existing process helper protects shared listeners; every case owns a
+    # disposable config/store and uses an ephemeral loopback port.
+    ENDPOINTS = ("    generation: {requests_per_minute: 1, burst: 1}\n"
+                 "    embeddings: {requests_per_minute: 1, burst: 1}\n")
+
+    @contextmanager
+    def _server(self, directory, endpoints=ENDPOINTS, aggregate="600", expect_ready=True, full_config=None):
+        directory = Path(directory)
+        config = directory / "server.yaml"
+        text = Path("config/server.yaml").read_text() if full_config is None else full_config
+        if endpoints is not None and full_config is None:
+            text = text.replace("auth:\n", "auth:\n  endpoint_limits:\n" + endpoints, 1)
+        config.write_text(text)
+        with socket.socket() as sock:
+            sock.bind((SERVER_HOST, 0))
+            port = sock.getsockname()[1]
+        env = os.environ.copy()
+        env.update(INFERFLUX_HOST_OVERRIDE=SERVER_HOST, INFERFLUX_PORT_OVERRIDE=str(port),
+                   INFERFLUX_MODEL_PATH="", INFERFLUX_RATE_LIMIT_PER_MINUTE=aggregate,
+                   INFERFLUX_POLICY_STORE=str(directory / "policy.enc"),
+                   INFERFLUX_POLICY_PASSPHRASE="disposable-rate-test-passphrase",
+                   INFERFLUX_AUDIT_LOG=str(directory / "audit.jsonl"))
+        proc = start_server_process([SERVER_BIN, "--config", str(config)], env=env,
+                                    text=True, merge_stderr=True)
+        output = deque(maxlen=20)
+        def drain():
+            for line in proc.stdout:
+                output.append(line.rstrip())
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        try:
+            if expect_ready:
+                deadline = time.monotonic() + 10
+                while time.monotonic() < deadline and proc.poll() is None:
+                    try:
+                        if self._request(port, "GET", "/livez")[0].status == 200:
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(0.02)
+                else:
+                    self.fail("disposable endpoint test server did not start: " + " | ".join(output))
+            yield port, proc
+        finally:
+            stop_server_process(proc)
+            reader.join(timeout=2)
+            proc.stdout.close()
+
+    def _request(self, port, method, path, data=None, key="dev-key-123"):
+        conn = http.client.HTTPConnection(SERVER_HOST, port, timeout=3)
+        try:
+            conn.request(method, path, body=None if data is None else json.dumps(data),
+                         headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+            response = conn.getresponse()
+            return response, json.loads(response.read())
+        finally:
+            conn.close()
+
+    def test_exact_routes_share_generation_and_isolate_embeddings(self):
+        with tempfile.TemporaryDirectory() as directory, self._server(directory) as (port, _):
+            response, _ = self._request(port, "POST", "/v1/completions", {}, key="invalid")
+            self.assertEqual(response.status, 401)
+            # Similar-looking unsupported routes must not consume generation capacity.
+            for method, path in [("GET", "/v1/completions"), ("POST", "/v1/completions/"),
+                                 ("POST", "/v1/chat/completions?extra=1")]:
+                response, _ = self._request(port, method, path, {})
+                self.assertEqual(response.status, 404)
+            response, _ = self._request(port, "POST", "/v1/completions", {})
+            self.assertEqual(response.status, 400)  # admitted; invalid payload
+            response, payload = self._request(port, "POST", "/v1/chat/completions", {})
+            self.assertEqual(response.status, 429)
+            self.assertEqual(payload["error"]["code"], "rate_limited")
+            self.assertEqual(payload["error"]["rate_limit"]["scope"], "generation")
+            retry = payload["error"]["rate_limit"]["retry_after_seconds"]
+            self.assertTrue(1 <= retry <= 60)
+            self.assertEqual(response.getheader("Retry-After"), str(retry))
+            self.assertEqual(response.getheader("X-RateLimit-Scope"), "generation")
+            response, _ = self._request(port, "POST", "/v1/embeddings", {})
+            self.assertEqual(response.status, 400)
+            response, payload = self._request(port, "POST", "/v1/embeddings", {})
+            self.assertEqual(response.status, 429)
+            self.assertEqual(payload["error"]["rate_limit"]["scope"], "embeddings")
+            response, _ = self._request(port, "GET", "/v1/models")
+            self.assertEqual(response.status, 200)
+
+    def test_effective_policy_and_shared_updates_preserve_endpoint_balances(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self._server(directory) as (port, _):
+                response, policy = self._request(port, "GET", "/v1/admin/rate_limit")
+                self.assertEqual(response.status, 200)
+                self.assertEqual(policy["tokens_per_minute"], 600)
+                self.assertEqual(policy["aggregate_source"], "environment")
+                self.assertEqual(policy["endpoint_limits_source"], "startup_yaml")
+                self.assertEqual(policy["endpoint_limits"]["generation"]["burst"], 1)
+                response, _ = self._request(port, "POST", "/v1/completions", {})
+                self.assertEqual(response.status, 400)
+                for invalid in (0, -1, 4294967297, -4294967295, 18446744073709551615):
+                    response, _ = self._request(port, "PUT", "/v1/admin/rate_limit", {"tokens_per_minute": invalid})
+                    self.assertEqual(response.status, 400, invalid)
+                response, _ = self._request(port, "PUT", "/v1/admin/rate_limit",
+                                            {"tokens_per_minute": 120, "endpoint_limits": {}})
+                self.assertEqual(response.status, 400)
+                response, _ = self._request(port, "PUT", "/v1/admin/rate_limit", {"tokens_per_minute": 120})
+                self.assertEqual(response.status, 200)
+                response, policy = self._request(port, "GET", "/v1/admin/rate_limit")
+                self.assertEqual(policy["aggregate_source"], "admin_api")
+                self.assertEqual(policy["requests_per_minute"], 120)
+                response, _ = self._request(port, "POST", "/v1/completions", {})
+                self.assertEqual(response.status, 429)
+            with self._server(directory) as (port, _):
+                response, policy = self._request(port, "GET", "/v1/admin/rate_limit")
+                self.assertEqual(response.status, 200)
+                self.assertEqual(policy["requests_per_minute"], 120)
+                self.assertEqual(policy["aggregate_source"], "policy_store")
+                self.assertEqual(policy["endpoint_limits"]["embeddings"]["burst"], 1)
+
+    def test_absent_policy_preserves_legacy_response(self):
+        with tempfile.TemporaryDirectory() as directory, self._server(directory, endpoints=None, aggregate="1") as (port, _):
+            response, policy = self._request(port, "GET", "/v1/admin/rate_limit")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(policy, {"tokens_per_minute": 1})
+            response, error = self._request(port, "POST", "/v1/embeddings", {})
+            self.assertEqual(response.status, 429)
+            self.assertNotIn("rate_limit", error["error"])
+            self.assertEqual(response.getheader("Retry-After"), "1")
+            self.assertEqual(response.getheader("X-RateLimit-Limit"), "per-minute bucket")
+
+    def test_invalid_endpoint_startup_exits_without_serving(self):
+        policy = "  endpoint_limits:\n" + self.ENDPOINTS
+        invalid_documents = [
+            "auth: {rate_limit_per_minute: 600}\nauth:\n" + policy,
+            "auth:\n" + policy + policy,
+            "auth:\n  rate_limit_per_minute: 600\n  rate_limit_per_minute: 1\n" + policy,
+        ]
+        cases = [("    typo: 8\n", "600", None),
+                 ("    generation: {requests_per_minute: 1}\n", "600", None),
+                 (self.ENDPOINTS, "0", None)]
+        cases.extend((self.ENDPOINTS, "600", document) for document in invalid_documents)
+        for endpoints, aggregate, full_config in cases:
+            with self.subTest(config=full_config or endpoints, aggregate=aggregate), tempfile.TemporaryDirectory() as directory:
+                with self._server(directory, endpoints=endpoints, aggregate=aggregate,
+                                  expect_ready=False, full_config=full_config) as (_, proc):
+                    try:
+                        code = proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        self.fail("invalid endpoint configuration was accepted")
+                    self.assertNotEqual(code, 0)
 
 
 if __name__ == "__main__":

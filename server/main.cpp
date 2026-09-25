@@ -20,6 +20,7 @@
 #include "scheduler/single_model_router.h"
 #include "server/auth/api_key_auth.h"
 #include "server/auth/oidc_validator.h"
+#include "server/auth/rate_limit_config.h"
 #include "server/auth/rate_limiter.h"
 #include "server/diagnostics/crash_handler.h"
 #include "server/http/http_server.h"
@@ -194,6 +195,8 @@ int main(int argc, char **argv) {
   std::optional<int> cuda_device_id;
   std::optional<int> rocm_device_id;
   int rate_limit_per_minute = 0;
+  std::string rate_limit_source = "default";
+  inferflux::EndpointRateLimits endpoint_limits;
   std::string audit_log_path;
   std::vector<std::string> guard_blocklist;
   std::string oidc_issuer;
@@ -571,11 +574,20 @@ int main(int argc, char **argv) {
         }
       }
 
+      // Validate enclosing keys before selecting any auth policy field.
+      try {
+        endpoint_limits = inferflux::ParseEndpointRateLimits(config);
+      } catch (const std::invalid_argument &error) {
+        inferflux::log::Error("server", error.what());
+        return 1;
+      }
       // Auth config
       if (config["auth"]) {
-        if (config["auth"]["rate_limit_per_minute"])
+        if (config["auth"]["rate_limit_per_minute"]) {
           rate_limit_per_minute =
               config["auth"]["rate_limit_per_minute"].as<int>();
+          rate_limit_source = "yaml";
+        }
         if (config["auth"]["oidc_issuer"])
           oidc_issuer = config["auth"]["oidc_issuer"].as<std::string>();
         if (config["auth"]["oidc_audience"])
@@ -693,6 +705,7 @@ int main(int argc, char **argv) {
   }
   if (const char *env_rate = std::getenv("INFERFLUX_RATE_LIMIT_PER_MINUTE")) {
     rate_limit_per_minute = std::stoi(env_rate);
+    rate_limit_source = "environment";
   }
   if (const char *env_audit = std::getenv("INFERFLUX_AUDIT_LOG")) {
     audit_log_path = env_audit;
@@ -1474,6 +1487,7 @@ int main(int argc, char **argv) {
   int store_limit = policy_store.RateLimitPerMinute();
   if (store_limit > 0) {
     rate_limit_per_minute = store_limit;
+    rate_limit_source = "policy_store";
   } else if (rate_limit_per_minute > 0) {
     policy_store.SetRateLimitPerMinute(rate_limit_per_minute);
   }
@@ -1596,7 +1610,14 @@ int main(int argc, char **argv) {
   auto &metrics = inferflux::GlobalMetrics();
   metrics.SetBackend(backend_label);
   inferflux::OIDCValidator oidc_validator(oidc_issuer, oidc_audience);
-  inferflux::RateLimiter rate_limiter(rate_limit_per_minute);
+  std::unique_ptr<inferflux::RateLimiter> rate_limiter;
+  try {
+    rate_limiter = std::make_unique<inferflux::RateLimiter>(
+        rate_limit_per_minute, endpoint_limits, rate_limit_source);
+  } catch (const std::invalid_argument &error) {
+    inferflux::log::Error("server", error.what());
+    return 1;
+  }
   inferflux::Guardrail guardrail;
   guardrail.SetBlocklist(guard_blocklist);
   guardrail.SetOPAEndpoint(opa_endpoint);
@@ -1702,7 +1723,7 @@ int main(int argc, char **argv) {
 
   inferflux::HttpServer server(
       host, port, &scheduler, auth, &metrics, &oidc_validator,
-      rate_limit_per_minute > 0 ? &rate_limiter : nullptr,
+      rate_limiter->Enabled() ? rate_limiter.get() : nullptr,
       guardrail.Enabled() ? &guardrail : nullptr,
       audit_logger.Enabled() ? &audit_logger : nullptr, &policy_store,
       speculative_decoder, tls_config, http_workers, routing_selection_options);

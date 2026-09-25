@@ -226,3 +226,37 @@ InferFlux ships with a native policy store that persists API keys, scopes, rate 
 3. **Policy plugins**: optional Cedar/advanced-rule adapters beyond the shipped OPA client for complex rules (tenant quotas, contextual guardrails).
 4. **UI & CLI parity**: extend `inferctl admin api-keys` and future dashboards to edit policies with RBAC + audit.
 
+
+
+### Endpoint admission rollout
+
+Keep one InferFlux listener (for example 8080) for generation and embeddings.
+Optional `auth.endpoint_limits` separates their per-subject rate/burst allowances;
+see [CONFIG_REFERENCE](CONFIG_REFERENCE.md#optional-endpoint-request-admission-on-one-listener).
+The shared ceiling is still authoritative. An on-disk positive shared limit takes
+precedence over YAML, so inspect `inferctl admin rate-limit --get` before changing
+traffic. `--set` adjusts only that shared limit; endpoint policy is startup-only.
+
+1. Use a reviewed, released build containing endpoint admission. Preserve the old
+   binary, private YAML, policy store and caches for rollback. Do not transfer
+   credentials or clear shared cache.
+2. Configure endpoint caps and verify the effective shared value/source in the
+   admin response. When Sandhi is optional, origin authentication and resource
+   protection must remain effective for direct clients. Gateway quotas can add
+   per-user controls when upstream calls share an identity.
+3. Benchmark fixed embedding input lengths and batch sizes at bounded 1/2/4/8
+   requests/s, first alone, then with generation on the GPU hosting embeddings.
+   Record admitted/rejected rates, structured 429 scope and retry delay, latency,
+   queue depth and GPU memory. Eight requests/s is a test target, not acceptance
+   established by a small embedding model or by CPU stub tests.
+4. Repeat direct and optional Sandhi paths. Retain request/session correlation,
+   explicit usage coverage and accounting conservation. Timeouts remain failures;
+   this rate policy does not extend the gateway's deadline.
+5. Select production limits from measured capacity and service objectives. Keep
+   mixed-team C5 and lifecycle acceptance open until their separate verdicts pass.
+
+Rollback removes `endpoint_limits` and restores the preserved shared policy value
+and released binary. Removing endpoint caps alone does not restore a shared limit
+changed through the admin API. Admission balances are process-local; restart
+resets them, and successful/failed shared-limit mutations retain the legacy shared
+bucket reset behavior. Endpoint balances survive those mutations and rollback.

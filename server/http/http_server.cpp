@@ -49,6 +49,7 @@ inline int inferflux_close_socket(int fd) { return ::close(fd); }
 #include <ctime>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -63,6 +64,19 @@ using json = nlohmann::json;
 namespace inferflux {
 
 namespace {
+// Classify the same exact routes for admission and handler dispatch.
+RequestClass ClassifyRequest(const std::string &method,
+                             const std::string &path) {
+  if (method == "POST") {
+    if (path == "/v1/completions" || path == "/v1/chat/completions") {
+      return RequestClass::kGeneration;
+    }
+    if (path == "/v1/embeddings") {
+      return RequestClass::kEmbeddings;
+    }
+  }
+  return RequestClass::kOther;
+}
 
 // Socket BIO writes can raise SIGPIPE during TLS reads/handshakes as well as
 // response writes. Use the per-socket option where available; otherwise block
@@ -1811,13 +1825,31 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
     return;
   }
-  if (rate_limiter_ && rate_limiter_->Enabled() &&
-      !rate_limiter_->Allow(auth_ctx.subject)) {
-    auto response = BuildResponse(
-        BuildErrorBody("rate_limited"), 429, "Too Many Requests",
+  const auto request_class = ClassifyRequest(method, path);
+  const auto rate_decision =
+      rate_limiter_ ? rate_limiter_->Admit(auth_ctx.subject, request_class)
+                    : RateLimitDecision{};
+  if (!rate_decision.allowed) {
+    std::string error = BuildErrorBody("rate_limited");
+    std::string limit_headers =
         "Retry-After: 1\r\nX-RateLimit-Limit: per-minute bucket\r\n"
-        "X-RateLimit-Remaining: 0\r\n");
-    SendAll(session, response);
+        "X-RateLimit-Remaining: 0\r\n";
+    if (rate_decision.endpoint_policy) {
+      auto payload = json::parse(error);
+      payload["error"]["rate_limit"] = {
+          {"scope", RequestClassName(rate_decision.scope)},
+          {"requests_per_minute", rate_decision.requests_per_minute},
+          {"retry_after_seconds", rate_decision.retry_after_seconds}};
+      error = payload.dump();
+      limit_headers =
+          "Retry-After: " + std::to_string(rate_decision.retry_after_seconds) +
+          "\r\nX-RateLimit-Limit: " +
+          std::to_string(rate_decision.requests_per_minute) +
+          "\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Scope: " +
+          RequestClassName(rate_decision.scope) + "\r\n";
+    }
+    SendAll(session,
+            BuildResponse(error, 429, "Too Many Requests", limit_headers));
     if (audit_logger_) {
       audit_logger_->Log(auth_ctx.subject, "", "rate_limited",
                          "token bucket exceeded");
@@ -1957,9 +1989,25 @@ void HttpServer::HandleClient(ClientSession &session) {
     if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
       return;
     }
-    int limit = rate_limiter_ ? rate_limiter_->CurrentLimit() : 0;
-    SendAll(session,
-            BuildResponse(json({{"tokens_per_minute", limit}}).dump()));
+    const auto policy = rate_limiter_ ? rate_limiter_->Snapshot()
+                                      : RateLimitSnapshot{0, "default", {}};
+    json payload = {{"tokens_per_minute", policy.requests_per_minute}};
+    if (policy.endpoints.Enabled()) {
+      payload["requests_per_minute"] = policy.requests_per_minute;
+      payload["aggregate_source"] = policy.source;
+      payload["endpoint_limits_source"] = "startup_yaml";
+      payload["endpoint_limits"] = json::object();
+      auto add = [&](const char *name, const auto &bucket) {
+        if (bucket) {
+          payload["endpoint_limits"][name] = {
+              {"requests_per_minute", bucket->requests_per_minute},
+              {"burst", bucket->burst}};
+        }
+      };
+      add("generation", policy.endpoints.generation);
+      add("embeddings", policy.endpoints.embeddings);
+    }
+    SendAll(session, BuildResponse(payload.dump()));
     return;
   }
 
@@ -1971,9 +2019,34 @@ void HttpServer::HandleClient(ClientSession &session) {
     bool valid = false;
     try {
       auto j = json::parse(body);
+      if (j.contains("endpoint_limits")) {
+        SendAll(session, BuildResponse(
+                             BuildErrorBody("endpoint_limits_are_startup_only"),
+                             400, "Bad Request"));
+        return;
+      }
       if (j.contains("tokens_per_minute") &&
           j["tokens_per_minute"].is_number_integer()) {
-        value = j["tokens_per_minute"].get<int>();
+        const auto &requested = j["tokens_per_minute"];
+        if (rate_limiter_ && rate_limiter_->Snapshot().endpoints.Enabled()) {
+          const auto maximum = std::numeric_limits<int>::max();
+          const bool in_range =
+              requested.is_number_unsigned()
+                  ? (requested.get<std::uint64_t>() > 0 &&
+                     requested.get<std::uint64_t>() <=
+                         static_cast<std::uint64_t>(maximum))
+                  : (requested.get<std::int64_t>() > 0 &&
+                     requested.get<std::int64_t>() <= maximum);
+          if (!in_range) {
+            SendAll(
+                session,
+                BuildResponse(
+                    BuildErrorBody("tokens_per_minute_must_be_positive_int32"),
+                    400, "Bad Request"));
+            return;
+          }
+        }
+        value = requested.get<int>();
         valid = true;
       }
     } catch (const json::exception &ex) {
@@ -1988,7 +2061,15 @@ void HttpServer::HandleClient(ClientSession &session) {
     auto start = std::chrono::steady_clock::now();
     {
       std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
-      int previous_limit = rate_limiter_ ? rate_limiter_->CurrentLimit() : 0;
+      const auto previous = rate_limiter_ ? rate_limiter_->Snapshot()
+                                          : RateLimitSnapshot{0, "default", {}};
+      if (previous.endpoints.Enabled() && value <= 0) {
+        SendAll(session, BuildResponse(BuildErrorBody(
+                                           "positive_aggregate_limit_required"),
+                                       400, "Bad Request"));
+        return;
+      }
+      int previous_limit = previous.requests_per_minute;
       int previous_store_limit =
           policy_store_ ? policy_store_->RateLimitPerMinute() : 0;
 
@@ -2000,7 +2081,7 @@ void HttpServer::HandleClient(ClientSession &session) {
         if (!policy_store_->Save()) {
           policy_store_->SetRateLimitPerMinute(previous_store_limit);
           if (rate_limiter_) {
-            rate_limiter_->UpdateLimit(previous_limit);
+            rate_limiter_->UpdateLimit(previous_limit, previous.source);
           }
           SendAll(session,
                   BuildResponse(BuildErrorBody("policy_persist_failed"), 500,
@@ -2684,7 +2765,7 @@ void HttpServer::HandleClient(ClientSession &session) {
   // OpenAI-compatible embeddings endpoint.  Two llama_context instances share
   // one llama_model* so weights are in RAM only once (structurally impossible
   // across process boundaries).  Requires "read" scope.
-  if (method == "POST" && path == "/v1/embeddings") {
+  if (request_class == RequestClass::kEmbeddings) {
     if (!RequireScope(auth_ctx, "read", session, "read scope required")) {
       return;
     }
@@ -2920,8 +3001,7 @@ void HttpServer::HandleClient(ClientSession &session) {
     return;
   }
 
-  if (method == "POST" &&
-      (path == "/v1/completions" || path == "/v1/chat/completions")) {
+  if (request_class == RequestClass::kGeneration) {
     if (!RequireScope(auth_ctx, "generate", session,
                       "generate scope required")) {
       return;
