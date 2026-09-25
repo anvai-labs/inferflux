@@ -198,3 +198,14 @@ Run the advisor test suite:
 ```
 
 Legacy advisor batch scripts were archived under `scripts/archive/advisor/`; use the canonical smoke and benchmark entry points instead.
+
+
+## Endpoint admission
+
+Use optional `auth.endpoint_limits` in the server YAML to separate generation and
+embedding request rates on the same listener. The exact same YAML contract applies
+to local files and files mounted into Docker/Kubernetes; no new ports, Helm values,
+or environment overrides for endpoint caps are introduced. Keep private credentials
+outside committed examples. Defaults are unchanged when the field is absent.
+See the [configuration contract](../docs/CONFIG_REFERENCE.md#optional-endpoint-request-admission-on-one-listener)
+and [rollout/rollback procedure](../docs/AdminGuide.md#endpoint-admission-rollout).
