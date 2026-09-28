@@ -148,6 +148,8 @@ add_library(inferflux_core STATIC
   server/http/http_server.h
   server/http/model_json.cpp
   server/http/model_json.h
+  server/http/embedding_payload.cpp
+  server/http/embedding_payload.h
   server/http/completion_payload.cpp
   server/http/completion_payload.h
   server/http/http_utils.h

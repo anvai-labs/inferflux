@@ -178,6 +178,72 @@ class StubIntegrationTests(unittest.TestCase):
     def test_stub_completion(self):
         resp, body = self._post("/v1/completions", {"model": "default", "prompt": "hi"})
         self.assertEqual(resp.status, 200, msg=f"Status: {resp.status}, Body: {body}")
+        payload = json.loads(body)
+        self.assertEqual(payload["object"], "text_completion")
+        self.assertTrue(payload["id"].startswith("cmpl-"))
+        self.assertIsInstance(payload["choices"][0]["text"], str)
+        self.assertNotIn("message", payload["choices"][0])
+
+    def test_legacy_completion_stream_preserves_wire_shape(self):
+        resp, body = self._post("/v1/completions", {
+            "model": "default", "prompt": "hi", "stream": True,
+            "stream_options": {"include_usage": True},
+        })
+        self.assertEqual(resp.status, 200)
+        self.assertIn("data: [DONE]", body)
+        events = [json.loads(line[6:]) for line in body.splitlines()
+                  if line.startswith("data: ") and line[6:] != "[DONE]"]
+        self.assertGreaterEqual(len(events), 3)
+        for event in events:
+            self.assertEqual(event["object"], "text_completion")
+            self.assertTrue(event["id"].startswith("cmpl-"))
+            for choice in event["choices"]:
+                self.assertIsInstance(choice["text"], str)
+                self.assertNotIn("delta", choice)
+                self.assertNotIn("message", choice)
+        self.assertTrue(any(e.get("usage") for e in events))
+        self.assertTrue(any(c.get("finish_reason") for e in events for c in e["choices"]))
+
+    def test_legacy_completion_rejects_chat_only_tools(self):
+        resp, body = self._post("/v1/completions", {
+            "model": "default", "prompt": "hi", "stream": True,
+            "tools": [{"type": "function", "function": {
+                "name": "demo", "parameters": {"type": "object", "properties": {}}
+            }}],
+        })
+        self.assertEqual(resp.status, 400, body)
+        self.assertIn("tools require", body)
+
+    def test_chat_endpoint_keeps_chat_wire_shape(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                resp, body = self._post("/v1/chat/completions", {
+                    "model": "default", "messages": [{"role": "user", "content": "hi"}],
+                    "stream": stream, "stream_options": {"include_usage": True},
+                })
+                self.assertEqual(resp.status, 200)
+                if stream:
+                    self.assertIn("data: [DONE]", body)
+                    events = [json.loads(line[6:]) for line in body.splitlines()
+                              if line.startswith("data: ") and line[6:] != "[DONE]"]
+                    self.assertTrue(events)
+                    for event in events:
+                        self.assertEqual(event["object"], "chat.completion.chunk")
+                        for choice in event["choices"]:
+                            self.assertIn("delta", choice)
+                else:
+                    payload = json.loads(body)
+                    self.assertEqual(payload["object"], "chat.completion")
+                    self.assertIn("message", payload["choices"][0])
+
+    def test_embeddings_reject_invalid_encoding_before_dispatch(self):
+        for encoding in (None, 123, [], "unsupported"):
+            with self.subTest(encoding=encoding):
+                resp, body = self._post("/v1/embeddings", {
+                    "input": "hello", "encoding_format": encoding,
+                })
+                self.assertEqual(resp.status, 400, body)
+                self.assertIn("encoding_format", body)
 
     def test_cache_warm(self):
         resp, body = self._post("/v1/admin/cache/warm", {"tokens": [1, 2, 3], "block_table": [100]})

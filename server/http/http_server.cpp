@@ -2,6 +2,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include "server/http/completion_payload.h"
+#include "server/http/embedding_payload.h"
 #include "server/http/model_json.h"
 
 #include "model/model_format.h"
@@ -813,7 +814,7 @@ std::string BuildCompletionBody(
   for (int i = 0; i < static_cast<int>(results.size()); ++i) {
     std::string per_result_content = results[i].completion;
     std::string per_result_reasoning;
-    if (!ReasoningSplitDisabled()) {
+    if (chat_mode && !ReasoningSplitDisabled()) {
       auto parts =
           ResponseSplitter::Split(chat_template_family, results[i].completion);
       per_result_content = std::move(parts.content);
@@ -971,18 +972,22 @@ void AppendJsonEscaped(std::string &out, std::string_view text) {
 // decode rates. Produces byte-identical framing to BuildStreamChunk for
 // plain content deltas (no logprobs).
 std::string BuildStreamChunkFast(const std::string &id, std::string_view model,
-                                 std::time_t ts, std::string_view content) {
+                                 std::time_t ts, std::string_view content,
+                                 bool chat_mode = true) {
   std::string out;
   out.reserve(content.size() + model.size() + id.size() + 128);
   out += "{\"id\":\"";
   AppendJsonEscaped(out, id);
-  out += "\",\"object\":\"chat.completion.chunk\",\"created\":";
+  out += chat_mode ? "\",\"object\":\"chat.completion.chunk\",\"created\":"
+                   : "\",\"object\":\"text_completion\",\"created\":";
   out += std::to_string(ts);
   out += ",\"model\":\"";
   AppendJsonEscaped(out, model);
-  out += "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"";
+  out += chat_mode ? "\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""
+                   : "\",\"choices\":[{\"index\":0,\"text\":\"";
   AppendJsonEscaped(out, content);
-  out += "\"},\"finish_reason\":null}]}";
+  out += chat_mode ? "\"},\"finish_reason\":null}]}"
+                   : "\",\"logprobs\":null,\"finish_reason\":null}]}";
   return "data: " + out + "\n\n";
 }
 
@@ -1014,6 +1019,7 @@ std::string BuildStreamReasoningChunkFast(const std::string &id,
 // INFERFLUX_SERVER_SSE_FLUSH_TOKENS / _BYTES to amortize socket writes and
 // JSON framing.
 struct SseStreamChunker {
+  bool chat_mode{true};
   int flush_tokens{1};
   std::size_t flush_bytes{4096};
 
@@ -1045,8 +1051,8 @@ struct SseStreamChunker {
   std::string TakeFrame(const std::string &id, std::string_view model,
                         std::time_t ts) {
     std::string frame = BuildStreamChunkFast(
-        id, model, ts,
-        buf.empty() ? std::string_view() : std::string_view(buf));
+        id, model, ts, buf.empty() ? std::string_view() : std::string_view(buf),
+        chat_mode);
     buf.clear();
     pieces_in_buf = 0;
     return frame;
@@ -1059,13 +1065,29 @@ std::string BuildStreamChunk(const std::string &id, std::string_view model,
                              std::time_t ts, const std::string &content,
                              bool finish,
                              std::string_view finish_reason = "stop",
-                             const TokenLogprob *logprob = nullptr) {
+                             const TokenLogprob *logprob = nullptr,
+                             bool chat_mode = true) {
   json j;
   j["id"] = id;
-  j["object"] = "chat.completion.chunk";
+  j["object"] = chat_mode ? "chat.completion.chunk" : "text_completion";
   j["created"] = ts;
   j["model"] = model;
 
+  if (!chat_mode) {
+    json choice = {{"index", 0},
+                   {"text", finish ? "" : content},
+                   {"logprobs", nullptr},
+                   {"finish_reason", nullptr}};
+    if (finish) {
+      choice["finish_reason"] = finish_reason;
+    } else if (logprob != nullptr) {
+      InferenceResult result;
+      result.logprobs.push_back(*logprob);
+      choice["logprobs"] = BuildLogprobsJson(result, false);
+    }
+    j["choices"] = json::array({choice});
+    return "data: " + SerializeJsonUtf8Safe(j) + "\n\n";
+  }
   if (finish) {
     j["choices"] = json::array({{{"index", 0},
                                  {"delta", json::object()},
@@ -1096,9 +1118,17 @@ std::string BuildStreamChunk(const std::string &id, std::string_view model,
 }
 
 std::string BuildStreamChunkForTest(const std::string &content,
-                                    const TokenLogprob *logprob) {
-  return BuildStreamChunk("chatcmpl-test", "test-model", 0, content, false,
-                          "stop", logprob);
+                                    const TokenLogprob *logprob,
+                                    bool chat_mode) {
+  return BuildStreamChunk(chat_mode ? "chatcmpl-test" : "cmpl-test",
+                          "test-model", 0, content, false, "stop", logprob,
+                          chat_mode);
+}
+
+std::string BuildStreamChunkFastForTest(const std::string &content,
+                                        bool chat_mode) {
+  return BuildStreamChunkFast(chat_mode ? "chatcmpl-test" : "cmpl-test",
+                              "test-model", 0, content, chat_mode);
 }
 
 // §2.3: emit SSE delta sequence for a streaming tool call response.
@@ -2770,9 +2800,22 @@ void HttpServer::HandleClient(ClientSession &session) {
       return;
     }
     std::string embed_model;
+    std::string embedding_encoding = "float";
     std::vector<std::string> inputs;
     try {
       auto j = json::parse(body);
+      if (j.contains("encoding_format")) {
+        if (!j["encoding_format"].is_string() ||
+            (j["encoding_format"] != "float" &&
+             j["encoding_format"] != "base64")) {
+          SendAll(session,
+                  BuildResponse(
+                      BuildErrorBody("encoding_format must be float or base64"),
+                      400, "Bad Request"));
+          return;
+        }
+        embedding_encoding = j["encoding_format"].get<std::string>();
+      }
       if (j.contains("model") && j["model"].is_string()) {
         embed_model = j["model"].get<std::string>();
       }
@@ -2904,9 +2947,11 @@ void HttpServer::HandleClient(ClientSession &session) {
     const int total_tokens = result.prompt_tokens;
     resolved_model = result.model_id;
     for (std::size_t idx = 0; idx < result.embeddings.size(); ++idx) {
-      data.push_back({{"object", "embedding"},
-                      {"embedding", result.embeddings[idx]},
-                      {"index", static_cast<int>(idx)}});
+      data.push_back(
+          {{"object", "embedding"},
+           {"embedding", BuildEmbeddingValue(result.embeddings[idx],
+                                             embedding_encoding == "base64")},
+           {"index", static_cast<int>(idx)}});
     }
 
     json resp = {
@@ -3095,6 +3140,12 @@ void HttpServer::HandleClient(ClientSession &session) {
     // §2.3: tool schema injection + model-native chat template formatting.
     bool use_tools = (parsed.has_tool_schema || !parsed.tools.empty()) &&
                      parsed.tool_choice != "none";
+    if (path == "/v1/completions" && use_tools) {
+      SendAll(session, BuildResponse(
+                           BuildErrorBody("tools require /v1/chat/completions"),
+                           400, "Bad Request"));
+      return;
+    }
     if (use_tools && std::getenv("INFERFLUX_LOG_TOOL_CALLS")) {
       std::cout << "[tools] request provided " << parsed.tools.size()
                 << " tool definition(s); choice=" << parsed.tool_choice
@@ -3262,21 +3313,20 @@ void HttpServer::HandleClient(ClientSession &session) {
       }
     }
 
-    bool chat_mode =
-        (path == "/v1/chat/completions") || !parsed.messages.empty();
+    // Internal prompt templating must never change the public wire dialect.
+    const bool chat_mode = (path == "/v1/chat/completions");
 
     // /v1/completions is deprecated per OpenAI API (Jan 2024).
     // Log once and add Deprecation header to response.
     const bool is_legacy_completions =
         (path == "/v1/completions" && !chat_mode);
     if (is_legacy_completions) {
-      static bool warned = false;
-      if (!warned) {
-        warned = true;
+      static std::once_flag warned;
+      std::call_once(warned, [] {
         inferflux::log::Warn(
             "server",
             "/v1/completions is deprecated; use /v1/chat/completions instead");
-      }
+      });
     }
     std::string guard_reason;
     if (guardrail_ && guardrail_->Enabled()) {
@@ -3485,6 +3535,7 @@ void HttpServer::HandleClient(ClientSession &session) {
     auto token_buffer = std::make_shared<std::vector<std::string>>();
     auto sse_chunker =
         std::make_shared<SseStreamChunker>(SseStreamChunker::FromEnv());
+    sse_chunker->chat_mode = chat_mode;
     // Reasoning separation on the streaming path (#W1): one splitter per
     // request; on_token drains reasoning deltas out of the tag-aware state
     // machine before content reaches the SSE chunker. The emitted-byte
@@ -3492,7 +3543,7 @@ void HttpServer::HandleClient(ClientSession &session) {
     // Plain size_t is safe across threads: the counters are written by the
     // decode worker inside on_token and read after future.get(), which
     // synchronizes with it.
-    auto stream_splitter = ReasoningSplitDisabled()
+    auto stream_splitter = (!chat_mode || ReasoningSplitDisabled())
                                ? std::shared_ptr<inferflux::ResponseSplitter>{}
                                : std::make_shared<inferflux::ResponseSplitter>(
                                      chat_template_family);
@@ -3515,7 +3566,8 @@ void HttpServer::HandleClient(ClientSession &session) {
           std::chrono::duration_cast<std::chrono::milliseconds>(
               std::chrono::system_clock::now().time_since_epoch())
               .count();
-      stream_id = "chatcmpl-" + std::to_string(stream_now_ms) + "-" +
+      stream_id = (chat_mode ? "chatcmpl-" : "cmpl-") +
+                  std::to_string(stream_now_ms) + "-" +
                   std::to_string(completion_seq.fetch_add(1) + 1);
       std::string stream_headers = "HTTP/1.1 200 OK\r\n"
                                    "Content-Type: text/event-stream\r\n"
@@ -3563,8 +3615,8 @@ void HttpServer::HandleClient(ClientSession &session) {
            stream_cancel_flag, stream_id, stream_model, stream_ts, token_buffer,
            buffer_tokens, sse_chunker, stream_collect_logprobs, stream_splitter,
            stream_emitted_reasoning_bytes, stream_emitted_content_bytes,
-           stream_reasoning_piece_count, send_reasoning_delta](
-              const std::string &chunk, const TokenLogprob *lp) {
+           stream_reasoning_piece_count, send_reasoning_delta,
+           chat_mode](const std::string &chunk, const TokenLogprob *lp) {
             if (chunk.empty() || !stream_active->load()) {
               return;
             }
@@ -3603,7 +3655,7 @@ void HttpServer::HandleClient(ClientSession &session) {
             if (stream_collect_logprobs && lp != nullptr) {
               std::string payload =
                   BuildStreamChunk(stream_id, stream_model, stream_ts,
-                                   content_piece, false, "stop", lp);
+                                   content_piece, false, "stop", lp, chat_mode);
               std::lock_guard<std::mutex> lock(*stream_mutex);
               if (!stream_active->load()) {
                 return;
@@ -3690,18 +3742,20 @@ void HttpServer::HandleClient(ClientSession &session) {
                 }
                 stub_content = std::move(parts.content);
               }
-              SendAll(session,
-                      BuildStreamChunk(stream_id, parsed.model, stream_ts,
-                                       stub_content, false));
               SendAll(session, BuildStreamChunk(stream_id, parsed.model,
-                                                stream_ts, "", true));
+                                                stream_ts, stub_content, false,
+                                                "stop", nullptr, chat_mode));
+              SendAll(session,
+                      BuildStreamChunk(stream_id, parsed.model, stream_ts, "",
+                                       true, "stop", nullptr, chat_mode));
             }
             if (parsed.stream_include_usage) {
               // Terminal usage frame on every path — gateways key billing on
               // it, so the stub path must not be the lone omission.
               json usage_frame = {
                   {"id", stream_id},
-                  {"object", "chat.completion.chunk"},
+                  {"object",
+                   chat_mode ? "chat.completion.chunk" : "text_completion"},
                   {"created", stream_ts},
                   {"model", parsed.model},
                   {"choices", json::array()},
@@ -3767,7 +3821,7 @@ void HttpServer::HandleClient(ClientSession &session) {
       // call written during deliberation is not a real call. Splitting first
       // also keeps <think> text out of the extraction residual (it would
       // otherwise be duplicated into content alongside reasoning_content).
-      if (!ReasoningSplitDisabled()) {
+      if (chat_mode && !ReasoningSplitDisabled()) {
         auto parts = inferflux::ResponseSplitter::Split(chat_template_family,
                                                         result.completion);
         if (!parts.reasoning.empty()) {
@@ -3882,20 +3936,22 @@ void HttpServer::HandleClient(ClientSession &session) {
               }
               for (const auto &piece : SplitForStreaming(replay_content)) {
                 SendAll(session, BuildStreamChunk(stream_id, parsed.model,
-                                                  stream_ts, piece, false));
+                                                  stream_ts, piece, false,
+                                                  "stop", nullptr, chat_mode));
               }
-              SendAll(session,
-                      BuildStreamChunk(stream_id, parsed.model, stream_ts, "",
-                                       true, stream_finish_reason));
+              SendAll(session, BuildStreamChunk(
+                                   stream_id, parsed.model, stream_ts, "", true,
+                                   stream_finish_reason, nullptr, chat_mode));
             } else {
-              SendAll(session,
-                      BuildStreamChunk(stream_id, parsed.model, stream_ts, "",
-                                       true, stream_finish_reason));
+              SendAll(session, BuildStreamChunk(
+                                   stream_id, parsed.model, stream_ts, "", true,
+                                   stream_finish_reason, nullptr, chat_mode));
             }
             if (parsed.stream_include_usage) {
               json uc;
               uc["id"] = stream_id;
-              uc["object"] = "chat.completion.chunk";
+              uc["object"] =
+                  chat_mode ? "chat.completion.chunk" : "text_completion";
               uc["created"] = stream_ts;
               uc["model"] = parsed.model;
               uc["choices"] = json::array();

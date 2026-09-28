@@ -43,7 +43,10 @@ inline std::string LookupHeaderValueForTest(const std::string &headers,
 }
 
 std::string BuildStreamChunkForTest(const std::string &content,
-                                    const TokenLogprob *logprob);
+                                    const TokenLogprob *logprob,
+                                    bool chat_mode = true);
+std::string BuildStreamChunkFastForTest(const std::string &content,
+                                        bool chat_mode);
 
 // Test hook for the request-body parser (defined in http_server.cpp).
 CompletionRequestPayload ParseJsonPayloadForTest(const std::string &body);
