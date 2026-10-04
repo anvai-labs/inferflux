@@ -204,6 +204,8 @@ int main(int argc, char **argv) {
   bool tls_enabled = false;
   std::string tls_cert_path;
   std::string tls_key_path;
+  int tls_port = 0;
+  std::string tls_bind_host;
   bool cuda_enabled = false;
   bool cuda_flash_attention_enabled = false;
   bool rocm_flash_attention_enabled = false;
@@ -647,6 +649,10 @@ int main(int argc, char **argv) {
           tls_cert_path = config["tls"]["cert_path"].as<std::string>();
         if (config["tls"]["key_path"])
           tls_key_path = config["tls"]["key_path"].as<std::string>();
+        if (config["tls"]["port"])
+          tls_port = config["tls"]["port"].as<int>();
+        if (config["tls"]["bind_host"])
+          tls_bind_host = config["tls"]["bind_host"].as<std::string>();
       }
 
     } catch (const YAML::Exception &e) {
@@ -793,6 +799,21 @@ int main(int argc, char **argv) {
   }
   if (const char *env_tls_key = std::getenv("INFERFLUX_TLS_KEY_PATH")) {
     tls_key_path = env_tls_key;
+  }
+  if (const char *env_tls_bind = std::getenv("INFERFLUX_TLS_BIND_HOST")) {
+    tls_bind_host = env_tls_bind;
+  }
+  if (const char *env_tls_port = std::getenv("INFERFLUX_TLS_PORT")) {
+    tls_port = std::stoi(env_tls_port);
+  }
+  // Test/CI single-knob enable: a positive override both sets the dedicated
+  // HTTPS listener's port and turns it on, mirroring how INFERFLUX_PORT_OVERRIDE
+  // is the single switch process_helper.py uses for the plain listener.
+  if (const char *env_tls_port_ov = std::getenv("INFERFLUX_TLS_PORT_OVERRIDE")) {
+    int value = std::stoi(env_tls_port_ov);
+    if (value > 0) {
+      tls_port = value;
+    }
   }
   if (const char *env_prefix_cap =
           std::getenv("INFERFLUX_PREFIX_CACHE_CAPACITY")) {
@@ -1065,12 +1086,36 @@ int main(int argc, char **argv) {
   tls_config.enabled = tls_enabled;
   tls_config.cert_path = tls_cert_path;
   tls_config.key_path = tls_key_path;
+  tls_config.port = tls_port;
+  tls_config.bind_host = tls_bind_host;
   if (tls_config.enabled &&
       (tls_config.cert_path.empty() || tls_config.key_path.empty())) {
     inferflux::log::Warn(
         "server",
         "TLS enabled without cert/key paths; disabling in-process TLS");
     tls_config.enabled = false;
+  }
+  if (tls_config.port > 0) {
+    // Dedicated-listener mode is an explicit operator contract: fail closed
+    // here rather than discover a silent plain-HTTP exposure at runtime.
+    if (tls_config.cert_path.empty() || tls_config.key_path.empty()) {
+      inferflux::log::Error(
+          "server", "tls.port requires tls.cert_path and tls.key_path");
+      return 1;
+    }
+    if (tls_config.port < 1 || tls_config.port > 65535) {
+      inferflux::log::Error("server", "tls.port must be in [1, 65535]");
+      return 1;
+    }
+    if (tls_config.port == port) {
+      inferflux::log::Error(
+          "server", "tls.port must differ from server.http_port; use the "
+                    "legacy tls.enabled mode to wrap the main listener");
+      return 1;
+    }
+    if (tls_config.bind_host.empty()) {
+      tls_config.bind_host = "0.0.0.0";
+    }
   }
 
   inferflux::SimpleTokenizer tokenizer;
@@ -1750,9 +1795,17 @@ int main(int argc, char **argv) {
   std::signal(SIGINT, SignalHandler);
   std::signal(SIGTERM, SignalHandler);
 
-  server.Start();
+  if (!server.Start()) {
+    inferflux::log::Error("server", "listener startup failed; exiting");
+    return 1;
+  }
   std::cout << "InferFlux listening on " << host << ":" << port
-            << (tls_config.enabled ? " (TLS enabled)" : "")
+            << (tls_config.enabled && tls_config.port <= 0 ? " (TLS enabled)"
+                                                           : "")
+            << (tls_config.port > 0 ? " (HTTPS on " + tls_config.bind_host +
+                                          ":" + std::to_string(tls_config.port) +
+                                          ")"
+                                    : "")
             << " prefix_cache_capacity=" << prefix_cache_capacity << std::endl;
 
   while (g_running) {

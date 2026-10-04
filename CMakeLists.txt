@@ -756,6 +756,7 @@ add_executable(inferflux_tests
   tests/unit/test_structured_output.cpp
   tests/unit/test_paged_kv_cache.cpp
   tests/unit/test_http_server_admin_cache.cpp
+  tests/unit/test_http_server_tls.cpp
   tests/unit/test_unified_batching.cpp
   tests/unit/test_lane_dispatcher.cpp
   tests/unit/test_model_load_spec.cpp
@@ -1200,6 +1201,16 @@ if(Python3_Interpreter_FOUND)
     TIMEOUT 60
     ENVIRONMENT
       "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN};INFERCTL_BIN=${_INFERCTL_BIN}")
+
+  # Dual-listener TLS: plain loopback HTTP + dedicated HTTPS with a
+  # disposable CA-signed certificate; needs the openssl CLI for the fixture.
+  add_test(NAME DualListenerTls
+           COMMAND ${Python3_EXECUTABLE} tests/integration/dual_listener_tls_test.py)
+  set_tests_properties(DualListenerTls PROPERTIES
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    TIMEOUT 90
+    ENVIRONMENT
+      "INFERFLUX_SERVER_BIN=${_INFERFLUX_SERVER_BIN}")
 
   # Focused CLI contract gate: script-facing model-list output modes +
   # auth failure semantics.

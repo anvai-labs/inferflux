@@ -1116,6 +1116,41 @@ std::string BuildApiKeysPayload(const std::vector<PolicyKeyEntry> &keys) {
   return json({{"api_keys", arr}}).dump();
 }
 
+// Build an SSL_CTX for a PEM certificate/key pair. Returns nullptr and fills
+// *error on failure. check_key_match additionally verifies the key belongs to
+// the certificate (used by the dedicated HTTPS listener, which must fail
+// closed rather than discover the mismatch on a client handshake).
+static SSL_CTX *BuildSslCtx(const std::string &cert_path,
+                            const std::string &key_path, bool check_key_match,
+                            std::string *error) {
+  SSL_load_error_strings();
+  OpenSSL_add_ssl_algorithms();
+  SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+  if (!ctx) {
+    *error = "failed to initialize TLS context";
+    return nullptr;
+  }
+  SSL_CTX_set_ecdh_auto(ctx, 1);
+  if (SSL_CTX_use_certificate_file(ctx, cert_path.c_str(), SSL_FILETYPE_PEM) <=
+      0) {
+    *error = "failed to load TLS certificate " + cert_path;
+    SSL_CTX_free(ctx);
+    return nullptr;
+  }
+  if (SSL_CTX_use_PrivateKey_file(ctx, key_path.c_str(), SSL_FILETYPE_PEM) <=
+      0) {
+    *error = "failed to load TLS key " + key_path;
+    SSL_CTX_free(ctx);
+    return nullptr;
+  }
+  if (check_key_match && SSL_CTX_check_private_key(ctx) != 1) {
+    *error = "private key does not match certificate " + cert_path;
+    SSL_CTX_free(ctx);
+    return nullptr;
+  }
+  return ctx;
+}
+
 HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
                        std::shared_ptr<ApiKeyAuth> auth,
                        MetricsRegistry *metrics, OIDCValidator *oidc,
@@ -1143,46 +1178,86 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
 #if INFERFLUX_ENABLE_WEBUI
   webui_renderer_ = std::make_unique<WebUiRenderer>();
 #endif
-  if (tls_config.enabled) {
+  if (tls_config.port > 0) {
+    // Dedicated-listener mode: the main listener stays plain HTTP (loopback
+    // gateway hop) and HTTPS is served separately. This is an explicit
+    // operator contract, so certificate problems fail closed at Start()
+    // instead of silently downgrading to HTTP.
+    if (tls_config.enabled) {
+      inferflux::log::Warn(
+          "http", "tls.enabled is ignored when tls.port is set; the main "
+                  "listener stays plain HTTP and HTTPS is served on tls.port");
+    }
+    if (tls_config.cert_path.empty() || tls_config.key_path.empty()) {
+      startup_error_ =
+          "tls.port requires tls.cert_path and tls.key_path; refusing to "
+          "start without a certificate";
+      inferflux::log::Error("http", startup_error_);
+      return;
+    }
+    std::string error;
+    SSL_CTX *ctx =
+        BuildSslCtx(tls_config.cert_path, tls_config.key_path,
+                    /*check_key_match=*/true, &error);
+    if (!ctx) {
+      startup_error_ = "https listener: " + error;
+      inferflux::log::Error("http", startup_error_);
+      return;
+    }
+    Listener &http = listeners_[0];
+    listener_count_ = 2;
+    http.name = "http";
+    http.bind_host = host_;
+    http.port = port_;
+    Listener &https = listeners_[1];
+    https.name = "https";
+    https.bind_host = tls_config.bind_host.empty() ? "0.0.0.0"
+                                                   : tls_config.bind_host;
+    https.port = tls_config.port;
+    https.ssl_ctx = ctx;
+    std::cout << "[http] plain listener " << http.bind_host << ":" << port_
+              << "; HTTPS listener " << https.bind_host << ":"
+              << tls_config.port << " using cert=" << tls_config.cert_path
+              << std::endl;
+  } else if (tls_config.enabled) {
+    // Legacy same-port mode: TLS wraps the main listener; certificate
+    // problems keep the historical silent fallback to plain HTTP.
     if (tls_config.cert_path.empty() || tls_config.key_path.empty()) {
       inferflux::log::Warn(
           "http", "TLS enabled without cert/key; falling back to HTTP");
     } else {
-      SSL_load_error_strings();
-      OpenSSL_add_ssl_algorithms();
-      ssl_ctx_ = SSL_CTX_new(TLS_server_method());
-      if (!ssl_ctx_) {
-        inferflux::log::Error("http", "Failed to initialize TLS context");
+      std::string error;
+      SSL_CTX *ctx = BuildSslCtx(tls_config.cert_path, tls_config.key_path,
+                                 /*check_key_match=*/false, &error);
+      if (!ctx) {
+        inferflux::log::Error("http", error);
       } else {
-        SSL_CTX_set_ecdh_auto(ssl_ctx_, 1);
-        if (SSL_CTX_use_certificate_file(ssl_ctx_, tls_config.cert_path.c_str(),
-                                         SSL_FILETYPE_PEM) <= 0) {
-          inferflux::log::Error("http", "Failed to load TLS certificate",
-                                tls_config.cert_path);
-          SSL_CTX_free(ssl_ctx_);
-          ssl_ctx_ = nullptr;
-        } else if (SSL_CTX_use_PrivateKey_file(ssl_ctx_,
-                                               tls_config.key_path.c_str(),
-                                               SSL_FILETYPE_PEM) <= 0) {
-          inferflux::log::Error("http", "Failed to load TLS key",
-                                tls_config.key_path);
-          SSL_CTX_free(ssl_ctx_);
-          ssl_ctx_ = nullptr;
-        } else {
-          tls_enabled_ = true;
-          std::cout << "[http] TLS enabled using cert=" << tls_config.cert_path
-                    << std::endl;
-        }
+        listener_count_ = 1;
+        Listener &http = listeners_[0];
+        http.name = "http";
+        http.bind_host = host_;
+        http.port = port_;
+        http.ssl_ctx = ctx;
+        std::cout << "[http] TLS enabled using cert=" << tls_config.cert_path
+                  << std::endl;
       }
     }
+  } else {
+    listener_count_ = 1;
+    Listener &http = listeners_[0];
+    http.name = "http";
+    http.bind_host = host_;
+    http.port = port_;
   }
 }
 
 HttpServer::~HttpServer() {
   Stop();
-  if (ssl_ctx_) {
-    SSL_CTX_free(ssl_ctx_);
-    ssl_ctx_ = nullptr;
+  for (int i = 0; i < listener_count_; ++i) {
+    if (listeners_[i].ssl_ctx) {
+      SSL_CTX_free(listeners_[i].ssl_ctx);
+      listeners_[i].ssl_ctx = nullptr;
+    }
   }
 }
 
@@ -1311,16 +1386,104 @@ HttpServer::EvaluateGenerationAdmissionDecision() const {
   return decision;
 }
 
-void HttpServer::Start() {
+// Create, bind and listen on one acceptor socket. Returns the fd, or -1 with
+// a logged error. Extracted verbatim from the former Run() prologue so bind
+// failures are observable from Start() instead of killing a background thread
+// while the process keeps idling.
+static int BindListener(const std::string &host, int port) {
+  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) {
+    std::perror("socket");
+#ifdef _WIN32
+    inferflux::log::Error("http", "socket() failed, WSAGetLastError=" +
+                                      std::to_string(WSAGetLastError()));
+#endif
+    return -1;
+  }
+
+  int opt = 1;
+#ifdef _WIN32
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char *>(&opt), sizeof(opt));
+#else
+  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+#endif
+
+  sockaddr_in addr;
+  std::memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_port = htons(static_cast<uint16_t>(port));
+  addr.sin_addr.s_addr = inet_addr(host.c_str());
+
+  if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
+    std::perror("bind");
+    inferflux::log::Error("http", "failed to bind " + host + ":" +
+                                      std::to_string(port) + ": " +
+                                      std::string(std::strerror(errno)));
+    inferflux_close_socket(fd);
+    return -1;
+  }
+
+  if (::listen(fd, 128) < 0) {
+    std::perror("listen");
+    inferflux::log::Error("http", "failed to listen on " + host + ":" +
+                                      std::to_string(port));
+    inferflux_close_socket(fd);
+    return -1;
+  }
+  return fd;
+}
+
+bool HttpServer::Start() {
   if (running_) {
-    return;
+    return true;
+  }
+  if (!startup_error_.empty()) {
+    inferflux::log::Error("http", startup_error_);
+    return false;
+  }
+#ifdef _WIN32
+  WSADATA wsa_data;
+  int wsa_err = WSAStartup(MAKEWORD(2, 2), &wsa_data);
+  if (wsa_err != 0) {
+    inferflux::log::Error("http", "WSAStartup failed with error: " +
+                                      std::to_string(wsa_err));
+    return false;
+  }
+#endif
+  // Bind every listener before starting workers so a port conflict is a
+  // synchronous startup failure instead of a silent dead listener.
+  for (int i = 0; i < listener_count_; ++i) {
+    Listener &listener = listeners_[i];
+    int fd = BindListener(listener.bind_host, listener.port);
+    if (fd < 0) {
+      for (int j = 0; j < i; ++j) {
+        int bound_fd = listeners_[j].fd.exchange(-1);
+        if (bound_fd >= 0) {
+          inferflux_close_socket(bound_fd);
+        }
+      }
+      running_ = false;
+#ifdef _WIN32
+      WSACleanup();
+#endif
+      return false;
+    }
+    listener.fd.store(fd);
+  }
+  if (!listeners_.empty()) {
+    server_fd_.store(listeners_[0].fd.load());
   }
   running_ = true;
   // Start worker threads.
   for (int i = 0; i < num_workers_; ++i) {
     workers_.emplace_back(&HttpServer::WorkerLoop, this);
   }
-  accept_thread_ = std::thread(&HttpServer::Run, this);
+  for (int i = 0; i < listener_count_; ++i) {
+    listeners_[i].thread =
+        std::thread(&HttpServer::AcceptLoop, this, std::ref(listeners_[i]));
+  }
+  return true;
 }
 
 void HttpServer::Stop() {
@@ -1328,16 +1491,21 @@ void HttpServer::Stop() {
     return;
   }
   running_ = false;
-  // Close the listening socket to unblock the accept() call in Run().
-  int fd = server_fd_.exchange(-1);
-  if (fd >= 0) {
-    ::shutdown(fd, SHUT_RDWR);
-    inferflux_close_socket(fd);
+  // Close every listening socket to unblock the accept() calls.
+  for (int i = 0; i < listener_count_; ++i) {
+    int fd = listeners_[i].fd.exchange(-1);
+    if (fd >= 0) {
+      ::shutdown(fd, SHUT_RDWR);
+      inferflux_close_socket(fd);
+    }
   }
+  server_fd_.store(-1);
   // Wake all worker threads.
   queue_cv_.notify_all();
-  if (accept_thread_.joinable()) {
-    accept_thread_.join();
+  for (int i = 0; i < listener_count_; ++i) {
+    if (listeners_[i].thread.joinable()) {
+      listeners_[i].thread.join();
+    }
   }
   for (auto &w : workers_) {
     if (w.joinable()) {
@@ -1381,169 +1549,140 @@ void HttpServer::WorkerLoop() {
   }
 }
 
-void HttpServer::Run() {
-#ifdef _WIN32
-  WSADATA wsa_data;
-  int wsa_err = WSAStartup(MAKEWORD(2, 2), &wsa_data);
-  if (wsa_err != 0) {
-    inferflux::log::Error("http", "WSAStartup failed with error: " +
-                                      std::to_string(wsa_err));
-    return;
-  }
-#endif
-
-  int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+void HttpServer::AcceptLoop(Listener &listener) {
+  const int fd = listener.fd.load();
   if (fd < 0) {
-    std::perror("socket");
-#ifdef _WIN32
-    inferflux::log::Error("http", "socket() failed, WSAGetLastError=" +
-                                      std::to_string(WSAGetLastError()));
-#endif
     return;
   }
-
-  int opt = 1;
-#ifdef _WIN32
-  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
-               reinterpret_cast<const char *>(&opt), sizeof(opt));
-#else
-  ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-#endif
-
-  sockaddr_in addr;
-  std::memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(port_));
-  addr.sin_addr.s_addr = inet_addr(host_.c_str());
-
-  if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) < 0) {
-    std::perror("bind");
-    inferflux_close_socket(fd);
-    return;
-  }
-
-  if (::listen(fd, 128) < 0) {
-    std::perror("listen");
-    inferflux_close_socket(fd);
-    return;
-  }
-
-  server_fd_.store(fd);
-
-  while (running_) {
-    sockaddr_in client_addr;
-    socklen_t client_len = sizeof(client_addr);
-    int client_fd =
-        ::accept(fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
-    if (client_fd < 0) {
-      break; // Socket closed by Stop() or error — exit loop.
-    }
-    if (!running_) {
-      inferflux_close_socket(client_fd);
-      break;
-    }
-    // Disable Nagle's algorithm for low-latency responses (especially SSE).
-    {
-      int nodelay = 1;
-#ifdef _WIN32
-      ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
-                   reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
-#else
-      ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
-                   sizeof(nodelay));
-#endif
-    }
-    // Socket deadlines: without them a stalled SSE client's kernel send
-    // buffer fills and ::send() blocks FOREVER inside the scheduler's decode
-    // worker (on_token -> SendAll), freezing token generation for every
-    // request on that worker — one remote client can halt the whole server.
-    // SO_SNDTIMEO turns that into a failed send -> SendAll returns false ->
-    // the stream is canceled. SO_RCVTIMEO bounds idle keep-alive reads so a
-    // slowloris client cannot pin a worker forever.
-    {
-      static const int send_timeout_sec = [] {
-        int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_SEND_TIMEOUT_SEC", 30);
-        return v > 0 ? v : 30;
-      }();
-      static const int recv_timeout_sec = [] {
-        int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_RECV_TIMEOUT_SEC", 120);
-        return v > 0 ? v : 120;
-      }();
-#ifdef _WIN32
-      DWORD send_tv = static_cast<DWORD>(send_timeout_sec * 1000);
-      DWORD recv_tv = static_cast<DWORD>(recv_timeout_sec * 1000);
-      ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
-                   reinterpret_cast<const char *>(&send_tv), sizeof(send_tv));
-      ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
-                   reinterpret_cast<const char *>(&recv_tv), sizeof(recv_tv));
-#else
-      struct timeval send_tv;
-      send_tv.tv_sec = send_timeout_sec;
-      send_tv.tv_usec = 0;
-      struct timeval recv_tv;
-      recv_tv.tv_sec = recv_timeout_sec;
-      recv_tv.tv_usec = 0;
-      ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &send_tv,
-                   sizeof(send_tv));
-      ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv,
-                   sizeof(recv_tv));
-#endif
-    }
-    ClientSession session;
-    session.fd = client_fd;
-    if (tls_enabled_) {
-      SSL *ssl = SSL_new(ssl_ctx_);
-      if (!ssl) {
-        inferflux_close_socket(client_fd);
-        continue;
+  try {
+    while (running_) {
+      sockaddr_in client_addr;
+      socklen_t client_len = sizeof(client_addr);
+      int client_fd =
+          ::accept(fd, reinterpret_cast<sockaddr *>(&client_addr), &client_len);
+      if (client_fd < 0) {
+        break; // Socket closed by Stop() or error — exit loop.
       }
-      SSL_set_fd(ssl, client_fd);
-      ScopedSocketSignals socket_signals(client_fd);
-      if (!socket_signals.ready() || SSL_accept(ssl) != 1) {
-        SSL_free(ssl);
+      if (!running_) {
         inferflux_close_socket(client_fd);
-        continue;
+        break;
       }
-      session.ssl = ssl;
-    }
-    {
-      std::unique_lock<std::mutex> lock(queue_mutex_);
-      // Bounded accept backlog: idle/slow connections must not accumulate
-      // without limit (with N workers, N stalled clients already halt
-      // request processing; an unbounded queue additionally lets a
-      // connection flood grow memory without bound). Reject by closing —
-      // the client sees a dropped connection and can retry.
-      static const std::size_t max_pending = [] {
-        int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS",
-                                       256);
-        return v > 0 ? static_cast<std::size_t>(v) : 256;
-      }();
-      if (client_queue_.size() >= max_pending) {
-        lock.unlock();
-        // The handshake already completed for TLS sessions — free the SSL
-        // object too or every rejected connection leaks its buffers (an
-        // unauthenticated flood would grow listener memory without bound,
-        // relocating the exact hazard the bound exists to stop).
-        if (session.ssl) {
-          SSL_free(session.ssl);
-          session.ssl = nullptr;
+      // Disable Nagle's algorithm for low-latency responses (especially SSE).
+      {
+        int nodelay = 1;
+#ifdef _WIN32
+        ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
+                     reinterpret_cast<const char *>(&nodelay), sizeof(nodelay));
+#else
+        ::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &nodelay,
+                     sizeof(nodelay));
+#endif
+      }
+      // Socket deadlines: without them a stalled SSE client's kernel send
+      // buffer fills and ::send() blocks FOREVER inside the scheduler's decode
+      // worker (on_token -> SendAll), freezing token generation for every
+      // request on that worker — one remote client can halt the whole server.
+      // SO_SNDTIMEO turns that into a failed send -> SendAll returns false ->
+      // the stream is canceled. SO_RCVTIMEO bounds idle keep-alive reads so a
+      // slowloris client cannot pin a worker forever.
+      {
+        static const int send_timeout_sec = [] {
+          int v = ParseNonNegativeEnvInt("INFERFLUX_HTTP_SEND_TIMEOUT_SEC", 30);
+          return v > 0 ? v : 30;
+        }();
+        static const int recv_timeout_sec = [] {
+          int v =
+              ParseNonNegativeEnvInt("INFERFLUX_HTTP_RECV_TIMEOUT_SEC", 120);
+          return v > 0 ? v : 120;
+        }();
+#ifdef _WIN32
+        DWORD send_tv = static_cast<DWORD>(send_timeout_sec * 1000);
+        DWORD recv_tv = static_cast<DWORD>(recv_timeout_sec * 1000);
+        ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO,
+                     reinterpret_cast<const char *>(&send_tv), sizeof(send_tv));
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO,
+                     reinterpret_cast<const char *>(&recv_tv), sizeof(recv_tv));
+#else
+        struct timeval send_tv;
+        send_tv.tv_sec = send_timeout_sec;
+        send_tv.tv_usec = 0;
+        struct timeval recv_tv;
+        recv_tv.tv_sec = recv_timeout_sec;
+        recv_tv.tv_usec = 0;
+        ::setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &send_tv,
+                     sizeof(send_tv));
+        ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &recv_tv,
+                     sizeof(recv_tv));
+#endif
+      }
+      ClientSession session;
+      session.fd = client_fd;
+      if (listener.ssl_ctx) {
+        SSL *ssl = SSL_new(listener.ssl_ctx);
+        if (!ssl) {
+          inferflux_close_socket(client_fd);
+          continue;
         }
-        inferflux_close_socket(client_fd);
-        continue;
+        SSL_set_fd(ssl, client_fd);
+        ScopedSocketSignals socket_signals(client_fd);
+        if (!socket_signals.ready() || SSL_accept(ssl) != 1) {
+          // TLS handshake failures were silent historically; on the dedicated
+          // HTTPS listener they are the operator's primary misconfiguration
+          // signal (wrong CA, wrong SNI probe, plaintext probe), so log them.
+          inferflux::log::Warn("http",
+                               listener.name + ": TLS handshake failed");
+          SSL_free(ssl);
+          inferflux_close_socket(client_fd);
+          continue;
+        }
+        session.ssl = ssl;
       }
-      client_queue_.push(std::move(session));
+      {
+        std::unique_lock<std::mutex> lock(queue_mutex_);
+        // Bounded accept backlog: idle/slow connections must not accumulate
+        // without limit (with N workers, N stalled clients already halt
+        // request processing; an unbounded queue additionally lets a
+        // connection flood grow memory without bound). Reject by closing —
+        // the client sees a dropped connection and can retry.
+        static const std::size_t max_pending = [] {
+          int v =
+              ParseNonNegativeEnvInt("INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS",
+                                     256);
+          return v > 0 ? static_cast<std::size_t>(v) : 256;
+        }();
+        if (client_queue_.size() >= max_pending) {
+          lock.unlock();
+          // The handshake already completed for TLS sessions — free the SSL
+          // object too or every rejected connection leaks its buffers (an
+          // unauthenticated flood would grow listener memory without bound,
+          // relocating the exact hazard the bound exists to stop).
+          if (session.ssl) {
+            SSL_free(session.ssl);
+            session.ssl = nullptr;
+          }
+          inferflux_close_socket(client_fd);
+          continue;
+        }
+        client_queue_.push(std::move(session));
+      }
+      queue_cv_.notify_one();
     }
-    queue_cv_.notify_one();
+  } catch (const std::exception &exc) {
+    running_ = false;
+    inferflux::log::Error("http",
+                          listener.name + " accept loop exited unexpectedly: " +
+                              exc.what());
+  } catch (...) {
+    running_ = false;
+    inferflux::log::Error("http",
+                          listener.name + " accept loop exited unexpectedly");
   }
 
   // If Stop() hasn't already closed the socket, close it now.
   int expected = fd;
-  if (server_fd_.compare_exchange_strong(expected, -1)) {
+  if (listener.fd.compare_exchange_strong(expected, -1)) {
     inferflux_close_socket(fd);
   }
-#ifdef _WIN32
-  WSACleanup();
-#endif
 }
 
 bool HttpServer::ResolveSubject(const std::string &headers,
