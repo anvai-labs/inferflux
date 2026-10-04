@@ -75,12 +75,16 @@ class DualListenerTlsTests(unittest.TestCase):
         cls.directory = tempfile.TemporaryDirectory(prefix="inferflux-dual-tls-")
         cls.root = Path(cls.directory.name)
         # Config-file CA extensions: portable across LibreSSL 3.3 (no
-        # `-addext`) and OpenSSL 3.x alike.
+        # `-addext`) and OpenSSL 3.x alike. SKI/AKI are explicit because
+        # modern verifiers reject a CA without an Authority Key Identifier
+        # and LibreSSL does not emit one unprompted.
         (cls.root / "ca.cnf").write_text(
             "[req]\ndistinguished_name = dn\nx509_extensions = v3_ca\n"
             "prompt = no\n[dn]\nCN = InferFlux Test CA\n[v3_ca]\n"
             "basicConstraints = critical,CA:TRUE\n"
-            "keyUsage = critical,keyCertSign,cRLSign\n")
+            "keyUsage = critical,keyCertSign,cRLSign\n"
+            "subjectKeyIdentifier = hash\n"
+            "authorityKeyIdentifier = keyid,issuer\n")
         openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
                 "-config", "ca.cnf", "-keyout", "ca.key", "-out", "ca.pem",
                 cwd=cls.root)
@@ -89,7 +93,9 @@ class DualListenerTlsTests(unittest.TestCase):
                 "-out", "server.csr", cwd=cls.root)
         (cls.root / "extensions").write_text(
             f"subjectAltName=DNS:localhost,IP:{SERVER_HOST}\n"
-            "basicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n")
+            "basicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n"
+            "subjectKeyIdentifier = hash\n"
+            "authorityKeyIdentifier = keyid,issuer\n")
         openssl("x509", "-req", "-in", "server.csr", "-CA", "ca.pem",
                 "-CAkey", "ca.key", "-CAcreateserial", "-days", "1",
                 "-extfile", "extensions", "-out", "server.crt",
