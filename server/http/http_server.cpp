@@ -1196,9 +1196,8 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
       return;
     }
     std::string error;
-    SSL_CTX *ctx =
-        BuildSslCtx(tls_config.cert_path, tls_config.key_path,
-                    /*check_key_match=*/true, &error);
+    SSL_CTX *ctx = BuildSslCtx(tls_config.cert_path, tls_config.key_path,
+                               /*check_key_match=*/true, &error);
     if (!ctx) {
       startup_error_ = "https listener: " + error;
       inferflux::log::Error("http", startup_error_);
@@ -1211,8 +1210,8 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
     http.port = port_;
     Listener &https = listeners_[1];
     https.name = "https";
-    https.bind_host = tls_config.bind_host.empty() ? "0.0.0.0"
-                                                   : tls_config.bind_host;
+    https.bind_host =
+        tls_config.bind_host.empty() ? "0.0.0.0" : tls_config.bind_host;
     https.port = tls_config.port;
     https.ssl_ctx = ctx;
     std::cout << "[http] plain listener " << http.bind_host << ":" << port_
@@ -1645,9 +1644,8 @@ void HttpServer::AcceptLoop(Listener &listener) {
         // connection flood grow memory without bound). Reject by closing —
         // the client sees a dropped connection and can retry.
         static const std::size_t max_pending = [] {
-          int v =
-              ParseNonNegativeEnvInt("INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS",
-                                     256);
+          int v = ParseNonNegativeEnvInt(
+              "INFERFLUX_HTTP_MAX_PENDING_CONNECTIONS", 256);
           return v > 0 ? static_cast<std::size_t>(v) : 256;
         }();
         if (client_queue_.size() >= max_pending) {
@@ -1669,9 +1667,9 @@ void HttpServer::AcceptLoop(Listener &listener) {
     }
   } catch (const std::exception &exc) {
     running_ = false;
-    inferflux::log::Error("http",
-                          listener.name + " accept loop exited unexpectedly: " +
-                              exc.what());
+    inferflux::log::Error(
+        "http",
+        listener.name + " accept loop exited unexpectedly: " + exc.what());
   } catch (...) {
     running_ = false;
     inferflux::log::Error("http",

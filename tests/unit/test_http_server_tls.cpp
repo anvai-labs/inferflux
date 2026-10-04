@@ -168,9 +168,8 @@ struct ServerFixture {
 
   ServerFixture() {
     auto device = std::make_shared<CPUDeviceContext>();
-    scheduler = std::make_unique<Scheduler>(tokenizer, device, nullptr,
-                                            nullptr, nullptr, nullptr,
-                                            FairnessConfig{},
+    scheduler = std::make_unique<Scheduler>(tokenizer, device, nullptr, nullptr,
+                                            nullptr, nullptr, FairnessConfig{},
                                             DisaggregatedConfig{});
     auth = std::make_shared<ApiKeyAuth>();
   }

@@ -807,9 +807,11 @@ int main(int argc, char **argv) {
     tls_port = std::stoi(env_tls_port);
   }
   // Test/CI single-knob enable: a positive override both sets the dedicated
-  // HTTPS listener's port and turns it on, mirroring how INFERFLUX_PORT_OVERRIDE
-  // is the single switch process_helper.py uses for the plain listener.
-  if (const char *env_tls_port_ov = std::getenv("INFERFLUX_TLS_PORT_OVERRIDE")) {
+  // HTTPS listener's port and turns it on, mirroring how
+  // INFERFLUX_PORT_OVERRIDE is the single switch process_helper.py uses for the
+  // plain listener.
+  if (const char *env_tls_port_ov =
+          std::getenv("INFERFLUX_TLS_PORT_OVERRIDE")) {
     int value = std::stoi(env_tls_port_ov);
     if (value > 0) {
       tls_port = value;
@@ -1099,8 +1101,8 @@ int main(int argc, char **argv) {
     // Dedicated-listener mode is an explicit operator contract: fail closed
     // here rather than discover a silent plain-HTTP exposure at runtime.
     if (tls_config.cert_path.empty() || tls_config.key_path.empty()) {
-      inferflux::log::Error(
-          "server", "tls.port requires tls.cert_path and tls.key_path");
+      inferflux::log::Error("server",
+                            "tls.port requires tls.cert_path and tls.key_path");
       return 1;
     }
     if (tls_config.port < 1 || tls_config.port > 65535) {
@@ -1802,10 +1804,10 @@ int main(int argc, char **argv) {
   std::cout << "InferFlux listening on " << host << ":" << port
             << (tls_config.enabled && tls_config.port <= 0 ? " (TLS enabled)"
                                                            : "")
-            << (tls_config.port > 0 ? " (HTTPS on " + tls_config.bind_host +
-                                          ":" + std::to_string(tls_config.port) +
-                                          ")"
-                                    : "")
+            << (tls_config.port > 0
+                    ? " (HTTPS on " + tls_config.bind_host + ":" +
+                          std::to_string(tls_config.port) + ")"
+                    : "")
             << " prefix_cache_capacity=" << prefix_cache_capacity << std::endl;
 
   while (g_running) {
