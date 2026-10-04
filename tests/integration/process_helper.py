@@ -67,22 +67,32 @@ def start_server_process(cmd, env=None, cwd=None, text=False,
     tls_port = int(effective_env.get("INFERFLUX_TLS_PORT_OVERRIDE", "0"))
     if tls_port:
         # Same pre-bind probe/reservation for the dedicated HTTPS listener
-        # (INFERFLUX_TLS_PORT_OVERRIDE > 0 also enables it server-side).
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        # (INFERFLUX_TLS_PORT_OVERRIDE > 0 also enables it server-side),
+        # mirroring the plain-port block above including the host mapping.
+        tls_host = effective_env.get("INFERFLUX_TLS_BIND_HOST", "0.0.0.0")
+        family = socket.AF_INET6 if ":" in tls_host else socket.AF_INET
+        probe_host = {"0.0.0.0": "127.0.0.1", "::": "::1"}.get(tls_host,
+                                                               tls_host)
+        with socket.socket(family, socket.SOCK_STREAM) as probe:
             probe.settimeout(1)
-            status = probe.connect_ex(("127.0.0.1", tls_port))
+            status = probe.connect_ex((probe_host, tls_port))
         if status != errno.ECONNREFUSED:
             raise RuntimeError(
-                f"integration TLS port 127.0.0.1:{tls_port} already in use "
+                f"integration TLS port {tls_host}:{tls_port} already in use "
                 "or unavailable"
             )
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
-            reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        with socket.socket(family,
+                           socket.SOCK_STREAM) as reservation:
+            if IS_WINDOWS:
+                reservation.setsockopt(socket.SOL_SOCKET,
+                                       socket.SO_EXCLUSIVEADDRUSE, 1)
+            else:
+                reservation.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                reservation.bind(("127.0.0.1", tls_port))
+                reservation.bind((tls_host, tls_port))
             except OSError as error:
                 raise RuntimeError(
-                    f"integration TLS port 127.0.0.1:{tls_port} already in "
+                    f"integration TLS port {tls_host}:{tls_port} already in "
                     "use or unavailable"
                 ) from error
 

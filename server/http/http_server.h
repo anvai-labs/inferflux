@@ -217,6 +217,9 @@ private:
   // Mirrors listeners_[0].fd (the plain/primary listener) after Start();
   // -1 before that. Introspection convenience, not a second source of truth.
   std::atomic<int> server_fd_{-1};
+#ifdef _WIN32
+  bool wsa_initialized_{false};
+#endif
   int num_workers_;
   std::vector<std::thread> workers_;
   std::queue<ClientSession> client_queue_;

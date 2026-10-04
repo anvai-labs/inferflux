@@ -1,99 +1,72 @@
-# InferFlux Docs Index (Canonical OSS)
+---
+title: InferFlux — Open-source multi-backend LLM inference server
+---
 
-> Fast map: canonical contracts first, deep dives second, archived evidence last.
+# InferFlux
+
+**InferFlux** is an open-source C++17 inference server exposing an
+OpenAI-compatible REST API (SSE streaming included) across **CUDA, ROCm,
+Metal (MPS), Vulkan, and CPU**, backed by first-party quantized kernels
+*and* an integrated llama.cpp runtime behind one scheduler, auth, policy,
+and monitoring surface.
 
 ```mermaid
-graph TD
-    A[InferFlux Docs] --> B[Start]
-    A --> C[Canonical Contracts]
-    A --> D[Operator Runbooks]
-    A --> E[Contributor Deep Dives]
-    A --> F[Backlog + Archive]
-
-    B --> B1[Quickstart]
-    B --> B2[API Surface]
-    B --> B3[Admin Guide]
-
-    C --> C1[Architecture]
-    C --> C2[Config Reference]
-    C --> C3[Developer Guide]
-    C --> C4[Product Vision + Roadmap]
-    C --> C6[ADRs + Features + Technical Debt]
-    C --> C5[Planning Artifacts]
-
-    D --> D1[User Guide]
-    D --> D2[Troubleshooting]
-    D --> D3[Monitoring]
-
-    F --> F2[ARCHIVE_INDEX]
+flowchart LR
+    A[OpenAI-compatible clients] --> B[InferFlux server]
+    B --> C[scheduler + batch executor]
+    C --> D[inferflux_cuda native kernels]
+    C --> E[llama.cpp wrapper]
+    C --> F["ROCm / MPS / Vulkan / CPU"]
+    B --> G[auth + policy + metrics]
 ```
 
-## 1) Start Here
+## Measured results
 
-| Goal | Doc |
+All numbers are greedy decode throughput measured on the hardware listed,
+same model file and battery per comparison. Reproduce with the
+[multi-backend harness](benchmarks.md#multi-backend-harness-reference); methodology and
+run-to-run variance notes in [benchmarks](benchmarks.md).
+
+### AMD Radeon AI PRO R9700 (gfx1201, 32 GB, ROCm 7.2) — Sep 13 2026
+
+Qwen2.5-3B Q4_K_M and four production-class models, 48×256-token battery,
+16 concurrent, vs a stock llama.cpp server built from the same pinned
+source:
+
+| Model | Stock llama.cpp | InferFlux | Delta |
+|---|---:|---:|---|
+| Qwen2.5-3B Q4_K_M (dense) | 992 tok/s | 1067 tok/s | **+8%** |
+| LFM2.5-8B-A1B Q4_K_M (hybrid MoE) | 861 tok/s | 1089 tok/s | **+26%** |
+| gpt-oss-20b MXFP4 (MoE) | 598 tok/s | 710 tok/s | **+19%** |
+| Qwen3-30B-A3B Q4_K_M (MoE) | 498 tok/s | 750 tok/s | **+51%** |
+| Qwen3-14B Q4_K_M (dense) | 391 tok/s | 388 tok/s | parity |
+
+Single-request streaming TTFT under the production config: ~170 ms.
+
+### NVIDIA RTX 4000 Ada (20 GB, CUDA 12.x) — Qwen2.5-3B Q4_K_M
+
+Native first-party CUDA kernels vs the llama.cpp wrapper and local
+competitors: see [Competitive Positioning](COMPETITIVE_POSITIONING.md) for
+the full dated tables (native leads llama.cpp up to 1.56× at c=16 on the
+32×64-token workload; vLLM/SGLang retain a safetensors decode lead that is
+tracked as the open performance target).
+
+## What the scheduler adds over a raw model server
+
+- Continuous batching with priority/age, LPM, and throughput-balanced
+  selection, chunked prefill, and wave-gathering admission
+- Per-tenant fairness with yield/resume, prefix-cache reuse (radix trie),
+  speculative decoding hooks, disaggregated prefill/decode pools
+- API-key + OIDC auth, policy/guardrail enforcement, Prometheus metrics,
+  audit logging, crash diagnostics
+- OpenAI-compatible surface: [API reference](API_SURFACE.md)
+
+## Where to go next
+
+| Goal | Start here |
 |---|---|
-| First local run | [Quickstart](Quickstart.md) |
-| API and auth contract | [API_SURFACE](API_SURFACE.md) |
-| Admin/model operations | [AdminGuide](AdminGuide.md) |
-
-## 2) Canonical Contracts (Source of Truth)
-
-| Domain | Doc |
-|---|---|
-| Vision and product envelope | [PRODUCT](PRODUCT.md) |
-| Runtime architecture | [Architecture](Architecture.md) |
-| API surface | [API_SURFACE](API_SURFACE.md) |
-| Configuration | [CONFIG_REFERENCE](CONFIG_REFERENCE.md) |
-| Benchmark results and current CUDA reading | [benchmarks](benchmarks.md) |
-| Multi-backend harness reference | [benchmarks](benchmarks.md) (harness appendix) |
-| Monitoring and tuning | [MONITORING](MONITORING.md) |
-| Archived throughput investigations | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) |
-| Developer workflow + CI contracts | [DeveloperGuide](DeveloperGuide.md) |
-| Trusted CUDA + ROCm runner setup | [GPU_CI_BOOTSTRAP](GPU_CI_BOOTSTRAP.md) |
-| Grades and execution plan | [Roadmap](Roadmap.md), [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md) |
-| Dependency-ordered product/design plan | [Roadmap](Roadmap.md), [Roadmap — Planning Principles](Roadmap.md#planning-principles-and-prioritization) |
-| Architecture decisions | [adr/README](adr/README.md) |
-| Feature specifications | [features/README](features/README.md) |
-| Technical-debt register | [technical-debt/README](technical-debt/README.md) |
-| Competitive positioning | [COMPETITIVE_POSITIONING](COMPETITIVE_POSITIONING.md) |
-| GGUF runtime contract | [GGUF_NATIVE_KERNEL_IMPLEMENTATION](GGUF_NATIVE_KERNEL_IMPLEMENTATION.md) |
-| FP16 / precision guidance | [benchmarks](benchmarks.md) |
-
-## 3) Operator Runbooks
-
-| Topic | Doc |
-|---|---|
-| User workflows | [UserGuide](UserGuide.md) |
-| Incident triage | [Troubleshooting](Troubleshooting.md) |
-| Release process | [ReleaseProcess](ReleaseProcess.md) |
-| Installer/package flow | [Quickstart](Quickstart.md) |
-| Startup sizing recommendations | [STARTUP_ADVISOR](STARTUP_ADVISOR.md) |
-| GGUF smoke validation | `scripts/README.md` (GGUF native smoke) |
-| ROCm on WSL install | [ROCM_INSTALLATION_GUIDE_WSL](ROCM_INSTALLATION_GUIDE_WSL.md) |
-| Dev hardware + CI runner | [GPU_CI_BOOTSTRAP](GPU_CI_BOOTSTRAP.md) |
-
-## 4) Contributor Deep Dives
-
-| Topic | Doc |
-|---|---|
-| Backend implementation | [BACKEND_DEVELOPMENT](BACKEND_DEVELOPMENT.md) |
-| Policy surface | [AdminGuide](AdminGuide.md) |
-| Backend value matrix + parity principles | [Architecture](Architecture.md) |
-| Native GGUF quantized runtime design | [design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE](design/NATIVE_GGUF_QUANTIZED_RUNTIME_ARCHITECTURE.md) |
-
-## 5) Backlog and Evidence
-
-| Need | Doc |
-|---|---|
-| Archived snapshots/benchmarks | [ARCHIVE_INDEX](ARCHIVE_INDEX.md) |
-
-## 6) Grade Table Source
-
-Use these two docs for current scoring and grade movement rationale:
-
-- [Roadmap](Roadmap.md)
-- [TechDebt_and_Competitive_Roadmap](TechDebt_and_Competitive_Roadmap.md)
-
-Historical old-practice -> modern-practice migration guidance lives in the
-[ARCHIVE_INDEX](ARCHIVE_INDEX.md) catalog (MODERNIZATION_AUDIT and
-MAINTENANCE_REVIEW were removed as point-in-time audits).
+| Run it locally | [Quickstart](Quickstart.md) |
+| Serve on an AMD GPU | [ROCm on WSL2](ROCM_INSTALLATION_GUIDE_WSL.md) |
+| Configure everything | [Configuration Reference](CONFIG_REFERENCE.md) |
+| Understand the architecture | [Architecture](Architecture.md) |
+| Compare against other servers | [Competitive Positioning](COMPETITIVE_POSITIONING.md) |

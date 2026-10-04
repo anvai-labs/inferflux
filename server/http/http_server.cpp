@@ -1125,6 +1125,15 @@ static SSL_CTX *BuildSslCtx(const std::string &cert_path,
                             std::string *error) {
   SSL_load_error_strings();
   OpenSSL_add_ssl_algorithms();
+  // Append the OpenSSL error queue's top entry: without it a failed key load
+  // is indistinguishable from a truncated file, a passphrase, or a format
+  // the linked TLS library cannot read.
+  auto last_error = [] {
+    const unsigned long code = ERR_get_error();
+    char buf[256];
+    ERR_error_string_n(code, buf, sizeof(buf));
+    return std::string(buf);
+  };
   SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
   if (!ctx) {
     *error = "failed to initialize TLS context";
@@ -1133,13 +1142,14 @@ static SSL_CTX *BuildSslCtx(const std::string &cert_path,
   SSL_CTX_set_ecdh_auto(ctx, 1);
   if (SSL_CTX_use_certificate_file(ctx, cert_path.c_str(), SSL_FILETYPE_PEM) <=
       0) {
-    *error = "failed to load TLS certificate " + cert_path;
+    *error = "failed to load TLS certificate " + cert_path + " (" +
+             last_error() + ")";
     SSL_CTX_free(ctx);
     return nullptr;
   }
   if (SSL_CTX_use_PrivateKey_file(ctx, key_path.c_str(), SSL_FILETYPE_PEM) <=
       0) {
-    *error = "failed to load TLS key " + key_path;
+    *error = "failed to load TLS key " + key_path + " (" + last_error() + ")";
     SSL_CTX_free(ctx);
     return nullptr;
   }
@@ -1220,7 +1230,14 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
               << std::endl;
   } else if (tls_config.enabled) {
     // Legacy same-port mode: TLS wraps the main listener; certificate
-    // problems keep the historical silent fallback to plain HTTP.
+    // problems keep the historical silent fallback to plain HTTP — the
+    // listener MUST still be configured, or Start() would bind nothing and
+    // leave a zombie process that serves no port at all.
+    listener_count_ = 1;
+    Listener &http = listeners_[0];
+    http.name = "http";
+    http.bind_host = host_;
+    http.port = port_;
     if (tls_config.cert_path.empty() || tls_config.key_path.empty()) {
       inferflux::log::Warn(
           "http", "TLS enabled without cert/key; falling back to HTTP");
@@ -1229,13 +1246,8 @@ HttpServer::HttpServer(std::string host, int port, Scheduler *scheduler,
       SSL_CTX *ctx = BuildSslCtx(tls_config.cert_path, tls_config.key_path,
                                  /*check_key_match=*/false, &error);
       if (!ctx) {
-        inferflux::log::Error("http", error);
+        inferflux::log::Error("http", error + "; falling back to HTTP");
       } else {
-        listener_count_ = 1;
-        Listener &http = listeners_[0];
-        http.name = "http";
-        http.bind_host = host_;
-        http.port = port_;
         http.ssl_ctx = ctx;
         std::cout << "[http] TLS enabled using cert=" << tls_config.cert_path
                   << std::endl;
@@ -1441,6 +1453,12 @@ bool HttpServer::Start() {
     inferflux::log::Error("http", startup_error_);
     return false;
   }
+  if (listener_count_ == 0) {
+    // Defense in depth: a constructor path that configured no listener is a
+    // bug, never a serving mode.
+    inferflux::log::Error("http", "no listener configured; refusing to start");
+    return false;
+  }
 #ifdef _WIN32
   WSADATA wsa_data;
   int wsa_err = WSAStartup(MAKEWORD(2, 2), &wsa_data);
@@ -1449,6 +1467,7 @@ bool HttpServer::Start() {
                                       std::to_string(wsa_err));
     return false;
   }
+  wsa_initialized_ = true;
 #endif
   // Bind every listener before starting workers so a port conflict is a
   // synchronous startup failure instead of a silent dead listener.
@@ -1464,13 +1483,16 @@ bool HttpServer::Start() {
       }
       running_ = false;
 #ifdef _WIN32
-      WSACleanup();
+      if (wsa_initialized_) {
+        WSACleanup();
+        wsa_initialized_ = false;
+      }
 #endif
       return false;
     }
     listener.fd.store(fd);
   }
-  if (!listeners_.empty()) {
+  if (listener_count_ > 0) {
     server_fd_.store(listeners_[0].fd.load());
   }
   running_ = true;
@@ -1499,6 +1521,12 @@ void HttpServer::Stop() {
     }
   }
   server_fd_.store(-1);
+#ifdef _WIN32
+  if (wsa_initialized_) {
+    WSACleanup();
+    wsa_initialized_ = false;
+  }
+#endif
   // Wake all worker threads.
   queue_cv_.notify_all();
   for (int i = 0; i < listener_count_; ++i) {
@@ -1628,8 +1656,16 @@ void HttpServer::AcceptLoop(Listener &listener) {
           // TLS handshake failures were silent historically; on the dedicated
           // HTTPS listener they are the operator's primary misconfiguration
           // signal (wrong CA, wrong SNI probe, plaintext probe), so log them.
-          inferflux::log::Warn("http",
-                               listener.name + ": TLS handshake failed");
+          // Throttled: an unauthenticated plaintext probe or internet scanner
+          // must not be able to flood the log with one line per connection.
+          static std::atomic<int> handshake_failures{0};
+          const int failures = handshake_failures.fetch_add(1);
+          if (failures == 0 || failures % 100 == 0) {
+            inferflux::log::Warn("http",
+                                 listener.name + ": TLS handshake failed (" +
+                                     std::to_string(failures + 1) +
+                                     " total; sample logged every 100)");
+          }
           SSL_free(ssl);
           inferflux_close_socket(client_fd);
           continue;
@@ -1670,10 +1706,26 @@ void HttpServer::AcceptLoop(Listener &listener) {
     inferflux::log::Error(
         "http",
         listener.name + " accept loop exited unexpectedly: " + exc.what());
+    // Unblock the sibling acceptor(s) so Stop() can join cleanly instead of
+    // leaving a half-dead server.
+    for (int i = 0; i < listener_count_; ++i) {
+      int peer_fd = listeners_[i].fd.exchange(-1);
+      if (peer_fd >= 0) {
+        ::shutdown(peer_fd, SHUT_RDWR);
+        inferflux_close_socket(peer_fd);
+      }
+    }
   } catch (...) {
     running_ = false;
     inferflux::log::Error("http",
                           listener.name + " accept loop exited unexpectedly");
+    for (int i = 0; i < listener_count_; ++i) {
+      int peer_fd = listeners_[i].fd.exchange(-1);
+      if (peer_fd >= 0) {
+        ::shutdown(peer_fd, SHUT_RDWR);
+        inferflux_close_socket(peer_fd);
+      }
+    }
   }
 
   // If Stop() hasn't already closed the socket, close it now.

@@ -4,11 +4,20 @@
 // Windows, matching the POSIX socket harness below).
 #include <catch2/catch_amalgamated.hpp>
 
+// Pre-include every standard header http_server.h pulls in: the
+// `#define private public` window below must never cover a libstdc++
+// header's first parse (GCC rejects the resulting access mismatch, e.g.
+// <any>'s manager structs).
+#include <any>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
+#include <queue>
 #include <string>
+#include <thread>
+#include <unordered_set>
 
 #ifdef _WIN32
 #define INFERFLUX_TLS_TEST_NO_POSIX 1
@@ -35,20 +44,6 @@
 
 namespace inferflux {
 namespace {
-
-std::string ShellOut(const std::string &cmd) {
-  std::string out;
-  FILE *pipe = ::popen(cmd.c_str(), "r");
-  if (!pipe) {
-    return out;
-  }
-  char buffer[256];
-  while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-    out.append(buffer);
-  }
-  ::pclose(pipe);
-  return out;
-}
 
 struct CertFixture {
   std::filesystem::path dir;
@@ -305,6 +300,60 @@ TEST_CASE("Legacy same-port TLS mode keeps one wrapped listener",
   REQUIRE(plaintext.find("200") == std::string::npos);
   const std::string secured = HttpsGet(port, kHealthRequest);
   REQUIRE(secured.find("200") != std::string::npos);
+  server.Stop();
+}
+
+TEST_CASE("Legacy mode falls back to plain HTTP on a bad certificate",
+          "[http_server][tls]") {
+  ServerFixture fx;
+  HttpServer::TlsConfig tls;
+  tls.enabled = true;
+  tls.cert_path = "/nonexistent/cert.pem";
+  tls.key_path = "/nonexistent/key.pem";
+  HttpServer server("127.0.0.1", 0, fx.scheduler.get(), fx.auth, &fx.metrics,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, tls,
+                    1);
+  // Historical contract: the server still starts and serves plain HTTP —
+  // degraded but alive, never a zombie that binds nothing.
+  REQUIRE(server.Start());
+  REQUIRE(server.listener_count_ == 1);
+  REQUIRE(server.listeners_[0].ssl_ctx == nullptr);
+  const int port = GetListenerPort(server.listeners_[0]);
+  REQUIRE(port > 0);
+  const std::string response = HttpGet(port, kHealthRequest);
+  REQUIRE(response.find("200") != std::string::npos);
+  server.Stop();
+}
+
+TEST_CASE("Dedicated TLS listener fails closed on a key/cert mismatch",
+          "[http_server][tls]") {
+  CertFixture certs;
+  if (!certs.ok) {
+    SKIP("openssl CLI unavailable; cannot build the certificate fixture");
+  }
+  // A second, unrelated key: SSL_CTX_check_private_key must reject the pair.
+  std::filesystem::path dir = certs.dir;
+  const std::string other_key = (dir / "other.key").string();
+  REQUIRE(std::system(("openssl req -new -x509 -newkey rsa:2048 -keyout '" +
+                       other_key + "' -nodes -subj /CN=other >/dev/null 2>&1")
+                          .c_str()) == 0);
+  REQUIRE(std::filesystem::exists(other_key));
+
+  ServerFixture fx;
+  const int tls_port = ReserveEphemeralPort();
+  HttpServer::TlsConfig tls;
+  tls.port = tls_port;
+  tls.bind_host = "127.0.0.1";
+  tls.cert_path = certs.cert;
+  tls.key_path = other_key;
+  HttpServer server("127.0.0.1", 0, fx.scheduler.get(), fx.auth, &fx.metrics,
+                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, tls,
+                    1);
+  REQUIRE_FALSE(server.Start());
+  // OpenSSL variants disagree on WHERE the mismatch surfaces (key load vs
+  // the explicit check): assert the offending key is named in the error.
+  INFO("startup_error_ = " << server.startup_error_);
+  REQUIRE(server.startup_error_.find("other.key") != std::string::npos);
   server.Stop();
 }
 

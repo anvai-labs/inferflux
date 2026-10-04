@@ -6,6 +6,7 @@ rejected, and the dedicated listener fails closed on a bad certificate.
 """
 import os
 from pathlib import Path
+import shutil
 import ssl
 import subprocess
 import sys
@@ -21,6 +22,9 @@ SERVER_HOST = "127.0.0.1"
 SERVER_PORT = int(os.environ.get("INFERFLUX_TEST_PORT_BASE", "18081")) + 8
 TLS_PORT = SERVER_PORT + 1
 SERVER_BIN = os.environ.get("INFERFLUX_SERVER_BIN", "./build/inferfluxd")
+
+if shutil.which("openssl") is None:
+    raise unittest.SkipTest("openssl CLI unavailable; TLS fixtures need it")
 
 
 def openssl(*args, cwd):
