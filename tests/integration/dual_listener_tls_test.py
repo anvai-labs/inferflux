@@ -7,6 +7,7 @@ rejected, and the dedicated listener fails closed on a bad certificate.
 import os
 from pathlib import Path
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -73,11 +74,16 @@ class DualListenerTlsTests(unittest.TestCase):
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory(prefix="inferflux-dual-tls-")
         cls.root = Path(cls.directory.name)
+        # Config-file CA extensions: portable across LibreSSL 3.3 (no
+        # `-addext`) and OpenSSL 3.x alike.
+        (cls.root / "ca.cnf").write_text(
+            "[req]\ndistinguished_name = dn\nx509_extensions = v3_ca\n"
+            "prompt = no\n[dn]\nCN = InferFlux Test CA\n[v3_ca]\n"
+            "basicConstraints = critical,CA:TRUE\n"
+            "keyUsage = critical,keyCertSign,cRLSign\n")
         openssl("req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                "-subj", "/CN=InferFlux Test CA",
-                "-addext", "basicConstraints=critical,CA:TRUE",
-                "-addext", "keyUsage=critical,keyCertSign,cRLSign",
-                "-keyout", "ca.key", "-out", "ca.pem", cwd=cls.root)
+                "-config", "ca.cnf", "-keyout", "ca.key", "-out", "ca.pem",
+                cwd=cls.root)
         openssl("req", "-new", "-newkey", "rsa:2048", "-nodes",
                 "-subj", f"/CN={SERVER_HOST}", "-keyout", "server.key",
                 "-out", "server.csr", cwd=cls.root)
@@ -101,12 +107,39 @@ class DualListenerTlsTests(unittest.TestCase):
             [SERVER_BIN, "--config", "config/server.yaml"], env=env,
             merge_stderr=True, text=True)
         if not wait_for_health(plain_healthz, SERVER_HOST, SERVER_PORT):
-            raise RuntimeError("plain listener never became healthy")
+            server_output = ""
+            if cls.server.stdout:
+                try:
+                    server_output = cls.server.stdout.read1(4096).decode(
+                        "utf-8", "replace")
+                except Exception:
+                    pass
+            raise RuntimeError(
+                f"plain listener never became healthy; server output: "
+                f"{server_output!r}")
         if not wait_for_health(
                 lambda host, port: tls_healthz(host, port, cls.root / "ca.pem",
                                                SERVER_HOST),
                 SERVER_HOST, TLS_PORT):
-            raise RuntimeError("HTTPS listener never became healthy")
+            # Diagnose the TLS listener directly: does the port accept, and
+            # does the handshake/certificate verify? Surface the real cause
+            # instead of a bare timeout.
+            diagnosis = []
+            probe = socket.socket()
+            probe.settimeout(2)
+            code = probe.connect_ex((SERVER_HOST, TLS_PORT))
+            probe.close()
+            diagnosis.append(f"connect_ex={code}")
+            context = ssl.create_default_context(
+                cafile=str(cls.root / "ca.pem"))
+            try:
+                status = tls_healthz(SERVER_HOST, TLS_PORT,
+                                     cls.root / "ca.pem", SERVER_HOST)
+                diagnosis.append(f"retry status={status}")
+            except Exception as exc:
+                diagnosis.append(f"tls error: {type(exc).__name__}: {exc}")
+            raise RuntimeError("HTTPS listener never became healthy: " +
+                               "; ".join(diagnosis))
 
     @classmethod
     def tearDownClass(cls):
