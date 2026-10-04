@@ -18,6 +18,7 @@
 #endif
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cctype>
 #include <condition_variable>
@@ -69,6 +70,11 @@ public:
     bool enabled{false};
     std::string cert_path;
     std::string key_path;
+    // port > 0 serves HTTPS on a dedicated listener bound to bind_host while
+    // http_port stays plain (loopback gateway hop); port <= 0 keeps the
+    // legacy mode where tls.enabled wraps the main listener itself.
+    int port{0};
+    std::string bind_host{"0.0.0.0"};
   };
 
   struct ReadyStatus {
@@ -133,7 +139,7 @@ public:
              const ModelSelectionOptions &model_selection_options = {});
   ~HttpServer();
 
-  void Start();
+  bool Start();
   void Stop();
   void SetModelReady(bool ready) { model_ready_.store(ready); }
   void SetRole(PoolRole role) { role_.store(role, std::memory_order_relaxed); }
@@ -145,6 +151,19 @@ public:
   AdmissionDecision EvaluateGenerationAdmissionDecision() const;
 
 private:
+  // One bound acceptor. Exactly listener_count_ of the two slots are active
+  // (plain http + optional https); a fixed array because the std::atomic fd
+  // makes Listener non-movable, which std::vector's allocator requirements
+  // reject outright.
+  struct Listener {
+    std::string name;
+    std::string bind_host;
+    int port{-1};
+    SSL_CTX *ssl_ctx{nullptr};
+    std::thread thread;
+    std::atomic<int> fd{-1};
+  };
+
   struct ClientSession {
     int fd{-1};
     SSL *ssl{nullptr};
@@ -152,7 +171,7 @@ private:
         false}; // Set to true after successful non-streaming response
   };
 
-  void Run();
+  void AcceptLoop(Listener &listener);
   void HandleClient(ClientSession &session);
 
   struct AuthContext {
@@ -182,8 +201,9 @@ private:
   mutable std::mutex policy_update_mutex_;
   mutable std::mutex model_selection_mutex_;
   ModelSelectionOptions model_selection_options_;
-  bool tls_enabled_{false};
-  SSL_CTX *ssl_ctx_{nullptr};
+  std::array<Listener, 2> listeners_;
+  int listener_count_{0};
+  std::string startup_error_;
   std::atomic<bool> running_{false};
   std::atomic<bool> model_ready_{false};
   std::atomic<PoolRole> role_{PoolRole::kUnified};
@@ -194,9 +214,13 @@ private:
 #if INFERFLUX_ENABLE_WEBUI
   std::unique_ptr<WebUiRenderer> webui_renderer_;
 #endif
+  // Mirrors listeners_[0].fd (the plain/primary listener) after Start();
+  // -1 before that. Introspection convenience, not a second source of truth.
   std::atomic<int> server_fd_{-1};
+#ifdef _WIN32
+  bool wsa_initialized_{false};
+#endif
   int num_workers_;
-  std::thread accept_thread_;
   std::vector<std::thread> workers_;
   std::queue<ClientSession> client_queue_;
   std::mutex queue_mutex_;

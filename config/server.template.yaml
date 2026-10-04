@@ -13,6 +13,19 @@ server:
   enable_metrics: true
   enable_tracing: false
 
+# TLS listeners (optional).
+# Dedicated-listener mode (recommended for "plain loopback + HTTPS remote"):
+#   tls.port > 0 serves HTTPS on its own bind_host:port while server.http_port
+#   stays PLAIN HTTP — the main listener never wraps. Certificate problems or
+#   port conflicts abort startup (fail closed).
+# Legacy same-port mode: tls.enabled: true (no tls.port) wraps the main
+#   listener itself; certificate problems silently fall back to plain HTTP.
+# tls:
+#   port: 8443
+#   bind_host: 0.0.0.0
+#   cert_path: /path/to/fullchain.pem
+#   key_path: /path/to/server.key
+
 # ============================================================================
 # MODEL CONFIGURATION
 # ============================================================================

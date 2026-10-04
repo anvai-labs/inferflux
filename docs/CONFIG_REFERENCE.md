@@ -67,6 +67,7 @@ flowchart LR
 | `guardrails` | Recommended | blocklist and optional OPA policy endpoint |
 | `logging` | Yes | level/format/audit log path |
 | `registry` | Optional | hot-reload model registry polling |
+| `tls` | Optional | TLS listeners — dedicated HTTPS listener (`port`) or legacy same-port wrap (`enabled`) |
 
 ## 4) Minimal Working Profiles
 
@@ -319,6 +320,31 @@ InferFlux CUDA KV sizing defaults:
 
 ### HTTP Server
 
+#### TLS listeners
+
+Two mutually exclusive TLS modes share one certificate pair:
+
+| Mode | Config | Behavior |
+|---|---|---|
+| Dedicated listener | `tls.port: 8443`, `tls.bind_host`, `tls.cert_path`, `tls.key_path` | `server.http_port` stays **plain HTTP** (loopback gateway hop); HTTPS is served on `bind_host:port` with the same route table. Certificate/key problems or port conflicts **abort startup** (fail closed) — an explicit operator contract never silently downgrades to plaintext. |
+| Legacy same-port wrap | `tls.enabled: true`, `tls.cert_path`, `tls.key_path` | TLS wraps the main listener itself; certificate problems **silently fall back to plain HTTP** (historical behavior, preserved). |
+
+Setting `tls.enabled` together with `tls.port` warns and ignores `enabled` — the main
+listener stays plain and the dedicated HTTPS listener serves.
+
+Client verification (mTLS) is not supported in either mode; TLS is one-way server
+authentication. Clients verify the server certificate against their private-CA trust
+store (e.g. `SSL_CERT_FILE` / system CA bundle).
+
+| Environment variable | Overrides |
+|---|---|
+| `INFERFLUX_TLS_PORT` | `tls.port` |
+| `INFERFLUX_TLS_BIND_HOST` | `tls.bind_host` |
+| `INFERFLUX_TLS_ENABLED` | `tls.enabled` (legacy mode) |
+| `INFERFLUX_TLS_CERT_PATH` | `tls.cert_path` |
+| `INFERFLUX_TLS_KEY_PATH` | `tls.key_path` |
+| `INFERFLUX_TLS_PORT_OVERRIDE` | `tls.port` (tests/CI; a value > 0 also enables the dedicated listener) |
+
 | Key | Default pattern | Tuning intent |
 |---|---|---|
 | `INFERFLUX_HTTP_WORKERS` | `16` | increase for high concurrency non-streaming workloads |
@@ -389,6 +415,11 @@ Scope contract:
 
 | Variable | Overrides |
 |---|---|
+| `INFERFLUX_TLS_PORT` | `tls.port` (dedicated HTTPS listener; `0` disables it) |
+| `INFERFLUX_TLS_BIND_HOST` | `tls.bind_host` |
+| `INFERFLUX_TLS_ENABLED` | `tls.enabled` (legacy same-port TLS mode) |
+| `INFERFLUX_TLS_CERT_PATH` | `tls.cert_path` |
+| `INFERFLUX_TLS_KEY_PATH` | `tls.key_path` |
 | `INFERFLUX_MODEL_PATH` | default model path |
 | `INFERFLUX_MODELS` | multi-model config string |
 | `INFERFLUX_CUDA_STRICT` | fail model load if InferFlux CUDA runtime reports fallback |
@@ -459,6 +490,10 @@ The startup advisor evaluates config quality at boot and emits recommendations f
 
 | Symptom | First check |
 |---|---|
+| `tls.port requires tls.cert_path and tls.key_path` at startup | set both paths — the dedicated HTTPS listener refuses to start without a certificate |
+| `private key does not match certificate` at startup | the key file does not belong to the cert file |
+| `failed to bind http listener` at startup | the port is already taken (often a previous instance that never exited) |
+| `TLS handshake failed` warnings | client probe mismatch — plaintext client on the TLS port, wrong CA/SNI, or a non-TLS health checker pointed at the HTTPS listener |
 | model load failure | model `path`, `format`, `backend` compatibility |
 | `422 backend_policy_violation` | strict inferflux request policy + backend readiness |
 | `/readyz` says `distributed kv transport degraded` | inspect `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt`, distributed KV ticket counters, and whether `INFERFLUX_ADMISSION_FAIL_CLOSED_ON_DISAGG_DEGRADED` is enabled |
