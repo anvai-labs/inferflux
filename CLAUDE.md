@@ -98,8 +98,10 @@ packaging, and compile-only jobs on GitHub-hosted runners. The registered runner
 is `aiserver1-dual-gpu` in group `inferflux-gpu-trusted-staging`, with CUDA and
 ROCm labels. Do not register two runner agents against these shared devices.
 
-This WSL environment has no systemd bus. Do not use `svc.sh`; after every host
-restart, start the listener in a durable host terminal and leave it running:
+This runner is managed through a durable terminal, not `svc.sh`. Host systemd
+availability does not change its registration or management mode. After every
+host restart, start the listener in a durable terminal and leave it running; see
+`docs/GPU_CI_BOOTSTRAP.md` for the current host lifecycle and test-port contract:
 
 ```bash
 cd /home/vsingh/actions-runner-inferflux-gpu
@@ -293,13 +295,14 @@ inferflux_cuda beats Ollama and LM Studio at c>=4.
 Primary bottleneck: FFN MMVQ kernels (45% of decode time).
 See docs/TechDebt_and_Competitive_Roadmap.md for optimization roadmap.
 
-IMPORTANT: After any source changes, do a clean CUDA rebuild to avoid
-stale object files (WSL2 filesystem timestamp issue). On dual-GPU boxes
-with ROCm installed, pass -DENABLE_ROCM=OFF explicitly: ENABLE_ROCM
-defaults ON and a combined CUDA+ROCm configure fails with conflicting
-dim3 declarations (hip_runtime.h vs CUDA vector_types.h in the same TU):
-  rm -rf build-cuda && cmake -S . -B build-cuda -DENABLE_CUDA=ON \
-    -DENABLE_ROCM=OFF && cmake --build build-cuda -j$(nproc) --target inferfluxd
+After source changes, use a fresh CUDA build directory to avoid stale WSL
+objects. For a CUDA-only benchmark, explicitly pass -DENABLE_ROCM=OFF.
+Combined CUDA+ROCm builds are supported through separate mixed-vendor
+backend modules; qualify that deployment through the trusted same-process
+gate. Do not overwrite a serving build directory to run a benchmark.
+Example with a new, unused directory:
+  cmake -S . -B build-cuda-fresh -DENABLE_CUDA=ON -DENABLE_ROCM=OFF
+  cmake --build build-cuda-fresh -j$(nproc) --target inferfluxd
 ```
 
 **Quality fixes applied:**
