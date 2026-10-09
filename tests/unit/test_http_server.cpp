@@ -4,6 +4,7 @@
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "scheduler/scheduler.h"
 #include "server/http/completion_payload.h"
+#include "server/http/embedding_payload.h"
 #include "server/http/http_server.h"
 #include "server/metrics/metrics.h"
 #include "support/scoped_env.h"
@@ -545,4 +546,36 @@ TEST_CASE("BuildTokenizeBody carries per-input counts and their total",
   REQUIRE(j["model"] == "qwen3-14b");
   REQUIRE(j["tokens"] == nlohmann::json::array({3, 5, 0}));
   REQUIRE(j["input_tokens"] == 8);
+}
+
+TEST_CASE("Embedding encoding preserves float and little-endian base64 values",
+          "[http_server][embedding_wire]") {
+  const std::vector<float> values{1.0f, -2.0f, 0.0f, 0.5f};
+  REQUIRE(BuildEmbeddingValue(values, false) == nlohmann::json(values));
+  REQUIRE(BuildEmbeddingValue(values, true) == "AACAPwAAAMAAAAAAAAAAPw==");
+  REQUIRE(BuildEmbeddingValue({1.0f}, true) == "AACAPw==");
+  REQUIRE(BuildEmbeddingValue({-0.0f}, true) == "AAAAgA==");
+  REQUIRE(BuildEmbeddingValue({}, true) == "");
+}
+
+TEST_CASE("Legacy stream frames preserve text and logprob wire fields",
+          "[http_server][completion_wire]") {
+  const std::string text = "quote\" newline\n backslash\\";
+  const auto fast =
+      nlohmann::json::parse(BuildStreamChunkFastForTest(text, false).substr(6));
+  const auto regular = nlohmann::json::parse(
+      BuildStreamChunkForTest(text, nullptr, false).substr(6));
+  REQUIRE(fast == regular);
+  REQUIRE(fast["object"] == "text_completion");
+  REQUIRE(fast["choices"][0]["text"] == text);
+  REQUIRE_FALSE(fast["choices"][0].contains("delta"));
+  TokenLogprob lp;
+  lp.token = "hello";
+  lp.logprob = -0.5f;
+  lp.top_logprobs.push_back({"hello", -0.5f});
+  const auto logged = nlohmann::json::parse(
+      BuildStreamChunkForTest("hello", &lp, false).substr(6));
+  REQUIRE(logged["choices"][0]["logprobs"]["tokens"][0] == "hello");
+  REQUIRE(logged["choices"][0]["logprobs"]["token_logprobs"][0] == -0.5f);
+  REQUIRE_FALSE(logged["choices"][0]["logprobs"].contains("content"));
 }
