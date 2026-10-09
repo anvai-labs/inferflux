@@ -84,6 +84,17 @@ graph TD
 - HTTP interface is OpenAI-style for client interoperability.
 - Scope checks are enforced server-side (`generate`, `read`, `admin`).
 - `/v1/models` and `/v1/models/{id}` are distinct from admin model lifecycle endpoints.
+- `/v1/completions` retains the legacy text wire format even when the prompt is
+  internally wrapped for an instruction model: buffered and SSE responses use
+  `object=text_completion`, `cmpl-` IDs and `choices[].text`. Streaming usage
+  remains opt-in. Chat-only tools are rejected on this route; use
+  `/v1/chat/completions` for tool calls and separated reasoning. Legacy text
+  preserves raw generated reasoning tags rather than emitting chat deltas.
+- `/v1/embeddings` accepts `encoding_format` `float` (default) or `base64`.
+  Base64 encodes each vector as IEEE754 float32 values in little-endian order;
+  model, indices and token usage are unchanged. Other values and non-string
+  encodings return400 before backend dispatch. This encoding change does not
+  add dimension reduction or tokenizer-ID inputs.
 - `session_id` is an optional InferFlux extension for `/v1/completions` and `/v1/chat/completions`;
   it is ignored unless `runtime.scheduler.session_handles.enabled=true` and does not change default stateless behavior.
 - Request/response headers are matched case-insensitively (RFC 9110 §5.1), including

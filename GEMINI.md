@@ -52,6 +52,15 @@ The project uses CMake for building. The following scripts are provided for conv
 
 *   **Dependencies:** The project uses several external libraries, including OpenSSL and `llama.cpp`. Dependencies are managed through a combination of `find_package` and submodules.
 
+## Trusted GPU operations
+
+Use the existing `aiserver1-dual-gpu` runner only for trusted-main runtime gates,
+with CUDA and ROCm serialized. Do not run pull-request code on the persistent GPU runner or
+register a second runner. The existing listener runs in a durable terminal,
+independently of the host's inference systemd service. Follow
+`docs/GPU_CI_BOOTSTRAP.md` for restart, exact-SHA evidence and test-port isolation;
+do not stop identity services to free their ports.
+
 ## Key Files
 
 *   `README.md`: The main entry point for understanding the project.

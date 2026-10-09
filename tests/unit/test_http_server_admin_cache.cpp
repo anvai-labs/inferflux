@@ -105,8 +105,11 @@ public:
 };
 
 TEST_CASE(
-    "HttpServer live tool stream retains reasoning prose and terminal usage",
-    "[http_server][tool_calls][reasoning]") {
+    "HttpServer live responses preserve endpoint reasoning and tool contracts",
+    "[http_server][tool_calls][reasoning][completion_wire]") {
+  const auto mode =
+      GENERATE(0, 1, 2); // chat tools, legacy buffered, legacy SSE
+  CAPTURE(mode);
   SimpleTokenizer tokenizer;
   auto backend = std::make_shared<ToolStreamBackend>();
   ModelInfo info;
@@ -154,10 +157,20 @@ TEST_CASE(
                        sizeof(timeout)) == 0);
   REQUIRE(::connect(client.fd, reinterpret_cast<sockaddr *>(&address),
                     sizeof(address)) == 0);
-  const std::string body =
+  std::string body =
       R"({"model":"tool-stream-model","messages":[{"role":"user","content":"read"}],"tools":[{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}],"stream":true,"stream_options":{"include_usage":true},"max_tokens":256})";
+  if (mode != 0) {
+    body = json{{"model", "tool-stream-model"},
+                {"prompt", "read"},
+                {"stream", mode == 2},
+                {"max_tokens", 256},
+                {"stream_options", {{"include_usage", true}}}}
+               .dump();
+  }
   const std::string request =
-      "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\n"
+      std::string("POST ") +
+      (mode == 0 ? "/v1/chat/completions" : "/v1/completions") +
+      " HTTP/1.1\r\nHost: localhost\r\n"
       "Authorization: Bearer test-key\r\nContent-Type: application/json\r\n"
       "Connection: close\r\nContent-Length: " +
       std::to_string(body.size()) + "\r\n\r\n" + body;
@@ -166,6 +179,41 @@ TEST_CASE(
   const auto response = ReadAll(client.fd);
   server.Stop();
   REQUIRE(response.find("HTTP/1.1 200 OK") != std::string::npos);
+  if (mode != 0) {
+    const std::string expected =
+        R"(<think>plan</think>Before <tool_call>{"name":"read","arguments":{}}</tool_call> After)";
+    const auto payload = response.substr(response.find("\r\n\r\n") + 4);
+    if (mode == 1) {
+      const auto frame = json::parse(payload);
+      REQUIRE(frame["object"] == "text_completion");
+      REQUIRE(frame["choices"][0]["text"] == expected);
+      REQUIRE_FALSE(frame["choices"][0].contains("message"));
+    } else {
+      REQUIRE(payload.find("data: [DONE]") != std::string::npos);
+      std::string text;
+      int usage_frames = 0;
+      for (std::size_t pos = payload.find("data: ");
+           pos != std::string::npos;) {
+        const auto end = payload.find("\n\n", pos);
+        REQUIRE(end != std::string::npos);
+        const auto data = payload.substr(pos + 6, end - pos - 6);
+        if (data != "[DONE]") {
+          const auto frame = json::parse(data);
+          REQUIRE(frame["object"] == "text_completion");
+          if (frame.contains("usage"))
+            ++usage_frames;
+          for (const auto &choice : frame["choices"]) {
+            REQUIRE_FALSE(choice.contains("delta"));
+            text += choice["text"].get<std::string>();
+          }
+        }
+        pos = payload.find("data: ", end + 2);
+      }
+      REQUIRE(text == expected);
+      REQUIRE(usage_frames == 1);
+    }
+    return;
+  }
   REQUIRE(response.find("data: [DONE]") != std::string::npos);
   std::string reasoning, content, tool_name;
   int usage_frames = 0, finish_frames = 0;
