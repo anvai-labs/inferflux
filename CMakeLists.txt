@@ -148,6 +148,8 @@ add_library(inferflux_core STATIC
   server/http/http_server.h
   server/http/model_json.cpp
   server/http/model_json.h
+  server/http/embedding_payload.cpp
+  server/http/embedding_payload.h
   server/http/completion_payload.cpp
   server/http/completion_payload.h
   server/http/http_utils.h
@@ -1392,9 +1394,7 @@ if(Python3_Interpreter_FOUND)
   add_test(
     NAME IntegrationStubReasoning
     COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
-            StubIntegrationReasoningTests.test_streaming_reasoning_separation
-            StubIntegrationReasoningTests.test_non_streaming_reasoning_separation
-            StubIntegrationReasoningTests.test_client_request_header_round_trips_in_header_and_body)
+            StubIntegrationReasoningTests)
   set_tests_properties(IntegrationStubReasoning PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
@@ -1404,9 +1404,7 @@ if(Python3_Interpreter_FOUND)
   add_test(
     NAME IntegrationStubReasoningHarmony
     COMMAND ${Python3_EXECUTABLE} tests/integration/stub_integration_test.py
-            StubIntegrationReasoningTests.test_streaming_reasoning_separation
-            StubIntegrationReasoningTests.test_non_streaming_reasoning_separation
-            StubIntegrationReasoningTests.test_client_request_header_round_trips_in_header_and_body)
+            StubIntegrationReasoningTests)
   set_tests_properties(IntegrationStubReasoningHarmony PROPERTIES
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     TIMEOUT 60
