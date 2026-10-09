@@ -20,7 +20,7 @@ Use two-space indentation, RAII, smart pointers, and the `inferflux` namespace. 
 
 ## Trusted GPU Runner Operations
 
-Use only `aiserver1-dual-gpu` for runtime gates; hosted runners handle non-GPU work. This WSL environment lacks a usable systemd service bus, so after a host restart run `/home/vsingh/actions-runner-inferflux-gpu/run.sh` in a durable terminal. Verify runner `9054` with `gh api orgs/anvai-labs/actions/runners/9054 --jq .status`. Do not rerun `config.sh` during normal startup or register a second agent. CUDA and ROCm jobs must run serially and never execute pull-request code. Follow `docs/GPU_CI_BOOTSTRAP.md` for recovery.
+Use only `aiserver1-dual-gpu` for runtime gates; hosted runners handle non-GPU work. The runner is managed through a durable terminal, independently of the host's inference systemd service. After a host restart run `/home/vsingh/actions-runner-inferflux-gpu/run.sh` in a durable terminal. Verify runner `9054` with `gh api orgs/anvai-labs/actions/runners/9054 --jq .status`. Do not rerun `config.sh` during normal startup or register a second agent. CUDA and ROCm jobs must run serially and never execute pull-request code. Follow `docs/GPU_CI_BOOTSTRAP.md` for recovery.
 
 ## Commits, Pull Requests, and Security
 

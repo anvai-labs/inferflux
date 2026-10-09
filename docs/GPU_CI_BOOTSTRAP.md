@@ -67,9 +67,11 @@ it is required by the release process for the exact promoted SHA.
 
 ## WSL Listener Lifecycle
 
-The current WSL execution environment has no systemd bus, so the runner's
-`svc.sh install/start` path is unavailable. Registration is persistent, but the
-listener must be started again after each host restart:
+The existing runner uses a durable host terminal. Registration persists, but
+the listener needs restarting after a host reboot. Systemd availability varies
+with the WSL deployment; the October 2026 host runs InferFlux as a user service,
+which does not make this runner systemd-managed. Preserve the existing runner
+registration and start it with:
 
 ```bash
 cd /home/vsingh/actions-runner-inferflux-gpu
@@ -91,10 +93,20 @@ WSL/CUDA/ROCm tool directories to `GITHUB_PATH` before device checks, so each jo
 resolve the installed tools without a privileged system-wide symlink.
 Wait until the existing listener is idle before restarting it; preserve its registration.
 
-Keep unrelated local acceptance servers away from integration-test ports. In
-addition to the model-backed gate's 18081/18082, stub/native-metrics tests use 18083.
-A temporary CPU acceptance server can use a verified-free port such as 28083.
-Never stop or reconfigure the serving Qwen listener on 8080 to free a test port.
+The trusted workflow sets `INFERFLUX_TEST_PORT_BASE=28081`; CUDA and ROCm
+model gates use 28081 and 28082 serially. Stub and TLS suites honor the base
+offset, using ports through 28090; reserve 28091/28092 for TLS failure fixtures. The separate opt-in same-process gate uses
+28085/18794 after these suites finish. Other fixtures retain their declared
+ports (for example SHM smoke 18082 and native metrics 18083). Optional
+`IntegrationSSE`, enabled only when `INFERFLUX_MODEL_PATH` is set, still uses
+18080 and does not honor this base; do not enable it against an occupied port.
+
+Preflight these ports before dispatch. Identity services now occupy 18080/18081;
+do not stop them to make a test pass. For standalone CPU suites use an explicitly
+verified-free `INFERFLUX_TEST_PORT_BASE` and retain failures from port conflicts.
+Never stop or reconfigure serving Qwen 8080 just to free a test port. Separately
+authorized GPU-memory maintenance must use the service manager, preserve rollback
+and persisted cache, and verify readiness after recovery.
 
 Do not rerun `config.sh` during ordinary startup. Recovery registration requires
 a fresh token from `POST /orgs/anvai-labs/actions/runners/registration-token`
