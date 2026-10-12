@@ -10,6 +10,7 @@ on:
       - 'mkdocs.yml'
       - 'mkdocs-requirements.txt'
       - '.github/workflows/docs.yml'
+      - 'scripts/check_brand_tokens.py'
   pull_request:
     branches:
       - main
@@ -19,6 +20,7 @@ on:
       - 'mkdocs.yml'
       - 'mkdocs-requirements.txt'
       - '.github/workflows/docs.yml'
+      - 'scripts/check_brand_tokens.py'
   workflow_dispatch:
 
 permissions:
@@ -30,7 +32,6 @@ concurrency:
 
 env:
   PYTHON_VERSION: "3.12"
-
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -52,6 +53,7 @@ jobs:
 
       - name: Check family brand tokens
         run: python scripts/check_brand_tokens.py .
+
       - name: Build documentation
         run: python -m mkdocs build --strict
 
