@@ -10,6 +10,8 @@ on:
       - 'mkdocs.yml'
       - 'mkdocs-requirements.txt'
       - '.github/workflows/docs.yml'
+      - 'scripts/check_brand_tokens.py'
+      - 'scripts/test_check_brand_tokens.py'
   pull_request:
     branches:
       - main
@@ -19,6 +21,8 @@ on:
       - 'mkdocs.yml'
       - 'mkdocs-requirements.txt'
       - '.github/workflows/docs.yml'
+      - 'scripts/check_brand_tokens.py'
+      - 'scripts/test_check_brand_tokens.py'
   workflow_dispatch:
 
 permissions:
@@ -49,6 +53,9 @@ jobs:
 
       - name: Install documentation dependencies
         run: python -m pip install -r mkdocs-requirements.txt
+
+      - name: Check family brand tokens
+        run: python scripts/test_check_brand_tokens.py && python scripts/check_brand_tokens.py .
 
       - name: Build documentation
         run: python -m mkdocs build --strict
