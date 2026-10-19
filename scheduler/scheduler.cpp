@@ -2194,6 +2194,18 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           cached_blocks = std::move(lookup.block_table);
           cached_seq_id = lookup.sequence_id;
           matched_tokens = lookup.matched_tokens;
+          // Trie-level observability: record the consultation itself. Accepted
+          // reuse stays a separate signal (kv_prefix_reuse / cached tokens);
+          // a candidate later discarded by copy failure, capacity eviction, or
+          // full-prefill recovery still counts as a lookup hit here.
+          metrics_->RecordPrefixLookup(prefix_hit);
+          if (prefix_hit) {
+            metrics_->RecordPrefixMatchedTokens(matched_tokens);
+            if (matched_tokens <
+                static_cast<int>(inf.bpe_prompt_tokens.size())) {
+              metrics_->RecordPartialPrefixHit();
+            }
+          }
         }
         // A lookup is only a candidate. Copy, replay, and full-prefill recovery
         // determine the accepted reuse extent below.

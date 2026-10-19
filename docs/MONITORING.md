@@ -38,9 +38,15 @@ flowchart LR
 
 `inferflux_prefix_hits_total`, `inferflux_prefix_misses_total`,
 `inferflux_prefix_matched_tokens_total`, and `inferflux_prefix_partial_hits_total`
-are legacy lookup-instrumentation counters. Their `backend` label is the
-registry's process-wide label. The scheduler's radix KV execution path does not
-call those legacy recording methods; zeros there do not mean KV reuse is absent.
+count radix-trie consultations from the scheduler's prefill admission: one
+lookup per admitted request that consults the trie (session-handle requests
+served from a warm lease skip the trie; a request requeued before prefill
+re-consults and counts again). Their `backend` label is the registry's
+process-wide label. These are trie-level signals: a candidate later discarded
+by capacity eviction, copy failure, or full-prefill recovery still counts as a
+hit, so hits do not by themselves prove accepted reuse -- pair with
+`inferflux_kv_prefix_reuse_total` and per-request
+`usage.prompt_tokens_details.cached_tokens`.
 
 `inferflux_kv_prefix_reuse_total` and `inferflux_kv_prefix_reuse_tokens_total`
 remain process aggregates. New `inferflux_cache_reuse_requests_total` and
