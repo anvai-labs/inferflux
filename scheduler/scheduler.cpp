@@ -262,8 +262,16 @@ std::size_t EstimateQueueTokenCost(const InferenceRequest &inference,
                                    const FairnessConfig &fairness_config) {
   // Prefill items are still charged by prompt width; decode items should be
   // charged by per-iteration decode demand to avoid re-charging full prompts on
-  // every fairness requeue.
+  // every fairness requeue.  Exceptions: requests that will run the stateless
+  // legacy Generate() path (logprobs, structured output) execute their whole
+  // decode budget inside the admitted pass, so admission must charge their
+  // prompt plus decode budget or max_batch_tokens over-packs concurrent work.
   if (!from_decode) {
+    if (inference.collect_logprobs || inference.response_format.has_format) {
+      return std::max<std::size_t>(
+          1, inference.prompt_tokens.size() +
+                 static_cast<std::size_t>(std::max(1, inference.max_tokens)));
+    }
     return std::max<std::size_t>(1, inference.prompt_tokens.size());
   }
 
