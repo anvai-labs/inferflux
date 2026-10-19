@@ -1498,14 +1498,14 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_prefix_misses_total{backend=\"" << backend << "\"} "
       << prefix_misses_.load() << "\n";
 
-  out << "# HELP inferflux_prefix_matched_tokens_total Tokens matched in "
-         "prefix (partial or exact)\n";
+  out << "# HELP inferflux_prefix_matched_tokens_total Tokens matched by "
+         "lookup hits (exact or partial-extent)\n";
   out << "# TYPE inferflux_prefix_matched_tokens_total counter\n";
   out << "inferflux_prefix_matched_tokens_total{backend=\"" << backend << "\"} "
       << prefix_matched_tokens_.load() << "\n";
 
-  out << "# HELP inferflux_prefix_partial_hits_total Lookups with a partial "
-         "prefix match but no exact hit\n";
+  out << "# HELP inferflux_prefix_partial_hits_total Lookup hits whose "
+         "matched prefix is shorter than the prompt\n";
   out << "# TYPE inferflux_prefix_partial_hits_total counter\n";
   out << "inferflux_prefix_partial_hits_total{backend=\"" << backend << "\"} "
       << prefix_partial_hits_.load() << "\n";
