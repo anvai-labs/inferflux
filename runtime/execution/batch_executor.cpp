@@ -563,15 +563,24 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   inference.fairness.last_timeslice_tokens = slice_limit;
   inference.fairness.timeslice_tokens =
       0; // consumed; refreshed on next fairness pass.
+  // Slice caps assume the request can resume cheaply from retained KV state
+  // (n_past/sequence_id, i.e. the Decode() continuation below). The legacy
+  // Generate()/GenerateWithImages() paths re-prefill the whole prompt on
+  // every executor pass and carry no cross-pass context, so slicing them
+  // multiplies prompt compute by max_tokens/slice and concatenates
+  // independent slice continuations into garbage output. Never slice a
+  // stateless pass.
+  const bool slice_resumable =
+      inference.n_past >= 0 && inference.sequence_id >= 0;
   int decode_limit = inference.max_tokens;
   if (inference.fairness.remaining_decode_tokens >= 0) {
     decode_limit =
         std::min(decode_limit, inference.fairness.remaining_decode_tokens);
   }
-  if (slice_limit > 0) {
+  if (slice_limit > 0 && slice_resumable) {
     decode_limit = std::min(decode_limit, slice_limit);
   }
-  if (tuning_.decode_burst_tokens > 0) {
+  if (tuning_.decode_burst_tokens > 0 && slice_resumable) {
     decode_limit = std::min(decode_limit, tuning_.decode_burst_tokens);
     if (slice_limit <= 0) {
       // Reuse fairness-yield semantics for bounded decode bursts.
@@ -773,7 +782,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   }
   inference.fairness.service_tokens += response.completion_tokens;
   inference.fairness.total_completion_tokens += response.completion_tokens;
-  bool fairness_active = slice_limit > 0;
+  bool fairness_active = slice_limit > 0 && slice_resumable;
   bool exhausted_slice =
       fairness_active && response.completion_tokens >= decode_limit;
   const int remaining_after_slice =
