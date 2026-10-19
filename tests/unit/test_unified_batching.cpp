@@ -1539,6 +1539,74 @@ TEST_CASE("BatchExecutor does not timeslice legacy Generate() requests",
   REQUIRE(req.phase == RequestPhase::kFinished);
 }
 
+namespace {
+// Vision backend standing in for the stateless GenerateWithImages() branch
+// (has_images requests whose phased prefill did not establish step state).
+class RecordingVisionGenerateBackend : public LlamaCppBackend {
+public:
+  struct VisionCall {
+    std::string prompt;
+    int max_tokens;
+  };
+  std::vector<VisionCall> vision_calls;
+
+  bool IsReady() const override { return true; }
+  bool SupportsVision() const override { return true; }
+
+  std::string GenerateWithImages(
+      const std::string &prompt, const std::vector<DecodedImage> &,
+      int max_tokens,
+      const std::function<bool(const std::string &, const TokenLogprob *)> &,
+      const std::function<bool()> &,
+      const std::vector<std::string> &) override {
+    vision_calls.push_back({prompt, max_tokens});
+    return std::string(static_cast<std::size_t>(max_tokens), 'y');
+  }
+
+  int TokenCount(const std::string &text) const override {
+    return static_cast<int>(text.size());
+  }
+};
+} // namespace
+
+TEST_CASE("BatchExecutor does not burst-slice stateless image generation",
+          "[unified_batch][decode_burst]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      10, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+
+  BatchExecutor::UnifiedBatchTuning tuning;
+  tuning.decode_burst_tokens = 8;
+  auto executor = std::make_unique<BatchExecutor>(&tokenizer, device, cache,
+                                                  router, nullptr, tuning);
+  auto backend = std::make_shared<RecordingVisionGenerateBackend>();
+
+  GlobalMetrics().SetBackend("cpu");
+
+  InferenceRequest req;
+  req.model = "mock";
+  req.prompt = "describe the attached image";
+  req.has_images = true;
+  req.max_tokens = 64;
+  req.fairness.remaining_decode_tokens = 64;
+
+  RequestBatch batch;
+  batch.requests = {&req};
+
+  auto results = executor->ExecuteBatch(batch, {backend});
+  REQUIRE(results.size() == 1);
+  // GenerateWithImages() re-prefills prompt plus image embeddings on every
+  // pass with no KV resume, so it must also run unsliced.
+  REQUIRE(backend->vision_calls.size() == 1);
+  REQUIRE(backend->vision_calls[0].max_tokens == 64);
+  REQUIRE(backend->vision_calls[0].prompt == req.prompt);
+  REQUIRE_FALSE(req.fairness.yielded);
+  REQUIRE(req.phase == RequestPhase::kFinished);
+  REQUIRE(results[0].completion_tokens == 64);
+}
+
 TEST_CASE("Distinct verified devices execute concurrently and isolate failure",
           "[unified_batch][placement]") {
   struct Rendezvous {
