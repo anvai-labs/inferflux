@@ -856,7 +856,6 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
   }
 
   MarkFirstTokenIfUnset(inference);
-  inference.fairness.service_tokens += response.completion_tokens;
 
   // KV memory release and slot bookkeeping (FreeSequence + FreeSeqSlot) are
   // intentionally handled by the scheduler (ProcessBatch / DecodeWorkerLoop)

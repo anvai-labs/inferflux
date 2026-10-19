@@ -740,6 +740,75 @@ TEST_CASE("on_token callback fires on prefix cache hit", "[scheduler]") {
   REQUIRE(resp.duration_ms >= 0.0);
 }
 
+namespace {
+int64_t ReadPrefixCounter(const std::string &name) {
+  const std::string output = GlobalMetrics().RenderPrometheus();
+  std::string key = name + "{backend=\"cpu\"} ";
+  auto pos = output.find(key);
+  if (pos == std::string::npos) {
+    return 0;
+  }
+  pos += key.size();
+  const auto line_end = output.find('\n', pos);
+  return std::stoll(output.substr(pos, line_end - pos));
+}
+} // namespace
+
+TEST_CASE("Scheduler records prefix lookup metrics per trie consultation",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto prefix_cache = std::make_shared<RadixPrefixCache>(
+      cache, [](int, std::shared_ptr<inferflux::BackendInterface>) {},
+      RadixPrefixCacheLimits{1024, 12});
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<ReadyStubBackend>("ok");
+
+  ModelInfo info;
+  info.id = "prefix-metrics-model";
+  info.path = "/tmp/prefix-metrics.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  Scheduler scheduler(tokenizer, device, cache, router, nullptr, prefix_cache);
+
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t misses_before =
+      ReadPrefixCounter("inferflux_prefix_misses_total");
+  const int64_t hits_before = ReadPrefixCounter("inferflux_prefix_hits_total");
+  const int64_t matched_before =
+      ReadPrefixCounter("inferflux_prefix_matched_tokens_total");
+
+  // Empty trie: the first request must consult and miss it.
+  InferenceRequest cold;
+  cold.model = info.id;
+  cold.prompt = "anything";
+  cold.max_tokens = 2;
+  auto cold_resp = scheduler.Generate(std::move(cold)).get();
+  REQUIRE_FALSE(cold_resp.no_backend);
+  REQUIRE(ReadPrefixCounter("inferflux_prefix_misses_total") ==
+          misses_before + 1);
+  REQUIRE(ReadPrefixCounter("inferflux_prefix_hits_total") == hits_before);
+
+  // Prime the trie with the stub backend's fixed BPE sequence.
+  prefix_cache->Insert(backend->TokenizeForCache("seed"), {100}, 0, backend);
+
+  InferenceRequest warm;
+  warm.model = info.id;
+  warm.prompt = "prefix cached prompt";
+  warm.max_tokens = 2;
+  auto warm_resp = scheduler.Generate(std::move(warm)).get();
+  REQUIRE_FALSE(warm_resp.no_backend);
+  // The exact-length hit records one hit plus its matched token count even
+  // though the full-prefill fallback still reports zero accepted reuse.
+  REQUIRE(ReadPrefixCounter("inferflux_prefix_hits_total") == hits_before + 1);
+  REQUIRE(ReadPrefixCounter("inferflux_prefix_matched_tokens_total") ==
+          matched_before + 3);
+}
+
 TEST_CASE("Scheduler does not report lookup hits after full prefill fallback",
           "[scheduler]") {
   SimpleTokenizer tokenizer;

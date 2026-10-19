@@ -1504,6 +1504,11 @@ TEST_CASE("BatchExecutor does not burst-slice legacy Generate() requests",
   REQUIRE_FALSE(req.fairness.yielded);
   REQUIRE(req.phase == RequestPhase::kFinished);
   REQUIRE(results[0].completion_tokens == 64);
+  // service_tokens is charged once per pass: the seeded prompt component
+  // plus this slice's completions (a second stray add used to double-count
+  // every completion on this path).
+  REQUIRE(req.fairness.service_tokens ==
+          results[0].prompt_tokens + results[0].completion_tokens);
 }
 
 TEST_CASE("BatchExecutor does not timeslice legacy Generate() requests",
