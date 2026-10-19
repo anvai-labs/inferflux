@@ -1,6 +1,9 @@
 # InferFlux resolution: 2026-10-18 gateway 504 execution timeout
 
-Answers [the Victor timeout handoff](VICTOR_PREFIX_CACHE_TIMEOUT_HANDOFF_2026-10-18.md).
+Answers the Victor timeout handoff dated 2026-10-18
+(`VICTOR_PREFIX_CACHE_TIMEOUT_HANDOFF_2026-10-18.md`, delivered to the
+repository working tree; see also [the September cache acceptance
+handoff](CACHE_ACCEPTANCE_HANDOFF_2026-09-19.md) and #184).
 Session: 2026-10-18/19, aiserver1, `/home/vsingh/code/inferflux`. Root cause
 found, reproduced live, fixed with TDD, and mitigated on the serving unit with a
 recorded config-only change. **#184/C5 remains open** for the Mac-owned
