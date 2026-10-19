@@ -1482,6 +1482,68 @@ TEST_CASE("Scheduler token budget accounts decode slices, not full prompts",
   REQUIRE(skips_after == skips_before);
 }
 
+TEST_CASE("Scheduler charges stateless admission prompt plus decode budget",
+          "[scheduler]") {
+  SimpleTokenizer tokenizer;
+  auto device = std::make_shared<CPUDeviceContext>();
+  auto cache = std::make_shared<PagedKVCache>(
+      4, 1024, PagedKVCache::EvictionPolicy::kLRU);
+  auto router = std::make_shared<SingleModelRouter>();
+  auto backend = std::make_shared<ReadyStubBackend>(" ok");
+
+  ModelInfo info;
+  info.id = "stateless-budget-model";
+  info.path = "/tmp/stateless-budget.gguf";
+  info.backend = "cpu";
+  REQUIRE(router->RegisterModel(info, backend));
+  REQUIRE(router->SetDefaultModel(info.id));
+
+  Scheduler::Config scheduler_config;
+  scheduler_config.max_batch_size = 2;
+  scheduler_config.max_batch_tokens = 12;
+  scheduler_config.min_batch_size = 1;
+  scheduler_config.batch_accumulation_ms = 20;
+
+  Scheduler scheduler(
+      tokenizer, device, cache, router, nullptr, nullptr, FairnessConfig{},
+      DisaggregatedConfig{},
+      ModelSelectionOptions{/*allow_capability_fallback_for_default=*/true,
+                            /*require_ready_backend=*/true},
+      scheduler_config);
+
+  GlobalMetrics().SetBackend("cpu");
+  const int64_t skips_before = ReadBatchTokenBudgetSkipsTotal();
+
+  // Both prompts tokenize to five tokens. The logprobs request runs the
+  // stateless legacy Generate() path and executes its whole decode budget in
+  // the admitted pass, so admission must charge prompt + max_tokens (25),
+  // not the prompt width alone (5). With a 12-token batch budget the pair no
+  // longer fits in one selection once the plain request is admitted.
+  auto make_request = []() {
+    InferenceRequest req;
+    req.prompt = "alpha beta gamma delta epsilon";
+    req.max_tokens = 20;
+    req.priority = 0;
+    return req;
+  };
+  auto plain = make_request();
+  auto stateless = make_request();
+  stateless.collect_logprobs = true;
+
+  auto fut_plain = scheduler.Generate(std::move(plain));
+  auto fut_stateless = scheduler.Generate(std::move(stateless));
+  auto resp_plain = fut_plain.get();
+  auto resp_stateless = fut_stateless.get();
+  REQUIRE_FALSE(resp_plain.no_backend);
+  REQUIRE_FALSE(resp_stateless.no_backend);
+  // The skipped request is not starved: it is selected alone on the next
+  // batch and completes.
+  REQUIRE_FALSE(resp_stateless.completion.empty());
+
+  const int64_t skips_after = ReadBatchTokenBudgetSkipsTotal();
+  REQUIRE(skips_after == skips_before + 1);
+}
+
 TEST_CASE("Scheduler unified mode records decode assembly selection metrics",
           "[scheduler]") {
   SimpleTokenizer tokenizer;
