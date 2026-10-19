@@ -1499,9 +1499,12 @@ TEST_CASE("Scheduler charges stateless admission prompt plus decode budget",
   REQUIRE(router->SetDefaultModel(info.id));
 
   Scheduler::Config scheduler_config;
+  // min_batch_size 2 (like the sibling budget test) holds the worker's
+  // accumulation window until BOTH requests are queued, so they share one
+  // BuildBatchLocked pass and the budget skip is deterministic.
   scheduler_config.max_batch_size = 2;
   scheduler_config.max_batch_tokens = 12;
-  scheduler_config.min_batch_size = 1;
+  scheduler_config.min_batch_size = 2;
   scheduler_config.batch_accumulation_ms = 20;
 
   Scheduler scheduler(
