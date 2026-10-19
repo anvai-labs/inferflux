@@ -255,7 +255,7 @@ For `backend: cuda` requests, runtime fallback order is:
 | `runtime.scheduler.min_batch_size` | 1 | keep low for responsiveness; **raise to ≈ `max_batch_size` for GPU concurrent serving** — phased calls run to completion, so a below-wave selection runs solo for a whole generation while later arrivals wait |
 | `runtime.scheduler.batch_accumulation_ms` | 0-5 | small wait to form better batches; **GPU concurrent serving: 50-100 ms** so a gathering wave can arrive (measured on the R9700: `min_batch_size=16, batch_accumulation_ms=100` took the 48×256 c=16 battery from 741 to 1067 tok/s, +44%, vs 992 for stock llama-server on the same hardware; cost is up to the window in first-token latency for a lone request — measured TTFT ~170 ms). Single-stream latency-sensitive deployments keep the low defaults |
 | `runtime.scheduler.policy` | `priority_age` | queue ranking policy (`priority_age`, `lpm_priority`, `throughput_balanced`) |
-| `runtime.scheduler.decode_burst_tokens` | `0` | decode burst cap per executor pass (`0` disables burst slicing) |
+| `runtime.scheduler.decode_burst_tokens` | `0` | decode burst cap per executor pass (`0` disables burst slicing); applies only to KV-resumable phased decode — requests on the legacy full-`Generate()` path (logprobs/structured output) always run their whole decode budget in one pass |
 | `runtime.scheduler.decode_pool_size` | `1` | dedicated decode lane count (0 = inline on worker loop, 1+ = decode threads; 1 is default/arch recommendation) |
 | `runtime.scheduler.chunked_prefill_tokens` | `512` | max tokens submitted per prefill chunk in mixed execution |
 | `runtime.scheduler.mixed_prefill_budget_ratio` | `1.0` | fraction (`0.0-1.0`) of token budget reserved for prefill in mixed steps |
@@ -291,7 +291,7 @@ Scheduler mixed-step env overrides:
 - Native stepwise burst env override: `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS`.
   Current sensible default for the March 27 WSL2/native CUDA burst solution is `4`.
   Use `2` for low-concurrency interactive traffic and keep `8` for explicit high-concurrency experiments only.
-- Keep `runtime.scheduler.decode_burst_tokens=0` unless you are explicitly testing scheduler fairness slices; it is not the same knob as `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS`.
+- Keep `runtime.scheduler.decode_burst_tokens=0` unless you are explicitly testing scheduler fairness slices; it is not the same knob as `INFERFLUX_NATIVE_BURST_CHUNK_TOKENS`. Since the stateless-Generate fix, a nonzero value can no longer slice logprobs/structured-output requests into full re-prefills, but phased decode still yields every N tokens — set it only when you want that fairness cadence.
 
 ### KV cache
 

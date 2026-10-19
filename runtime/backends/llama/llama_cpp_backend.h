@@ -161,8 +161,9 @@ public:
   int ActiveExperts() const override;
   ModelMetadata GetModelMetadata() const override;
 
-  // Vision-aware generation.
-  std::string GenerateWithImages(
+  // Vision-aware generation. Virtual so test doubles and backend variants can
+  // intercept the stateless image path like Generate().
+  virtual std::string GenerateWithImages(
       const std::string &prompt, const std::vector<DecodedImage> &images,
       int max_tokens,
       const std::function<bool(const std::string &, const TokenLogprob *)>
