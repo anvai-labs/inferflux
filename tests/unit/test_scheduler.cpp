@@ -1539,8 +1539,13 @@ TEST_CASE("PrepareFairnessDecodeRequeue preserves original prompt state",
   REQUIRE(req.sequence_generation == 3);
 }
 
-TEST_CASE("Scheduler fairness requeue does not mutate prompt between slices",
+TEST_CASE("Scheduler runs stateless full-Generate requests in one pass",
           "[scheduler]") {
+  // collect_logprobs keeps the request on the legacy Generate() path, which
+  // re-prefills the whole prompt per executor pass and cannot resume from KV
+  // state. Timeslice slicing such a request made every slice re-evaluate the
+  // entire prompt and concatenated independent slice continuations, so the
+  // scheduler must run the full decode budget in a single pass.
   auto backend = std::make_shared<PromptRecordingSliceBackend>(
       std::vector<std::string>{"A", "B", "C"});
 
@@ -1574,21 +1579,19 @@ TEST_CASE("Scheduler fairness requeue does not mutate prompt between slices",
   req.model = info.id;
   req.prompt = "seed prompt";
   req.max_tokens = 3;
-  req.collect_logprobs = true; // Keep every slice on the full Generate path.
+  req.collect_logprobs = true; // Keep the request on the full Generate path.
 
   auto result = scheduler.Generate(std::move(req)).get();
   REQUIRE_FALSE(result.no_backend);
-  REQUIRE(result.completion == "ABC");
+  REQUIRE(result.completion == "A");
   REQUIRE(result.prompt_tokens == 40);
-  REQUIRE(result.completion_tokens == 3);
+  REQUIRE(result.completion_tokens == 1);
   REQUIRE(backend->tokenize_calls == 1);
-  // The original prompt is charged once across three one-token slices.
+  // The original prompt is charged exactly once for the single unsliced pass.
   REQUIRE(metrics.RenderPrometheus().find(
-              "inferflux_fairness_tokens_total{priority=\"0\"} 43\n") !=
+              "inferflux_fairness_tokens_total{priority=\"0\"} 41\n") !=
           std::string::npos);
-  REQUIRE(backend->SeenPrompts() == std::vector<std::string>{"seed prompt",
-                                                             "seed prompt",
-                                                             "seed prompt"});
+  REQUIRE(backend->SeenPrompts() == std::vector<std::string>{"seed prompt"});
 }
 
 TEST_CASE("Scheduler fails fast when distributed enqueue retries are exhausted",
