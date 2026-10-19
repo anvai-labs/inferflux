@@ -101,10 +101,18 @@ unretained original request bodies.
 
 ## Cache/lifecycle observations for the next gate
 
-- `inferflux_prefix_hits_total / misses / matched_tokens` for
-  `llama_cpp_rocm` are all zero since Oct 15 — no executed reuse is claimed or
-  disproven for this backend in the window; cache-contract acceptance (handoff
-  gate 5) remains to be exercised on the fixed binary.
+- **Executed reuse works on the phased path**: two identical 718-token plain
+  prompts back-to-back reported `cached_tokens` 0 then 717/718 (second call).
+  However `inferflux_prefix_hits_total / misses / matched_tokens` for
+  `llama_cpp_rocm` stayed 0/0/0 — those Prometheus counters are not wired for
+  this backend path; per-request `usage.prompt_tokens_details.cached_tokens`
+  is the working signal. Metrics coverage gap, not absent reuse.
+- **Logprobs/structured requests are cache-ineligible by design on this
+  binary** (the full_generate path sets `cache_reused_tokens = 0` and
+  re-prefills). Gateway C5 cache-ratio expectations must account for this:
+  DeepSeek-class ratios (≈80%) apply only to plain requests until
+  logprobs/structured output joins the phased path (same follow-up as the
+  slow-path note below).
 - `inferflux_llama_prompt_tokens_total` is inflated by cumulative
   `llama_perf_context` counters across mixed execution paths (phased paths do
   not reset them; the next full-`Generate()` request absorbs the drift). Do not
