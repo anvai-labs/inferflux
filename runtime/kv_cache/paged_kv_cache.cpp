@@ -16,12 +16,10 @@ PagedKVCache::PagedKVCache(std::size_t pages, std::size_t page_size_bytes,
   clock_ref_bits_.assign(pages, false);
 }
 
-int PagedKVCache::ReservePage() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  int candidate = SelectEvictionCandidate();
-  if (candidate < 0) {
-    throw std::runtime_error("KV cache exhausted");
-  }
+// Caller holds mutex_. Reset one selected page to a fresh single-reference
+// state (§P1b), reallocating zeroed storage when its capacity differs.
+// Shared by ReservePage and ReserveBlocks; previously duplicated.
+int PagedKVCache::AcquirePageLocked(int candidate) {
   auto &page = pages_[candidate];
   page.last_used = usage_counter_++;
   page.in_use = true;
@@ -36,37 +34,10 @@ int PagedKVCache::ReservePage() {
   return candidate;
 }
 
-std::vector<int> PagedKVCache::ReserveBlocks(std::size_t n) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  std::vector<int> reserved;
-  reserved.reserve(n);
-  for (std::size_t i = 0; i < n; ++i) {
-    int candidate = SelectEvictionCandidate();
-    if (candidate < 0) {
-      for (int id : reserved) {
-        pages_[id].in_use = false;
-      }
-      throw std::runtime_error(
-          "KV cache exhausted during multi-block allocation");
-    }
-    auto &page = pages_[candidate];
-    page.last_used = usage_counter_++;
-    page.in_use = true;
-    page.ref_count = 1; // Initial reference (§P1b)
-    page.dirty = false;
-    if (page.data.size() != page_size_bytes_ / sizeof(float)) {
-      page.data.assign(page_size_bytes_ / sizeof(float), 0.0f);
-    }
-    if (static_cast<std::size_t>(candidate) < clock_ref_bits_.size()) {
-      clock_ref_bits_[candidate] = true;
-    }
-    reserved.push_back(candidate);
-  }
-  return reserved;
-}
-
-void PagedKVCache::ReleasePage(int page_id) {
-  std::lock_guard<std::mutex> lock(mutex_);
+// Caller holds mutex_. Drop one reference from a page, persisting and
+// freeing it when the last owner releases. Shared by ReleasePage and
+// ReleaseBlocks; previously duplicated.
+void PagedKVCache::ReleasePageLocked(int page_id) {
   if (page_id < 0 || static_cast<std::size_t>(page_id) >= pages_.size()) {
     return;
   }
@@ -87,27 +58,42 @@ void PagedKVCache::ReleasePage(int page_id) {
   }
 }
 
+int PagedKVCache::ReservePage() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  int candidate = SelectEvictionCandidate();
+  if (candidate < 0) {
+    throw std::runtime_error("KV cache exhausted");
+  }
+  return AcquirePageLocked(candidate);
+}
+
+std::vector<int> PagedKVCache::ReserveBlocks(std::size_t n) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<int> reserved;
+  reserved.reserve(n);
+  for (std::size_t i = 0; i < n; ++i) {
+    int candidate = SelectEvictionCandidate();
+    if (candidate < 0) {
+      for (int id : reserved) {
+        pages_[id].in_use = false;
+      }
+      throw std::runtime_error(
+          "KV cache exhausted during multi-block allocation");
+    }
+    reserved.push_back(AcquirePageLocked(candidate));
+  }
+  return reserved;
+}
+
+void PagedKVCache::ReleasePage(int page_id) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ReleasePageLocked(page_id);
+}
+
 void PagedKVCache::ReleaseBlocks(const std::vector<int> &blocks) {
   std::lock_guard<std::mutex> lock(mutex_);
   for (int page_id : blocks) {
-    if (page_id < 0 || static_cast<std::size_t>(page_id) >= pages_.size()) {
-      continue;
-    }
-
-    if (--pages_[page_id].ref_count > 0) {
-      continue; // Still in use
-    }
-
-    if (!offload_path_.empty() && !pages_[page_id].data.empty() &&
-        pages_[page_id].dirty) {
-      PersistPage(page_id, pages_[page_id].data);
-    }
-    pages_[page_id].in_use = false;
-    pages_[page_id].data.clear();
-    pages_[page_id].dirty = false;
-    if (static_cast<std::size_t>(page_id) < clock_ref_bits_.size()) {
-      clock_ref_bits_[page_id] = false;
-    }
+    ReleasePageLocked(page_id);
   }
 }
 
