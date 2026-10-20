@@ -37,7 +37,8 @@ source SHA and independent review, then promote through the protected branch wor
 Rebasing or adding runtime fixes invalidates earlier exact-revision evidence for promotion.
 The current [v0.5.2 candidate record](releases/v0.5.2.md) tracks the scheduler-accounting
 maintenance release; the [v0.5.1 candidate record](releases/v0.5.1.md) documents the decode-burst
-listener and wire-contract repairs from promotion, GPU, packaging and deployment
+maintenance release. The [v0.5.0 candidate record](releases/v0.5.0.md) documents the TLS
+listener and wire-contract repairs through promotion, GPU, packaging and deployment
 gates. The [v0.4.0 candidate record](releases/v0.4.0.md) is historical preparation
 evidence; it is not the current deployment status. The
 [v0.3.0 candidate record](releases/v0.3.0.md) preserves its historical pre-release evidence;
