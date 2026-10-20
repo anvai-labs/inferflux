@@ -157,24 +157,46 @@ void SequenceSlotManager::ReleaseSlot(int slot_id) {
   ResetSlotForReuse(slot);
 }
 
-bool SequenceSlotManager::RetireLease(const SequenceLease &lease,
-                                      SequenceRetireFence fence) {
+// Caller holds mutex_ via the returned lock. Validates the lease, range-
+// checks the slot, and verifies generation plus state membership; returns
+// null on any failure. Shared prologue by the lease-transition methods;
+// previously duplicated.
+SequenceSlot *SequenceSlotManager::LockAndValidateLease(
+    const SequenceLease &lease, std::initializer_list<SequenceState> accepted,
+    std::unique_lock<std::shared_mutex> &lock) {
   if (!lease.IsValid()) {
-    return false;
+    return nullptr;
   }
 
-  std::unique_lock<std::shared_mutex> lock(mutex_);
+  lock = std::unique_lock<std::shared_mutex>(mutex_);
   if (lease.slot_id < 0 || lease.slot_id >= static_cast<int>(max_slots_)) {
-    return false;
+    return nullptr;
   }
 
   auto &slot = slots_[lease.slot_id];
-  if (slot.generation != lease.generation ||
-      (slot.state != SequenceState::kPrefilling &&
-       slot.state != SequenceState::kDecoding &&
-       slot.state != SequenceState::kCompleted)) {
+  if (slot.generation != lease.generation) {
+    return nullptr;
+  }
+  for (const SequenceState state : accepted) {
+    if (slot.state == state) {
+      return &slot;
+    }
+  }
+  return nullptr;
+}
+
+bool SequenceSlotManager::RetireLease(const SequenceLease &lease,
+                                      SequenceRetireFence fence) {
+  std::unique_lock<std::shared_mutex> lock;
+  auto *slot_ptr = LockAndValidateLease(lease,
+                                        {SequenceState::kPrefilling,
+                                         SequenceState::kDecoding,
+                                         SequenceState::kCompleted},
+                                        lock);
+  if (slot_ptr == nullptr) {
     return false;
   }
+  auto &slot = *slot_ptr;
 
   slot.state = SequenceState::kRetiring;
   slot.retire_ready_at = fence.ready_at;
@@ -196,20 +218,13 @@ bool SequenceSlotManager::ReleaseLease(const SequenceLease &lease) {
 }
 
 bool SequenceSlotManager::CompleteRetiredLease(const SequenceLease &lease) {
-  if (!lease.IsValid()) {
+  std::unique_lock<std::shared_mutex> lock;
+  auto *slot_ptr =
+      LockAndValidateLease(lease, {SequenceState::kRetiring}, lock);
+  if (slot_ptr == nullptr) {
     return false;
   }
-
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  if (lease.slot_id < 0 || lease.slot_id >= static_cast<int>(max_slots_)) {
-    return false;
-  }
-
-  auto &slot = slots_[lease.slot_id];
-  if (slot.generation != lease.generation ||
-      slot.state != SequenceState::kRetiring) {
-    return false;
-  }
+  auto &slot = *slot_ptr;
 
   LogSlotEvent("retire_complete", slot);
   ResetSlotForReuse(slot);
@@ -349,22 +364,16 @@ std::vector<SequenceSlot> SequenceSlotManager::GetSlotStatus() const {
 
 bool SequenceSlotManager::MarkCompleted(const SequenceLease &lease,
                                         int token_count) {
-  if (!lease.IsValid()) {
+  std::unique_lock<std::shared_mutex> lock;
+  auto *slot_ptr = LockAndValidateLease(lease,
+                                        {SequenceState::kPrefilling,
+                                         SequenceState::kDecoding,
+                                         SequenceState::kCompleted},
+                                        lock);
+  if (slot_ptr == nullptr) {
     return false;
   }
-
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  if (lease.slot_id < 0 || lease.slot_id >= static_cast<int>(max_slots_)) {
-    return false;
-  }
-
-  auto &slot = slots_[lease.slot_id];
-  if (slot.generation != lease.generation ||
-      (slot.state != SequenceState::kPrefilling &&
-       slot.state != SequenceState::kDecoding &&
-       slot.state != SequenceState::kCompleted)) {
-    return false;
-  }
+  auto &slot = *slot_ptr;
 
   slot.state = SequenceState::kCompleted;
   slot.token_count = std::max(0, token_count);
@@ -376,20 +385,13 @@ bool SequenceSlotManager::MarkCompleted(const SequenceLease &lease,
 bool SequenceSlotManager::RestoreLease(const SequenceLease &lease,
                                        int64_t request_id, int sequence_id,
                                        int token_count) {
-  if (!lease.IsValid()) {
+  std::unique_lock<std::shared_mutex> lock;
+  auto *slot_ptr =
+      LockAndValidateLease(lease, {SequenceState::kCompleted}, lock);
+  if (slot_ptr == nullptr) {
     return false;
   }
-
-  std::unique_lock<std::shared_mutex> lock(mutex_);
-  if (lease.slot_id < 0 || lease.slot_id >= static_cast<int>(max_slots_)) {
-    return false;
-  }
-
-  auto &slot = slots_[lease.slot_id];
-  if (slot.generation != lease.generation ||
-      slot.state != SequenceState::kCompleted) {
-    return false;
-  }
+  auto &slot = *slot_ptr;
 
   const auto now = std::chrono::steady_clock::now();
   slot.request_id = request_id;

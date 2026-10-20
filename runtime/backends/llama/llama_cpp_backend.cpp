@@ -148,10 +148,30 @@ bool TokenTraceDebugEnabled() {
   return enabled;
 }
 
-bool ConsumeTokenTraceBudget() {
-  static const int initial_budget = [] {
-    int parsed = 128;
-    if (const char *env = std::getenv("INFERFLUX_DEBUG_TOKEN_TRACE_LIMIT")) {
+// Process-wide debug-trace budget: parsed once from an env var (positive
+// integers only, clamped to int), then consumed atomically until exhausted.
+// Shared by the token-trace and logits debug paths; previously duplicated.
+class EnvDebugBudget {
+public:
+  EnvDebugBudget(const char *env_name, int default_budget)
+      : remaining_(ParseInitialBudget(env_name, default_budget)) {}
+
+  bool TryConsume() {
+    int current = remaining_.load(std::memory_order_relaxed);
+    while (current > 0) {
+      if (remaining_.compare_exchange_weak(current, current - 1,
+                                           std::memory_order_relaxed,
+                                           std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+private:
+  static int ParseInitialBudget(const char *env_name, int default_budget) {
+    int parsed = default_budget;
+    if (const char *env = std::getenv(env_name)) {
       char *end = nullptr;
       const long value = std::strtol(env, &end, 10);
       if (end != env && *end == '\0' && value > 0 &&
@@ -160,17 +180,14 @@ bool ConsumeTokenTraceBudget() {
       }
     }
     return parsed;
-  }();
-  static std::atomic<int> remaining(initial_budget);
-  int current = remaining.load(std::memory_order_relaxed);
-  while (current > 0) {
-    if (remaining.compare_exchange_weak(current, current - 1,
-                                        std::memory_order_relaxed,
-                                        std::memory_order_relaxed)) {
-      return true;
-    }
   }
-  return false;
+
+  std::atomic<int> remaining_;
+};
+
+bool ConsumeTokenTraceBudget() {
+  static EnvDebugBudget budget("INFERFLUX_DEBUG_TOKEN_TRACE_LIMIT", 128);
+  return budget.TryConsume();
 }
 
 bool LogitsDebugEnabled() {
@@ -200,28 +217,8 @@ bool GreedyArgmaxDisabled() {
 }
 
 bool ConsumeLogitsDebugBudget() {
-  static const int initial_budget = [] {
-    int parsed = 64;
-    if (const char *env = std::getenv("INFERFLUX_DEBUG_LOGITS_LIMIT")) {
-      char *end = nullptr;
-      const long value = std::strtol(env, &end, 10);
-      if (end != env && *end == '\0' && value > 0 &&
-          value <= static_cast<long>(std::numeric_limits<int>::max())) {
-        parsed = static_cast<int>(value);
-      }
-    }
-    return parsed;
-  }();
-  static std::atomic<int> remaining(initial_budget);
-  int current = remaining.load(std::memory_order_relaxed);
-  while (current > 0) {
-    if (remaining.compare_exchange_weak(current, current - 1,
-                                        std::memory_order_relaxed,
-                                        std::memory_order_relaxed)) {
-      return true;
-    }
-  }
-  return false;
+  static EnvDebugBudget budget("INFERFLUX_DEBUG_LOGITS_LIMIT", 64);
+  return budget.TryConsume();
 }
 
 void LogTokenTrace(std::string_view stage, int64_t request_id, int sequence_id,

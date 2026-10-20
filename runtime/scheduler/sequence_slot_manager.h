@@ -295,6 +295,10 @@ private:
    * @return Slot ID if found, nullopt if all slots in use
    */
   std::optional<int> FindFreeSlot(int sequence_capacity);
+  SequenceSlot *
+  LockAndValidateLease(const SequenceLease &lease,
+                       std::initializer_list<SequenceState> accepted,
+                       std::unique_lock<std::shared_mutex> &lock);
 
   /**
    * @brief Find slot by request ID

@@ -51,6 +51,25 @@ CreateNativeBackendForTarget(LlamaBackendTarget target) {
   return nullptr;
 }
 
+// Assemble the common native-provider result fields; callers layer any
+// policy-specific flags (e.g. require_strict_inferflux_execution) on top.
+// Previously duplicated across the strict and preferred native paths.
+BackendFactoryResult
+MakeNativeBackendResult(const LlamaBackendTarget &target,
+                        const LlamaBackendTraits &traits,
+                        std::shared_ptr<BackendInterface> backend) {
+  BackendFactoryResult out;
+  out.target = target;
+  out.traits = traits;
+  out.capabilities = traits.capabilities;
+  out.backend_label =
+      BackendFactory::CanonicalBackendId(BackendProvider::kNative, target);
+  out.provider = BackendProvider::kNative;
+  out.backend = std::move(backend);
+  out.config = TuneLlamaBackendConfig(target, {});
+  return out;
+}
+
 BackendFactoryResult CpuFallback(const std::string &reason) {
   if (!reason.empty()) {
     log::Warn("backend_factory", reason);
@@ -316,15 +335,8 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
 
       auto backend = CreateNativeBackendForTarget(target);
       if (backend) {
-        BackendFactoryResult out;
-        out.target = target;
-        out.traits = traits;
-        out.capabilities = traits.capabilities;
-        out.backend_label =
-            CanonicalBackendId(BackendProvider::kNative, target);
-        out.provider = BackendProvider::kNative;
-        out.backend = std::move(backend);
-        out.config = TuneLlamaBackendConfig(target, {});
+        BackendFactoryResult out =
+            MakeNativeBackendResult(target, traits, std::move(backend));
         out.require_strict_inferflux_execution =
             policy.strict_inferflux_request;
         return out;
@@ -342,16 +354,7 @@ BackendFactoryResult BackendFactory::Create(const std::string &backend_hint) {
       // Native kernels are ready - create inferflux backend
       auto backend = CreateNativeBackendForTarget(target);
       if (backend) {
-        BackendFactoryResult out;
-        out.target = target;
-        out.traits = traits;
-        out.capabilities = traits.capabilities;
-        out.backend_label =
-            CanonicalBackendId(BackendProvider::kNative, target);
-        out.provider = BackendProvider::kNative;
-        out.backend = std::move(backend);
-        out.config = TuneLlamaBackendConfig(target, {});
-        return out;
+        return MakeNativeBackendResult(target, traits, std::move(backend));
       }
       if (policy.allow_llama_cpp_fallback) {
         auto out = LlamaCppForTarget(target, hint);
