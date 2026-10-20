@@ -326,23 +326,6 @@ int ResidentSequenceTokenCount(const InferenceRequest &inference) {
   return token_count;
 }
 
-bool WaitForUnifiedBatchAsync(
-    LlamaCppBackend *backend, UnifiedBatchHandle handle,
-    std::vector<UnifiedBatchOutput> *outputs,
-    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
-  if (!backend || !outputs || handle == 0) {
-    return false;
-  }
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (backend->TryCollectUnifiedBatchAsync(handle, outputs)) {
-      return true;
-    }
-    std::this_thread::yield();
-  }
-  return backend->TryCollectUnifiedBatchAsync(handle, outputs);
-}
-
 struct PrefillStepState {
   int sequence_id{-1};
   int n_past_start{0};
@@ -1399,19 +1382,7 @@ void Scheduler::DecodeWorkerLoop() {
                                    pending->resolved_backend.get());
           {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (inference->session_lease_acquired &&
-                RequestUsesSessionHandle(*inference)) {
-              FinalizeSessionLease(pending.get(), !result.no_backend);
-            } else if (inference->sequence_id >= 0) {
-              if (cache_) {
-                cache_->ReleaseBlocksRef(inference->block_table);
-              }
-              inference->block_table.clear();
-              FreeSeqSlot(inference->sequence_id,
-                          inference->sequence_generation,
-                          pending->resolved_backend);
-              ResetSequenceLease(inference);
-            }
+            ReleasePendingRequestResources(pending.get(), !result.no_backend);
           }
           pending->promise.set_value(std::move(result));
         }
@@ -1444,18 +1415,7 @@ void Scheduler::DecodeWorkerLoop() {
           pending->promise.set_value(std::move(error));
           // Return the sequence slot and KV blocks so they are not leaked.
           std::lock_guard<std::mutex> lock(queue_mutex_);
-          if (inference->session_lease_acquired &&
-              RequestUsesSessionHandle(*inference)) {
-            FinalizeSessionLease(pending.get(), false);
-          } else if (inference->sequence_id >= 0) {
-            if (cache_) {
-              cache_->ReleaseBlocksRef(inference->block_table);
-            }
-            inference->block_table.clear();
-            FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                        pending->resolved_backend);
-            ResetSequenceLease(inference);
-          }
+          ReleasePendingRequestResources(pending.get(), false);
           continue;
         }
         if (inference->response_format.has_format &&
@@ -1475,19 +1435,7 @@ void Scheduler::DecodeWorkerLoop() {
                                    : adapter_error;
             pending->promise.set_value(std::move(error));
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (inference->session_lease_acquired &&
-                RequestUsesSessionHandle(*inference)) {
-              FinalizeSessionLease(pending.get(), false);
-            } else if (inference->sequence_id >= 0) {
-              if (cache_) {
-                cache_->ReleaseBlocksRef(inference->block_table);
-              }
-              inference->block_table.clear();
-              FreeSeqSlot(inference->sequence_id,
-                          inference->sequence_generation,
-                          pending->resolved_backend);
-              ResetSequenceLease(inference);
-            }
+            ReleasePendingRequestResources(pending.get(), false);
             continue;
           }
           inference->response_format.constraint = constraint;
@@ -1620,18 +1568,7 @@ void Scheduler::DecodeWorkerLoop() {
         // both FreeSequence and FreeSeqSlot together in one place.
         {
           std::lock_guard<std::mutex> lock(queue_mutex_);
-          if (inference->session_lease_acquired &&
-              RequestUsesSessionHandle(*inference)) {
-            FinalizeSessionLease(pending.get(), !result.no_backend);
-          } else if (inference->sequence_id >= 0) {
-            if (cache_) {
-              cache_->ReleaseBlocksRef(inference->block_table);
-            }
-            inference->block_table.clear();
-            FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                        pending->resolved_backend);
-            ResetSequenceLease(inference);
-          }
+          ReleasePendingRequestResources(pending.get(), !result.no_backend);
         }
         if (!use_stepwise_decode) {
           inference->phase = RequestPhase::kFinished;
@@ -2770,18 +2707,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           inference->response_format.error.empty()
               ? "Selected model does not support requested features"
               : inference->response_format.error;
-      if (inference->session_lease_acquired &&
-          RequestUsesSessionHandle(*inference)) {
-        FinalizeSessionLease(pending.get(), false);
-      } else if (inference->sequence_id >= 0) {
-        if (cache_) {
-          cache_->ReleaseBlocksRef(inference->block_table);
-        }
-        inference->block_table.clear();
-        FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                    pending->resolved_backend);
-        ResetSequenceLease(inference);
-      }
+      ReleasePendingRequestResources(pending.get(), false);
       pending->promise.set_value(std::move(error));
       continue;
     }
@@ -2798,18 +2724,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         error.completion = adapter_error.empty()
                                ? "response_format could not be converted"
                                : adapter_error;
-        if (inference->session_lease_acquired &&
-            RequestUsesSessionHandle(*inference)) {
-          FinalizeSessionLease(pending.get(), false);
-        } else if (inference->sequence_id >= 0) {
-          if (cache_) {
-            cache_->ReleaseBlocksRef(inference->block_table);
-          }
-          inference->block_table.clear();
-          FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                      pending->resolved_backend);
-          ResetSequenceLease(inference);
-        }
+        ReleasePendingRequestResources(pending.get(), false);
         pending->promise.set_value(std::move(error));
         continue;
       }
@@ -3381,6 +3296,25 @@ void Scheduler::FinalizeSessionLease(PendingRequest *pending,
   }
   session_handle_manager_->ReleaseLease(inference.session_id);
   inference.session_lease_acquired = false;
+}
+
+void Scheduler::ReleasePendingRequestResources(PendingRequest *pending,
+                                               bool lease_success) {
+  if (!pending) {
+    return;
+  }
+  auto &inference = pending->inference;
+  if (inference.session_lease_acquired && RequestUsesSessionHandle(inference)) {
+    FinalizeSessionLease(pending, lease_success);
+  } else if (inference.sequence_id >= 0) {
+    if (cache_) {
+      cache_->ReleaseBlocksRef(inference.block_table);
+    }
+    inference.block_table.clear();
+    FreeSeqSlot(inference.sequence_id, inference.sequence_generation,
+                pending->resolved_backend);
+    ResetSequenceLease(&inference);
+  }
 }
 
 void Scheduler::EvictionWorkerLoop() {
