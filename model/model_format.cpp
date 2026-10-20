@@ -76,12 +76,22 @@ int ScoreGgufFile(const std::string &file_name) {
   return -1;
 }
 
-std::filesystem::path
-SelectBestGgufInDirectory(const std::filesystem::path &dir) {
+// Scan one directory for its best-scored regular .gguf file. Fresh scoring
+// state per directory; returns an empty path when the directory holds no
+// .gguf. directory_readable (optional) distinguishes an unreadable directory
+// from an empty result so callers can preserve fail-fast semantics.
+std::filesystem::path FindBestGgufInDir(const std::filesystem::path &dir,
+                                        bool *directory_readable = nullptr) {
   std::error_code ec;
   std::filesystem::directory_iterator it(dir, ec);
   if (ec) {
+    if (directory_readable) {
+      *directory_readable = false;
+    }
     return {};
+  }
+  if (directory_readable) {
+    *directory_readable = true;
   }
 
   std::filesystem::path best_path;
@@ -105,38 +115,21 @@ SelectBestGgufInDirectory(const std::filesystem::path &dir) {
       best_path = entry.path();
     }
   }
-  if (!best_path.empty()) {
-    return best_path;
+  return best_path;
+}
+
+std::filesystem::path
+SelectBestGgufInDirectory(const std::filesystem::path &dir) {
+  bool main_readable = false;
+  const std::filesystem::path best = FindBestGgufInDir(dir, &main_readable);
+  if (!main_readable || !best.empty()) {
+    return best;
   }
 
   // Conventional sidecar layout: <model_dir>/sidecar/*.gguf (produced by
   // safetensors -> GGUF conversion tooling). One explicit level, not a
   // recursive scan.
-  const std::filesystem::path sidecar_dir = dir / "sidecar";
-  ec.clear();
-  std::filesystem::directory_iterator sidecar_it(sidecar_dir, ec);
-  if (ec) {
-    return {};
-  }
-  best_name.clear();
-  for (const auto &entry : sidecar_it) {
-    if (!entry.is_regular_file(ec) || ec) {
-      ec.clear();
-      continue;
-    }
-    const auto ext = ToLower(entry.path().extension().string());
-    if (ext != ".gguf") {
-      continue;
-    }
-    const auto name = entry.path().filename().string();
-    const int score = ScoreGgufFile(name);
-    if (score > best_score || (score == best_score && name < best_name)) {
-      best_score = score;
-      best_name = name;
-      best_path = entry.path();
-    }
-  }
-  return best_path;
+  return FindBestGgufInDir(dir / "sidecar");
 }
 
 bool DirectoryContainsExtension(const std::filesystem::path &dir,

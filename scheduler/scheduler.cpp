@@ -116,6 +116,49 @@ void LogCacheDecision(const InferenceRequest &req,
   log::Info("cache_decision", event.dump());
 }
 
+struct PrefixReusePlan {
+  int prefill_start{0};
+  bool copied_prefix{false};
+};
+
+// Clamp a warm-prefix lookup to the live prompt, replay one suffix token on
+// exact hits to refresh logits, and copy the donor KV into the target
+// sequence (session-warm state needs no copy). Shared by the deferred and
+// direct phased-prefill paths in ProcessBatch; previously an exact duplicate.
+PrefixReusePlan ResolvePrefixReuse(const InferenceRequest &inf,
+                                   LlamaCppBackend *backend, bool prefix_hit,
+                                   int matched_tokens, int cached_seq_id,
+                                   int seq_id, bool reused_session_state) {
+  PrefixReusePlan plan;
+  if (!(prefix_hit && matched_tokens > 0 && cached_seq_id >= 0)) {
+    return plan;
+  }
+  // Correctness Fix (§ Item 3): must copy KV state into new slot!
+  // matched_tokens is clamped to the current prompt length before use.
+  plan.prefill_start = std::clamp(
+      matched_tokens, 0, static_cast<int>(inf.bpe_prompt_tokens.size()));
+  if (!inf.bpe_prompt_tokens.empty() &&
+      plan.prefill_start >= static_cast<int>(inf.bpe_prompt_tokens.size())) {
+    // Replay one suffix token on exact hits to refresh logits and avoid
+    // zero-token decode continuations.
+    plan.prefill_start = static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
+  }
+  if (!reused_session_state) {
+    plan.copied_prefix =
+        backend->CopySequencePrefix(cached_seq_id, seq_id, plan.prefill_start);
+    if (!plan.copied_prefix) {
+      LogCacheDecision(inf, backend, "copy_failed", matched_tokens, 0,
+                       cached_seq_id);
+      // Hybrid memory could not hold the copied prefix — the backend cleared
+      // the slot; fall back to a full prefill below (issue #161).
+      plan.prefill_start = 0;
+    }
+  } else {
+    plan.copied_prefix = true;
+  }
+  return plan;
+}
+
 bool FairnessTraceEnabled() {
   static const bool enabled = []() {
     const char *value = std::getenv("INFERFLUX_DEBUG_FAIRNESS");
@@ -324,23 +367,6 @@ int ResidentSequenceTokenCount(const InferenceRequest &inference) {
   token_count = std::max(token_count,
                          static_cast<int>(inference.bpe_prompt_tokens.size()));
   return token_count;
-}
-
-bool WaitForUnifiedBatchAsync(
-    LlamaCppBackend *backend, UnifiedBatchHandle handle,
-    std::vector<UnifiedBatchOutput> *outputs,
-    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
-  if (!backend || !outputs || handle == 0) {
-    return false;
-  }
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (backend->TryCollectUnifiedBatchAsync(handle, outputs)) {
-      return true;
-    }
-    std::this_thread::yield();
-  }
-  return backend->TryCollectUnifiedBatchAsync(handle, outputs);
 }
 
 struct PrefillStepState {
@@ -1399,19 +1425,7 @@ void Scheduler::DecodeWorkerLoop() {
                                    pending->resolved_backend.get());
           {
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (inference->session_lease_acquired &&
-                RequestUsesSessionHandle(*inference)) {
-              FinalizeSessionLease(pending.get(), !result.no_backend);
-            } else if (inference->sequence_id >= 0) {
-              if (cache_) {
-                cache_->ReleaseBlocksRef(inference->block_table);
-              }
-              inference->block_table.clear();
-              FreeSeqSlot(inference->sequence_id,
-                          inference->sequence_generation,
-                          pending->resolved_backend);
-              ResetSequenceLease(inference);
-            }
+            ReleasePendingRequestResources(pending.get(), !result.no_backend);
           }
           pending->promise.set_value(std::move(result));
         }
@@ -1444,18 +1458,7 @@ void Scheduler::DecodeWorkerLoop() {
           pending->promise.set_value(std::move(error));
           // Return the sequence slot and KV blocks so they are not leaked.
           std::lock_guard<std::mutex> lock(queue_mutex_);
-          if (inference->session_lease_acquired &&
-              RequestUsesSessionHandle(*inference)) {
-            FinalizeSessionLease(pending.get(), false);
-          } else if (inference->sequence_id >= 0) {
-            if (cache_) {
-              cache_->ReleaseBlocksRef(inference->block_table);
-            }
-            inference->block_table.clear();
-            FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                        pending->resolved_backend);
-            ResetSequenceLease(inference);
-          }
+          ReleasePendingRequestResources(pending.get(), false);
           continue;
         }
         if (inference->response_format.has_format &&
@@ -1475,19 +1478,7 @@ void Scheduler::DecodeWorkerLoop() {
                                    : adapter_error;
             pending->promise.set_value(std::move(error));
             std::lock_guard<std::mutex> lock(queue_mutex_);
-            if (inference->session_lease_acquired &&
-                RequestUsesSessionHandle(*inference)) {
-              FinalizeSessionLease(pending.get(), false);
-            } else if (inference->sequence_id >= 0) {
-              if (cache_) {
-                cache_->ReleaseBlocksRef(inference->block_table);
-              }
-              inference->block_table.clear();
-              FreeSeqSlot(inference->sequence_id,
-                          inference->sequence_generation,
-                          pending->resolved_backend);
-              ResetSequenceLease(inference);
-            }
+            ReleasePendingRequestResources(pending.get(), false);
             continue;
           }
           inference->response_format.constraint = constraint;
@@ -1620,18 +1611,7 @@ void Scheduler::DecodeWorkerLoop() {
         // both FreeSequence and FreeSeqSlot together in one place.
         {
           std::lock_guard<std::mutex> lock(queue_mutex_);
-          if (inference->session_lease_acquired &&
-              RequestUsesSessionHandle(*inference)) {
-            FinalizeSessionLease(pending.get(), !result.no_backend);
-          } else if (inference->sequence_id >= 0) {
-            if (cache_) {
-              cache_->ReleaseBlocksRef(inference->block_table);
-            }
-            inference->block_table.clear();
-            FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                        pending->resolved_backend);
-            ResetSequenceLease(inference);
-          }
+          ReleasePendingRequestResources(pending.get(), !result.no_backend);
         }
         if (!use_stepwise_decode) {
           inference->phase = RequestPhase::kFinished;
@@ -2382,36 +2362,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               !inf.collect_logprobs && !inf.response_format.has_format &&
               !inf.has_images && !inf.bpe_prompt_tokens.empty();
           if (can_defer_to_unified_prefill) {
-            int prefill_start = 0;
-            bool copied_prefix = false;
-            if (prefix_hit && matched_tokens > 0 && cached_seq_id >= 0) {
-              // Correctness Fix (§ Item 3): must copy KV state into new slot!
-              // matched_tokens is clamped to the current prompt length before
-              // use.
-              prefill_start =
-                  std::clamp(matched_tokens, 0,
-                             static_cast<int>(inf.bpe_prompt_tokens.size()));
-              if (!inf.bpe_prompt_tokens.empty() &&
-                  prefill_start >=
-                      static_cast<int>(inf.bpe_prompt_tokens.size())) {
-                // Replay one suffix token on exact hits to refresh logits and
-                // avoid zero-token decode continuations.
-                prefill_start =
-                    static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
-              }
-              if (!reused_session_state) {
-                copied_prefix = pending->resolved_backend->CopySequencePrefix(
-                    cached_seq_id, seq_id, prefill_start);
-                if (!copied_prefix) {
-                  LogCacheDecision(inf, pending->resolved_backend.get(),
-                                   "copy_failed", matched_tokens, 0,
-                                   cached_seq_id);
-                  prefill_start = 0;
-                }
-              } else {
-                copied_prefix = true;
-              }
-            }
+            const PrefixReusePlan reuse = ResolvePrefixReuse(
+                inf, pending->resolved_backend.get(), prefix_hit,
+                matched_tokens, cached_seq_id, seq_id, reused_session_state);
+            const int prefill_start = reuse.prefill_start;
+            const bool copied_prefix = reuse.copied_prefix;
 
             // Defer prefill compute into ExecuteUnifiedBatchPhased so decode
             // steps can overlap with in-flight prefill chunks in the same
@@ -2433,39 +2388,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             queued_via_unified_prefill = true;
           } else {
             PrefillResult pr;
-            bool copied_prefix = false;
-            int prefill_start = 0;
-            if (prefix_hit && matched_tokens > 0 && cached_seq_id >= 0) {
-              // Correctness Fix (§ Item 3): must copy KV state into new slot!
-              // matched_tokens is clamped to the current prompt length before
-              // use.
-              prefill_start =
-                  std::clamp(matched_tokens, 0,
-                             static_cast<int>(inf.bpe_prompt_tokens.size()));
-              if (!inf.bpe_prompt_tokens.empty() &&
-                  prefill_start >=
-                      static_cast<int>(inf.bpe_prompt_tokens.size())) {
-                // Replay one suffix token on exact hits to refresh logits and
-                // avoid zero-token decode continuations.
-                prefill_start =
-                    static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
-              }
-              if (!reused_session_state) {
-                copied_prefix = pending->resolved_backend->CopySequencePrefix(
-                    cached_seq_id, seq_id, prefill_start);
-                if (!copied_prefix) {
-                  LogCacheDecision(inf, pending->resolved_backend.get(),
-                                   "copy_failed", matched_tokens, 0,
-                                   cached_seq_id);
-                  // Hybrid memory could not hold the copied prefix — the
-                  // backend cleared the slot; fall back to a full prefill
-                  // below (issue #161).
-                  prefill_start = 0;
-                }
-              } else {
-                copied_prefix = true;
-              }
-            }
+            const PrefixReusePlan reuse = ResolvePrefixReuse(
+                inf, pending->resolved_backend.get(), prefix_hit,
+                matched_tokens, cached_seq_id, seq_id, reused_session_state);
+            bool copied_prefix = reuse.copied_prefix;
+            int prefill_start = reuse.prefill_start;
 
             bool prefill_ok = ExecutePhasedPrefillStep(
                 pending->resolved_backend.get(), inf,
@@ -2770,18 +2697,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           inference->response_format.error.empty()
               ? "Selected model does not support requested features"
               : inference->response_format.error;
-      if (inference->session_lease_acquired &&
-          RequestUsesSessionHandle(*inference)) {
-        FinalizeSessionLease(pending.get(), false);
-      } else if (inference->sequence_id >= 0) {
-        if (cache_) {
-          cache_->ReleaseBlocksRef(inference->block_table);
-        }
-        inference->block_table.clear();
-        FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                    pending->resolved_backend);
-        ResetSequenceLease(inference);
-      }
+      ReleasePendingRequestResources(pending.get(), false);
       pending->promise.set_value(std::move(error));
       continue;
     }
@@ -2798,18 +2714,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         error.completion = adapter_error.empty()
                                ? "response_format could not be converted"
                                : adapter_error;
-        if (inference->session_lease_acquired &&
-            RequestUsesSessionHandle(*inference)) {
-          FinalizeSessionLease(pending.get(), false);
-        } else if (inference->sequence_id >= 0) {
-          if (cache_) {
-            cache_->ReleaseBlocksRef(inference->block_table);
-          }
-          inference->block_table.clear();
-          FreeSeqSlot(inference->sequence_id, inference->sequence_generation,
-                      pending->resolved_backend);
-          ResetSequenceLease(inference);
-        }
+        ReleasePendingRequestResources(pending.get(), false);
         pending->promise.set_value(std::move(error));
         continue;
       }
@@ -3381,6 +3286,25 @@ void Scheduler::FinalizeSessionLease(PendingRequest *pending,
   }
   session_handle_manager_->ReleaseLease(inference.session_id);
   inference.session_lease_acquired = false;
+}
+
+void Scheduler::ReleasePendingRequestResources(PendingRequest *pending,
+                                               bool lease_success) {
+  if (!pending) {
+    return;
+  }
+  auto &inference = pending->inference;
+  if (inference.session_lease_acquired && RequestUsesSessionHandle(inference)) {
+    FinalizeSessionLease(pending, lease_success);
+  } else if (inference.sequence_id >= 0) {
+    if (cache_) {
+      cache_->ReleaseBlocksRef(inference.block_table);
+    }
+    inference.block_table.clear();
+    FreeSeqSlot(inference.sequence_id, inference.sequence_generation,
+                pending->resolved_backend);
+    ResetSequenceLease(&inference);
+  }
 }
 
 void Scheduler::EvictionWorkerLoop() {

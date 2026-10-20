@@ -83,6 +83,98 @@ void FinishGeneratedText(InferenceRequest *req, std::string *completion,
 
 int MaxNonEmittingSteps(int max_tokens) { return std::max(max_tokens * 8, 32); }
 
+// Per-slice fairness plan shared by the phased executors: seeds the result
+// identity, consumes the granted timeslice, and computes this slice's decode
+// limit from the request budget, remaining budget, timeslice, and decode-burst
+// tuning. Previously duplicated (drifted) across ExecuteBatchDecodePhased and
+// ExecuteUnifiedBatchPhased.
+struct FairnessSlicePlan {
+  int decode_limit{1};
+  int max_non_emitting_steps{32};
+  bool slice_active{false};
+};
+
+FairnessSlicePlan PlanFairnessSlice(InferenceRequest *req, InferenceResult *out,
+                                    int decode_burst_tokens) {
+  req->fairness.yielded = false;
+  out->model_id =
+      req->resolved_model.empty() ? req->model : req->resolved_model;
+  out->prompt_tokens = req->fairness.reported_prompt_tokens >= 0
+                           ? req->fairness.reported_prompt_tokens
+                           : static_cast<int>(req->prompt_tokens.size());
+  int limit = req->max_tokens;
+  if (req->fairness.remaining_decode_tokens >= 0) {
+    limit = std::min(limit, req->fairness.remaining_decode_tokens);
+  }
+  int slice = req->fairness.timeslice_tokens;
+  req->fairness.last_timeslice_tokens = slice;
+  req->fairness.timeslice_tokens = 0;
+  if (slice > 0) {
+    limit = std::min(limit, slice);
+  }
+  if (decode_burst_tokens > 0) {
+    limit = std::min(limit, decode_burst_tokens);
+  }
+  if (limit <= 0) {
+    limit = 1;
+  }
+  FairnessSlicePlan plan;
+  plan.decode_limit = limit;
+  plan.max_non_emitting_steps = MaxNonEmittingSteps(req->max_tokens);
+  plan.slice_active = (slice > 0) || (decode_burst_tokens > 0);
+  return plan;
+}
+
+// Shared fairness accounting for one finished executor slice: token charge
+// (prompt component on the first slice), the yield-vs-finish decision, output
+// accumulation, and the remaining-decode-budget update. Previously duplicated
+// across the two phased executors (the service-token charge already drifted
+// once in a third copy).
+void FinalizeFairnessSlice(InferenceRequest *req, InferenceResult *out, int gen,
+                           bool slice_active, int decode_limit,
+                           int current_token, MetricsRegistry *metrics) {
+  bool first_slice = (req->fairness.total_completion_tokens == 0);
+  int fairness_delta = gen;
+  if (first_slice) {
+    int prompt_comp = out->prompt_tokens;
+    if (prompt_comp <= 0 && req->fairness.reported_prompt_tokens >= 0) {
+      prompt_comp = req->fairness.reported_prompt_tokens;
+    }
+    fairness_delta += prompt_comp;
+  }
+  if (fairness_delta > 0) {
+    metrics->RecordFairnessTokens(req->fairness.priority_level, fairness_delta);
+  }
+  req->fairness.service_tokens += gen;
+  req->fairness.total_completion_tokens += gen;
+
+  bool exhausted = slice_active && gen >= decode_limit;
+  const int remaining_after_slice =
+      (req->fairness.remaining_decode_tokens >= 0)
+          ? std::max(0, req->fairness.remaining_decode_tokens - gen)
+          : -1;
+  if (slice_active && exhausted && remaining_after_slice > 0) {
+    req->fairness.yielded = true;
+    metrics->RecordFairnessYield(req->fairness.priority_level, gen,
+                                 remaining_after_slice);
+    req->phase = RequestPhase::kPending;
+    req->first_token = current_token;
+  } else {
+    req->phase = RequestPhase::kFinished;
+    req->first_token = -1;
+    FinishGeneratedText(req, &out->completion, metrics);
+  }
+  req->first_piece.clear();
+
+  if (!out->completion.empty() &&
+      !IsNonAccumulatingCompletion(out->completion)) {
+    req->accumulated_output.append(out->completion);
+  }
+  if (req->fairness.remaining_decode_tokens >= 0) {
+    req->fairness.remaining_decode_tokens = remaining_after_slice;
+  }
+}
+
 bool HasValidUnifiedPhasedState(const InferenceRequest &req) {
   if (req.n_past < 0 || req.sequence_id < 0) {
     return false;
@@ -244,21 +336,71 @@ private:
   bool active_{false};
 };
 
-bool WaitForUnifiedBatchAsync(
-    LlamaCppBackend *backend, LlamaCppBackend::UnifiedBatchHandle handle,
-    std::vector<LlamaCppBackend::UnifiedBatchOutput> *outputs,
-    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
-  if (!backend || !outputs || handle == 0) {
-    return false;
-  }
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (backend->TryCollectUnifiedBatchAsync(handle, outputs)) {
-      return true;
+// Partition unified-batch inputs into prefill/decode lanes, submit both
+// async lanes before waiting (so async backends can overlap them), then
+// collect each lane and scatter outputs back by position. Shared by the
+// phased executor (scratch vectors reused across steps) and the stepwise
+// executor; previously an exact duplicate. Returns false when a lane submit
+// fails or returns a mismatched output count; outputs may be partially
+// filled on failure and callers own their failure policy.
+bool RunAsyncUnifiedLanes(
+    LlamaCppBackend *backend,
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &batch_inputs,
+    const std::function<bool(std::size_t)> &is_prefill,
+    std::vector<LlamaCppBackend::UnifiedBatchInput> *decode_inputs,
+    std::vector<LlamaCppBackend::UnifiedBatchInput> *prefill_inputs,
+    std::vector<std::size_t> *decode_positions,
+    std::vector<std::size_t> *prefill_positions,
+    std::vector<LlamaCppBackend::UnifiedBatchOutput> *outputs) {
+  decode_inputs->clear();
+  prefill_inputs->clear();
+  decode_positions->clear();
+  prefill_positions->clear();
+  for (std::size_t j = 0; j < batch_inputs.size(); ++j) {
+    if (is_prefill(j)) {
+      prefill_positions->push_back(j);
+      prefill_inputs->push_back(batch_inputs[j]);
+    } else {
+      decode_positions->push_back(j);
+      decode_inputs->push_back(batch_inputs[j]);
     }
-    std::this_thread::yield();
   }
-  return backend->TryCollectUnifiedBatchAsync(handle, outputs);
+  outputs->resize(batch_inputs.size());
+  bool ok = true;
+  LlamaCppBackend::UnifiedBatchHandle decode_handle = 0;
+  LlamaCppBackend::UnifiedBatchHandle prefill_handle = 0;
+  if (!decode_inputs->empty()) {
+    decode_handle = backend->SubmitUnifiedBatchAsync(
+        *decode_inputs, LlamaCppBackend::UnifiedBatchLane::kDecode);
+    if (decode_handle == 0) {
+      ok = false;
+    }
+  }
+  if (ok && !prefill_inputs->empty()) {
+    prefill_handle = backend->SubmitUnifiedBatchAsync(
+        *prefill_inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
+    if (prefill_handle == 0) {
+      ok = false;
+    }
+  }
+  const auto collect_lane = [&](LlamaCppBackend::UnifiedBatchHandle handle,
+                                const std::vector<std::size_t> &positions) {
+    if (handle == 0) {
+      return;
+    }
+    std::vector<LlamaCppBackend::UnifiedBatchOutput> lane_outputs;
+    if (!WaitForUnifiedBatchAsync(backend, handle, &lane_outputs) ||
+        lane_outputs.size() != positions.size()) {
+      ok = false;
+      return;
+    }
+    for (std::size_t i = 0; i < positions.size(); ++i) {
+      (*outputs)[positions[i]] = std::move(lane_outputs[i]);
+    }
+  };
+  collect_lane(decode_handle, *decode_positions);
+  collect_lane(prefill_handle, *prefill_positions);
+  return ok;
 }
 
 BatchExecutor::UnifiedBatchTuning
@@ -890,32 +1032,11 @@ BatchExecutor::ExecuteBatchDecodePhased(
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = eligible[i];
     auto &out = outcomes[i].result;
-    req->fairness.yielded = false;
-    out.model_id =
-        req->resolved_model.empty() ? req->model : req->resolved_model;
-    out.prompt_tokens = req->fairness.reported_prompt_tokens >= 0
-                            ? req->fairness.reported_prompt_tokens
-                            : static_cast<int>(req->prompt_tokens.size());
-
-    // Compute per-request decode limit respecting fairness timeslice.
-    int limit = req->max_tokens;
-    if (req->fairness.remaining_decode_tokens >= 0) {
-      limit = std::min(limit, req->fairness.remaining_decode_tokens);
-    }
-    int slice = req->fairness.timeslice_tokens;
-    req->fairness.last_timeslice_tokens = slice;
-    req->fairness.timeslice_tokens = 0;
-    if (slice > 0) {
-      limit = std::min(limit, slice);
-    }
-    if (tuning_.decode_burst_tokens > 0) {
-      limit = std::min(limit, tuning_.decode_burst_tokens);
-    }
-    if (limit <= 0)
-      limit = 1;
-    states[i].decode_limit = limit;
-    states[i].max_non_emitting_steps = MaxNonEmittingSteps(req->max_tokens);
-    states[i].slice_active = (slice > 0) || (tuning_.decode_burst_tokens > 0);
+    const FairnessSlicePlan plan =
+        PlanFairnessSlice(req, &out, tuning_.decode_burst_tokens);
+    states[i].decode_limit = plan.decode_limit;
+    states[i].max_non_emitting_steps = plan.max_non_emitting_steps;
+    states[i].slice_active = plan.slice_active;
 
     // Emit the first token (pre-sampled by Prefill while its logits were
     // fresh).
@@ -1013,49 +1134,9 @@ BatchExecutor::ExecuteBatchDecodePhased(
     outcomes[i].decode_ms = decode_ms / static_cast<double>(n);
 
     // Fairness token accounting.
-    bool first_slice = (req->fairness.total_completion_tokens == 0);
-    int fairness_delta = gen;
-    if (first_slice) {
-      int prompt_comp = out.prompt_tokens;
-      if (prompt_comp <= 0 && req->fairness.reported_prompt_tokens >= 0) {
-        prompt_comp = req->fairness.reported_prompt_tokens;
-      }
-      fairness_delta += prompt_comp;
-    }
-    if (fairness_delta > 0) {
-      metrics_.RecordFairnessTokens(req->fairness.priority_level,
-                                    fairness_delta);
-    }
-    req->fairness.service_tokens += gen;
-    req->fairness.total_completion_tokens += gen;
-
-    // Fairness yield decision.
-    bool exhausted = states[i].slice_active && gen >= states[i].decode_limit;
-    const int remaining_after_slice =
-        (req->fairness.remaining_decode_tokens >= 0)
-            ? std::max(0, req->fairness.remaining_decode_tokens - gen)
-            : -1;
-    if (states[i].slice_active && exhausted && remaining_after_slice > 0) {
-      req->fairness.yielded = true;
-      metrics_.RecordFairnessYield(req->fairness.priority_level, gen,
-                                   remaining_after_slice);
-      req->phase = RequestPhase::kPending;
-      req->first_token = states[i].current_token;
-    } else {
-      req->phase = RequestPhase::kFinished;
-      req->first_token = -1;
-      FinishGeneratedText(req, &out.completion, &metrics_);
-    }
-    req->first_piece.clear();
-
-    // Accumulate and track remaining decode budget.
-    if (!out.completion.empty() &&
-        !IsNonAccumulatingCompletion(out.completion)) {
-      req->accumulated_output.append(out.completion);
-    }
-    if (req->fairness.remaining_decode_tokens >= 0) {
-      req->fairness.remaining_decode_tokens = remaining_after_slice;
-    }
+    FinalizeFairnessSlice(req, &out, gen, states[i].slice_active,
+                          states[i].decode_limit, states[i].current_token,
+                          &metrics_);
 
     MarkFirstTokenIfUnset(*req);
     // sequence_id left intact — scheduler handles FreeSequence + FreeSeqSlot.
@@ -1091,31 +1172,11 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = eligible[i];
     auto &out = outcomes[i].result;
-    req->fairness.yielded = false;
-    out.model_id =
-        req->resolved_model.empty() ? req->model : req->resolved_model;
-    out.prompt_tokens = req->fairness.reported_prompt_tokens >= 0
-                            ? req->fairness.reported_prompt_tokens
-                            : static_cast<int>(req->prompt_tokens.size());
-
-    int limit = req->max_tokens;
-    if (req->fairness.remaining_decode_tokens >= 0) {
-      limit = std::min(limit, req->fairness.remaining_decode_tokens);
-    }
-    int slice = req->fairness.timeslice_tokens;
-    req->fairness.last_timeslice_tokens = slice;
-    req->fairness.timeslice_tokens = 0;
-    if (slice > 0) {
-      limit = std::min(limit, slice);
-    }
-    if (tuning_.decode_burst_tokens > 0) {
-      limit = std::min(limit, tuning_.decode_burst_tokens);
-    }
-    if (limit <= 0)
-      limit = 1;
-    states[i].decode_limit = limit;
-    states[i].max_non_emitting_steps = MaxNonEmittingSteps(req->max_tokens);
-    states[i].slice_active = (slice > 0) || (tuning_.decode_burst_tokens > 0);
+    const FairnessSlicePlan plan =
+        PlanFairnessSlice(req, &out, tuning_.decode_burst_tokens);
+    states[i].decode_limit = plan.decode_limit;
+    states[i].max_non_emitting_steps = plan.max_non_emitting_steps;
+    states[i].slice_active = plan.slice_active;
 
     // If n_past is 0 and bpe_prompt_tokens is not empty, this is a fresh
     // prefill. (Note: In the current scheduler, Prefill() is called BEFORE
@@ -1254,68 +1315,13 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     step.clear();
     bool step_ok = true;
     if (backend->SupportsAsyncUnifiedBatch()) {
-      decode_inputs.clear();
-      prefill_inputs.clear();
-      decode_positions.clear();
-      prefill_positions.clear();
-
-      for (std::size_t j = 0; j < batch_inputs.size(); ++j) {
-        std::size_t req_idx = active_idx[j];
-        if (states[req_idx].in_prefill) {
-          prefill_positions.push_back(j);
-          prefill_inputs.push_back(batch_inputs[j]);
-        } else {
-          decode_positions.push_back(j);
-          decode_inputs.push_back(batch_inputs[j]);
-        }
-      }
-
-      step.resize(batch_inputs.size());
-      LlamaCppBackend::UnifiedBatchHandle decode_handle = 0;
-      LlamaCppBackend::UnifiedBatchHandle prefill_handle = 0;
-
-      if (!decode_inputs.empty()) {
-        decode_handle = backend->SubmitUnifiedBatchAsync(
-            decode_inputs, LlamaCppBackend::UnifiedBatchLane::kDecode);
-        if (decode_handle == 0) {
-          step_ok = false;
-        }
-      }
-      if (step_ok && !prefill_inputs.empty()) {
-        // Submit both lanes before waiting so async backends can overlap
-        // decode/pre-fill execution in the same scheduler step.
-        prefill_handle = backend->SubmitUnifiedBatchAsync(
-            prefill_inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
-        if (prefill_handle == 0) {
-          step_ok = false;
-        }
-      }
-
-      if (decode_handle != 0) {
-        std::vector<LlamaCppBackend::UnifiedBatchOutput> decode_outputs;
-        if (!WaitForUnifiedBatchAsync(backend.get(), decode_handle,
-                                      &decode_outputs) ||
-            decode_outputs.size() != decode_positions.size()) {
-          step_ok = false;
-        } else {
-          for (std::size_t i = 0; i < decode_positions.size(); ++i) {
-            step[decode_positions[i]] = std::move(decode_outputs[i]);
-          }
-        }
-      }
-
-      if (prefill_handle != 0) {
-        std::vector<LlamaCppBackend::UnifiedBatchOutput> prefill_outputs;
-        if (!WaitForUnifiedBatchAsync(backend.get(), prefill_handle,
-                                      &prefill_outputs) ||
-            prefill_outputs.size() != prefill_positions.size()) {
-          step_ok = false;
-        } else {
-          for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
-            step[prefill_positions[i]] = std::move(prefill_outputs[i]);
-          }
-        }
-      }
+      step_ok = RunAsyncUnifiedLanes(
+          backend.get(), batch_inputs,
+          [&states, &active_idx](std::size_t j) {
+            return states[active_idx[j]].in_prefill;
+          },
+          &decode_inputs, &prefill_inputs, &decode_positions,
+          &prefill_positions, &step);
     } else {
       step = backend->ExecuteUnifiedBatch(batch_inputs);
       step_ok = !step.empty();
@@ -1432,47 +1438,9 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     out.completion_tokens = gen;
     outcomes[i].decode_ms = total_ms / static_cast<double>(n);
 
-    bool first_slice = (req->fairness.total_completion_tokens == 0);
-    int fairness_delta = gen;
-    if (first_slice) {
-      int prompt_comp = out.prompt_tokens;
-      if (prompt_comp <= 0 && req->fairness.reported_prompt_tokens >= 0) {
-        prompt_comp = req->fairness.reported_prompt_tokens;
-      }
-      fairness_delta += prompt_comp;
-    }
-    if (fairness_delta > 0) {
-      metrics_.RecordFairnessTokens(req->fairness.priority_level,
-                                    fairness_delta);
-    }
-    req->fairness.service_tokens += gen;
-    req->fairness.total_completion_tokens += gen;
-
-    bool exhausted = states[i].slice_active && gen >= states[i].decode_limit;
-    const int remaining_after_slice =
-        (req->fairness.remaining_decode_tokens >= 0)
-            ? std::max(0, req->fairness.remaining_decode_tokens - gen)
-            : -1;
-    if (states[i].slice_active && exhausted && remaining_after_slice > 0) {
-      req->fairness.yielded = true;
-      metrics_.RecordFairnessYield(req->fairness.priority_level, gen,
-                                   remaining_after_slice);
-      req->phase = RequestPhase::kPending;
-      req->first_token = states[i].current_token;
-    } else {
-      req->phase = RequestPhase::kFinished;
-      req->first_token = -1;
-      FinishGeneratedText(req, &out.completion, &metrics_);
-    }
-    req->first_piece.clear();
-
-    if (!out.completion.empty() &&
-        !IsNonAccumulatingCompletion(out.completion)) {
-      req->accumulated_output.append(out.completion);
-    }
-    if (req->fairness.remaining_decode_tokens >= 0) {
-      req->fairness.remaining_decode_tokens = remaining_after_slice;
-    }
+    FinalizeFairnessSlice(req, &out, gen, states[i].slice_active,
+                          states[i].decode_limit, states[i].current_token,
+                          &metrics_);
     LogUnifiedAssemblyState("finalize", *req, std::string_view{},
                             out.completion, -1, gen, req->n_past, false,
                             states[i].active);
@@ -1664,68 +1632,13 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     std::vector<LlamaCppBackend::UnifiedBatchInput> prefill_inputs;
     std::vector<std::size_t> decode_positions;
     std::vector<std::size_t> prefill_positions;
-    decode_inputs.reserve(batch_inputs.size());
-    prefill_inputs.reserve(batch_inputs.size());
-    decode_positions.reserve(batch_inputs.size());
-    prefill_positions.reserve(batch_inputs.size());
-
-    for (std::size_t j = 0; j < batch_inputs.size(); ++j) {
-      if (active_reqs[j]->execution.in_prefill) {
-        prefill_positions.push_back(j);
-        prefill_inputs.push_back(batch_inputs[j]);
-      } else {
-        decode_positions.push_back(j);
-        decode_inputs.push_back(batch_inputs[j]);
-      }
-    }
-
-    step_outputs.resize(batch_inputs.size());
-    bool step_ok = true;
-    LlamaCppBackend::UnifiedBatchHandle decode_handle = 0;
-    LlamaCppBackend::UnifiedBatchHandle prefill_handle = 0;
-
-    if (!decode_inputs.empty()) {
-      decode_handle = backend->SubmitUnifiedBatchAsync(
-          decode_inputs, LlamaCppBackend::UnifiedBatchLane::kDecode);
-      if (decode_handle == 0) {
-        step_ok = false;
-      }
-    }
-    if (step_ok && !prefill_inputs.empty()) {
-      prefill_handle = backend->SubmitUnifiedBatchAsync(
-          prefill_inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
-      if (prefill_handle == 0) {
-        step_ok = false;
-      }
-    }
-
-    if (decode_handle != 0) {
-      std::vector<LlamaCppBackend::UnifiedBatchOutput> decode_outputs;
-      if (!WaitForUnifiedBatchAsync(backend.get(), decode_handle,
-                                    &decode_outputs) ||
-          decode_outputs.size() != decode_positions.size()) {
-        step_ok = false;
-      } else {
-        for (std::size_t i = 0; i < decode_positions.size(); ++i) {
-          step_outputs[decode_positions[i]] = std::move(decode_outputs[i]);
-        }
-      }
-    }
-
-    if (prefill_handle != 0) {
-      std::vector<LlamaCppBackend::UnifiedBatchOutput> prefill_outputs;
-      if (!WaitForUnifiedBatchAsync(backend.get(), prefill_handle,
-                                    &prefill_outputs) ||
-          prefill_outputs.size() != prefill_positions.size()) {
-        step_ok = false;
-      } else {
-        for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
-          step_outputs[prefill_positions[i]] = std::move(prefill_outputs[i]);
-        }
-      }
-    }
-
-    if (!step_ok) {
+    if (!RunAsyncUnifiedLanes(
+            backend.get(), batch_inputs,
+            [&active_reqs](std::size_t j) {
+              return active_reqs[j]->execution.in_prefill;
+            },
+            &decode_inputs, &prefill_inputs, &decode_positions,
+            &prefill_positions, &step_outputs)) {
       step_outputs.clear();
     }
   } else if (backend->SupportsUnifiedBatchBurst() &&

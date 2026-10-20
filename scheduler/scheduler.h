@@ -188,6 +188,11 @@ private:
   void ReleaseSessionState(const scheduler::SessionHandleState &state,
                            std::shared_ptr<LlamaCppBackend> backend_hint);
   void FinalizeSessionLease(PendingRequest *pending, bool commit_state);
+  // Release a finished request's session lease OR its paged-block reference,
+  // sequence slot, and sequence lease. Callers own the queue mutex decision
+  // (decode-worker sites hold queue_mutex_; ProcessBatch sites must not).
+  void ReleasePendingRequestResources(PendingRequest *pending,
+                                      bool lease_success);
   bool BackendUsesSplitDecodeWorkers(
       const std::shared_ptr<LlamaCppBackend> &backend) const;
   bool CanAppendToStickyStepBatchLocked(
