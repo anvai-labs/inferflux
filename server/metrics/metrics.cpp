@@ -2257,75 +2257,56 @@ std::string MetricsRegistry::RenderPrometheus() const {
     }
   }
 
+  // Shared exposition for the per-phase operator-selection counters: build
+  // the operator universe from the static label set plus runtime-observed
+  // keys (so a new label can never be silently unexported), then emit
+  // phase x operator series with 0-default lookups. Previously duplicated
+  // between the FFN-proj and down-proj series.
+  const auto write_operator_phase_series =
+      [&](const char *metric_name, const auto &labels,
+          const std::unordered_map<std::string, uint64_t> &counts) {
+        static constexpr const char *kPhases[] = {"prefill", "decode"};
+        std::set<std::string> ops;
+        for (const char *label : labels) {
+          ops.insert(label);
+        }
+        {
+          std::lock_guard<std::mutex> lock(
+              inferflux_cuda_operator_metrics_mutex_);
+          for (const auto &kv : counts) {
+            const std::string::size_type bar = kv.first.find('|');
+            if (bar != std::string::npos) {
+              ops.insert(kv.first.substr(bar + 1));
+            }
+          }
+        }
+        std::lock_guard<std::mutex> lock(
+            inferflux_cuda_operator_metrics_mutex_);
+        for (const char *phase : kPhases) {
+          for (const auto &op : ops) {
+            const std::string key = std::string(phase) + "|" + op;
+            const auto it = counts.find(key);
+            const uint64_t count = it == counts.end() ? 0 : it->second;
+            out << metric_name << "{phase=\"" << phase << "\",operator=\"" << op
+                << "\"} " << count << "\n";
+          }
+        }
+      };
+
   out << "# HELP inferflux_cuda_ffn_proj_operator_total InferFlux CUDA FFN "
          "gate+up projection operator selections by phase and operator\n";
   out << "# TYPE inferflux_cuda_ffn_proj_operator_total counter\n";
-  {
-    static constexpr const char *kPhases[] = {"prefill", "decode"};
-    // Operator universe derived from dispatch_catalog.h — plus any key
-    // observed at runtime, so a new label can never be silently dropped
-    // from exposition again.
-    std::set<std::string> ops;
-    for (const char *label : kFfnMetricLabels) {
-      ops.insert(label);
-    }
-    {
-      std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
-      for (const auto &kv : inferflux_cuda_ffn_proj_operator_counts_) {
-        const std::string::size_type bar = kv.first.find('|');
-        if (bar != std::string::npos) {
-          ops.insert(kv.first.substr(bar + 1));
-        }
-      }
-    }
-    std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
-    for (const char *phase : kPhases) {
-      for (const auto &op : ops) {
-        const std::string key = std::string(phase) + "|" + op;
-        const auto it = inferflux_cuda_ffn_proj_operator_counts_.find(key);
-        const uint64_t count =
-            it == inferflux_cuda_ffn_proj_operator_counts_.end() ? 0
-                                                                 : it->second;
-        out << "inferflux_cuda_ffn_proj_operator_total{phase=\"" << phase
-            << "\",operator=\"" << op << "\"} " << count << "\n";
-      }
-    }
-  }
+  write_operator_phase_series("inferflux_cuda_ffn_proj_operator_total",
+                              kFfnMetricLabels,
+                              inferflux_cuda_ffn_proj_operator_counts_);
 
   out << "# HELP inferflux_cuda_down_proj_operator_total InferFlux CUDA "
          "down-proj "
          "operator selections by phase and operator\n";
   out << "# TYPE inferflux_cuda_down_proj_operator_total counter\n";
-  {
-    static constexpr const char *kPhases[] = {"prefill", "decode"};
-    // Operator universe derived from dispatch_catalog.h plus any runtime
-    // observed key — a new label can never be silently unexported.
-    std::set<std::string> ops;
-    for (const char *label : kDownMetricLabels) {
-      ops.insert(label);
-    }
-    {
-      std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
-      for (const auto &kv : inferflux_cuda_down_proj_operator_counts_) {
-        const std::string::size_type bar = kv.first.find('|');
-        if (bar != std::string::npos) {
-          ops.insert(kv.first.substr(bar + 1));
-        }
-      }
-    }
-    std::lock_guard<std::mutex> lock(inferflux_cuda_operator_metrics_mutex_);
-    for (const char *phase : kPhases) {
-      for (const auto &op : ops) {
-        const std::string key = std::string(phase) + "|" + op;
-        const auto it = inferflux_cuda_down_proj_operator_counts_.find(key);
-        const uint64_t count =
-            it == inferflux_cuda_down_proj_operator_counts_.end() ? 0
-                                                                  : it->second;
-        out << "inferflux_cuda_down_proj_operator_total{phase=\"" << phase
-            << "\",operator=\"" << op << "\"} " << count << "\n";
-      }
-    }
-  }
+  write_operator_phase_series("inferflux_cuda_down_proj_operator_total",
+                              kDownMetricLabels,
+                              inferflux_cuda_down_proj_operator_counts_);
 
   out << "# HELP inferflux_cuda_ffn_proj_geometry_total InferFlux CUDA FFN "
          "gate+up "

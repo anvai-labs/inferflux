@@ -83,6 +83,10 @@ private:
   void PersistPage(int page_id, const std::vector<float> &values) const;
   std::vector<float> LoadPage(int page_id) const;
   int SelectEvictionCandidate() const;
+
+  // Caller holds mutex_.
+  int AcquirePageLocked(int candidate);
+  void ReleasePageLocked(int page_id);
 };
 
 } // namespace inferflux
