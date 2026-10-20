@@ -7,12 +7,14 @@
 #include "runtime/multimodal/image_preprocessor.h"
 #include "scheduler/request_batch.h"
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -248,5 +250,24 @@ private:
 #endif
   bool vision_ready_{false};
 };
+
+// Poll an async unified-batch handle until completion or timeout. Shared by
+// the scheduler and batch executor (previously an exact clone in both TUs).
+inline bool WaitForUnifiedBatchAsync(
+    LlamaCppBackend *backend, UnifiedBatchHandle handle,
+    std::vector<UnifiedBatchOutput> *outputs,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
+  if (!backend || !outputs || handle == 0) {
+    return false;
+  }
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (backend->TryCollectUnifiedBatchAsync(handle, outputs)) {
+      return true;
+    }
+    std::this_thread::yield();
+  }
+  return backend->TryCollectUnifiedBatchAsync(handle, outputs);
+}
 
 } // namespace inferflux

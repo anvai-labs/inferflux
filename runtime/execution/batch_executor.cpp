@@ -83,6 +83,98 @@ void FinishGeneratedText(InferenceRequest *req, std::string *completion,
 
 int MaxNonEmittingSteps(int max_tokens) { return std::max(max_tokens * 8, 32); }
 
+// Per-slice fairness plan shared by the phased executors: seeds the result
+// identity, consumes the granted timeslice, and computes this slice's decode
+// limit from the request budget, remaining budget, timeslice, and decode-burst
+// tuning. Previously duplicated (drifted) across ExecuteBatchDecodePhased and
+// ExecuteUnifiedBatchPhased.
+struct FairnessSlicePlan {
+  int decode_limit{1};
+  int max_non_emitting_steps{32};
+  bool slice_active{false};
+};
+
+FairnessSlicePlan PlanFairnessSlice(InferenceRequest *req, InferenceResult *out,
+                                    int decode_burst_tokens) {
+  req->fairness.yielded = false;
+  out->model_id =
+      req->resolved_model.empty() ? req->model : req->resolved_model;
+  out->prompt_tokens = req->fairness.reported_prompt_tokens >= 0
+                           ? req->fairness.reported_prompt_tokens
+                           : static_cast<int>(req->prompt_tokens.size());
+  int limit = req->max_tokens;
+  if (req->fairness.remaining_decode_tokens >= 0) {
+    limit = std::min(limit, req->fairness.remaining_decode_tokens);
+  }
+  int slice = req->fairness.timeslice_tokens;
+  req->fairness.last_timeslice_tokens = slice;
+  req->fairness.timeslice_tokens = 0;
+  if (slice > 0) {
+    limit = std::min(limit, slice);
+  }
+  if (decode_burst_tokens > 0) {
+    limit = std::min(limit, decode_burst_tokens);
+  }
+  if (limit <= 0) {
+    limit = 1;
+  }
+  FairnessSlicePlan plan;
+  plan.decode_limit = limit;
+  plan.max_non_emitting_steps = MaxNonEmittingSteps(req->max_tokens);
+  plan.slice_active = (slice > 0) || (decode_burst_tokens > 0);
+  return plan;
+}
+
+// Shared fairness accounting for one finished executor slice: token charge
+// (prompt component on the first slice), the yield-vs-finish decision, output
+// accumulation, and the remaining-decode-budget update. Previously duplicated
+// across the two phased executors (the service-token charge already drifted
+// once in a third copy).
+void FinalizeFairnessSlice(InferenceRequest *req, InferenceResult *out, int gen,
+                           bool slice_active, int decode_limit,
+                           int current_token, MetricsRegistry *metrics) {
+  bool first_slice = (req->fairness.total_completion_tokens == 0);
+  int fairness_delta = gen;
+  if (first_slice) {
+    int prompt_comp = out->prompt_tokens;
+    if (prompt_comp <= 0 && req->fairness.reported_prompt_tokens >= 0) {
+      prompt_comp = req->fairness.reported_prompt_tokens;
+    }
+    fairness_delta += prompt_comp;
+  }
+  if (fairness_delta > 0) {
+    metrics->RecordFairnessTokens(req->fairness.priority_level, fairness_delta);
+  }
+  req->fairness.service_tokens += gen;
+  req->fairness.total_completion_tokens += gen;
+
+  bool exhausted = slice_active && gen >= decode_limit;
+  const int remaining_after_slice =
+      (req->fairness.remaining_decode_tokens >= 0)
+          ? std::max(0, req->fairness.remaining_decode_tokens - gen)
+          : -1;
+  if (slice_active && exhausted && remaining_after_slice > 0) {
+    req->fairness.yielded = true;
+    metrics->RecordFairnessYield(req->fairness.priority_level, gen,
+                                 remaining_after_slice);
+    req->phase = RequestPhase::kPending;
+    req->first_token = current_token;
+  } else {
+    req->phase = RequestPhase::kFinished;
+    req->first_token = -1;
+    FinishGeneratedText(req, &out->completion, metrics);
+  }
+  req->first_piece.clear();
+
+  if (!out->completion.empty() &&
+      !IsNonAccumulatingCompletion(out->completion)) {
+    req->accumulated_output.append(out->completion);
+  }
+  if (req->fairness.remaining_decode_tokens >= 0) {
+    req->fairness.remaining_decode_tokens = remaining_after_slice;
+  }
+}
+
 bool HasValidUnifiedPhasedState(const InferenceRequest &req) {
   if (req.n_past < 0 || req.sequence_id < 0) {
     return false;
@@ -243,23 +335,6 @@ private:
   LlamaCppBackend *backend_{nullptr};
   bool active_{false};
 };
-
-bool WaitForUnifiedBatchAsync(
-    LlamaCppBackend *backend, LlamaCppBackend::UnifiedBatchHandle handle,
-    std::vector<LlamaCppBackend::UnifiedBatchOutput> *outputs,
-    std::chrono::milliseconds timeout = std::chrono::milliseconds(5000)) {
-  if (!backend || !outputs || handle == 0) {
-    return false;
-  }
-  const auto deadline = std::chrono::steady_clock::now() + timeout;
-  while (std::chrono::steady_clock::now() < deadline) {
-    if (backend->TryCollectUnifiedBatchAsync(handle, outputs)) {
-      return true;
-    }
-    std::this_thread::yield();
-  }
-  return backend->TryCollectUnifiedBatchAsync(handle, outputs);
-}
 
 BatchExecutor::UnifiedBatchTuning
 NormalizeUnifiedBatchTuning(BatchExecutor::UnifiedBatchTuning raw) {
@@ -890,32 +965,11 @@ BatchExecutor::ExecuteBatchDecodePhased(
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = eligible[i];
     auto &out = outcomes[i].result;
-    req->fairness.yielded = false;
-    out.model_id =
-        req->resolved_model.empty() ? req->model : req->resolved_model;
-    out.prompt_tokens = req->fairness.reported_prompt_tokens >= 0
-                            ? req->fairness.reported_prompt_tokens
-                            : static_cast<int>(req->prompt_tokens.size());
-
-    // Compute per-request decode limit respecting fairness timeslice.
-    int limit = req->max_tokens;
-    if (req->fairness.remaining_decode_tokens >= 0) {
-      limit = std::min(limit, req->fairness.remaining_decode_tokens);
-    }
-    int slice = req->fairness.timeslice_tokens;
-    req->fairness.last_timeslice_tokens = slice;
-    req->fairness.timeslice_tokens = 0;
-    if (slice > 0) {
-      limit = std::min(limit, slice);
-    }
-    if (tuning_.decode_burst_tokens > 0) {
-      limit = std::min(limit, tuning_.decode_burst_tokens);
-    }
-    if (limit <= 0)
-      limit = 1;
-    states[i].decode_limit = limit;
-    states[i].max_non_emitting_steps = MaxNonEmittingSteps(req->max_tokens);
-    states[i].slice_active = (slice > 0) || (tuning_.decode_burst_tokens > 0);
+    const FairnessSlicePlan plan =
+        PlanFairnessSlice(req, &out, tuning_.decode_burst_tokens);
+    states[i].decode_limit = plan.decode_limit;
+    states[i].max_non_emitting_steps = plan.max_non_emitting_steps;
+    states[i].slice_active = plan.slice_active;
 
     // Emit the first token (pre-sampled by Prefill while its logits were
     // fresh).
@@ -1013,49 +1067,9 @@ BatchExecutor::ExecuteBatchDecodePhased(
     outcomes[i].decode_ms = decode_ms / static_cast<double>(n);
 
     // Fairness token accounting.
-    bool first_slice = (req->fairness.total_completion_tokens == 0);
-    int fairness_delta = gen;
-    if (first_slice) {
-      int prompt_comp = out.prompt_tokens;
-      if (prompt_comp <= 0 && req->fairness.reported_prompt_tokens >= 0) {
-        prompt_comp = req->fairness.reported_prompt_tokens;
-      }
-      fairness_delta += prompt_comp;
-    }
-    if (fairness_delta > 0) {
-      metrics_.RecordFairnessTokens(req->fairness.priority_level,
-                                    fairness_delta);
-    }
-    req->fairness.service_tokens += gen;
-    req->fairness.total_completion_tokens += gen;
-
-    // Fairness yield decision.
-    bool exhausted = states[i].slice_active && gen >= states[i].decode_limit;
-    const int remaining_after_slice =
-        (req->fairness.remaining_decode_tokens >= 0)
-            ? std::max(0, req->fairness.remaining_decode_tokens - gen)
-            : -1;
-    if (states[i].slice_active && exhausted && remaining_after_slice > 0) {
-      req->fairness.yielded = true;
-      metrics_.RecordFairnessYield(req->fairness.priority_level, gen,
-                                   remaining_after_slice);
-      req->phase = RequestPhase::kPending;
-      req->first_token = states[i].current_token;
-    } else {
-      req->phase = RequestPhase::kFinished;
-      req->first_token = -1;
-      FinishGeneratedText(req, &out.completion, &metrics_);
-    }
-    req->first_piece.clear();
-
-    // Accumulate and track remaining decode budget.
-    if (!out.completion.empty() &&
-        !IsNonAccumulatingCompletion(out.completion)) {
-      req->accumulated_output.append(out.completion);
-    }
-    if (req->fairness.remaining_decode_tokens >= 0) {
-      req->fairness.remaining_decode_tokens = remaining_after_slice;
-    }
+    FinalizeFairnessSlice(req, &out, gen, states[i].slice_active,
+                          states[i].decode_limit, states[i].current_token,
+                          &metrics_);
 
     MarkFirstTokenIfUnset(*req);
     // sequence_id left intact — scheduler handles FreeSequence + FreeSeqSlot.
@@ -1091,31 +1105,11 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
   for (std::size_t i = 0; i < n; ++i) {
     auto *req = eligible[i];
     auto &out = outcomes[i].result;
-    req->fairness.yielded = false;
-    out.model_id =
-        req->resolved_model.empty() ? req->model : req->resolved_model;
-    out.prompt_tokens = req->fairness.reported_prompt_tokens >= 0
-                            ? req->fairness.reported_prompt_tokens
-                            : static_cast<int>(req->prompt_tokens.size());
-
-    int limit = req->max_tokens;
-    if (req->fairness.remaining_decode_tokens >= 0) {
-      limit = std::min(limit, req->fairness.remaining_decode_tokens);
-    }
-    int slice = req->fairness.timeslice_tokens;
-    req->fairness.last_timeslice_tokens = slice;
-    req->fairness.timeslice_tokens = 0;
-    if (slice > 0) {
-      limit = std::min(limit, slice);
-    }
-    if (tuning_.decode_burst_tokens > 0) {
-      limit = std::min(limit, tuning_.decode_burst_tokens);
-    }
-    if (limit <= 0)
-      limit = 1;
-    states[i].decode_limit = limit;
-    states[i].max_non_emitting_steps = MaxNonEmittingSteps(req->max_tokens);
-    states[i].slice_active = (slice > 0) || (tuning_.decode_burst_tokens > 0);
+    const FairnessSlicePlan plan =
+        PlanFairnessSlice(req, &out, tuning_.decode_burst_tokens);
+    states[i].decode_limit = plan.decode_limit;
+    states[i].max_non_emitting_steps = plan.max_non_emitting_steps;
+    states[i].slice_active = plan.slice_active;
 
     // If n_past is 0 and bpe_prompt_tokens is not empty, this is a fresh
     // prefill. (Note: In the current scheduler, Prefill() is called BEFORE
@@ -1432,47 +1426,9 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     out.completion_tokens = gen;
     outcomes[i].decode_ms = total_ms / static_cast<double>(n);
 
-    bool first_slice = (req->fairness.total_completion_tokens == 0);
-    int fairness_delta = gen;
-    if (first_slice) {
-      int prompt_comp = out.prompt_tokens;
-      if (prompt_comp <= 0 && req->fairness.reported_prompt_tokens >= 0) {
-        prompt_comp = req->fairness.reported_prompt_tokens;
-      }
-      fairness_delta += prompt_comp;
-    }
-    if (fairness_delta > 0) {
-      metrics_.RecordFairnessTokens(req->fairness.priority_level,
-                                    fairness_delta);
-    }
-    req->fairness.service_tokens += gen;
-    req->fairness.total_completion_tokens += gen;
-
-    bool exhausted = states[i].slice_active && gen >= states[i].decode_limit;
-    const int remaining_after_slice =
-        (req->fairness.remaining_decode_tokens >= 0)
-            ? std::max(0, req->fairness.remaining_decode_tokens - gen)
-            : -1;
-    if (states[i].slice_active && exhausted && remaining_after_slice > 0) {
-      req->fairness.yielded = true;
-      metrics_.RecordFairnessYield(req->fairness.priority_level, gen,
-                                   remaining_after_slice);
-      req->phase = RequestPhase::kPending;
-      req->first_token = states[i].current_token;
-    } else {
-      req->phase = RequestPhase::kFinished;
-      req->first_token = -1;
-      FinishGeneratedText(req, &out.completion, &metrics_);
-    }
-    req->first_piece.clear();
-
-    if (!out.completion.empty() &&
-        !IsNonAccumulatingCompletion(out.completion)) {
-      req->accumulated_output.append(out.completion);
-    }
-    if (req->fairness.remaining_decode_tokens >= 0) {
-      req->fairness.remaining_decode_tokens = remaining_after_slice;
-    }
+    FinalizeFairnessSlice(req, &out, gen, states[i].slice_active,
+                          states[i].decode_limit, states[i].current_token,
+                          &metrics_);
     LogUnifiedAssemblyState("finalize", *req, std::string_view{},
                             out.completion, -1, gen, req->n_past, false,
                             states[i].active);
