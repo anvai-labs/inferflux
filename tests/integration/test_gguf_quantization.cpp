@@ -20,9 +20,11 @@
 #ifdef INFERFLUX_HAS_CUDA
 #include <cuda_runtime_api.h>
 #endif
+#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -599,7 +601,18 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
     return;
   }
 
-  auto run_policy_contract = [](DequantizedCachePolicy policy) {
+  // One full policy scenario, returning the free-memory readings the
+  // recovery contract evaluates. Kept separate from the assertions so the
+  // retry loop below can re-measure when a co-resident process perturbs
+  // absolute cudaMemGetInfo values between samples.
+  struct PolicyReadings {
+    size_t free_before{0};
+    size_t free_after_req1{0};
+    size_t free_after_clear{0};
+    size_t free_after_req2{0};
+    size_t min_recovered_bytes{0};
+  };
+  auto measure_policy_contract = [](DequantizedCachePolicy policy) {
     cudaStream_t stream = nullptr;
     REQUIRE(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
             cudaSuccess);
@@ -667,10 +680,8 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
     size_t free_after_clear = 0;
     REQUIRE(cudaMemGetInfo(&free_after_clear, &total_mem) == cudaSuccess);
 
-    // Require visible recovery to catch regressions that retain dequant
-    // buffers.
-    const size_t min_recovered_bytes = dequantized_bytes / 8; // conservative
-    REQUIRE(free_after_clear >= free_after_req1 + min_recovered_bytes);
+    // Conservative visible-recovery floor, evaluated by the caller.
+    const size_t min_recovered_bytes = dequantized_bytes / 8;
 
     // Request 2: cache is rebuilt (new request after boundary).
     half *req2_ptr = accessor->GetDequantizedGpuWeights(stream);
@@ -682,11 +693,40 @@ TEST_CASE("GGUF Integration: Batch dequant policy drops allocations between "
 
     size_t free_after_req2 = 0;
     REQUIRE(cudaMemGetInfo(&free_after_req2, &total_mem) == cudaSuccess);
-    REQUIRE(free_after_req2 + min_recovered_bytes <= free_after_clear);
-    REQUIRE(free_after_req1 + min_recovered_bytes <= free_before);
 
     loader.FreeGPUMemory();
     REQUIRE(cudaStreamDestroy(stream) == cudaSuccess);
+    return PolicyReadings{free_before, free_after_req1, free_after_clear,
+                          free_after_req2, min_recovered_bytes};
+  };
+
+  // The recovery contract compares absolute free-memory readings taken
+  // microseconds apart, which assumes an otherwise-idle GPU. A co-resident
+  // process (serving instance on a shared runner) allocating in that window
+  // shifts the readings and fails the contract spuriously — observed as an
+  // exact-2 MiB flake. Retry the bounded scenario so a transient perturbation
+  // passes on a later attempt; a genuine retained-buffer regression fails
+  // every attempt identically and still fails the assertions below.
+  auto run_policy_contract = [measure_policy_contract](
+                                 DequantizedCachePolicy policy) {
+    constexpr int kMaxAttempts = 3;
+    PolicyReadings r{};
+    for (int attempt = 1;; ++attempt) {
+      r = measure_policy_contract(policy);
+      const bool recovered =
+          r.free_after_clear >= r.free_after_req1 + r.min_recovered_bytes &&
+          r.free_after_req2 + r.min_recovered_bytes <= r.free_after_clear &&
+          r.free_after_req1 + r.min_recovered_bytes <= r.free_before;
+      if (recovered || attempt == kMaxAttempts) {
+        break;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    // Require visible recovery to catch regressions that retain dequant
+    // buffers.
+    REQUIRE(r.free_after_clear >= r.free_after_req1 + r.min_recovered_bytes);
+    REQUIRE(r.free_after_req2 + r.min_recovered_bytes <= r.free_after_clear);
+    REQUIRE(r.free_after_req1 + r.min_recovered_bytes <= r.free_before);
   };
 
   auto run_model_policy_contract = []() {
