@@ -1670,22 +1670,32 @@ int main(int argc, char **argv) {
           << "Usage: inferctl server {start|stop|status|restart|logs} [...]\n";
       return 1;
     }
-    std::string server_cmd = argv[2];
-
-    if (server_cmd == "start") {
-      std::string config = serve_config_override.empty()
+    // Shared --config/--no-wait parse for the server start/restart tails.
+    const auto parse_server_start_args = [&]() {
+      struct ServerStartArgs {
+        std::string config;
+        bool wait_for_ready;
+      };
+      ServerStartArgs args{serve_config_override.empty()
                                ? DefaultConfigPath().string()
-                               : serve_config_override;
-      bool wait_for_ready = true;
+                               : serve_config_override,
+                           true};
       for (int i = 3; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--config" && i + 1 < argc) {
-          config = argv[++i];
+          args.config = argv[++i];
         } else if (arg == "--no-wait") {
-          wait_for_ready = false;
+          args.wait_for_ready = false;
         }
       }
-      return CmdServerStart(config, wait_for_ready);
+      return args;
+    };
+
+    std::string server_cmd = argv[2];
+
+    if (server_cmd == "start") {
+      const auto args = parse_server_start_args();
+      return CmdServerStart(args.config, args.wait_for_ready);
     }
 
     if (server_cmd == "stop") {
@@ -1711,19 +1721,8 @@ int main(int argc, char **argv) {
     }
 
     if (server_cmd == "restart") {
-      std::string config = serve_config_override.empty()
-                               ? DefaultConfigPath().string()
-                               : serve_config_override;
-      bool wait_for_ready = true;
-      for (int i = 3; i < argc; ++i) {
-        std::string arg = argv[i];
-        if (arg == "--config" && i + 1 < argc) {
-          config = argv[++i];
-        } else if (arg == "--no-wait") {
-          wait_for_ready = false;
-        }
-      }
-      return CmdServerRestart(config, wait_for_ready);
+      const auto args = parse_server_start_args();
+      return CmdServerRestart(args.config, args.wait_for_ready);
     }
 
     if (server_cmd == "logs") {
