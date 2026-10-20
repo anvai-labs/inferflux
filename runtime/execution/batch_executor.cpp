@@ -336,6 +336,73 @@ private:
   bool active_{false};
 };
 
+// Partition unified-batch inputs into prefill/decode lanes, submit both
+// async lanes before waiting (so async backends can overlap them), then
+// collect each lane and scatter outputs back by position. Shared by the
+// phased executor (scratch vectors reused across steps) and the stepwise
+// executor; previously an exact duplicate. Returns false when a lane submit
+// fails or returns a mismatched output count; outputs may be partially
+// filled on failure and callers own their failure policy.
+bool RunAsyncUnifiedLanes(
+    LlamaCppBackend *backend,
+    const std::vector<LlamaCppBackend::UnifiedBatchInput> &batch_inputs,
+    const std::function<bool(std::size_t)> &is_prefill,
+    std::vector<LlamaCppBackend::UnifiedBatchInput> *decode_inputs,
+    std::vector<LlamaCppBackend::UnifiedBatchInput> *prefill_inputs,
+    std::vector<std::size_t> *decode_positions,
+    std::vector<std::size_t> *prefill_positions,
+    std::vector<LlamaCppBackend::UnifiedBatchOutput> *outputs) {
+  decode_inputs->clear();
+  prefill_inputs->clear();
+  decode_positions->clear();
+  prefill_positions->clear();
+  for (std::size_t j = 0; j < batch_inputs.size(); ++j) {
+    if (is_prefill(j)) {
+      prefill_positions->push_back(j);
+      prefill_inputs->push_back(batch_inputs[j]);
+    } else {
+      decode_positions->push_back(j);
+      decode_inputs->push_back(batch_inputs[j]);
+    }
+  }
+  outputs->resize(batch_inputs.size());
+  bool ok = true;
+  LlamaCppBackend::UnifiedBatchHandle decode_handle = 0;
+  LlamaCppBackend::UnifiedBatchHandle prefill_handle = 0;
+  if (!decode_inputs->empty()) {
+    decode_handle = backend->SubmitUnifiedBatchAsync(
+        *decode_inputs, LlamaCppBackend::UnifiedBatchLane::kDecode);
+    if (decode_handle == 0) {
+      ok = false;
+    }
+  }
+  if (ok && !prefill_inputs->empty()) {
+    prefill_handle = backend->SubmitUnifiedBatchAsync(
+        *prefill_inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
+    if (prefill_handle == 0) {
+      ok = false;
+    }
+  }
+  const auto collect_lane = [&](LlamaCppBackend::UnifiedBatchHandle handle,
+                                const std::vector<std::size_t> &positions) {
+    if (handle == 0) {
+      return;
+    }
+    std::vector<LlamaCppBackend::UnifiedBatchOutput> lane_outputs;
+    if (!WaitForUnifiedBatchAsync(backend, handle, &lane_outputs) ||
+        lane_outputs.size() != positions.size()) {
+      ok = false;
+      return;
+    }
+    for (std::size_t i = 0; i < positions.size(); ++i) {
+      (*outputs)[positions[i]] = std::move(lane_outputs[i]);
+    }
+  };
+  collect_lane(decode_handle, *decode_positions);
+  collect_lane(prefill_handle, *prefill_positions);
+  return ok;
+}
+
 BatchExecutor::UnifiedBatchTuning
 NormalizeUnifiedBatchTuning(BatchExecutor::UnifiedBatchTuning raw) {
   raw.decode_burst_tokens = std::max(0, raw.decode_burst_tokens);
@@ -1248,68 +1315,13 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     step.clear();
     bool step_ok = true;
     if (backend->SupportsAsyncUnifiedBatch()) {
-      decode_inputs.clear();
-      prefill_inputs.clear();
-      decode_positions.clear();
-      prefill_positions.clear();
-
-      for (std::size_t j = 0; j < batch_inputs.size(); ++j) {
-        std::size_t req_idx = active_idx[j];
-        if (states[req_idx].in_prefill) {
-          prefill_positions.push_back(j);
-          prefill_inputs.push_back(batch_inputs[j]);
-        } else {
-          decode_positions.push_back(j);
-          decode_inputs.push_back(batch_inputs[j]);
-        }
-      }
-
-      step.resize(batch_inputs.size());
-      LlamaCppBackend::UnifiedBatchHandle decode_handle = 0;
-      LlamaCppBackend::UnifiedBatchHandle prefill_handle = 0;
-
-      if (!decode_inputs.empty()) {
-        decode_handle = backend->SubmitUnifiedBatchAsync(
-            decode_inputs, LlamaCppBackend::UnifiedBatchLane::kDecode);
-        if (decode_handle == 0) {
-          step_ok = false;
-        }
-      }
-      if (step_ok && !prefill_inputs.empty()) {
-        // Submit both lanes before waiting so async backends can overlap
-        // decode/pre-fill execution in the same scheduler step.
-        prefill_handle = backend->SubmitUnifiedBatchAsync(
-            prefill_inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
-        if (prefill_handle == 0) {
-          step_ok = false;
-        }
-      }
-
-      if (decode_handle != 0) {
-        std::vector<LlamaCppBackend::UnifiedBatchOutput> decode_outputs;
-        if (!WaitForUnifiedBatchAsync(backend.get(), decode_handle,
-                                      &decode_outputs) ||
-            decode_outputs.size() != decode_positions.size()) {
-          step_ok = false;
-        } else {
-          for (std::size_t i = 0; i < decode_positions.size(); ++i) {
-            step[decode_positions[i]] = std::move(decode_outputs[i]);
-          }
-        }
-      }
-
-      if (prefill_handle != 0) {
-        std::vector<LlamaCppBackend::UnifiedBatchOutput> prefill_outputs;
-        if (!WaitForUnifiedBatchAsync(backend.get(), prefill_handle,
-                                      &prefill_outputs) ||
-            prefill_outputs.size() != prefill_positions.size()) {
-          step_ok = false;
-        } else {
-          for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
-            step[prefill_positions[i]] = std::move(prefill_outputs[i]);
-          }
-        }
-      }
+      step_ok = RunAsyncUnifiedLanes(
+          backend.get(), batch_inputs,
+          [&states, &active_idx](std::size_t j) {
+            return states[active_idx[j]].in_prefill;
+          },
+          &decode_inputs, &prefill_inputs, &decode_positions,
+          &prefill_positions, &step);
     } else {
       step = backend->ExecuteUnifiedBatch(batch_inputs);
       step_ok = !step.empty();
@@ -1620,68 +1632,13 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
     std::vector<LlamaCppBackend::UnifiedBatchInput> prefill_inputs;
     std::vector<std::size_t> decode_positions;
     std::vector<std::size_t> prefill_positions;
-    decode_inputs.reserve(batch_inputs.size());
-    prefill_inputs.reserve(batch_inputs.size());
-    decode_positions.reserve(batch_inputs.size());
-    prefill_positions.reserve(batch_inputs.size());
-
-    for (std::size_t j = 0; j < batch_inputs.size(); ++j) {
-      if (active_reqs[j]->execution.in_prefill) {
-        prefill_positions.push_back(j);
-        prefill_inputs.push_back(batch_inputs[j]);
-      } else {
-        decode_positions.push_back(j);
-        decode_inputs.push_back(batch_inputs[j]);
-      }
-    }
-
-    step_outputs.resize(batch_inputs.size());
-    bool step_ok = true;
-    LlamaCppBackend::UnifiedBatchHandle decode_handle = 0;
-    LlamaCppBackend::UnifiedBatchHandle prefill_handle = 0;
-
-    if (!decode_inputs.empty()) {
-      decode_handle = backend->SubmitUnifiedBatchAsync(
-          decode_inputs, LlamaCppBackend::UnifiedBatchLane::kDecode);
-      if (decode_handle == 0) {
-        step_ok = false;
-      }
-    }
-    if (step_ok && !prefill_inputs.empty()) {
-      prefill_handle = backend->SubmitUnifiedBatchAsync(
-          prefill_inputs, LlamaCppBackend::UnifiedBatchLane::kPrefill);
-      if (prefill_handle == 0) {
-        step_ok = false;
-      }
-    }
-
-    if (decode_handle != 0) {
-      std::vector<LlamaCppBackend::UnifiedBatchOutput> decode_outputs;
-      if (!WaitForUnifiedBatchAsync(backend.get(), decode_handle,
-                                    &decode_outputs) ||
-          decode_outputs.size() != decode_positions.size()) {
-        step_ok = false;
-      } else {
-        for (std::size_t i = 0; i < decode_positions.size(); ++i) {
-          step_outputs[decode_positions[i]] = std::move(decode_outputs[i]);
-        }
-      }
-    }
-
-    if (prefill_handle != 0) {
-      std::vector<LlamaCppBackend::UnifiedBatchOutput> prefill_outputs;
-      if (!WaitForUnifiedBatchAsync(backend.get(), prefill_handle,
-                                    &prefill_outputs) ||
-          prefill_outputs.size() != prefill_positions.size()) {
-        step_ok = false;
-      } else {
-        for (std::size_t i = 0; i < prefill_positions.size(); ++i) {
-          step_outputs[prefill_positions[i]] = std::move(prefill_outputs[i]);
-        }
-      }
-    }
-
-    if (!step_ok) {
+    if (!RunAsyncUnifiedLanes(
+            backend.get(), batch_inputs,
+            [&active_reqs](std::size_t j) {
+              return active_reqs[j]->execution.in_prefill;
+            },
+            &decode_inputs, &prefill_inputs, &decode_positions,
+            &prefill_positions, &step_outputs)) {
       step_outputs.clear();
     }
   } else if (backend->SupportsUnifiedBatchBurst() &&

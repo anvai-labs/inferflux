@@ -116,6 +116,49 @@ void LogCacheDecision(const InferenceRequest &req,
   log::Info("cache_decision", event.dump());
 }
 
+struct PrefixReusePlan {
+  int prefill_start{0};
+  bool copied_prefix{false};
+};
+
+// Clamp a warm-prefix lookup to the live prompt, replay one suffix token on
+// exact hits to refresh logits, and copy the donor KV into the target
+// sequence (session-warm state needs no copy). Shared by the deferred and
+// direct phased-prefill paths in ProcessBatch; previously an exact duplicate.
+PrefixReusePlan ResolvePrefixReuse(const InferenceRequest &inf,
+                                   LlamaCppBackend *backend, bool prefix_hit,
+                                   int matched_tokens, int cached_seq_id,
+                                   int seq_id, bool reused_session_state) {
+  PrefixReusePlan plan;
+  if (!(prefix_hit && matched_tokens > 0 && cached_seq_id >= 0)) {
+    return plan;
+  }
+  // Correctness Fix (§ Item 3): must copy KV state into new slot!
+  // matched_tokens is clamped to the current prompt length before use.
+  plan.prefill_start = std::clamp(
+      matched_tokens, 0, static_cast<int>(inf.bpe_prompt_tokens.size()));
+  if (!inf.bpe_prompt_tokens.empty() &&
+      plan.prefill_start >= static_cast<int>(inf.bpe_prompt_tokens.size())) {
+    // Replay one suffix token on exact hits to refresh logits and avoid
+    // zero-token decode continuations.
+    plan.prefill_start = static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
+  }
+  if (!reused_session_state) {
+    plan.copied_prefix =
+        backend->CopySequencePrefix(cached_seq_id, seq_id, plan.prefill_start);
+    if (!plan.copied_prefix) {
+      LogCacheDecision(inf, backend, "copy_failed", matched_tokens, 0,
+                       cached_seq_id);
+      // Hybrid memory could not hold the copied prefix — the backend cleared
+      // the slot; fall back to a full prefill below (issue #161).
+      plan.prefill_start = 0;
+    }
+  } else {
+    plan.copied_prefix = true;
+  }
+  return plan;
+}
+
 bool FairnessTraceEnabled() {
   static const bool enabled = []() {
     const char *value = std::getenv("INFERFLUX_DEBUG_FAIRNESS");
@@ -2319,36 +2362,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               !inf.collect_logprobs && !inf.response_format.has_format &&
               !inf.has_images && !inf.bpe_prompt_tokens.empty();
           if (can_defer_to_unified_prefill) {
-            int prefill_start = 0;
-            bool copied_prefix = false;
-            if (prefix_hit && matched_tokens > 0 && cached_seq_id >= 0) {
-              // Correctness Fix (§ Item 3): must copy KV state into new slot!
-              // matched_tokens is clamped to the current prompt length before
-              // use.
-              prefill_start =
-                  std::clamp(matched_tokens, 0,
-                             static_cast<int>(inf.bpe_prompt_tokens.size()));
-              if (!inf.bpe_prompt_tokens.empty() &&
-                  prefill_start >=
-                      static_cast<int>(inf.bpe_prompt_tokens.size())) {
-                // Replay one suffix token on exact hits to refresh logits and
-                // avoid zero-token decode continuations.
-                prefill_start =
-                    static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
-              }
-              if (!reused_session_state) {
-                copied_prefix = pending->resolved_backend->CopySequencePrefix(
-                    cached_seq_id, seq_id, prefill_start);
-                if (!copied_prefix) {
-                  LogCacheDecision(inf, pending->resolved_backend.get(),
-                                   "copy_failed", matched_tokens, 0,
-                                   cached_seq_id);
-                  prefill_start = 0;
-                }
-              } else {
-                copied_prefix = true;
-              }
-            }
+            const PrefixReusePlan reuse = ResolvePrefixReuse(
+                inf, pending->resolved_backend.get(), prefix_hit,
+                matched_tokens, cached_seq_id, seq_id, reused_session_state);
+            const int prefill_start = reuse.prefill_start;
+            const bool copied_prefix = reuse.copied_prefix;
 
             // Defer prefill compute into ExecuteUnifiedBatchPhased so decode
             // steps can overlap with in-flight prefill chunks in the same
@@ -2370,39 +2388,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
             queued_via_unified_prefill = true;
           } else {
             PrefillResult pr;
-            bool copied_prefix = false;
-            int prefill_start = 0;
-            if (prefix_hit && matched_tokens > 0 && cached_seq_id >= 0) {
-              // Correctness Fix (§ Item 3): must copy KV state into new slot!
-              // matched_tokens is clamped to the current prompt length before
-              // use.
-              prefill_start =
-                  std::clamp(matched_tokens, 0,
-                             static_cast<int>(inf.bpe_prompt_tokens.size()));
-              if (!inf.bpe_prompt_tokens.empty() &&
-                  prefill_start >=
-                      static_cast<int>(inf.bpe_prompt_tokens.size())) {
-                // Replay one suffix token on exact hits to refresh logits and
-                // avoid zero-token decode continuations.
-                prefill_start =
-                    static_cast<int>(inf.bpe_prompt_tokens.size()) - 1;
-              }
-              if (!reused_session_state) {
-                copied_prefix = pending->resolved_backend->CopySequencePrefix(
-                    cached_seq_id, seq_id, prefill_start);
-                if (!copied_prefix) {
-                  LogCacheDecision(inf, pending->resolved_backend.get(),
-                                   "copy_failed", matched_tokens, 0,
-                                   cached_seq_id);
-                  // Hybrid memory could not hold the copied prefix — the
-                  // backend cleared the slot; fall back to a full prefill
-                  // below (issue #161).
-                  prefill_start = 0;
-                }
-              } else {
-                copied_prefix = true;
-              }
-            }
+            const PrefixReusePlan reuse = ResolvePrefixReuse(
+                inf, pending->resolved_backend.get(), prefix_hit,
+                matched_tokens, cached_seq_id, seq_id, reused_session_state);
+            bool copied_prefix = reuse.copied_prefix;
+            int prefill_start = reuse.prefill_start;
 
             bool prefill_ok = ExecutePhasedPrefillStep(
                 pending->resolved_backend.get(), inf,
