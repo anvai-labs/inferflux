@@ -187,6 +187,18 @@ private:
                     ClientSession &session, const std::string &error_message);
 
   bool SendAll(ClientSession &session, const std::string &payload);
+
+  // Apply one api-key mutation under the policy lock with rollback on
+  // persistence failure. previous_scopes is captured from the policy store
+  // before apply and handed to the caller's rollback, so each caller keeps
+  // its own restore semantics (POST removes a newly created key when none
+  // existed; DELETE restores only a previously existing one). Returns true
+  // when the store persisted the mutation. Callers send responses and audit
+  // entries after the lock is released.
+  bool ApplyApiKeyMutation(
+      const std::string &key_hash, const std::function<void()> &apply,
+      const std::function<void(const std::optional<std::vector<std::string>> &)>
+          &rollback);
   ssize_t Receive(ClientSession &session, char *buffer, std::size_t length);
   void CloseSession(ClientSession &session);
 

@@ -1804,6 +1804,27 @@ bool HttpServer::ResolveSubject(const std::string &headers,
   return false;
 }
 
+bool HttpServer::ApplyApiKeyMutation(
+    const std::string &key_hash, const std::function<void()> &apply,
+    const std::function<void(const std::optional<std::vector<std::string>> &)>
+        &rollback) {
+  std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
+  std::optional<std::vector<std::string>> previous_scopes;
+  for (const auto &entry : policy_store_->ApiKeys()) {
+    if (entry.key == key_hash) {
+      previous_scopes = entry.scopes;
+      break;
+    }
+  }
+
+  apply();
+  if (!policy_store_->Save()) {
+    rollback(previous_scopes);
+    return false;
+  }
+  return true;
+}
+
 bool HttpServer::RequireScope(const AuthContext &ctx, const std::string &scope,
                               ClientSession &session,
                               const std::string &error_message) {
@@ -2368,34 +2389,29 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
     auto start = std::chrono::steady_clock::now();
     const std::string key_hash = ApiKeyAuth::HashKey(key);
-    {
-      std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
-      std::optional<std::vector<std::string>> previous_scopes;
-      for (const auto &entry : policy_store_->ApiKeys()) {
-        if (entry.key == key_hash) {
-          previous_scopes = entry.scopes;
-          break;
-        }
+    const bool persisted = ApplyApiKeyMutation(
+        key_hash,
+        [&] {
+          auth_->AddKey(key, scopes);
+          policy_store_->SetApiKey(key, scopes);
+        },
+        [&](const std::optional<std::vector<std::string>> &previous) {
+          if (previous.has_value()) {
+            auth_->AddKeyHashed(key_hash, *previous);
+            policy_store_->SetApiKey(key, *previous);
+          } else {
+            auth_->RemoveKey(key);
+            policy_store_->RemoveApiKey(key);
+          }
+        });
+    if (!persisted) {
+      SendAll(session, BuildResponse(BuildErrorBody("policy_persist_failed"),
+                                     500, "Internal Server Error"));
+      if (audit_logger_) {
+        audit_logger_->Log(auth_ctx.subject, "", "policy_persist_failed",
+                           "api_key_upsert");
       }
-
-      auth_->AddKey(key, scopes);
-      policy_store_->SetApiKey(key, scopes);
-      if (!policy_store_->Save()) {
-        if (previous_scopes.has_value()) {
-          auth_->AddKeyHashed(key_hash, *previous_scopes);
-          policy_store_->SetApiKey(key, *previous_scopes);
-        } else {
-          auth_->RemoveKey(key);
-          policy_store_->RemoveApiKey(key);
-        }
-        SendAll(session, BuildResponse(BuildErrorBody("policy_persist_failed"),
-                                       500, "Internal Server Error"));
-        if (audit_logger_) {
-          audit_logger_->Log(auth_ctx.subject, "", "policy_persist_failed",
-                             "api_key_upsert");
-        }
-        return;
-      }
+      return;
     }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
@@ -2434,31 +2450,26 @@ void HttpServer::HandleClient(ClientSession &session) {
     }
     auto start = std::chrono::steady_clock::now();
     const std::string key_hash = ApiKeyAuth::HashKey(key);
-    {
-      std::lock_guard<std::mutex> policy_lock(policy_update_mutex_);
-      std::optional<std::vector<std::string>> previous_scopes;
-      for (const auto &entry : policy_store_->ApiKeys()) {
-        if (entry.key == key_hash) {
-          previous_scopes = entry.scopes;
-          break;
-        }
+    const bool persisted = ApplyApiKeyMutation(
+        key_hash,
+        [&] {
+          auth_->RemoveKey(key);
+          policy_store_->RemoveApiKey(key);
+        },
+        [&](const std::optional<std::vector<std::string>> &previous) {
+          if (previous.has_value()) {
+            auth_->AddKeyHashed(key_hash, *previous);
+            policy_store_->SetApiKey(key, *previous);
+          }
+        });
+    if (!persisted) {
+      SendAll(session, BuildResponse(BuildErrorBody("policy_persist_failed"),
+                                     500, "Internal Server Error"));
+      if (audit_logger_) {
+        audit_logger_->Log(auth_ctx.subject, "", "policy_persist_failed",
+                           "api_key_remove");
       }
-
-      auth_->RemoveKey(key);
-      policy_store_->RemoveApiKey(key);
-      if (!policy_store_->Save()) {
-        if (previous_scopes.has_value()) {
-          auth_->AddKeyHashed(key_hash, *previous_scopes);
-          policy_store_->SetApiKey(key, *previous_scopes);
-        }
-        SendAll(session, BuildResponse(BuildErrorBody("policy_persist_failed"),
-                                       500, "Internal Server Error"));
-        if (audit_logger_) {
-          audit_logger_->Log(auth_ctx.subject, "", "policy_persist_failed",
-                             "api_key_remove");
-        }
-        return;
-      }
+      return;
     }
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - start);
