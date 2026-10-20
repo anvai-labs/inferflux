@@ -896,8 +896,25 @@ void Scheduler::SyncSequenceSlotProgress(
                                   ResidentSequenceTokenCount(request));
 }
 
+// Release a stale sequence lease (no backend owner): warn and log on
+// rejection, then refresh KV-memory metrics. Shared by the no-backend and
+// legacy-generation branches of FreeSeqSlot; previously duplicated.
+void Scheduler::ReleaseStaleSequenceLease(int slot, uint64_t generation) {
+  const bool released = slot_manager_->ReleaseLease({slot, generation, -1});
+  if (!released) {
+    log::Warn("scheduler", "Rejected stale sequence lease release for slot " +
+                               std::to_string(slot) +
+                               " gen=" + std::to_string(generation));
+  } else {
+    LogSequenceSlotEvent("release", /*request_id=*/-1, slot, generation,
+                         RequestPhase::kFinished, /*n_past=*/-1,
+                         /*remaining_decode_tokens=*/-1);
+  }
+  RefreshNativeKvMemoryMetrics();
+}
+
 void Scheduler::RefreshNativeKvMemoryMetrics() const {
-  if (!slot_manager_) {
+  const auto reset_zero = [&] {
     metrics_->SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
                                             /*active_bytes=*/0,
                                             /*prefix_retained_bytes=*/0,
@@ -906,20 +923,16 @@ void Scheduler::RefreshNativeKvMemoryMetrics() const {
                                             /*prefix_retained_sequences=*/0,
                                             /*free_sequences=*/0,
                                             /*max_sequences=*/0);
+  };
+  if (!slot_manager_) {
+    reset_zero();
     return;
   }
 
   const uint64_t total_bytes = metrics_->GetInferfluxCudaKvPlannedBytes();
   const int max_sequences = metrics_->GetInferfluxCudaKvMaxSequences();
   if (total_bytes == 0 || max_sequences <= 0) {
-    metrics_->SetInferfluxCudaKvMemoryBytes(/*total_bytes=*/0,
-                                            /*active_bytes=*/0,
-                                            /*prefix_retained_bytes=*/0,
-                                            /*free_bytes=*/0,
-                                            /*active_sequences=*/0,
-                                            /*prefix_retained_sequences=*/0,
-                                            /*free_sequences=*/0,
-                                            /*max_sequences=*/0);
+    reset_zero();
     return;
   }
 
@@ -3174,32 +3187,12 @@ void Scheduler::FreeSeqSlot(int slot, uint64_t generation,
     RefreshNativeKvMemoryMetrics();
     return;
   } else if (!backend && generation != 0) {
-    const bool released = slot_manager_->ReleaseLease({slot, generation, -1});
-    if (!released) {
-      log::Warn("scheduler", "Rejected stale sequence lease release for slot " +
-                                 std::to_string(slot) +
-                                 " gen=" + std::to_string(generation));
-    } else {
-      LogSequenceSlotEvent("release", /*request_id=*/-1, slot, generation,
-                           RequestPhase::kFinished, /*n_past=*/-1,
-                           /*remaining_decode_tokens=*/-1);
-    }
-    RefreshNativeKvMemoryMetrics();
+    ReleaseStaleSequenceLease(slot, generation);
     return;
   }
 
   if (generation != 0) {
-    const bool released = slot_manager_->ReleaseLease({slot, generation, -1});
-    if (!released) {
-      log::Warn("scheduler", "Rejected stale sequence lease release for slot " +
-                                 std::to_string(slot) +
-                                 " gen=" + std::to_string(generation));
-    } else {
-      LogSequenceSlotEvent("release", /*request_id=*/-1, slot, generation,
-                           RequestPhase::kFinished, /*n_past=*/-1,
-                           /*remaining_decode_tokens=*/-1);
-    }
-    RefreshNativeKvMemoryMetrics();
+    ReleaseStaleSequenceLease(slot, generation);
     return;
   }
   slot_manager_->ReleaseSlot(slot);

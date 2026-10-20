@@ -184,6 +184,7 @@ private:
   void UpdateQueueDepthLocked() const;
   void
   ResolveBackends(const std::vector<std::shared_ptr<PendingRequest>> &batch);
+  void ReleaseStaleSequenceLease(int slot, uint64_t generation);
   bool RequestUsesSessionHandle(const InferenceRequest &request) const;
   void ReleaseSessionState(const scheduler::SessionHandleState &state,
                            std::shared_ptr<LlamaCppBackend> backend_hint);
