@@ -1,4 +1,4 @@
-#include "server/rocr_spin_tamer.h"
+#include "runtime/rocr_spin_tamer.h"
 
 #include "runtime/string_utils.h"
 #include "runtime/thread_name.h"
@@ -42,19 +42,29 @@ constexpr int kWindowMs = 1200;
 constexpr int kSleepSliceMs = 50;
 constexpr int kMinRunnablePercent = 80;
 constexpr long kMaxStimeDeltaTicks = 2;
-// PC proof: a strict majority of samples must land in the code owner; the
-// rest may be vDSO/libc helpers the spin loop calls without a syscall.
-constexpr int kPcSamples = 5;
-constexpr int kPcOwnedRequired = 3;
+// PC proof: at least kPcOwnedRequired of kPcSamples samples must land in the
+// code owner (the rest may be vDSO/libc helpers the spin loop calls without
+// a syscall). Sampling stops as soon as the verdict is decided, so a
+// non-owner receives at most 2 probe signals.
+constexpr int kPcSamples = 3;
+constexpr int kPcOwnedRequired = 2;
 // Generous: a runnable-but-starved spinner on a loaded host may wait on a
 // runqueue before the handler runs. Scans are background work.
 constexpr int kPcReplyTimeoutMs = 500;
+// Upper bound for an in-flight handler to finish after its probe ended.
+constexpr int kHandlerDrainTimeoutMs = 1000;
 // The ROCr runtime spawns 2 pollers; this only bounds work and log noise.
 constexpr int kMaxConfined = 8;
 // Offset from SIGRTMIN for the PC probe. glibc reserves the RT signals below
 // its SIGRTMIN; nothing in InferFlux or llama.cpp/ggml uses RT signals, and
 // a foreign handler (at install time or any later scan) disables probing.
 constexpr int kProbeSignalOffset = 5;
+// Follow-up scans: shortly after a requested scan (pollers created lazily
+// right after a load), then periodically while the ROCr runtime is loaded.
+constexpr auto kFollowUpDelay = std::chrono::seconds(10);
+constexpr auto kPeriodicInterval = std::chrono::minutes(5);
+
+using ThreadKey = std::pair<pid_t, unsigned long long>; // (tid, starttime)
 
 struct ThreadSample {
   unsigned long long starttime = 0; // Distinguishes a reused TID.
@@ -67,8 +77,6 @@ struct ThreadSample {
   unsigned long long run_ns = 0;
   unsigned long long wait_ns = 0;
 };
-
-pid_t CurrentTid() { return static_cast<pid_t>(syscall(SYS_gettid)); }
 
 std::string TaskPath(pid_t tid, const char *leaf) {
   return "/proc/self/task/" + std::to_string(tid) + "/" + leaf;
@@ -119,14 +127,16 @@ bool ReadThreadStat(pid_t tid, ThreadSample *out) {
   return true;
 }
 
-bool ReadVoluntarySwitches(pid_t tid, long long *out) {
+// Reads one "Key:\tvalue" line of /proc/.../status. strtoull skips the
+// separator whitespace itself, so this does not depend on /proc padding.
+bool ReadStatusField(pid_t tid, const char *key, int base,
+                     unsigned long long *out) {
   std::ifstream file(TaskPath(tid, "status"));
+  const std::size_t key_len = std::strlen(key);
   std::string line;
   while (file && std::getline(file, line)) {
-    if (line.rfind("voluntary_ctxt_switches:", 0) == 0) {
-      // strtoll skips the separator whitespace itself, so this does not
-      // depend on the exact /proc padding after the 24-char key.
-      *out = std::strtoll(line.c_str() + 24, nullptr, 10);
+    if (line.compare(0, key_len, key) == 0) {
+      *out = std::strtoull(line.c_str() + key_len, nullptr, base);
       return true;
     }
   }
@@ -143,10 +153,12 @@ std::unordered_map<pid_t, ThreadSample> SampleAllThreads() {
   std::unordered_map<pid_t, ThreadSample> samples;
   for (const pid_t tid : ListThreads()) {
     ThreadSample sample;
+    unsigned long long voluntary = 0;
     if (!ReadThreadStat(tid, &sample) ||
-        !ReadVoluntarySwitches(tid, &sample.voluntary_switches)) {
+        !ReadStatusField(tid, "voluntary_ctxt_switches:", 10, &voluntary)) {
       continue;
     }
+    sample.voluntary_switches = static_cast<long long>(voluntary);
     sample.has_schedstat = ReadSchedstat(tid, &sample.run_ns, &sample.wait_ns);
     samples.emplace(tid, sample);
   }
@@ -165,42 +177,55 @@ bool HsaRuntimeLoaded() {
   return false;
 }
 
-// Threads already confined, by (tid, starttime): never re-confined or double
-// counted, and immune to TID reuse.
-std::mutex g_confined_mutex;
-std::set<std::pair<pid_t, unsigned long long>> g_confined;
+// Verdict memory, keyed by (tid, starttime) so a reused TID starts fresh.
+// `g_confined`: never re-confined or double counted. `g_not_owner`: proven
+// to run other code (production owner only); never probed again.
+std::mutex g_memory_mutex;
+std::set<ThreadKey> g_confined;
+std::set<ThreadKey> g_not_owner;
 
-bool AlreadyConfined(pid_t tid, unsigned long long starttime) {
-  std::lock_guard<std::mutex> lock(g_confined_mutex);
-  return g_confined.count({tid, starttime}) != 0;
+bool Remembered(const std::set<ThreadKey> &set, const ThreadKey &key) {
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  return set.count(key) != 0;
+}
+
+void Remember(std::set<ThreadKey> *set, const ThreadKey &key) {
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  set->insert(key);
 }
 
 // --- Instruction-pointer probe ---------------------------------------------
 // The handler only stores the interrupted PC of the targeted thread; all
-// interpretation (dladdr) happens on the scanning thread. Both atomics are
-// lock-free, so the handler is async-signal-safe.
+// interpretation (dladdr) happens on the scanning thread. Every handler
+// invocation counts itself in g_probe_inflight, and the scanner drains that
+// count to zero after clearing g_probe_tid and before arming the next probe,
+// so a handler that passed the tid check for thread T can never store into
+// a later probe of thread U. All atomics are lock-free (async-signal-safe).
 static_assert(std::atomic<pid_t>::is_always_lock_free,
               "probe tid slot must be lock-free");
 static_assert(std::atomic<std::uintptr_t>::is_always_lock_free,
               "probe pc slot must be lock-free");
+static_assert(std::atomic<int>::is_always_lock_free,
+              "probe in-flight counter must be lock-free");
 std::atomic<pid_t> g_probe_tid{0};
 std::atomic<std::uintptr_t> g_probe_pc{0};
+std::atomic<int> g_probe_inflight{0};
 
 void ProbeHandler(int /*sig*/, siginfo_t * /*info*/, void *raw_context) {
-  if (static_cast<pid_t>(syscall(SYS_gettid)) !=
-      g_probe_tid.load(std::memory_order_acquire)) {
-    return; // Late delivery for an abandoned probe: ignore.
-  }
-  const auto *context = static_cast<const ucontext_t *>(raw_context);
-  std::uintptr_t pc = 0;
+  g_probe_inflight.fetch_add(1);
+  if (CurrentThreadId() == g_probe_tid.load()) {
+    const auto *context = static_cast<const ucontext_t *>(raw_context);
+    std::uintptr_t pc = 0;
 #if defined(__x86_64__)
-  pc = static_cast<std::uintptr_t>(context->uc_mcontext.gregs[REG_RIP]);
+    pc = static_cast<std::uintptr_t>(context->uc_mcontext.gregs[REG_RIP]);
 #elif defined(__aarch64__)
-  pc = static_cast<std::uintptr_t>(context->uc_mcontext.pc);
+    pc = static_cast<std::uintptr_t>(context->uc_mcontext.pc);
 #else
-  (void)context;
+    (void)context;
 #endif
-  g_probe_pc.store(pc, std::memory_order_release);
+    g_probe_pc.store(pc);
+  }
+  g_probe_inflight.fetch_sub(1);
 }
 
 std::mutex g_probe_mutex; // Serializes the single probe slot.
@@ -253,22 +278,52 @@ int ProbeSignal() {
 #endif
 }
 
-// Interrupts `tid` and returns the PC it was executing, or 0 on no reply
-// (signal blocked, thread exited, or timeout). Caller holds g_probe_mutex.
-std::uintptr_t SamplePc(pid_t pid, pid_t tid, int sig) {
-  g_probe_pc.store(0, std::memory_order_release);
-  g_probe_tid.store(tid, std::memory_order_release);
-  std::uintptr_t pc = 0;
+// A thread that blocks or ignores the probe signal would queue RT signals
+// (they do not coalesce) or drop them; never signal it.
+bool AcceptsProbeSignal(pid_t tid, int sig) {
+  const unsigned long long bit = 1ULL << (sig - 1);
+  unsigned long long blocked = 0;
+  unsigned long long ignored = 0;
+  return ReadStatusField(tid, "SigBlk:", 16, &blocked) &&
+         ReadStatusField(tid, "SigIgn:", 16, &ignored) &&
+         (blocked & bit) == 0 && (ignored & bit) == 0;
+}
+
+bool DrainHandlers() {
+  const auto deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(kHandlerDrainTimeoutMs);
+  while (g_probe_inflight.load() != 0) {
+    if (std::chrono::steady_clock::now() >= deadline) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  return true;
+}
+
+enum class SampleResult { kPc, kNoReply, kSlotUnsafe };
+
+// Interrupts `tid` and reports the PC it was executing. kNoReply: thread
+// exited or did not run the handler in time. kSlotUnsafe: an in-flight
+// handler did not finish, so the probe slot must not be reused this scan.
+// Caller holds g_probe_mutex.
+SampleResult SamplePc(pid_t pid, pid_t tid, int sig, std::uintptr_t *pc) {
+  g_probe_pc.store(0);
+  g_probe_tid.store(tid);
+  *pc = 0;
   if (syscall(SYS_tgkill, pid, tid, sig) == 0) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(kPcReplyTimeoutMs);
-    while ((pc = g_probe_pc.load(std::memory_order_acquire)) == 0 &&
+    while ((*pc = g_probe_pc.load()) == 0 &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
   }
-  g_probe_tid.store(0, std::memory_order_release);
-  return pc;
+  g_probe_tid.store(0);
+  if (!DrainHandlers()) {
+    return SampleResult::kSlotUnsafe;
+  }
+  return *pc != 0 ? SampleResult::kPc : SampleResult::kNoReply;
 }
 
 bool PcOwned(std::uintptr_t pc, const RocrSpinTamerOptions &options) {
@@ -281,38 +336,55 @@ bool PcOwned(std::uintptr_t pc, const RocrSpinTamerOptions &options) {
          std::strstr(info.dli_fname, options.code_owner.c_str()) != nullptr;
 }
 
-// True when a majority of sampled PCs of `tid` belong to the code owner.
-bool ProvenOwnerThread(pid_t pid, pid_t tid,
-                       const RocrSpinTamerOptions &options,
-                       const std::atomic<bool> *cancelled) {
+enum class Verdict { kOwner, kNotOwner, kUnknown, kAbortScan };
+
+// Samples `tid`'s PC until ownership is decided. kNotOwner only when every
+// probe got a reply (a starved or exited thread stays kUnknown and may be
+// re-probed by a later scan).
+Verdict ProveOwner(pid_t pid, pid_t tid, const RocrSpinTamerOptions &options,
+                   const std::atomic<bool> *cancelled) {
   std::lock_guard<std::mutex> lock(g_probe_mutex);
   const int sig = ProbeSignal();
   if (sig == 0) {
-    return false;
+    return Verdict::kAbortScan;
+  }
+  if (!AcceptsProbeSignal(tid, sig)) {
+    return Verdict::kUnknown;
   }
   int owned = 0;
+  int replied = 0;
   for (int i = 0; i < kPcSamples; ++i) {
     if (cancelled && cancelled->load(std::memory_order_relaxed)) {
-      return false;
+      return Verdict::kAbortScan;
     }
-    const std::uintptr_t pc = SamplePc(pid, tid, sig);
-    if (pc != 0 && PcOwned(pc, options)) {
-      ++owned;
+    std::uintptr_t pc = 0;
+    switch (SamplePc(pid, tid, sig, &pc)) {
+    case SampleResult::kSlotUnsafe:
+      return Verdict::kAbortScan;
+    case SampleResult::kNoReply:
+      break;
+    case SampleResult::kPc:
+      ++replied;
+      if (PcOwned(pc, options)) {
+        ++owned;
+      }
+      break;
     }
     if (owned >= kPcOwnedRequired) {
-      return true;
+      return Verdict::kOwner;
     }
     if (owned + (kPcSamples - 1 - i) < kPcOwnedRequired) {
-      return false; // Majority no longer reachable.
+      return replied == i + 1 ? Verdict::kNotOwner : Verdict::kUnknown;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
-  return false;
+  return Verdict::kUnknown;
 }
 
 // Resolves the pin target. Returns false when pinning must be skipped
-// (single-CPU mask). An explicitly requested core outside the process
-// affinity mask warns and falls back to the highest allowed CPU.
+// (single-CPU mask). An invalid INFERFLUX_ROCR_TAME_CORE (unparseable, out
+// of range, or outside the process affinity mask) warns and falls back to
+// the highest allowed CPU.
 bool ChooseTameCore(int *tame_core) {
   cpu_set_t allowed;
   CPU_ZERO(&allowed);
@@ -336,15 +408,16 @@ bool ChooseTameCore(int *tame_core) {
   // would make CPU_ISSET/CPU_SET address past the end of cpu_set_t.
   const int requested =
       ParseIntEnv("INFERFLUX_ROCR_TAME_CORE", -1, 0, CPU_SETSIZE - 1);
-  if (requested >= 0) {
-    if (CPU_ISSET(requested, &allowed)) {
-      *tame_core = requested;
-      return true;
-    }
-    log::Warn(kComponent,
-              "INFERFLUX_ROCR_TAME_CORE=" + std::to_string(requested) +
-                  " is outside the allowed CPU mask; using CPU " +
-                  std::to_string(highest));
+  const char *raw = std::getenv("INFERFLUX_ROCR_TAME_CORE");
+  const bool set = raw != nullptr && *raw != '\0';
+  if (requested >= 0 && CPU_ISSET(requested, &allowed)) {
+    *tame_core = requested;
+    return true;
+  }
+  if (set) {
+    log::Warn(kComponent, std::string("INFERFLUX_ROCR_TAME_CORE=") + raw +
+                              " is not a CPU in the allowed mask; using CPU " +
+                              std::to_string(highest));
   }
   *tame_core = highest;
   return true;
@@ -352,8 +425,13 @@ bool ChooseTameCore(int *tame_core) {
 
 std::atomic<int> g_next_spin_name{0}; // Unique rocr-spin-N across scans.
 
-bool ConfineThread(pid_t tid, unsigned long long starttime, int tame_core,
-                   bool pin) {
+bool ConfineThread(const ThreadKey &key, int tame_core, bool pin) {
+  const pid_t tid = key.first;
+  // The proof can take a while; refuse if the TID now names another thread.
+  ThreadSample now;
+  if (!ReadThreadStat(tid, &now) || now.starttime != key.second) {
+    return false;
+  }
   int demoted = 0;
   // PRIO_PROCESS with a tid targets that thread's nice value on Linux.
   if (setpriority(PRIO_PROCESS, tid, 19) == 0) {
@@ -366,10 +444,7 @@ bool ConfineThread(pid_t tid, unsigned long long starttime, int tame_core,
   if (demoted == 0) {
     return false; // ESRCH (thread exited) or EPERM: give up on this one.
   }
-  {
-    std::lock_guard<std::mutex> lock(g_confined_mutex);
-    g_confined.insert({tid, starttime});
-  }
+  Remember(&g_confined, key);
   if (pin) {
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -399,8 +474,9 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   if (!options.pc_owner && options.code_owner.empty()) {
     return 0; // An empty owner would match every object.
   }
+  const bool remember_rejections = !options.pc_owner;
   const pid_t pid = getpid();
-  const pid_t self = CurrentTid();
+  const pid_t self = CurrentThreadId();
 
   const auto first = SampleAllThreads();
   const auto window_start = std::chrono::steady_clock::now();
@@ -423,7 +499,7 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
       window_ns / 1000000 * ticks_per_second * kMinRunnablePercent / 100000);
 
   // Stage 1 prefilter: threads that never blocked during the window.
-  std::vector<std::pair<pid_t, unsigned long long>> candidates;
+  std::vector<ThreadKey> candidates;
   for (const auto &entry : second) {
     const pid_t tid = entry.first;
     if (tid == pid || tid == self) {
@@ -431,7 +507,7 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     }
     const auto it_before = first.find(tid);
     if (it_before == first.end()) {
-      continue; // Appeared mid-window; a later scan will see it whole.
+      continue; // Appeared mid-window; the follow-up scan sees it whole.
     }
     const ThreadSample &before = it_before->second;
     const ThreadSample &after = entry.second;
@@ -441,7 +517,9 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
         after.voluntary_switches < before.voluntary_switches) {
       continue; // TID reused by a different thread inside the window.
     }
-    if (AlreadyConfined(tid, after.starttime)) {
+    const ThreadKey key{tid, after.starttime};
+    if (Remembered(g_confined, key) ||
+        (remember_rejections && Remembered(g_not_owner, key))) {
       continue;
     }
     const long utime_delta = after.utime_ticks - before.utime_ticks;
@@ -464,7 +542,7 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     }
     if (always_runnable && utime_delta > 0 &&
         stime_delta <= kMaxStimeDeltaTicks && voluntary_delta == 0) {
-      candidates.emplace_back(tid, after.starttime);
+      candidates.push_back(key);
     }
   }
   if (candidates.empty()) {
@@ -475,13 +553,18 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   int tame_core = -1;
   const bool pin = ChooseTameCore(&tame_core);
   int confined = 0;
-  for (const auto &[tid, starttime] : candidates) {
-    if (confined >= kMaxConfined ||
-        (cancelled && cancelled->load(std::memory_order_relaxed))) {
+  for (const ThreadKey &key : candidates) {
+    if (confined >= kMaxConfined) {
       break;
     }
-    if (ProvenOwnerThread(pid, tid, options, cancelled) &&
-        ConfineThread(tid, starttime, tame_core, pin)) {
+    const Verdict verdict = ProveOwner(pid, key.first, options, cancelled);
+    if (verdict == Verdict::kAbortScan) {
+      break;
+    }
+    if (verdict == Verdict::kNotOwner && remember_rejections) {
+      Remember(&g_not_owner, key);
+    }
+    if (verdict == Verdict::kOwner && ConfineThread(key, tame_core, pin)) {
       ++confined;
     }
   }
@@ -495,6 +578,12 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
             (pin ? std::string(", pinned to CPU ") + std::to_string(tame_core)
                  : std::string(", pin skipped")) +
             ")");
+  } else {
+    log::Debug(kComponent, std::to_string(candidates.size()) +
+                               " never-blocking thread(s) found; none proven "
+                               "to run in " +
+                               (options.pc_owner ? std::string("the test owner")
+                                                 : options.code_owner));
   }
   return confined;
 }
@@ -502,15 +591,16 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
 // Background scanner. Requests set `pending_` and wake the worker; requests
 // landing mid-scan leave `pending_` set, so they coalesce into exactly one
 // follow-up scan. Between scans the worker blocks on the condition variable
-// (never spins). Never destroyed (see Instance()).
+// (never spins), waking for the follow-up/periodic rescans while the ROCr
+// runtime is loaded. Never destroyed (see Instance()).
 class TamerWorker {
 public:
   // Leaked on purpose: Request() may run on any thread (HTTP workers, the
   // registry watcher) while the process exits, so the object must outlive
-  // static destruction. The atexit hook is registered after GlobalMetrics()
-  // and the logger exist (first use is inside main), so it runs before they
-  // are torn down: it stops and joins the worker, and later Request() calls
-  // see stop_ and return.
+  // static destruction. The logger and metrics registry are namespace-scope
+  // globals constructed before main, so this atexit hook (registered later,
+  // on first use) runs before they are destroyed. It stops and joins the
+  // worker, and later Request() calls see stop_ and return.
   static TamerWorker &Instance() {
     static TamerWorker *instance = [] {
       auto *worker = new TamerWorker();
@@ -561,20 +651,39 @@ private:
 
   void Loop() {
     SetCurrentThreadName("if-rocr-tamer");
+    using Clock = std::chrono::steady_clock;
+    bool have_next = false;
+    Clock::time_point next{};
     std::unique_lock<std::mutex> lock(mutex_);
     while (true) {
-      cv_.wait(lock, [this] { return stop_ || pending_; });
+      const auto ready = [this] { return stop_ || pending_; };
+      if (have_next) {
+        cv_.wait_until(lock, next, ready);
+      } else {
+        cv_.wait(lock, ready);
+      }
       if (stop_) {
         return;
       }
+      const bool requested = pending_;
+      if (!requested && have_next && Clock::now() < next) {
+        continue; // Spurious wakeup before the scheduled rescan.
+      }
       pending_ = false;
       lock.unlock();
+      bool runtime_loaded = false;
       try {
         TameRuntimeSpinThreadsImpl(RocrSpinTamerOptions{}, &cancelled_);
+        runtime_loaded = HsaRuntimeLoaded();
       } catch (...) {
         // Best-effort hygiene must never take the server down.
       }
       lock.lock();
+      have_next = runtime_loaded;
+      if (have_next) {
+        next = Clock::now() + (requested ? Clock::duration(kFollowUpDelay)
+                                         : Clock::duration(kPeriodicInterval));
+      }
     }
   }
 

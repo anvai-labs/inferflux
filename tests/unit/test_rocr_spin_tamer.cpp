@@ -1,12 +1,11 @@
 #include <catch2/catch_amalgamated.hpp>
 
+#include "runtime/rocr_spin_tamer.h"
 #include "runtime/thread_name.h"
-#include "server/rocr_spin_tamer.h"
 #include "support/scoped_env.h"
 
 #if defined(__linux__)
 #include <sched.h>
-#include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -31,10 +30,6 @@ TEST_CASE("rocr spin tamer disabled via env returns 0", "[rocr_spin_tamer]") {
 }
 
 #if defined(__linux__)
-namespace {
-
-pid_t CurrentTid() { return static_cast<pid_t>(syscall(SYS_gettid)); }
-} // namespace
 
 // The spin loop lives alone in its own linker section; the linker-provided
 // __start_/__stop_ symbols bound exactly its code, giving the tests a precise
@@ -95,7 +90,7 @@ public:
         if (name) {
           inferflux::SetCurrentThreadName(name);
         }
-        tids_[i].store(CurrentTid());
+        tids_[i].store(inferflux::CurrentThreadId());
         RocrTamerTestSpinUntil(&stop_);
       });
     }
@@ -217,5 +212,32 @@ TEST_CASE("rocr spin tamer confines a poller that inherited a thread name",
   // name. Names must not exclude them; only the PC proof decides.
   SpinnerGroup spinners(1, "if-registry");
   REQUIRE(ScanUntil(1, OwnedBy(InTestSpinLoop)) == 1);
+}
+TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
+          "[rocr_spin_tamer]") {
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
+  // The predicate is consulted once per replied sample, so its call count
+  // also proves the probe really sampled the thread. A spinner running owner
+  // code for only 1 of 3 samples is rejected; 2 of 3 is enough.
+  auto first_n_owned = [](int n) {
+    auto calls = std::make_shared<std::atomic<int>>(0);
+    return OwnedBy([calls, n](std::uintptr_t pc) {
+      return InTestSpinLoop(pc) && calls->fetch_add(1) < n;
+    });
+  };
+  {
+    SpinnerGroup spinners(1);
+    REQUIRE(inferflux::TameRuntimeSpinThreads(first_n_owned(1)) == 0);
+  }
+  {
+    SpinnerGroup spinners(1);
+    // Retry with a fresh predicate: a loaded runner may miss the window.
+    int confined = 0;
+    for (int attempt = 0; attempt < 3 && confined == 0; ++attempt) {
+      confined = inferflux::TameRuntimeSpinThreads(first_n_owned(2));
+    }
+    REQUIRE(confined == 1);
+  }
 }
 #endif // defined(__linux__)

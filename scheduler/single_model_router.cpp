@@ -2,9 +2,9 @@
 
 #include "model/model_format.h"
 #include "runtime/backends/backend_factory.h"
+#include "runtime/rocr_spin_tamer.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
-#include "server/rocr_spin_tamer.h"
 
 #include <algorithm>
 #include <filesystem>

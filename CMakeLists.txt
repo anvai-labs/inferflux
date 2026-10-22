@@ -177,8 +177,8 @@ add_library(inferflux_core STATIC
   server/startup_advisor_rocm.cpp
   server/startup_advisor.cpp
   server/startup_advisor.h
-  server/rocr_spin_tamer.cpp
-  server/rocr_spin_tamer.h
+  runtime/rocr_spin_tamer.cpp
+  runtime/rocr_spin_tamer.h
   policy/policy_store.cpp
   policy/policy_store.h
   policy/opa_client.cpp
@@ -570,7 +570,7 @@ target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto OpenSSL::SSL yaml-cp
 if(UNIX AND NOT APPLE)
   target_link_libraries(inferflux_core PUBLIC rt)
 endif()
-# dlopen/dladdr (server/rocr_spin_tamer.cpp) live in libdl on glibc < 2.34.
+# dlopen/dladdr (runtime/rocr_spin_tamer.cpp) live in libdl on glibc < 2.34.
 target_link_libraries(inferflux_core PUBLIC ${CMAKE_DL_LIBS})
 
 # §2.2 Multimodal support via libmtmd (ENABLE_MTMD=OFF by default)

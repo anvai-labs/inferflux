@@ -3,6 +3,11 @@
 #if defined(__linux__) || defined(__APPLE__)
 #include <pthread.h>
 #endif
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
 
 namespace inferflux {
 
@@ -24,5 +29,13 @@ inline void SetCurrentThreadName(const char *name) {
   (void)name;
 #endif
 }
+
+#if defined(__linux__)
+/// Kernel thread id of the calling thread (the TID in /proc/self/task).
+/// Async-signal-safe: a single raw syscall.
+inline pid_t CurrentThreadId() {
+  return static_cast<pid_t>(syscall(SYS_gettid));
+}
+#endif
 
 } // namespace inferflux

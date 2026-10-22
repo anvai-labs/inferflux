@@ -11,6 +11,7 @@
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/prefix_cache/prefix_cache.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
+#include "runtime/rocr_spin_tamer.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "runtime/string_utils.h"
 #include "scheduler/model_registry.h"
@@ -28,7 +29,6 @@
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 #include "server/policy/guardrail.h"
-#include "server/rocr_spin_tamer.h"
 #include "server/startup_advisor.h"
 
 #include <algorithm>
@@ -1749,13 +1749,13 @@ int main(int argc, char **argv) {
     inferflux::RunStartupAdvisor(advisor_ctx);
   }
 
-  // ROCr spin-thread tamer (WSL2/ROCm AsyncEventsLoop workaround). Each
-  // model load already queues a scan; this one covers HIP initialized by
-  // backend probing with no model loaded. Async: the classifier needs a
-  // ~1.2 s window and must not block startup. First-party threads are named
-  // (runtime/thread_name.h), so they are never candidates regardless of
-  // timing.
-  inferflux::TameRuntimeSpinThreadsAsync();
+  // ROCr spin-thread tamer (WSL2/ROCm AsyncEventsLoop workaround). Every
+  // LoadModel attempt above already queued a background scan; with no
+  // configured models, HIP may still have been initialized by backend
+  // probing, so queue one here. Async: never blocks startup.
+  if (configured_models.empty()) {
+    inferflux::TameRuntimeSpinThreadsAsync();
+  }
 
   int http_workers = 16; // Increased from 4 for better concurrent throughput
   if (const char *env_workers = std::getenv("INFERFLUX_HTTP_WORKERS")) {
