@@ -4,8 +4,8 @@ Status: Proposed
 Date: 2026-10-21 (rev 2 — incorporates adversarial design review; rev 1
 gaps listed under Revision history)
 Owners: Runtime (InferFlux); consumers: Gateway (Sandhi metering), Agent (Victor)
-Dependencies: #241 (stateless-Generate decode-burst fix), #248 (stateless
-admission cost), ADR-0005 (trusted-GPU release evidence). Tracks #243 item 4.
+Dependencies: ADR-0005 (trusted-GPU release evidence). Tracks #243 item 4
+and the #241/#248 scheduler repairs it builds on.
 
 ## Context
 

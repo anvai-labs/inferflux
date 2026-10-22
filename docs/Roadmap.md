@@ -97,6 +97,7 @@ gantt
 1. **Baseline gate:** no feature implementation merges while the portable build/test contract is red.
 2. **Runtime gate:** continue native CUDA investment only when retained evidence meets ADR-0001 thresholds; otherwise use the compatibility provider as the primary data plane.
 3. **Release gate:** require exact-SHA CUDA and ROCm evidence without exposing the persistent GPU host to pull-request code (ADR-0005).
+4b. **Cache-path gate:** logprobs and structured-output traffic rides the phased, cache-eligible execution path (ADR-0007) -- metering clients stop observing zero cache ratios by construction.
 4. **Adoption gate:** local autostart must preserve the same API/policy semantics as remote serving.
 5. **Tenant gate:** reusable cache, adapter, session, and audit state must share one tenant identity boundary.
 6. **Scale gate:** no distributed maturity claim precedes deterministic ownership and cleanup tests.

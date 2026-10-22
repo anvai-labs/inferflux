@@ -296,6 +296,12 @@ public:
   virtual std::string LoadError() const { return ""; }
   virtual bool IsReady() const { return false; }
 
+  // ADR-0007 Stage 1 scope boundary: true when this backend's unified batch
+  // execution honors logprob_top_n capture. Llama-family default true;
+  // variants routing unified execution elsewhere (MLX, native runtimes)
+  // override to false so logprob requests keep the legacy path.
+  virtual bool SupportsUnifiedLogprobCapture() const { return true; }
+
   virtual bool SupportsVision() const { return false; }
 
   virtual bool IsMoE() const { return false; }

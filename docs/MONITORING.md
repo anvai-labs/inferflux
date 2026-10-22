@@ -32,6 +32,7 @@ flowchart LR
 | Row-pair kernel usage | `inferflux_cuda_rowpair_selection_total{phase=...,operator=...,bucket=...}` | Correlates multi-row batches (bucket ≥2) to the actual row-pair code paths for FFN gate/up (`q8_1_group_row_pair_w4`) and down-proj (`q8_1_gemv_row_pair*`). Use the bucket label to validate only grouped workloads triggered the specialized kernels before enabling them by default. |
 | Native KV planning | `inferflux_cuda_kv_active_sequences`, `inferflux_cuda_kv_max_sequences`, `inferflux_cuda_kv_autotune_events_total`, `inferflux_cuda_kv_requested_max_seq`, `inferflux_cuda_kv_planned_max_seq`, `inferflux_cuda_kv_budget_bytes` |
 | Distributed KV health | `inferflux_disagg_kv_tickets_total{stage=...}`, `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt` |
+| Cache execution path | `inferflux_cache_execution_path_total{path=...}` | `phased`, `full_generate`, `full_generate_images` -- the bypass population is visible directly; `INFERFLUX_DISABLE_PHASED_LOGPROBS=1` moves logprobs traffic back to `full_generate` (ADR-0007 Stage 1) |
 | Cache reuse | `inferflux_prefix_hits_total`, `inferflux_prefix_partial_hits_total`, `inferflux_prefix_matched_tokens_total`, `inferflux_kv_prefix_reuse_total` |
 
 ## Cache counter scopes
