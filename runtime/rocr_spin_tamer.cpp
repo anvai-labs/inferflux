@@ -78,6 +78,9 @@ struct ThreadSample {
   bool has_schedstat = false;
   unsigned long long run_ns = 0;
   unsigned long long wait_ns = 0;
+  // When this thread's counters were read; each thread's window runs from
+  // its own first read to its own second read.
+  std::chrono::steady_clock::time_point read_at{};
 };
 
 bool Cancelled(const std::atomic<bool> *cancelled) {
@@ -175,6 +178,7 @@ std::unordered_map<pid_t, ThreadSample> SampleAllThreads() {
     }
     sample.voluntary_switches = static_cast<long long>(voluntary);
     sample.has_schedstat = ReadSchedstat(tid, &sample.run_ns, &sample.wait_ns);
+    sample.read_at = std::chrono::steady_clock::now();
     samples.emplace(tid, sample);
   }
   return samples;
@@ -211,9 +215,16 @@ unsigned long long g_scan_seq = 0;
 // no longer exist (exited, or TID reused). Returns the scan's sequence.
 unsigned long long
 BeginScan(const std::unordered_map<pid_t, ThreadSample> &alive) {
+  // A thread missing from the snapshot may only have had a transient /proc
+  // read failure; re-read it before forgetting it (a confined thread that is
+  // forgotten would be confined and counted again).
   const auto is_dead = [&alive](const ThreadKey &key) {
     const auto it = alive.find(key.first);
-    return it == alive.end() || it->second.starttime != key.second;
+    if (it != alive.end()) {
+      return it->second.starttime != key.second;
+    }
+    ThreadSample now;
+    return !ReadThreadStat(key.first, &now) || now.starttime != key.second;
   };
   std::lock_guard<std::mutex> lock(g_memory_mutex);
   for (auto it = g_confined.begin(); it != g_confined.end();) {
@@ -351,7 +362,10 @@ int ProbeSignal() {
 //    The check and the signal cannot be made atomic from user space, so this
 //    minimizes rather than eliminates that window; spinners are always 'R';
 //  - its mask must neither block (RT signals queue rather than coalesce) nor
-//    ignore the probe.
+//    ignore the probe;
+//  - no earlier probe may still be pending for it (one that timed out): a
+//    second signal would queue behind it, and the late delivery could be
+//    counted as a fresh sample.
 bool SafeToProbe(const ThreadKey &key, int sig) {
   ThreadSample now;
   if (!ReadThreadStat(key.first, &now) || now.starttime != key.second ||
@@ -359,10 +373,12 @@ bool SafeToProbe(const ThreadKey &key, int sig) {
     return false;
   }
   const unsigned long long bit = 1ULL << (sig - 1);
-  unsigned long long masks[2] = {0, 0}; // SigBlk, SigIgn
-  return ReadStatusFields(key.first, {{"SigBlk:", 16}, {"SigIgn:", 16}},
+  unsigned long long masks[3] = {0, 0, 0}; // SigPnd, SigBlk, SigIgn
+  return ReadStatusFields(key.first,
+                          {{"SigPnd:", 16}, {"SigBlk:", 16}, {"SigIgn:", 16}},
                           masks) &&
-         (masks[0] & bit) == 0 && (masks[1] & bit) == 0;
+         (masks[0] & bit) == 0 && (masks[1] & bit) == 0 &&
+         (masks[2] & bit) == 0;
 }
 
 // Waits for `done()` up to `timeout_ms`, giving up early on cancellation.
@@ -451,12 +467,15 @@ Verdict ProveOwner(pid_t pid, const ThreadKey &key,
   return Verdict::kNotProven;
 }
 
-// Resolves the pin target from the confined thread's own affinity mask (the
-// ROCr runtime widens its threads to every CPU the process may use; the
-// main thread's mask can be narrower). Returns false when pinning must be
-// skipped (single-CPU mask). An invalid INFERFLUX_ROCR_TAME_CORE
-// (unparseable, out of range, or outside the mask) warns once and falls
-// back to the highest allowed CPU.
+int g_tame_core = -1; // Shared pin target once chosen; g_memory_mutex.
+
+// Resolves the pin target. All confined threads share one core (the first
+// one chosen) so the cost stays bounded to a single core; the target comes
+// from the confined thread's own affinity mask (ROCr widens its threads to
+// every CPU the process may use; the main thread's mask can be narrower).
+// Returns false when pinning must be skipped (single-CPU mask). An invalid
+// INFERFLUX_ROCR_TAME_CORE (unparseable, out of range, or outside the mask)
+// warns once and falls back to the highest allowed CPU.
 bool ChooseTameCore(pid_t tid, int *tame_core) {
   cpu_set_t allowed;
   CPU_ZERO(&allowed);
@@ -474,12 +493,21 @@ bool ChooseTameCore(pid_t tid, int *tame_core) {
   if (count <= 1) {
     return false; // Nothing to gain from pinning.
   }
+  {
+    std::lock_guard<std::mutex> lock(g_memory_mutex);
+    if (g_tame_core >= 0 && CPU_ISSET(g_tame_core, &allowed)) {
+      *tame_core = g_tame_core;
+      return true;
+    }
+  }
   // Valid CPU indices are [0, CPU_SETSIZE - 1]; an index of CPU_SETSIZE
   // would make CPU_ISSET/CPU_SET address past the end of cpu_set_t.
   const int requested =
       ParseIntEnv("INFERFLUX_ROCR_TAME_CORE", -1, 0, CPU_SETSIZE - 1);
   if (requested >= 0 && CPU_ISSET(requested, &allowed)) {
     *tame_core = requested;
+    std::lock_guard<std::mutex> lock(g_memory_mutex);
+    g_tame_core = requested;
     return true;
   }
   const char *raw = std::getenv("INFERFLUX_ROCR_TAME_CORE");
@@ -490,6 +518,8 @@ bool ChooseTameCore(pid_t tid, int *tame_core) {
                               std::to_string(highest));
   }
   *tame_core = highest;
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  g_tame_core = highest;
   return true;
 }
 
@@ -505,9 +535,11 @@ std::atomic<int> g_next_spin_name{0}; // Unique rocr-spin-N across scans.
 bool ConfineThread(const ThreadKey &key, int *pinned_cpu) {
   const pid_t tid = key.first;
   *pinned_cpu = -1;
-  // The proof can take a while; refuse if the TID now names another thread.
+  // The proof can take a while; refuse if the TID now names another thread
+  // or belongs to InferFlux itself.
   ThreadSample now;
-  if (!ReadThreadStat(tid, &now) || now.starttime != key.second) {
+  if (!ReadThreadStat(tid, &now) || now.starttime != key.second ||
+      IsFirstPartyThread(tid)) {
     return false;
   }
   switch (ClaimConfinement(key)) {
@@ -592,7 +624,6 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   const pid_t self = CurrentThreadId();
 
   const auto first = SampleAllThreads();
-  const auto window_start = std::chrono::steady_clock::now();
   for (int slept = 0; slept < kWindowMs; slept += kSleepSliceMs) {
     if (Cancelled(cancelled)) {
       return 0; // Process is exiting: don't touch metrics or statics.
@@ -601,16 +632,8 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   }
   const auto second = SampleAllThreads();
   const unsigned long long scan = BeginScan(second);
-  const long long window_ns =
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - window_start)
-          .count();
-  const unsigned long long min_runnable_ns =
-      static_cast<unsigned long long>(window_ns) / 100 * kMinRunnablePercent;
   const long hz = sysconf(_SC_CLK_TCK);
   const long ticks_per_second = hz > 0 ? hz : 100; // No USER_HZ assumption.
-  const long min_busy_ticks = static_cast<long>(
-      window_ns / 1000000 * ticks_per_second * kMinRunnablePercent / 100000);
 
   // Stage 1 prefilter: threads that never blocked during the window.
   std::vector<ThreadKey> candidates;
@@ -632,13 +655,25 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
       continue; // TID reused by a different thread inside the window.
     }
     const ThreadKey key{tid, after.starttime};
-    if (SkipThisScan(key, scan)) {
+    // InferFlux's own threads may busy-wait inside libhsa-runtime64 (e.g. a
+    // long hipStreamSynchronize on WSL2, where waits poll); executing ROCr
+    // code does not make them ROCr's pollers. Never consider them.
+    if (IsFirstPartyThread(tid) || SkipThisScan(key, scan)) {
       continue;
     }
     const long utime_delta = after.utime_ticks - before.utime_ticks;
     const long stime_delta = after.stime_ticks - before.stime_ticks;
     const long long voluntary_delta =
         after.voluntary_switches - before.voluntary_switches;
+    // This thread's own window: from its first read to its second read.
+    const long long window_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(after.read_at -
+                                                             before.read_at)
+            .count();
+    const unsigned long long min_runnable_ns =
+        static_cast<unsigned long long>(window_ns) / 100 * kMinRunnablePercent;
+    const long min_busy_ticks = static_cast<long>(
+        window_ns / 1000000 * ticks_per_second * kMinRunnablePercent / 100000);
     if (stime_delta <= kMaxStimeDeltaTicks && voluntary_delta == 0 &&
         AlwaysRunnable(before, after, utime_delta, min_runnable_ns,
                        min_busy_ticks)) {

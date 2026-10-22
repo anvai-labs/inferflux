@@ -1,5 +1,4 @@
 #include "server/http/http_server.h"
-#include "runtime/thread_name.h"
 #include <yaml-cpp/yaml.h>
 
 #include "server/http/completion_payload.h"
@@ -14,6 +13,7 @@
 #include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/string_utils.h"
 #include "runtime/text/response_splitter.h"
+#include "runtime/thread_name.h"
 #include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"

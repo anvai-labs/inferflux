@@ -284,8 +284,10 @@ time, and zero voluntary context switches. Thread names are ignored (Linux
 threads inherit their creator's name). Each shortlisted thread is then
 interrupted with a probe signal (up to 3 times; threads that block or
 ignore it are never signalled) and confined only if at least 2 sampled
-instruction pointers resolve into `libhsa-runtime64`. A busy CPU threadpool
-or any other non-ROCr thread is never confined; a thread that is not proven
+instruction pointers resolve into `libhsa-runtime64`. InferFlux's own
+threads register themselves and are never probed, even when an inference
+thread busy-waits inside `libhsa-runtime64` (as `hipStreamSynchronize` does
+on WSL2). A busy CPU threadpool or other non-ROCr thread is never confined; a thread that is not proven
 backs off for 1, 2, 4, ... up to 12 scans (~1 h) before it is probed again,
 so it receives at most 2 `SA_RESTART` probe signals per back-off period. At most 8 live
 threads are confined at once. InferFlux's own threads are named `if-*` for

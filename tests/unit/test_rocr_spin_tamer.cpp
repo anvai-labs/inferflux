@@ -105,8 +105,11 @@ bool ProbePending(pid_t tid) {
 class SpinnerGroup {
 public:
   struct Options {
-    const char *name = nullptr; // Thread name to set before spinning.
-    bool block_probe = false;   // Block the probe signal before spinning.
+    // Thread name set with raw pthread_setname_np (simulates a name inherited
+    // from a creator, without registering the thread as first-party).
+    const char *inherited_name = nullptr;
+    bool first_party = false; // MarkFirstPartyThread() before spinning.
+    bool block_probe = false; // Block the probe signal before spinning.
   };
 
   explicit SpinnerGroup(int count) : SpinnerGroup(count, Options{}) {}
@@ -116,8 +119,11 @@ public:
     for (int i = 0; i < count; ++i) {
       tids_[i].store(0);
       threads_.emplace_back([this, i, options] {
-        if (options.name) {
-          inferflux::SetCurrentThreadName(options.name);
+        if (options.inherited_name) {
+          pthread_setname_np(pthread_self(), options.inherited_name);
+        }
+        if (options.first_party) {
+          inferflux::MarkFirstPartyThread();
         }
         if (options.block_probe) {
           sigset_t set;
@@ -156,9 +162,11 @@ private:
   std::vector<std::thread> threads_;
 };
 
-// Ownership predicate that counts every replied sample it is asked about,
-// so tests can prove the probe really ran. Answers "owned" for the first
-// `owned` calls on test-loop PCs and "not owned" after that.
+// Ownership predicate that counts replied samples from the test spin loop,
+// so tests can prove the probe really ran. PCs from any other thread in the
+// test process are answered "not owned" without being counted, so stray
+// threads cannot disturb the counts. Answers "owned" for the first `owned`
+// counted calls and "not owned" after that.
 struct CountingOwner {
   std::shared_ptr<std::atomic<int>> calls =
       std::make_shared<std::atomic<int>>(0);
@@ -170,8 +178,10 @@ struct CountingOwner {
     auto counter = calls;
     const int limit = owned;
     options.pc_owner = [counter, limit](std::uintptr_t pc) {
-      const int call = counter->fetch_add(1);
-      return InTestSpinLoop(pc) && call < limit;
+      if (!InTestSpinLoop(pc)) {
+        return false;
+      }
+      return counter->fetch_add(1) < limit;
     };
     return options;
   }
@@ -316,9 +326,28 @@ TEST_CASE("rocr spin tamer confines a poller that inherited a thread name",
   // registry reload or admin load runs on "if-registry"/"if-http" carry that
   // name. Names must not exclude them; only the PC proof decides.
   SpinnerGroup::Options named;
-  named.name = "if-registry";
+  named.inherited_name = "if-registry";
   SpinnerGroup spinners(1, named);
   REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
+}
+
+TEST_CASE("rocr spin tamer never confines a first-party thread",
+          "[rocr_spin_tamer]") {
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  // An InferFlux inference thread can busy-wait inside libhsa-runtime64
+  // (hipStreamSynchronize on WSL2 polls). Executing owner code must not make
+  // it a confinement target: registered threads are never probed.
+  SpinnerGroup::Options ours;
+  ours.first_party = true;
+  SpinnerGroup spinners(1, ours);
+  CountingOwner owner;
+  owner.owned = 1000;
+  int confined = 0;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    confined += inferflux::TameRuntimeSpinThreads(owner.Options());
+  }
+  REQUIRE(owner.calls->load() == 0);
+  REQUIRE(confined == 0);
 }
 
 TEST_CASE("rocr spin tamer never signals a thread that blocks the probe",
