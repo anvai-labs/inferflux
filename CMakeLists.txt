@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(InferFlux VERSION 0.5.2 LANGUAGES CXX)
+project(InferFlux VERSION 0.5.3 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
