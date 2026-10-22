@@ -295,6 +295,11 @@ void MetricsRegistry::RecordPrefixLookup(bool hit) {
   }
 }
 
+void MetricsRegistry::RecordCacheExecutionPath(const std::string &path) {
+  std::lock_guard<std::mutex> lock(cache_execution_path_mutex_);
+  cache_execution_path_counts_[path] += 1;
+}
+
 void MetricsRegistry::RecordPrefixMatchedTokens(int tokens) {
   if (tokens <= 0)
     return;
@@ -1487,6 +1492,17 @@ std::string MetricsRegistry::RenderPrometheus() const {
       << batch_exec_latency_.sum_ms.load() << "\n";
   out << "inferflux_batch_exec_duration_ms_count{backend=\"" << backend
       << "\"} " << batch_exec_latency_.total.load() << "\n";
+
+  out << "# HELP inferflux_cache_execution_path_total Requests admitted by "
+         "cache execution path\n";
+  out << "# TYPE inferflux_cache_execution_path_total counter\n";
+  {
+    std::lock_guard<std::mutex> lock(cache_execution_path_mutex_);
+    for (const auto &kv : cache_execution_path_counts_) {
+      out << "inferflux_cache_execution_path_total{path=\"" << kv.first
+          << "\"} " << kv.second << "\n";
+    }
+  }
 
   out << "# HELP inferflux_prefix_hits_total Prefix cache hits\n";
   out << "# TYPE inferflux_prefix_hits_total counter\n";

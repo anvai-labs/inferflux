@@ -1412,6 +1412,13 @@ LlamaCppBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
     } else {
       results[static_cast<std::size_t>(i)].token = tok;
       results[static_cast<std::size_t>(i)].piece = TokenToString(tok);
+      if (inputs[i].logprob_top_n >= 0) {
+        results[static_cast<std::size_t>(i)].step_logprob =
+            CollectLogprobFromRow(logits, tok,
+                                  results[static_cast<std::size_t>(i)].piece,
+                                  inputs[i].logprob_top_n);
+        results[static_cast<std::size_t>(i)].has_step_logprob = true;
+      }
       LogTokenTrace("batch_decode", -1, inputs[i].sequence_id, "", 0,
                     inputs[i].n_past, tok,
                     results[static_cast<std::size_t>(i)].piece);
@@ -1599,6 +1606,11 @@ LlamaCppBackend::ExecuteUnifiedBatch(
           } else {
             results[i].token = tok;
             results[i].piece = TokenToString(tok);
+            if (inp.logprob_top_n >= 0) {
+              results[i].step_logprob = CollectLogprobFromRow(
+                  logits, tok, results[i].piece, inp.logprob_top_n);
+              results[i].has_step_logprob = true;
+            }
             LogTokenTrace("unified_batch", inp.request_id, inp.sequence_id,
                           inp.client_request_id, inp.sequence_generation,
                           inp.n_past + static_cast<int>(inp.tokens.size()), tok,
@@ -1634,6 +1646,11 @@ LlamaCppBackend::ExecuteUnifiedBatch(
         } else {
           results[i].token = tok;
           results[i].piece = TokenToString(tok);
+          if (inp.logprob_top_n >= 0) {
+            results[i].step_logprob = CollectLogprobFromRow(
+                logits, tok, results[i].piece, inp.logprob_top_n);
+            results[i].has_step_logprob = true;
+          }
           LogTokenTrace("unified_batch", inp.request_id, inp.sequence_id,
                         inp.client_request_id, inp.sequence_generation,
                         inp.n_past + static_cast<int>(inp.tokens.size()), tok,
@@ -1894,6 +1911,17 @@ TokenLogprob LlamaCppBackend::CollectLogprob(int token_id,
                                              int top_n) const {
   const float *logits = llama_get_logits(context_);
   return ComputeLogprob(logits, n_vocab_, token_id, token_str, top_n,
+                        [this](int32_t id) { return TokenToString(id); });
+}
+
+// Row-parameterized variant for the unified batch sampling block, where the
+// per-sequence row comes from llama_get_logits_ith (ADR-0007 Stage 1). Same
+// math derivation as CollectLogprob.
+TokenLogprob
+LlamaCppBackend::CollectLogprobFromRow(const float *row, int token_id,
+                                       const std::string &token_str,
+                                       int top_n) const {
+  return ComputeLogprob(row, n_vocab_, token_id, token_str, top_n,
                         [this](int32_t id) { return TokenToString(id); });
 }
 

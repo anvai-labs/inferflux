@@ -39,7 +39,8 @@ bool IsNonAccumulatingCompletion(std::string_view text) {
 bool IsVisibleGeneratedPiece(std::string_view piece) { return !piece.empty(); }
 
 bool AppendGeneratedPiece(InferenceRequest *req, std::string_view raw_piece,
-                          std::string *completion, MetricsRegistry *metrics) {
+                          std::string *completion, MetricsRegistry *metrics,
+                          const TokenLogprob *lp = nullptr) {
   if (!req || !completion || !metrics) {
     return false;
   }
@@ -268,6 +269,7 @@ MakeUnifiedBatchInput(const InferenceRequest &req, int n_past,
   input.request_id = static_cast<int64_t>(req.id);
   input.client_request_id = req.client_request_id;
   input.sequence_generation = req.sequence_generation;
+  input.logprob_top_n = req.collect_logprobs ? req.logprob_top_n : -1;
   return input;
 }
 
@@ -288,7 +290,9 @@ bool BurstStepEligible(
   }
   for (const auto &input : batch_inputs) {
     if (input.tokens.size() != 1 || !input.request_logits ||
-        input.sampling.temperature > 0.0f) {
+        input.sampling.temperature > 0.0f || input.logprob_top_n >= 0) {
+      // logprob-carrying requests are burst-ineligible (ADR-0007 Stage 1):
+      // the burst fast path does not produce per-token logprobs.
       return false;
     }
   }
@@ -579,8 +583,7 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     }
     if (!req->embedding_request && HasValidUnifiedPhasedState(*req) &&
         !req->response_format.constraint.has_grammar &&
-        !req->collect_logprobs && !req->response_format.has_format && be &&
-        be->IsReady()) {
+        !req->response_format.has_format && be && be->IsReady()) {
       auto *key = be.get();
       auto it = group_index_by_backend.find(key);
       if (it == group_index_by_backend.end()) {
@@ -834,6 +837,7 @@ BatchExecutor::ExecutionOutcome BatchExecutor::ExecuteRequest(
                             lp_out, inference.first_token, inference.stop);
       } else if (inference.has_images && backend->SupportsVision()) {
         inference.cache_execution_path = "full_generate_images";
+        metrics_.RecordCacheExecutionPath(inference.cache_execution_path);
         inference.cache_reused_tokens = 0;
         inference.cache_prefill_complete = false;
         text = backend->GenerateWithImages(inference.prompt, inference.images,
@@ -1042,7 +1046,6 @@ BatchExecutor::ExecuteBatchDecodePhased(
     // fresh).
     if (req->first_token >= 0) {
       states[i].current_token = req->first_token;
-
       std::string piece = req->first_piece;
       if (IsVisibleGeneratedPiece(piece)) {
         states[i].tokens_generated = 1;
@@ -1186,11 +1189,19 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
     if (req->n_past >= 0 && req->first_token >= 0) {
       states[i].current_token = req->first_token;
 
+      const TokenLogprob *seed_lp = nullptr;
+      if (req->collect_logprobs && req->has_first_logprob) {
+        req->accumulated_logprobs.push_back(req->first_logprob);
+        seed_lp = &req->accumulated_logprobs.back();
+        req->has_first_logprob = false;
+      }
+
       std::string piece = req->first_piece;
       bool stop_hit = false;
       if (IsVisibleGeneratedPiece(piece)) {
         states[i].tokens_generated = 1;
-        stop_hit = AppendGeneratedPiece(req, piece, &out.completion, &metrics_);
+        stop_hit = AppendGeneratedPiece(req, piece, &out.completion, &metrics_,
+                                        seed_lp);
 
         if (stop_hit ||
             (req->cancellation_flag && req->cancellation_flag->load())) {
@@ -1366,12 +1377,16 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
             continue;
           }
           states[i].current_token = res.token;
+          if (req->collect_logprobs && res.has_step_logprob) {
+            req->accumulated_logprobs.push_back(res.step_logprob);
+          }
           std::string piece = res.piece;
           bool stop_hit = false;
           if (IsVisibleGeneratedPiece(piece)) {
             states[i].tokens_generated++;
             stop_hit = AppendGeneratedPiece(
-                req, piece, &outcomes[i].result.completion, &metrics_);
+                req, piece, &outcomes[i].result.completion, &metrics_,
+                res.has_step_logprob ? &res.step_logprob : nullptr);
 
             if (stop_hit) {
               states[i].active = false;
@@ -1397,12 +1412,16 @@ BatchExecutor::ExecuteUnifiedBatchPhased(
         }
 
         states[i].current_token = res.token;
+        if (req->collect_logprobs && res.has_step_logprob) {
+          req->accumulated_logprobs.push_back(res.step_logprob);
+        }
         std::string piece = res.piece;
         bool stop_hit = false;
         if (IsVisibleGeneratedPiece(piece)) {
           states[i].tokens_generated++;
           stop_hit = AppendGeneratedPiece(
-              req, piece, &outcomes[i].result.completion, &metrics_);
+              req, piece, &outcomes[i].result.completion, &metrics_,
+              res.has_step_logprob ? &res.step_logprob : nullptr);
           if (req->cancellation_flag && req->cancellation_flag->load()) {
             states[i].active = false;
           }
@@ -1548,8 +1567,10 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
   if (active_prefill_reqs == 0 && active_decode_reqs == 1) {
     InferenceRequest *burst_req = nullptr;
     for (auto *req : active_reqs) {
-      if (!req->execution.in_prefill &&
+      if (!req->execution.in_prefill && !req->collect_logprobs &&
           req->execution.tokens_generated < req->execution.decode_limit) {
+        // logprob-carrying requests skip the single-request greedy burst
+        // (ADR-0007 Stage 1): it produces no per-token logprobs.
         burst_req = req;
         break;
       }
@@ -1739,13 +1760,17 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
         }
         req->execution.current_token = res.token;
         req->n_past = req->prefill_offset;
+        if (res.has_step_logprob && req->collect_logprobs) {
+          req->accumulated_logprobs.push_back(res.step_logprob);
+        }
 
         std::string piece = res.piece;
         bool stop_hit = false;
         if (IsVisibleGeneratedPiece(piece)) {
           req->execution.tokens_generated++;
           stop_hit = AppendGeneratedPiece(
-              req, piece, &req->execution.result.completion, &metrics_);
+              req, piece, &req->execution.result.completion, &metrics_,
+              res.has_step_logprob ? &res.step_logprob : nullptr);
           if (stop_hit)
             req->execution.active = false;
         } else if (++req->execution.non_emitting_steps >=
@@ -1769,13 +1794,17 @@ void BatchExecutor::ExecuteUnifiedBatchStep(
         continue;
       }
       req->execution.current_token = res.token;
+      if (res.has_step_logprob && req->collect_logprobs) {
+        req->accumulated_logprobs.push_back(res.step_logprob);
+      }
 
       std::string piece = res.piece;
       bool stop_hit = false;
       if (IsVisibleGeneratedPiece(piece)) {
         req->execution.tokens_generated++;
         stop_hit = AppendGeneratedPiece(
-            req, piece, &req->execution.result.completion, &metrics_);
+            req, piece, &req->execution.result.completion, &metrics_,
+            res.has_step_logprob ? &res.step_logprob : nullptr);
         if (req->cancellation_flag && req->cancellation_flag->load()) {
           req->execution.active = false;
         }

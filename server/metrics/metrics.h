@@ -53,6 +53,7 @@ public:
   void RecordBatchTokenBudgetSkip();
   void RecordPrefixAffinityProbe(bool hit, int matched_tokens);
   void RecordPrefixLookup(bool hit);
+  void RecordCacheExecutionPath(const std::string &path);
   void RecordPrefixMatchedTokens(int tokens);
   void RecordPartialPrefixHit();
   // One finalized execution event drives both legacy aggregates and per-model
@@ -362,6 +363,8 @@ private:
   std::atomic<uint64_t> scheduler_prefix_affinity_matched_tokens_{0};
   std::atomic<uint64_t> prefix_hits_{0};
   std::atomic<uint64_t> prefix_misses_{0};
+  std::unordered_map<std::string, uint64_t> cache_execution_path_counts_;
+  mutable std::mutex cache_execution_path_mutex_;
   std::atomic<uint64_t> prefix_matched_tokens_{0};
   std::atomic<uint64_t> prefix_partial_hits_{0};
   std::atomic<uint64_t> kv_prefix_reuse_count_{0};

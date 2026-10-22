@@ -66,10 +66,14 @@ public:
     int sequence_id;
     int n_past;
     int feed_token;
+    // ADR-0007 Stage 1 logprob capture (see UnifiedBatchInput).
+    int logprob_top_n{-1};
   };
   struct BatchDecodeOutput {
     int token{-1};
     std::string piece;
+    TokenLogprob step_logprob;
+    bool has_step_logprob{false};
   };
   struct BurstDecodeOutput {
     int token{-1};
@@ -222,6 +226,9 @@ private:
   std::vector<int> Tokenize(const std::string &prompt, bool add_bos) const;
   std::string TokenToString(int token) const;
 
+  TokenLogprob CollectLogprobFromRow(const float *row, int token_id,
+                                     const std::string &token_str,
+                                     int top_n) const;
   TokenLogprob CollectLogprob(int token_id, const std::string &token_str,
                               int top_n) const;
 

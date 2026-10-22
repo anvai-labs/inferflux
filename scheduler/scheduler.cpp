@@ -300,17 +300,40 @@ bool TokensHavePrefix(const std::vector<int> &tokens,
   return std::equal(prefix.begin(), prefix.end(), tokens.begin());
 }
 
+// ADR-0007 Stage 1 kill switch: restores the pre-Stage-1 routing that keeps
+// logprobs requests on the legacy Generate() path.
+bool PhasedLogprobsDisabled() {
+  // Read per call (admission rate, not per-token): keeps the switch
+  // live-tunable and directly testable in-process.
+  const char *env = std::getenv("INFERFLUX_DISABLE_PHASED_LOGPROBS");
+  return env != nullptr && std::string(env) != "0" &&
+         std::string(env) != "false";
+}
+
+// ADR-0007 scope boundary: native backends implement their own unified
+// execution and never reach the llama sampling block Stage 1 extends, so
+// logprobs/structured requests stay on the legacy path there.
+bool BackendKeepsLegacyLogprobPath(const std::string &backend_name) {
+  return backend_name.rfind("inferflux_", 0) == 0;
+}
+
 std::size_t EstimateQueueTokenCost(const InferenceRequest &inference,
                                    bool from_decode,
                                    const FairnessConfig &fairness_config) {
   // Prefill items are still charged by prompt width; decode items should be
   // charged by per-iteration decode demand to avoid re-charging full prompts on
   // every fairness requeue.  Exceptions: requests that will run the stateless
-  // legacy Generate() path (logprobs, structured output) execute their whole
-  // decode budget inside the admitted pass, so admission must charge their
-  // prompt plus decode budget or max_batch_tokens over-packs concurrent work.
+  // legacy Generate() path (structured output, images; logprobs too on native
+  // backends and behind the kill switch) execute their whole decode budget
+  // inside the admitted pass, so admission must charge their prompt plus
+  // decode budget or max_batch_tokens over-packs concurrent work. Phased
+  // logprobs requests (ADR-0007 Stage 1) revert to prompt-width admission —
+  // their decode demand is charged from the decode queue like plain traffic.
+  const bool stateless_execution =
+      inference.has_images || inference.response_format.has_format ||
+      (inference.collect_logprobs && PhasedLogprobsDisabled());
   if (!from_decode) {
-    if (inference.collect_logprobs || inference.response_format.has_format) {
+    if (stateless_execution) {
       return std::max<std::size_t>(
           1, inference.prompt_tokens.size() +
                  static_cast<std::size_t>(std::max(1, inference.max_tokens)));
@@ -433,6 +456,9 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
     input.sampling = inference.sampling;
     input.request_id = static_cast<int64_t>(inference.id);
     input.sequence_generation = state.sequence_generation;
+    input.logprob_top_n = (inference.collect_logprobs && request_logits)
+                              ? inference.logprob_top_n
+                              : -1;
     inputs.push_back(std::move(input));
 
     std::vector<UnifiedBatchOutput> outputs;
@@ -461,6 +487,9 @@ bool ExecutePhasedPrefillStep(LlamaCppBackend *backend,
   result->n_past = static_cast<int>(prompt_tokens.size());
   result->first_token = final_output.token;
   result->first_piece = (final_output.token >= 0) ? final_output.piece : "";
+  result->first_logprob = final_output.step_logprob;
+  result->has_first_logprob =
+      final_output.has_step_logprob && final_output.token >= 0;
   return true;
 }
 
@@ -493,7 +522,8 @@ std::string ResolveResultModelId(const InferenceRequest &req) {
   return req.resolved_model.empty() ? req.model : req.resolved_model;
 }
 
-bool AppendGeneratedPiece(InferenceRequest *req, std::string_view raw_piece) {
+bool AppendGeneratedPiece(InferenceRequest *req, std::string_view raw_piece,
+                          const TokenLogprob *lp = nullptr) {
   auto assembled = req->output_utf8.Append(raw_piece);
   GlobalMetrics().RecordOutputUtf8Replacements(assembled.replacements);
   if (assembled.text.empty()) {
@@ -505,7 +535,7 @@ bool AppendGeneratedPiece(InferenceRequest *req, std::string_view raw_piece) {
       assembled.text, req->execution.result.completion, req->stop, &emit_piece);
   if (req->on_token && !emit_piece.empty()) {
     GlobalMetrics().RecordStreamTokens(1);
-    req->on_token(emit_piece, nullptr);
+    req->on_token(emit_piece, lp);
   }
   return stop_hit;
 }
@@ -571,10 +601,24 @@ void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
     const std::string piece = req->first_piece;
     req->first_piece.clear();
 
+    // First-token logprob captured at prefill (ADR-0007 Stage 1): one
+    // entry per sampled token, emitted here where the first token is
+    // consumed — mirroring legacy Decode()'s prefill entry.
+    fprintf(stderr,
+            "[DBG] prime first-token collect=%d has_lp=%d n_past=%d first=%d\n",
+            (int)req->collect_logprobs, (int)req->has_first_logprob,
+            req->n_past, req->first_token);
+    const TokenLogprob *first_lp = nullptr;
+    if (req->collect_logprobs && req->has_first_logprob) {
+      req->accumulated_logprobs.push_back(req->first_logprob);
+      first_lp = &req->accumulated_logprobs.back();
+      req->has_first_logprob = false;
+    }
+
     bool stop_hit = false;
     if (!piece.empty()) {
       req->execution.tokens_generated++;
-      stop_hit = AppendGeneratedPiece(req, piece);
+      stop_hit = AppendGeneratedPiece(req, piece, first_lp);
     } else {
       req->execution.non_emitting_steps++;
     }
@@ -673,6 +717,9 @@ void FinalizeUnifiedDecodeStepResult(InferenceRequest *req,
   result->model_id = ResolveResultModelId(*req);
   result->completion = req->accumulated_output;
   result->completion_tokens = req->fairness.total_completion_tokens;
+  if (req->collect_logprobs) {
+    result->logprobs = std::move(req->accumulated_logprobs);
+  }
   result->prompt_tokens = req->fairness.reported_prompt_tokens >= 0
                               ? req->fairness.reported_prompt_tokens
                               : static_cast<int>(req->prompt_tokens.size());
@@ -1001,7 +1048,7 @@ bool Scheduler::CanAppendToStickyStepBatchLocked(
   return pending->resolved_backend.get() == sticky_step_backend.get() &&
          HasValidUnifiedStepState(inference) &&
          !inference.response_format.constraint.has_grammar &&
-         !inference.collect_logprobs && !inference.response_format.has_format &&
+         !inference.response_format.has_format &&
          inference.response_format.supported;
 }
 
@@ -1371,7 +1418,6 @@ void Scheduler::DecodeWorkerLoop() {
           if (!HasBoundDecodeBackend(inference, backend) || !backend ||
               !backend->IsReady() || !inference.response_format.supported ||
               inference.response_format.constraint.has_grammar ||
-              inference.collect_logprobs ||
               inference.response_format.has_format) {
             return nullptr;
           }
@@ -1519,7 +1565,6 @@ void Scheduler::DecodeWorkerLoop() {
           if (!backend || !backend->IsReady() ||
               !HasValidUnifiedStepState(*inference) ||
               inference->response_format.constraint.has_grammar ||
-              inference->collect_logprobs ||
               inference->response_format.has_format) {
             use_stepwise_decode = false;
             break;
@@ -2098,6 +2143,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       }
       if (pending->resolved_backend && pending->resolved_backend->IsReady()) {
         inf.cache_execution_path = "phased";
+        metrics_->RecordCacheExecutionPath(inf.cache_execution_path);
         // Compute BPE tokens for prefix matching (INF-7).  We do this once per
         // request: if bpe_prompt_tokens is already populated (e.g., a retry
         // after channel-full rejection), reuse the cached result.
@@ -2114,12 +2160,19 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           inf.fairness.reported_prompt_tokens =
               static_cast<int>(inf.bpe_prompt_tokens.size());
         }
-        // Keep logprobs/structured-output requests on the full Generate()
-        // path so the backend can apply a single consistent sampler/grammar
-        // state. Phased prefill + Decode() would split sampler state across
-        // phases and force sequence-state handoff between heterogeneous paths.
-        if (inf.collect_logprobs || inf.response_format.has_format) {
+        // Structured-output requests stay on the full Generate() path (their
+        // sampler/grammar state is call-scoped; ADR-0007 Stage 2 moves them).
+        // Images requests keep the legacy path because phased prefill is
+        // text-only. Logprobs requests join the phased path (ADR-0007
+        // Stage 1) except on native backends and behind the kill switch.
+        const bool backend_keeps_legacy = BackendKeepsLegacyLogprobPath(
+            pending->resolved_backend ? pending->resolved_backend->Name()
+                                      : std::string());
+        if (inf.has_images || inf.response_format.has_format ||
+            (inf.collect_logprobs &&
+             (backend_keeps_legacy || PhasedLogprobsDisabled()))) {
           inf.cache_execution_path = "full_generate";
+          metrics_->RecordCacheExecutionPath(inf.cache_execution_path);
           inf.cache_reused_tokens = 0;
           inf.cache_reuse_pending_tokens = 0;
           inf.cache_prefill_complete = false;
@@ -2372,8 +2425,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           const bool can_defer_to_unified_prefill =
               !use_decode_workers_ && pending->resolved_backend &&
               pending->resolved_backend->SupportsAsyncUnifiedBatch() &&
-              !inf.collect_logprobs && !inf.response_format.has_format &&
-              !inf.has_images && !inf.bpe_prompt_tokens.empty();
+              !inf.response_format.has_format && !inf.has_images &&
+              !inf.bpe_prompt_tokens.empty();
           if (can_defer_to_unified_prefill) {
             const PrefixReusePlan reuse = ResolvePrefixReuse(
                 inf, pending->resolved_backend.get(), prefix_hit,
@@ -2445,6 +2498,8 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
               inf.sequence_generation = seq_generation;
               inf.first_token = pr.first_token;
               inf.first_piece = pr.first_piece;
+              inf.first_logprob = pr.first_logprob;
+              inf.has_first_logprob = pr.has_first_logprob;
               SyncSequenceSlotProgress(inf);
               LogCacheDecision(inf, pending->resolved_backend.get(),
                                "prefill_accepted", matched_tokens,
@@ -2840,6 +2895,12 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       if (inference->fairness.total_completion_tokens > 0) {
         result.completion_tokens = inference->fairness.total_completion_tokens;
       }
+    }
+    // Phased executors accumulate logprobs on the request (ADR-0007 Stage 1);
+    // carry them into the final result here alongside the completion text.
+    if (inference->collect_logprobs &&
+        !inference->accumulated_logprobs.empty()) {
+      result.logprobs = std::move(inference->accumulated_logprobs);
     }
     if (inference->fairness.reported_prompt_tokens >= 0) {
       result.prompt_tokens = inference->fairness.reported_prompt_tokens;
