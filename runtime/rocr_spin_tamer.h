@@ -25,17 +25,18 @@ namespace inferflux {
 //  2. Proof (decides confinement): the thread is interrupted with a probe
 //     signal up to 3 times and confined only if at least 2 sampled
 //     instruction pointers resolve (dladdr) into the ROCr runtime library.
-//     A thread whose signal mask blocks or ignores the probe is never
-//     signalled.
+//     A thread is signalled only while it is running/runnable and its
+//     signal mask neither blocks nor ignores the probe, so a thread parked
+//     in a syscall never sees EINTR from it.
 // A thread not proven (other code, or no reply) backs off for 1, 2, 4, ...
 // up to 12 scans before it is probed again, so a busy third-party worker
 // (ggml/OpenMP/BLAS) receives at most 2 SA_RESTART probe signals per
 // back-off period and is never confined, while a real poller that was
 // unlucky once is still caught later. Confined threads are remembered by
 // (tid, start time); a TID reused before confinement is detected by
-// re-checking the start time. At most 8 threads are confined per process
-// lifetime. If the probe signal is owned by another handler or the
-// architecture is unsupported, nothing is confined.
+// re-checking the start time. At most 8 live threads are confined at once
+// (slots free up when confined threads exit). If the probe signal is owned by
+// another handler or the architecture is unsupported, nothing is confined.
 //
 // Linux-only; every entry point is a no-op elsewhere.
 //
@@ -68,11 +69,12 @@ int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options = {});
 // Call after startup has initialized backends. The worker scans
 // immediately, again after ~10 s and ~60 s, then every ~5 min for the
 // process lifetime, so pollers created lazily or by a model loaded at
-// runtime are caught within one period. When the ROCr runtime is not
-// loaded a scan is a single dlopen(RTLD_NOLOAD) check. Does nothing when
-// INFERFLUX_ROCR_TAME is disabled. The worker blocks on a condition
-// variable between scans and is never destroyed: an atexit hook stops and
-// joins it before the logger and metrics registry are torn down.
+// runtime are caught within one period. Starts nothing when
+// INFERFLUX_ROCR_TAME is disabled or libhsa-runtime64 is not loaded (it is
+// linked into ROCm builds, so CPU-only and CUDA-only builds get no thread). The
+// worker blocks on a condition variable between scans and is never destroyed:
+// an atexit hook stops and joins it before the logger and metrics registry are
+// torn down.
 void StartRuntimeSpinTamer() noexcept;
 
 } // namespace inferflux

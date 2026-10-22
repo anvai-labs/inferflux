@@ -242,7 +242,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 | VRAM pressure | native KV planning metrics + dequant policy | tighten budget or keep memory-first dequant policy |
 | Cache not helping | prefix/kv reuse counters | validate warmup patterns and prefix-affinity policy |
 | Selected operator never executes | dispatch divergence metric plus `parse_dispatch_trace.py` | check `dispatch_catalog.h`, the executor allowlist, and `/readyz` down-rank fields |
-| Idle ROCm server burns ~2 CPU cores | `top -H -p $(pidof inferfluxd)` for unnamed 100% threads; `inferflux_runtime_spin_threads_confined_total` | expect `rocr-spin-N` threads sharing one core within ~5 min; if the counter stays `0`, check `INFERFLUX_ROCR_TAME` and debug logs from `rocr_tamer` |
+| Idle ROCm server burns ~2 CPU cores | `top -H -p $(pidof inferfluxd)` for threads at ~100% CPU (ROCr pollers may carry an inherited `if-*` name); `inferflux_runtime_spin_threads_confined_total` | expect `rocr-spin-N` threads sharing one core within ~5 min; if the counter stays `0`, check `INFERFLUX_ROCR_TAME` and `rocr_tamer` debug logs |
 
 ## 9) Related Docs
 

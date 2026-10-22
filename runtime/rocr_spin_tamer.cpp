@@ -24,6 +24,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <initializer_list>
 #include <iterator>
 #include <map>
 #include <mutex>
@@ -59,7 +60,9 @@ constexpr int kHandlerDrainTimeoutMs = 1000;
 // A thread not proven waits 1, 2, 4, ... scans (capped) before re-probing.
 constexpr unsigned long long kMaxBackoffScans = 12;
 // The ROCr runtime spawns 2 pollers; caps blast radius if anything misfires.
-constexpr int kMaxConfinedLifetime = 8;
+// Counts threads confined and still alive, so a runtime that is torn down
+// and re-initialized (new pollers) never exhausts it.
+constexpr std::size_t kMaxConfinedAlive = 8;
 // Offset from SIGRTMIN for the PC probe. glibc reserves the RT signals below
 // its SIGRTMIN; nothing in InferFlux or llama.cpp/ggml uses RT signals, and
 // a foreign handler (at install time or any later scan) disables probing.
@@ -144,6 +147,40 @@ bool ReadStatusField(pid_t tid, const char *key, int base,
   return false; // TID vanished; caller skips it.
 }
 
+// Reads several "Key:" fields of /proc/.../status in one pass. Returns
+// false unless every key was found.
+bool ReadStatusFields(pid_t tid,
+                      std::initializer_list<std::pair<const char *, int>> keys,
+                      unsigned long long *out) {
+  std::ifstream file(TaskPath(tid, "status"));
+  std::size_t found = 0;
+  std::string line;
+  while (found < keys.size() && file && std::getline(file, line)) {
+    std::size_t i = 0;
+    for (const auto &[key, base] : keys) {
+      const std::size_t key_len = std::strlen(key);
+      if (line.compare(0, key_len, key) == 0) {
+        out[i] = std::strtoull(line.c_str() + key_len, nullptr, base);
+        ++found;
+      }
+      ++i;
+    }
+  }
+  return found == keys.size();
+}
+
+// The scheduler state letter (stat field 3): 'R' = running or runnable.
+char ReadThreadState(pid_t tid) {
+  std::ifstream file(TaskPath(tid, "stat"));
+  std::string line;
+  if (!file || !std::getline(file, line)) {
+    return '\0';
+  }
+  const std::size_t close = line.rfind(')');
+  return close != std::string::npos && close + 2 < line.size() ? line[close + 2]
+                                                               : '\0';
+}
+
 bool ReadSchedstat(pid_t tid, unsigned long long *run_ns,
                    unsigned long long *wait_ns) {
   std::ifstream file(TaskPath(tid, "schedstat"));
@@ -190,7 +227,6 @@ std::mutex g_memory_mutex;
 std::set<ThreadKey> g_confined;
 std::map<ThreadKey, Backoff> g_backoff;
 unsigned long long g_scan_seq = 0;
-int g_confined_lifetime = 0;
 
 // Starts a scan: advances the sequence and prunes entries for threads that
 // no longer exist (exited, or TID reused). Returns the scan's sequence.
@@ -314,16 +350,20 @@ int ProbeSignal() {
 #endif
 }
 
-// A thread that blocks or ignores the probe signal would queue RT signals
-// (they do not coalesce) or drop them; never signal it. Checked before every
-// probe, since a thread may change its mask between samples.
-bool AcceptsProbeSignal(pid_t tid, int sig) {
+// Checked immediately before every probe signal:
+//  - a thread that blocks or ignores the probe would queue RT signals (they
+//    do not coalesce) or drop them;
+//  - a thread that is not running/runnable ('R') is parked in a syscall
+//    (epoll_wait, sem_timedwait, ...), where a signal could surface as EINTR
+//    even with SA_RESTART. Spinners are always 'R', so nothing is lost.
+bool SafeToProbe(pid_t tid, int sig) {
+  if (ReadThreadState(tid) != 'R') {
+    return false;
+  }
   const unsigned long long bit = 1ULL << (sig - 1);
-  unsigned long long blocked = 0;
-  unsigned long long ignored = 0;
-  return ReadStatusField(tid, "SigBlk:", 16, &blocked) &&
-         ReadStatusField(tid, "SigIgn:", 16, &ignored) &&
-         (blocked & bit) == 0 && (ignored & bit) == 0;
+  unsigned long long masks[2] = {0, 0}; // SigBlk, SigIgn
+  return ReadStatusFields(tid, {{"SigBlk:", 16}, {"SigIgn:", 16}}, masks) &&
+         (masks[0] & bit) == 0 && (masks[1] & bit) == 0;
 }
 
 bool DrainHandlers() {
@@ -341,12 +381,12 @@ bool DrainHandlers() {
 enum class SampleResult { kPc, kNoReply, kSlotUnsafe };
 
 // Interrupts `tid` and reports the PC it was executing. kNoReply: thread
-// exited, refuses the signal, or did not run the handler in time.
+// exited, is not safe to signal now, or did not run the handler in time.
 // kSlotUnsafe: an in-flight handler did not finish, so the probe slot must
 // not be reused this scan. Caller holds g_probe_mutex.
 SampleResult SamplePc(pid_t pid, pid_t tid, int sig, std::uintptr_t *pc) {
   *pc = 0;
-  if (!AcceptsProbeSignal(tid, sig)) {
+  if (!SafeToProbe(tid, sig)) {
     return SampleResult::kNoReply;
   }
   g_probe_pc.store(0);
@@ -442,7 +482,8 @@ bool ChooseTameCore(int *tame_core) {
     *tame_core = requested;
     return true;
   }
-  if (raw != nullptr && *raw != '\0') {
+  static std::atomic<bool> warned_invalid{false};
+  if (raw != nullptr && *raw != '\0' && !warned_invalid.exchange(true)) {
     log::Warn(kComponent, std::string("INFERFLUX_ROCR_TAME_CORE=") + raw +
                               " is not a CPU in the allowed mask; using CPU " +
                               std::to_string(highest));
@@ -453,19 +494,25 @@ bool ChooseTameCore(int *tame_core) {
 
 std::atomic<int> g_next_spin_name{0}; // Unique rocr-spin-N across scans.
 
-// Reserves one slot of the lifetime confinement cap.
-bool ReserveConfinement() {
+enum class Claim { kClaimed, kAlreadyConfined, kCapReached };
+
+// Atomically claims `key` for confinement: concurrent scans (the background
+// worker and a synchronous caller) can never confine or count it twice.
+Claim ClaimConfinement(const ThreadKey &key) {
   std::lock_guard<std::mutex> lock(g_memory_mutex);
-  if (g_confined_lifetime >= kMaxConfinedLifetime) {
-    return false;
+  if (g_confined.count(key) != 0) {
+    return Claim::kAlreadyConfined;
   }
-  ++g_confined_lifetime;
-  return true;
+  if (g_confined.size() >= kMaxConfinedAlive) {
+    return Claim::kCapReached;
+  }
+  g_confined.insert(key);
+  return Claim::kClaimed;
 }
 
-void ReleaseConfinement() {
+void UnclaimConfinement(const ThreadKey &key) {
   std::lock_guard<std::mutex> lock(g_memory_mutex);
-  --g_confined_lifetime;
+  g_confined.erase(key);
 }
 
 bool ConfineThread(const ThreadKey &key, int tame_core, bool pin) {
@@ -475,14 +522,20 @@ bool ConfineThread(const ThreadKey &key, int tame_core, bool pin) {
   if (!ReadThreadStat(tid, &now) || now.starttime != key.second) {
     return false;
   }
-  if (!ReserveConfinement()) {
+  switch (ClaimConfinement(key)) {
+  case Claim::kAlreadyConfined:
+    return false;
+  case Claim::kCapReached: {
     static std::atomic<bool> warned{false};
     if (!warned.exchange(true)) {
-      log::Warn(kComponent, "lifetime cap of " +
-                                std::to_string(kMaxConfinedLifetime) +
-                                " confined threads reached; confining no more");
+      log::Warn(kComponent, "cap of " + std::to_string(kMaxConfinedAlive) +
+                                " confined live threads reached; confining no "
+                                "more until some exit");
     }
     return false;
+  }
+  case Claim::kClaimed:
+    break;
   }
   int demoted = 0;
   // PRIO_PROCESS with a tid targets that thread's nice value on Linux.
@@ -494,12 +547,8 @@ bool ConfineThread(const ThreadKey &key, int tame_core, bool pin) {
     ++demoted;
   }
   if (demoted == 0) {
-    ReleaseConfinement(); // ESRCH (thread exited) or EPERM.
+    UnclaimConfinement(key); // ESRCH (thread exited) or EPERM.
     return false;
-  }
-  {
-    std::lock_guard<std::mutex> lock(g_memory_mutex);
-    g_confined.insert(key);
   }
   if (pin) {
     cpu_set_t set;
@@ -512,9 +561,10 @@ bool ConfineThread(const ThreadKey &key, int tame_core, bool pin) {
   }
   // Best-effort rename for observability: same-tgid comm writes need no
   // capabilities, and "rocr-spin-N" fits the 15-char TASK_COMM_LEN limit.
+  // No trailing newline: the kernel stores the written bytes verbatim.
   std::ofstream comm(TaskPath(tid, "comm"));
   if (comm) {
-    comm << "rocr-spin-" << g_next_spin_name.fetch_add(1) << "\n";
+    comm << "rocr-spin-" << g_next_spin_name.fetch_add(1);
   }
   return true;
 }
@@ -601,8 +651,7 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     const long stime_delta = after.stime_ticks - before.stime_ticks;
     const long long voluntary_delta =
         after.voluntary_switches - before.voluntary_switches;
-    if (utime_delta > 0 && stime_delta <= kMaxStimeDeltaTicks &&
-        voluntary_delta == 0 &&
+    if (stime_delta <= kMaxStimeDeltaTicks && voluntary_delta == 0 &&
         AlwaysRunnable(before, after, utime_delta, min_runnable_ns,
                        min_busy_ticks)) {
       candidates.push_back(key);
@@ -613,8 +662,10 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   }
 
   // Stage 2 proof: only threads provably executing the code owner's code.
+  // The pin target is resolved lazily, on the first proven thread.
+  bool core_resolved = false;
+  bool pin = false;
   int tame_core = -1;
-  const bool pin = ChooseTameCore(&tame_core);
   int confined = 0;
   for (const ThreadKey &key : candidates) {
     const Verdict verdict = ProveOwner(pid, key.first, options, cancelled);
@@ -623,7 +674,13 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     }
     if (verdict == Verdict::kNotProven) {
       RecordNotProven(key, scan);
-    } else if (ConfineThread(key, tame_core, pin)) {
+      continue;
+    }
+    if (!core_resolved) {
+      pin = ChooseTameCore(&tame_core);
+      core_resolved = true;
+    }
+    if (ConfineThread(key, tame_core, pin)) {
       ++confined;
     }
   }
@@ -740,6 +797,11 @@ void StartRuntimeSpinTamer() noexcept {
 #if defined(__linux__)
   try {
     if (!ParseBoolEnv("INFERFLUX_ROCR_TAME", true)) {
+      return;
+    }
+    // libhsa-runtime64 is linked into ROCm builds, so it is mapped from exec
+    // whenever HIP could ever initialize; other builds get no thread at all.
+    if (!HsaRuntimeLoaded()) {
       return;
     }
     TamerWorker::Instance().Start();

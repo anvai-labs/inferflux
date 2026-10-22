@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <string>
 #include <thread>
@@ -206,6 +207,16 @@ TEST_CASE("rocr spin tamer confines a spinner proven to run owner code",
 
   REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
 
+  // Renamed exactly "rocr-spin-N": the kernel stores written bytes verbatim,
+  // so a stray newline would end up inside the name.
+  std::ifstream comm_file("/proc/self/task/" + std::to_string(spinners.tid(0)) +
+                          "/comm");
+  const std::string comm((std::istreambuf_iterator<char>(comm_file)),
+                         std::istreambuf_iterator<char>());
+  REQUIRE(comm.rfind("rocr-spin-", 0) == 0);
+  REQUIRE(comm.back() == '\n');
+  REQUIRE(comm.find('\n') == comm.size() - 1);
+
   if (ncpu > 1) {
     cpu_set_t now;
     CPU_ZERO(&now);
@@ -237,7 +248,7 @@ TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
   {
-    // Only 1 of 3 samples owned: probed (3 replies), rejected.
+    // Only 1 of 3 samples owned: probed, rejected.
     SpinnerGroup spinners(1);
     CountingOwner one_owned;
     one_owned.owned = 1;
@@ -246,11 +257,12 @@ TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
          ++attempt) {
       confined += inferflux::TameRuntimeSpinThreads(one_owned.Options());
     }
-    REQUIRE(one_owned.calls->load() == 3);
+    REQUIRE(one_owned.calls->load() >= 1);
     REQUIRE(confined == 0);
   }
   {
-    // 2 of 3 owned: confined after exactly 2 samples.
+    // 2 of 3 owned: confined once 2 replied samples are owned (a sample
+    // that times out never reaches the predicate).
     SpinnerGroup spinners(1);
     CountingOwner two_owned;
     two_owned.owned = 2;

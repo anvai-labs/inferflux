@@ -287,8 +287,8 @@ ignore it are never signalled) and confined only if at least 2 sampled
 instruction pointers resolve into `libhsa-runtime64`. A busy CPU threadpool
 or any other non-ROCr thread is never confined; a thread that is not proven
 backs off for 1, 2, 4, ... up to 12 scans (~1 h) before it is probed again,
-so it receives at most 2 `SA_RESTART` probe signals per back-off period. At
-most 8 threads are ever confined per process. InferFlux's own threads are named `if-*` for
+so it receives at most 2 `SA_RESTART` probe signals per back-off period. At most 8 live
+threads are confined at once. InferFlux's own threads are named `if-*` for
 `top -H` readability. Confined
 threads are demoted (nice 19 + `SCHED_IDLE`) and co-pinned onto a single
 core, bounding the cost from 2 cores to 1. GPU sync latency is unaffected
