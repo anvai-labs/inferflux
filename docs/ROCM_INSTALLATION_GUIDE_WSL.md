@@ -273,7 +273,7 @@ and no HSA environment knob disables the loop (`HSA_ENABLE_SLEEP`,
 nice are additionally not enforced for service-cgroup threads, so CPU
 affinity is the only effective mitigation.
 
-`inferfluxd` applies it automatically from a background thread that scans
+With `INFERFLUX_ROCR_TAME=1`, `inferfluxd` applies it from a background thread that scans
 at startup (after models load), again after ~10 s and ~60 s, and then every
 ~5 min, so pollers created lazily or by a model loaded at runtime are caught
 within one period. Processes without `libhsa-runtime64` loaded (CPU-only
@@ -299,7 +299,9 @@ the HSA signal-handler thread these pollers also run). GPU sync latency is unaff
 
 Knobs (see `docs/CONFIG_REFERENCE.md` section 10):
 
-- `INFERFLUX_ROCR_TAME=0` disables the tamer.
+- `INFERFLUX_ROCR_TAME=1` enables the tamer. It is **off by default**: it
+  signals and confines threads InferFlux does not own, so it is opt-in for
+  hosts that show the spin (e.g. WSL2 + gfx1201).
 - `INFERFLUX_ROCR_TAME_CORE=<n>` pins the spin threads to CPU `n` (default:
   highest CPU in the server's affinity mask).
 

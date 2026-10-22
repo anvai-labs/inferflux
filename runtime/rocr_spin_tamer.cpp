@@ -64,6 +64,9 @@ constexpr unsigned long long kMaxBackoffScans = 12;
 // and re-initialized (new pollers) never exhausts it.
 constexpr std::size_t kMaxConfinedAlive = 8;
 constexpr int kProbeSignalOffset = kRocrTamerProbeSignalOffset;
+// Opt-in (INFERFLUX_ROCR_TAME=1): the mechanism signals and confines
+// threads it does not own, so it stays off unless an operator enables it.
+constexpr bool kTameEnabledByDefault = false;
 
 using ThreadKey = std::pair<pid_t, unsigned long long>; // (tid, starttime)
 
@@ -611,7 +614,7 @@ bool AlwaysRunnable(const ThreadSample &before, const ThreadSample &after,
 
 int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
                                const std::atomic<bool> *cancelled) {
-  if (!ParseBoolEnv("INFERFLUX_ROCR_TAME", true)) {
+  if (!ParseBoolEnv("INFERFLUX_ROCR_TAME", kTameEnabledByDefault)) {
     return 0;
   }
   if (options.require_hsa_runtime && !HsaRuntimeLoaded()) {
@@ -817,7 +820,7 @@ int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options) {
 void StartRuntimeSpinTamer() noexcept {
 #if defined(__linux__)
   try {
-    if (!ParseBoolEnv("INFERFLUX_ROCR_TAME", true)) {
+    if (!ParseBoolEnv("INFERFLUX_ROCR_TAME", kTameEnabledByDefault)) {
       return;
     }
     // libhsa-runtime64 is linked into ROCm builds, so it is mapped from exec

@@ -28,6 +28,13 @@ using namespace inferflux;
 // Runs on every platform so the [rocr_spin_tamer] tag always matches at
 // least one test case (an empty match makes the Catch2 binary exit
 // non-zero, which would break the macOS CI ctest entry).
+TEST_CASE("rocr spin tamer is off unless opted in", "[rocr_spin_tamer]") {
+  inferflux::test::ScopedEnvVar unset("INFERFLUX_ROCR_TAME", nullptr);
+  RocrSpinTamerOptions options;
+  options.require_hsa_runtime = false;
+  REQUIRE(inferflux::TameRuntimeSpinThreads(options) == 0);
+}
+
 TEST_CASE("rocr spin tamer disabled via env returns 0", "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar disable("INFERFLUX_ROCR_TAME", "0");
   RocrSpinTamerOptions options;
@@ -208,7 +215,7 @@ int ScanUntil(int expected, const RocrSpinTamerOptions &options) {
 
 TEST_CASE("rocr spin tamer confines a spinner proven to run owner code",
           "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
 
   SpinnerGroup spinners(1);
@@ -238,7 +245,7 @@ TEST_CASE("rocr spin tamer confines a spinner proven to run owner code",
 
 TEST_CASE("rocr spin tamer refuses spinners running other code",
           "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   // Spinners pass the never-blocks prefilter and are probed (the predicate
   // is consulted), but none is proven to run owner code — the case of a busy
   // third-party CPU threadpool in a ROCm process.
@@ -255,7 +262,7 @@ TEST_CASE("rocr spin tamer refuses spinners running other code",
 
 TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
           "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
   {
     // Only 1 of 3 samples owned: probed, rejected.
@@ -290,7 +297,7 @@ TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
 }
 
 TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   std::atomic<bool> stop{false};
   std::thread sleeper([&] {
     while (!stop.load(std::memory_order_relaxed)) {
@@ -309,7 +316,7 @@ TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
 
 TEST_CASE("rocr spin tamer does not re-confine an already confined thread",
           "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
   SpinnerGroup spinners(1);
   REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
@@ -320,7 +327,7 @@ TEST_CASE("rocr spin tamer does not re-confine an already confined thread",
 
 TEST_CASE("rocr spin tamer confines a poller that inherited a thread name",
           "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
   // Linux threads inherit their creator's name: ROCr pollers spawned while a
   // registry reload or admin load runs on "if-registry"/"if-http" carry that
@@ -333,7 +340,7 @@ TEST_CASE("rocr spin tamer confines a poller that inherited a thread name",
 
 TEST_CASE("rocr spin tamer never confines a first-party thread",
           "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   // An InferFlux inference thread can busy-wait inside libhsa-runtime64
   // (hipStreamSynchronize on WSL2 polls). Executing owner code must not make
   // it a confinement target: registered threads are never probed.
@@ -352,7 +359,7 @@ TEST_CASE("rocr spin tamer never confines a first-party thread",
 
 TEST_CASE("rocr spin tamer never signals a thread that blocks the probe",
           "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   // RT signals queue instead of coalescing; probing a thread that blocks the
   // signal would pile them up against RLIMIT_SIGPENDING.
   SpinnerGroup::Options blocking;
@@ -371,7 +378,7 @@ TEST_CASE("rocr spin tamer never signals a thread that blocks the probe",
 
 TEST_CASE("rocr spin tamer backs off a rejected thread, then re-probes it",
           "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
   SpinnerGroup spinners(1);
 

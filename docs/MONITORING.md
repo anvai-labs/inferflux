@@ -34,7 +34,7 @@ flowchart LR
 | Distributed KV health | `inferflux_disagg_kv_tickets_total{stage=...}`, `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt` |
 | Cache execution path | `inferflux_cache_execution_path_total{path=...}` | `phased`, `full_generate`, `full_generate_images` -- the bypass population is visible directly; `INFERFLUX_DISABLE_PHASED_LOGPROBS=1` moves logprobs traffic back to `full_generate` (ADR-0007 Stage 1) |
 | Cache reuse | `inferflux_prefix_hits_total`, `inferflux_prefix_partial_hits_total`, `inferflux_prefix_matched_tokens_total`, `inferflux_kv_prefix_reuse_total` |
-| ROCr spin-thread confinement | `inferflux_runtime_spin_threads_confined_total` — ROCr `AsyncEventsLoop` busy-spin pollers proven (signal-sampled instruction pointers) and confined to one core; cumulative — grows by `2` per ROCr runtime initialization on WSL2/gfx1201 (more after unload/reload cycles), stays `0` elsewhere. Confined threads appear as `rocr-spin-N` in `top -H`. Scans run at startup, +10 s, +60 s, then every 5 min (`INFERFLUX_ROCR_TAME`, `docs/ROCM_INSTALLATION_GUIDE_WSL.md`) |
+| ROCr spin-thread confinement | `inferflux_runtime_spin_threads_confined_total` — ROCr `AsyncEventsLoop` busy-spin pollers proven (signal-sampled instruction pointers) and confined to one core; cumulative — grows by `2` per ROCr runtime initialization on WSL2/gfx1201 (more after unload/reload cycles), stays `0` elsewhere. Confined threads appear as `rocr-spin-N` in `top -H`. Opt-in via `INFERFLUX_ROCR_TAME=1`; scans run at startup, +10 s, +60 s, then every 5 min (`docs/ROCM_INSTALLATION_GUIDE_WSL.md`) |
 
 ## Cache counter scopes
 

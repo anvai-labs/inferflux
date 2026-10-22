@@ -50,7 +50,7 @@ namespace inferflux {
 // Linux-only; every entry point is a no-op elsewhere.
 //
 // Knobs (env-only, see docs/CONFIG_REFERENCE.md section 10):
-//   INFERFLUX_ROCR_TAME       enable/disable (default: enabled)
+//   INFERFLUX_ROCR_TAME       enable (default: disabled; opt-in with 1)
 //   INFERFLUX_ROCR_TAME_CORE  pin target CPU index (default: highest CPU in
 //                             the process affinity mask; invalid values warn
 //                             and fall back; pinning skipped when <= 1 CPU
@@ -78,8 +78,8 @@ int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options = {});
 // Call after startup has initialized backends. The worker scans
 // immediately, again after ~10 s and ~60 s, then every ~5 min for the
 // process lifetime, so pollers created lazily or by a model loaded at
-// runtime are caught within one period. Starts nothing when
-// INFERFLUX_ROCR_TAME is disabled or libhsa-runtime64 is not loaded (it is
+// runtime are caught within one period. Starts nothing unless
+// INFERFLUX_ROCR_TAME=1, or when libhsa-runtime64 is not loaded (it is
 // linked into ROCm builds, so CPU-only and CUDA-only builds get no thread). The
 // worker blocks on a condition variable between scans and is never destroyed:
 // an atexit hook stops and joins it before the logger and metrics registry are
