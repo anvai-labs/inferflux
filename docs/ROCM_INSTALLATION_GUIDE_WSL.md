@@ -274,17 +274,18 @@ nice are additionally not enforced for service-cgroup threads, so CPU
 affinity is the only effective mitigation.
 
 `inferfluxd` applies it automatically after startup and after every model
-load (startup, admin API, or registry hot-reload), but only when
-`libhsa-runtime64` is loaded. Over a ~1.2 s window it looks for threads that
-still carry the process name (every InferFlux thread names itself `if-*`),
-stay runnable for the whole window (on-CPU plus run-queue time from
-`/proc/.../schedstat`, so the check holds on a busy host), spend ~no time in
-the kernel, and make zero voluntary context switches. Matches are demoted
-(nice 19 + `SCHED_IDLE`) and co-pinned onto a single core, bounding the cost
-from 2 cores to 1. If more than 4 threads match — something other than the
-two pollers, such as a busy CPU threadpool — nothing is confined and a
-warning is logged. GPU sync latency is unaffected (verified empirically
-under full CPU contention).
+load attempt (startup, admin API, or registry hot-reload), when
+`libhsa-runtime64` is loaded. Over a ~1.2 s window it shortlists threads
+that never block: still carrying the process name (every InferFlux thread
+names itself `if-*`), runnable for the whole window (on-CPU plus run-queue
+time from `/proc/.../schedstat`, so the check holds on a busy host), ~no
+kernel time, and zero voluntary context switches. Each shortlisted thread is
+then interrupted with a probe signal; it is confined only if every sampled
+instruction pointer resolves into `libhsa-runtime64`, so a busy CPU
+threadpool or any other non-ROCr thread can never be touched. Confined
+threads are demoted (nice 19 + `SCHED_IDLE`) and co-pinned onto a single
+core, bounding the cost from 2 cores to 1. GPU sync latency is unaffected
+(verified empirically under full CPU contention).
 
 Knobs (see `docs/CONFIG_REFERENCE.md` section 10):
 

@@ -4,6 +4,7 @@
 #include "support/scoped_env.h"
 
 #if defined(__linux__)
+#include <dlfcn.h>
 #include <sched.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
@@ -12,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 #endif
@@ -32,6 +34,17 @@ TEST_CASE("rocr spin tamer disabled via env returns 0", "[rocr_spin_tamer]") {
 namespace {
 
 pid_t CurrentTid() { return static_cast<pid_t>(syscall(SYS_gettid)); }
+
+// Path of the loaded object holding this test's code (the test binary), as
+// dladdr reports it — the same resolution the tamer applies to sampled PCs.
+std::string ThisTestBinary() {
+  Dl_info info{};
+  if (dladdr(reinterpret_cast<void *>(&ThisTestBinary), &info) == 0 ||
+      info.dli_fname == nullptr) {
+    return {};
+  }
+  return info.dli_fname;
+}
 
 int HighestAllowedCpu() {
   cpu_set_t set;
@@ -58,9 +71,10 @@ int CountAllowedCpus() {
 }
 
 // Unnamed pure-userspace spinners (zero syscalls, zero voluntary context
-// switches) that stop and join on scope exit — including when a REQUIRE
-// throws, so a failed assertion can never destroy a joinable std::thread
-// (which would std::terminate the whole test binary).
+// switches; the loop's code lives in the test binary) that stop and join on
+// scope exit — including when a REQUIRE throws, so a failed assertion can
+// never destroy a joinable std::thread (which would std::terminate the whole
+// test binary).
 class SpinnerGroup {
 public:
   explicit SpinnerGroup(int count) {
@@ -100,30 +114,30 @@ private:
   std::vector<std::thread> threads_;
 };
 
-RocrSpinTamerOptions WithoutHsaGate() {
+// Scan without the ROCr-runtime fast path, treating `owner` as the code
+// owner. Pointing it at the test binary also makes any real ROCr pollers in
+// a ROCm-build test process ineligible, keeping these cases hermetic.
+RocrSpinTamerOptions OwnedBy(std::string owner) {
   RocrSpinTamerOptions options;
   options.require_hsa_runtime = false;
+  options.code_owner = std::move(owner);
   return options;
 }
 
 } // namespace
 
-TEST_CASE("rocr spin tamer confines a pure busy-spin thread",
+TEST_CASE("rocr spin tamer confines a spinner proven to run owner code",
           "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
+  const std::string owner = ThisTestBinary();
+  REQUIRE_FALSE(owner.empty());
 
   SpinnerGroup spinners(1);
   const int ncpu = CountAllowedCpus();
   const int expected_core = HighestAllowedCpu();
 
-  // Retry once: on a loaded few-core CI runner the spinner may miss the
-  // 80%-of-window utime threshold on the first measurement.
-  int confined = 0;
-  for (int attempt = 0; attempt < 2 && confined == 0; ++attempt) {
-    confined = inferflux::TameRuntimeSpinThreads(WithoutHsaGate());
-  }
-  REQUIRE(confined == 1);
+  REQUIRE(inferflux::TameRuntimeSpinThreads(OwnedBy(owner)) == 1);
 
   if (ncpu > 1) {
     cpu_set_t now;
@@ -134,9 +148,21 @@ TEST_CASE("rocr spin tamer confines a pure busy-spin thread",
   }
 }
 
+TEST_CASE("rocr spin tamer refuses spinners running other code",
+          "[rocr_spin_tamer]") {
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  // Several spinners pass the never-blocks prefilter, but none executes in
+  // the code owner, so the PC proof must reject all of them — the case of a
+  // busy third-party CPU threadpool in a ROCm process.
+  SpinnerGroup spinners(3);
+  REQUIRE(inferflux::TameRuntimeSpinThreads(
+              OwnedBy("no-such-object-owns-this-code")) == 0);
+}
+
 TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
-  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
+  const std::string owner = ThisTestBinary();
+  REQUIRE_FALSE(owner.empty());
 
   std::atomic<bool> stop{false};
   std::thread sleeper([&] {
@@ -145,32 +171,24 @@ TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
     }
   });
   // Join before asserting so a failure cannot leave a joinable thread.
-  const int confined = inferflux::TameRuntimeSpinThreads(WithoutHsaGate());
+  const int confined = inferflux::TameRuntimeSpinThreads(OwnedBy(owner));
   stop.store(true);
   sleeper.join();
 
   REQUIRE(confined == 0);
 }
 
-TEST_CASE("rocr spin tamer skips processes without the ROCr runtime",
-          "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
-  // The test binary never loads libhsa-runtime64, so with the default gate
-  // even a real spinner must be left alone.
-  SpinnerGroup spinners(1);
-  REQUIRE(inferflux::TameRuntimeSpinThreads() == 0);
-}
-
-TEST_CASE("rocr spin tamer confines nothing when too many threads match",
+TEST_CASE("rocr spin tamer does not re-confine an already confined thread",
           "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
-  // Five spinners need five uncontended CPUs to each clear the busy
-  // threshold; on smaller runners the burst cannot be produced reliably.
-  if (CountAllowedCpus() < 8) {
-    SKIP("needs >= 8 allowed CPUs to produce a deterministic burst");
-  }
-  SpinnerGroup spinners(5);
-  REQUIRE(inferflux::TameRuntimeSpinThreads(WithoutHsaGate()) == 0);
+  const std::string owner = ThisTestBinary();
+  REQUIRE_FALSE(owner.empty());
+
+  SpinnerGroup spinners(1);
+  REQUIRE(inferflux::TameRuntimeSpinThreads(OwnedBy(owner)) == 1);
+  // The first scan renamed it rocr-spin-N; repeat scans (one per model load)
+  // must leave it alone rather than re-confine and double count.
+  REQUIRE(inferflux::TameRuntimeSpinThreads(OwnedBy(owner)) == 0);
 }
 #endif // defined(__linux__)

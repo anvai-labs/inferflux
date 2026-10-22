@@ -7,16 +7,20 @@
 
 #if defined(__linux__)
 #include <dirent.h>
+#include <dlfcn.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -35,12 +39,20 @@ const char *kComponent = "rocr_tamer";
 
 constexpr int kWindowMs = 1200;
 constexpr int kSleepSliceMs = 50;
-constexpr int kMinBusyPercent = 80;
+constexpr int kMinRunnablePercent = 80;
 constexpr long kMaxStimeDeltaTicks = 2;
-// ROCm spawns 2 pollers; more matches than this trips the burst guard.
-constexpr int kMaxConfined = 4;
+// Every sampled PC must land in the code owner; one stray sample rejects.
+constexpr int kPcSamples = 3;
+constexpr int kPcReplyTimeoutMs = 100;
+// The ROCr runtime spawns 2 pollers; this only bounds work and log noise.
+constexpr int kMaxConfined = 8;
+// Offset from SIGRTMIN for the PC probe. glibc reserves the RT signals below
+// its SIGRTMIN; nothing in InferFlux or llama.cpp/ggml uses RT signals, and
+// a foreign handler found at install time disables probing entirely.
+constexpr int kProbeSignalOffset = 5;
 
 struct ThreadSample {
+  unsigned long long starttime = 0; // Distinguishes a reused TID.
   long utime_ticks = 0;
   long stime_ticks = 0;
   long long voluntary_switches = 0;
@@ -52,6 +64,10 @@ struct ThreadSample {
 };
 
 pid_t CurrentTid() { return static_cast<pid_t>(syscall(SYS_gettid)); }
+
+std::string TaskPath(pid_t tid, const char *leaf) {
+  return "/proc/self/task/" + std::to_string(tid) + "/" + leaf;
+}
 
 std::vector<pid_t> ListThreads() {
   std::vector<pid_t> tids;
@@ -70,11 +86,11 @@ std::vector<pid_t> ListThreads() {
   return tids;
 }
 
-// comm may contain spaces/parens, so parse fields after the LAST ')'.
-// Token layout after ')': tok[0]=state(3) ... tok[11]=utime(14),
-// tok[12]=stime(15) of the /proc stat field numbering.
+// comm may contain spaces/parens, so parse fields after the LAST ')'. Field
+// N of the stat format is tokens[N - 3]: utime(14), stime(15),
+// starttime(22).
 bool ReadThreadStat(pid_t tid, std::string *comm, ThreadSample *out) {
-  std::ifstream file("/proc/self/task/" + std::to_string(tid) + "/stat");
+  std::ifstream file(TaskPath(tid, "stat"));
   std::string line;
   if (!file || !std::getline(file, line)) {
     return false; // TID vanished mid-sample; caller skips it.
@@ -93,16 +109,17 @@ bool ReadThreadStat(pid_t tid, std::string *comm, ThreadSample *out) {
   while (fields >> token) {
     tokens.push_back(token);
   }
-  if (tokens.size() < 13) {
+  if (tokens.size() < 20) {
     return false;
   }
   out->utime_ticks = std::strtol(tokens[11].c_str(), nullptr, 10);
   out->stime_ticks = std::strtol(tokens[12].c_str(), nullptr, 10);
+  out->starttime = std::strtoull(tokens[19].c_str(), nullptr, 10);
   return true;
 }
 
 bool ReadVoluntarySwitches(pid_t tid, long long *out) {
-  std::ifstream file("/proc/self/task/" + std::to_string(tid) + "/status");
+  std::ifstream file(TaskPath(tid, "status"));
   std::string line;
   while (file && std::getline(file, line)) {
     if (line.rfind("voluntary_ctxt_switches:", 0) == 0) {
@@ -117,13 +134,12 @@ bool ReadVoluntarySwitches(pid_t tid, long long *out) {
 
 bool ReadSchedstat(pid_t tid, unsigned long long *run_ns,
                    unsigned long long *wait_ns) {
-  std::ifstream file("/proc/self/task/" + std::to_string(tid) + "/schedstat");
+  std::ifstream file(TaskPath(tid, "schedstat"));
   return static_cast<bool>(file >> *run_ns >> *wait_ns);
 }
 
-// Snapshots utime/stime/voluntary counters per thread. Thread comms are
-// read on the first snapshot only: classification keys off the creation
-// comm, and a confined thread may already have been renamed by a prior run.
+// Snapshots counters per thread. Comms are read on the first snapshot only:
+// classification keys off the name the thread had when the window opened.
 std::unordered_map<pid_t, ThreadSample>
 SampleAllThreads(std::unordered_map<pid_t, std::string> *comms) {
   std::unordered_map<pid_t, ThreadSample> samples;
@@ -145,9 +161,131 @@ SampleAllThreads(std::unordered_map<pid_t, std::string> *comms) {
   return samples;
 }
 
+// O(1) fast path: is the ROCr runtime loaded at all? RTLD_NOLOAD never loads
+// anything; it only returns a handle when the library is already mapped.
+bool HsaRuntimeLoaded() {
+  for (const char *soname : {"libhsa-runtime64.so.1", "libhsa-runtime64.so"}) {
+    if (void *handle = dlopen(soname, RTLD_LAZY | RTLD_NOLOAD)) {
+      dlclose(handle);
+      return true;
+    }
+  }
+  return false;
+}
+
+// --- Instruction-pointer probe ---------------------------------------------
+// The handler only stores the interrupted PC of the targeted thread; all
+// interpretation (dladdr) happens on the scanning thread. Both atomics are
+// lock-free, so the handler is async-signal-safe.
+static_assert(std::atomic<pid_t>::is_always_lock_free,
+              "probe tid slot must be lock-free");
+static_assert(std::atomic<std::uintptr_t>::is_always_lock_free,
+              "probe pc slot must be lock-free");
+std::atomic<pid_t> g_probe_tid{0};
+std::atomic<std::uintptr_t> g_probe_pc{0};
+
+void ProbeHandler(int /*sig*/, siginfo_t * /*info*/, void *raw_context) {
+  if (static_cast<pid_t>(syscall(SYS_gettid)) !=
+      g_probe_tid.load(std::memory_order_acquire)) {
+    return; // Late delivery for an abandoned probe: ignore.
+  }
+  const auto *context = static_cast<const ucontext_t *>(raw_context);
+  std::uintptr_t pc = 0;
+#if defined(__x86_64__)
+  pc = static_cast<std::uintptr_t>(context->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__aarch64__)
+  pc = static_cast<std::uintptr_t>(context->uc_mcontext.pc);
+#else
+  (void)context;
+#endif
+  g_probe_pc.store(pc, std::memory_order_release);
+}
+
+std::mutex g_probe_mutex; // Serializes the single probe slot.
+
+// Installs the probe handler once and keeps it installed for the process
+// lifetime: restoring SIG_DFL would let a late-delivered probe terminate the
+// process (the default action for RT signals). Returns the signal number, or
+// 0 when probing is unavailable. Caller holds g_probe_mutex.
+int EnsureProbeSignal() {
+#if !defined(__x86_64__) && !defined(__aarch64__)
+  return 0;
+#else
+  static int installed = -1; // -1 unknown, 0 unavailable, else signal.
+  if (installed >= 0) {
+    return installed;
+  }
+  const int sig = SIGRTMIN + kProbeSignalOffset;
+  if (sig > SIGRTMAX) {
+    installed = 0;
+    return installed;
+  }
+  struct sigaction current{};
+  if (sigaction(sig, nullptr, &current) != 0) {
+    installed = 0;
+    return installed;
+  }
+  const bool foreign = (current.sa_flags & SA_SIGINFO)
+                           ? current.sa_sigaction != ProbeHandler
+                           : current.sa_handler != SIG_DFL;
+  if (foreign) {
+    log::Warn(kComponent, "probe signal SIGRTMIN+" +
+                              std::to_string(kProbeSignalOffset) +
+                              " already has a handler; spin tamer disabled");
+    installed = 0;
+    return installed;
+  }
+  struct sigaction action{};
+  action.sa_sigaction = ProbeHandler;
+  action.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&action.sa_mask);
+  installed = sigaction(sig, &action, nullptr) == 0 ? sig : 0;
+  return installed;
+#endif
+}
+
+// Interrupts `tid` and returns the PC it was executing, or 0 on no reply
+// (signal blocked, thread exited, or timeout). Caller holds g_probe_mutex.
+std::uintptr_t SamplePc(pid_t pid, pid_t tid, int sig) {
+  g_probe_pc.store(0, std::memory_order_release);
+  g_probe_tid.store(tid, std::memory_order_release);
+  std::uintptr_t pc = 0;
+  if (syscall(SYS_tgkill, pid, tid, sig) == 0) {
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(kPcReplyTimeoutMs);
+    while ((pc = g_probe_pc.load(std::memory_order_acquire)) == 0 &&
+           std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+  }
+  g_probe_tid.store(0, std::memory_order_release);
+  return pc;
+}
+
+// True only when every sampled PC of `tid` resolves into a loaded object
+// whose path contains `code_owner`.
+bool ExecutesOnlyIn(pid_t pid, pid_t tid, const std::string &code_owner) {
+  std::lock_guard<std::mutex> lock(g_probe_mutex);
+  const int sig = EnsureProbeSignal();
+  if (sig == 0) {
+    return false;
+  }
+  for (int i = 0; i < kPcSamples; ++i) {
+    const std::uintptr_t pc = SamplePc(pid, tid, sig);
+    Dl_info info{};
+    if (pc == 0 || dladdr(reinterpret_cast<void *>(pc), &info) == 0 ||
+        info.dli_fname == nullptr ||
+        std::strstr(info.dli_fname, code_owner.c_str()) == nullptr) {
+      return false;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  return true;
+}
+
 // Resolves the pin target. Returns false when pinning must be skipped
 // (single-CPU mask). An explicitly requested core outside the process
-// affinity mask warns once and falls back to the highest allowed CPU.
+// affinity mask warns and falls back to the highest allowed CPU.
 bool ChooseTameCore(int *tame_core) {
   cpu_set_t allowed;
   CPU_ZERO(&allowed);
@@ -185,7 +323,9 @@ bool ChooseTameCore(int *tame_core) {
   return true;
 }
 
-bool ConfineThread(pid_t tid, int index, int tame_core, bool pin) {
+std::atomic<int> g_next_spin_name{0}; // Unique rocr-spin-N across scans.
+
+bool ConfineThread(pid_t tid, int tame_core, bool pin) {
   int demoted = 0;
   // PRIO_PROCESS with a tid targets that thread's nice value on Linux.
   if (setpriority(PRIO_PROCESS, tid, 19) == 0) {
@@ -207,26 +347,14 @@ bool ConfineThread(pid_t tid, int index, int tame_core, bool pin) {
                                 " failed: " + std::strerror(errno));
     }
   }
-  // Best-effort rename for observability: same-tgid comm writes need no
-  // capabilities, and "rocr-spin-N" fits the 15-char TASK_COMM_LEN limit.
-  std::ofstream comm("/proc/self/task/" + std::to_string(tid) + "/comm");
+  // Best-effort rename for observability (and so later scans skip it):
+  // same-tgid comm writes need no capabilities, and "rocr-spin-N" fits the
+  // 15-char TASK_COMM_LEN limit.
+  std::ofstream comm(TaskPath(tid, "comm"));
   if (comm) {
-    comm << "rocr-spin-" << index << "\n";
+    comm << "rocr-spin-" << g_next_spin_name.fetch_add(1) << "\n";
   }
   return true;
-}
-
-// The pollers only exist once the ROCr runtime is loaded; without it, a
-// matching thread is by definition something else and must not be touched.
-bool HsaRuntimeLoaded() {
-  std::ifstream maps("/proc/self/maps");
-  std::string line;
-  while (maps && std::getline(maps, line)) {
-    if (line.find("libhsa-runtime64") != std::string::npos) {
-      return true;
-    }
-  }
-  return false;
 }
 
 int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
@@ -237,15 +365,15 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   if (options.require_hsa_runtime && !HsaRuntimeLoaded()) {
     return 0;
   }
+  if (options.code_owner.empty()) {
+    return 0; // An empty owner would match every object.
+  }
   const pid_t pid = getpid();
   const pid_t self = CurrentTid();
 
   std::ifstream comm_file("/proc/self/comm");
   std::string process_comm;
   std::getline(comm_file, process_comm);
-  if (!process_comm.empty() && process_comm.back() == '\n') {
-    process_comm.pop_back();
-  }
   if (process_comm.empty()) {
     return 0; // No comm baseline to discriminate against; do nothing.
   }
@@ -261,22 +389,19 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     std::this_thread::sleep_for(std::chrono::milliseconds(kSleepSliceMs));
   }
 
-  const long hz = sysconf(_SC_CLK_TCK);
-  const long ticks_per_second = hz > 0 ? hz : 100; // No USER_HZ assumption.
-  const long min_busy_ticks =
-      static_cast<long>(static_cast<long long>(kWindowMs) * ticks_per_second *
-                        kMinBusyPercent / 100000);
-
-  int tame_core = -1;
-  const bool pin = ChooseTameCore(&tame_core);
-
   const auto second = SampleAllThreads(nullptr);
-  const unsigned long long window_ns = static_cast<unsigned long long>(
+  const long long window_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - window_start)
-          .count());
+          .count();
   const unsigned long long min_runnable_ns =
-      window_ns / 100 * static_cast<unsigned long long>(kMinBusyPercent);
+      static_cast<unsigned long long>(window_ns) / 100 * kMinRunnablePercent;
+  const long hz = sysconf(_SC_CLK_TCK);
+  const long ticks_per_second = hz > 0 ? hz : 100; // No USER_HZ assumption.
+  const long min_busy_ticks = static_cast<long>(
+      window_ns / 1000000 * ticks_per_second * kMinRunnablePercent / 100000);
+
+  // Stage 1 prefilter: threads that never blocked during the window.
   std::vector<pid_t> candidates;
   for (const auto &entry : second) {
     const pid_t tid = entry.first;
@@ -284,60 +409,57 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
       continue;
     }
     const auto it_before = first.find(tid);
-    if (it_before == first.end()) {
-      continue; // Appeared mid-window: not a hipInit-era poller.
-    }
     const auto it_comm = comms.find(tid);
-    if (it_comm == comms.end() || it_comm->second != process_comm) {
-      continue; // Named thread: not an unnamed runtime poller.
+    if (it_before == first.end() || it_comm == comms.end() ||
+        it_comm->second != process_comm) {
+      continue; // New mid-window, or named (first-party / already confined).
     }
     const ThreadSample &before = it_before->second;
     const ThreadSample &after = entry.second;
+    if (after.starttime != before.starttime ||
+        after.utime_ticks < before.utime_ticks ||
+        after.stime_ticks < before.stime_ticks ||
+        after.voluntary_switches < before.voluntary_switches) {
+      continue; // TID reused by a different thread inside the window.
+    }
     const long utime_delta = after.utime_ticks - before.utime_ticks;
     const long stime_delta = after.stime_ticks - before.stime_ticks;
     const long long voluntary_delta =
         after.voluntary_switches - before.voluntary_switches;
-    // "Never blocks": a spinner is runnable for the whole window. With
-    // schedstat that is on-CPU + runqueue-wait time, which stays ~100% of the
-    // window however contended the host is (a starved spinner waits rather
-    // than runs). Without schedstat, fall back to user time, which a heavily
-    // loaded host can push below the threshold (a miss, never a false hit).
-    bool always_runnable;
-    if (before.has_schedstat && after.has_schedstat) {
+    // Runnable for the whole window: with schedstat that is on-CPU +
+    // runqueue-wait time, which stays ~100% however contended the host is
+    // (a starved spinner waits rather than runs). Without schedstat, user
+    // time against the measured window; a loaded host can push that below
+    // the threshold, which is a miss, never a false confinement.
+    bool always_runnable = false;
+    if (before.has_schedstat && after.has_schedstat &&
+        after.run_ns >= before.run_ns && after.wait_ns >= before.wait_ns) {
       always_runnable =
           (after.run_ns - before.run_ns) + (after.wait_ns - before.wait_ns) >=
           min_runnable_ns;
-    } else {
+    } else if (!before.has_schedstat || !after.has_schedstat) {
       always_runnable = utime_delta >= min_busy_ticks;
     }
-    // Pure userspace spin: always runnable, no kernel time, and no voluntary
-    // sleeps. Preemption only bumps *non*voluntary switches, so the switch
-    // test holds even on a fully loaded machine.
     if (always_runnable && utime_delta > 0 &&
         stime_delta <= kMaxStimeDeltaTicks && voluntary_delta == 0) {
       candidates.push_back(tid);
     }
   }
-
-  // Burst guard: the ROCr runtime spawns two pollers. Many simultaneous
-  // matches mean something else is spinning (e.g. a third-party CPU
-  // threadpool mid-compute); demoting those would be irreversible, so
-  // confine nothing rather than a guessed subset.
-  if (static_cast<int>(candidates.size()) > kMaxConfined) {
-    log::Warn(kComponent, std::to_string(candidates.size()) +
-                              " unnamed threads match the spin signature "
-                              "(expected <= " +
-                              std::to_string(kMaxConfined) +
-                              "); confining none");
-    return 0;
-  }
-  if (cancelled && cancelled->load(std::memory_order_relaxed)) {
+  if (candidates.empty()) {
     return 0;
   }
 
+  // Stage 2 proof: only threads provably executing the code owner's code.
+  int tame_core = -1;
+  const bool pin = ChooseTameCore(&tame_core);
   int confined = 0;
   for (const pid_t tid : candidates) {
-    if (ConfineThread(tid, confined, tame_core, pin)) {
+    if (confined >= kMaxConfined ||
+        (cancelled && cancelled->load(std::memory_order_relaxed))) {
+      break;
+    }
+    if (ExecutesOnlyIn(pid, tid, options.code_owner) &&
+        ConfineThread(tid, tame_core, pin)) {
       ++confined;
     }
   }
@@ -354,9 +476,7 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   }
   return confined;
 }
-#endif // defined(__linux__)
 
-#if defined(__linux__)
 // Lazily started background scanner. Requests set `pending_` and wake the
 // worker; requests landing mid-scan leave `pending_` set, so they coalesce
 // into exactly one follow-up scan. Between scans the worker blocks on the
@@ -367,7 +487,7 @@ public:
     // Runs at exit in reverse construction order: g_metrics and the logger
     // are constructed before this worker (first request is inside main), so
     // they are still alive while we join. `cancelled_` cuts an in-flight
-    // scan's sampling window short (<= one 50 ms slice).
+    // scan short (<= one 50 ms slice, or one PC probe).
     {
       std::lock_guard<std::mutex> lock(mutex_);
       stop_ = true;
@@ -425,7 +545,7 @@ private:
   std::atomic<bool> cancelled_{false};
   std::thread thread_;
 };
-#endif
+#endif // defined(__linux__)
 
 } // namespace
 
