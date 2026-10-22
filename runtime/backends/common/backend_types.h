@@ -28,6 +28,9 @@ struct UnifiedBatchInput {
   int64_t request_id{-1};
   std::string client_request_id;
   uint64_t sequence_generation{0};
+  // Logprob capture for this step (ADR-0007 Stage 1): -1 = not requested;
+  // 0 = selected token's logprob only; N = include N alternatives.
+  int logprob_top_n{-1};
 };
 
 /// Output for one sequence in a unified batch execution.
@@ -35,6 +38,11 @@ struct UnifiedBatchOutput {
   int token{-1};     // Next sampled token; -1 = EOS or error
   std::string piece; // Text of token; empty when token == -1
   bool ok{false};    // true if token was successfully sampled
+  // Populated when the input requested logprobs and a non-terminal token was
+  // sampled. One entry per SAMPLED token, matching the legacy Generate()
+  // list semantics (terminal/EOS tokens carry no entry).
+  TokenLogprob step_logprob;
+  bool has_step_logprob{false};
 };
 
 // ============================================================================
@@ -105,6 +113,10 @@ struct PrefillResult {
   bool ok{false};          ///< true on success
   int first_token{-1};     ///< First output token sampled from prefill logits
   std::string first_piece; ///< Text of first_token
+  /// Logprob of first_token when the request asked for capture (ADR-0007
+  /// Stage 1); legacy Decode() emits this entry from prefill state.
+  TokenLogprob first_logprob;
+  bool has_first_logprob{false};
 };
 
 } // namespace inferflux

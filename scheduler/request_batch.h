@@ -232,6 +232,14 @@ struct InferenceRequest {
   std::function<void(const std::string &, const TokenLogprob *)> on_token;
   std::string
       accumulated_output; // Aggregated completion text across fairness slices.
+  // Aggregated per-sampled-token logprobs across phased decode steps
+  // (ADR-0007 Stage 1); survives step reprimes like accumulated_output and
+  // is copied into the final result at finalize.
+  std::vector<TokenLogprob> accumulated_logprobs;
+  // First-token logprob captured at phased prefill (ADR-0007 Stage 1);
+  // consumed once at emission, mirroring first_piece.
+  TokenLogprob first_logprob;
+  bool has_first_logprob{false};
   // Native tokenizers may split one UTF-8 code point across token pieces.
   // Preserve the incomplete suffix across scheduler fairness slices.
   IncrementalUtf8Assembler output_utf8;

@@ -222,6 +222,9 @@ private:
   std::vector<int> Tokenize(const std::string &prompt, bool add_bos) const;
   std::string TokenToString(int token) const;
 
+  TokenLogprob CollectLogprobFromRow(const float *row, int token_id,
+                                     const std::string &token_str,
+                                     int top_n) const;
   TokenLogprob CollectLogprob(int token_id, const std::string &token_str,
                               int top_n) const;
 

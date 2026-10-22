@@ -93,6 +93,8 @@ public:
   std::vector<TopLogitEntry> TopLogitsForParity(int top_n) override;
   int TokenCount(const std::string &text) const override;
   std::vector<int> TokenizeForCache(const std::string &prompt) const override;
+  bool SupportsUnifiedLogprobCapture() const override { return false; }
+
   bool IsReady() const override;
 
   // --- Embedding (overrides BackendInterface via LlamaCppBackend) ---

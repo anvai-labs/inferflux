@@ -1517,11 +1517,14 @@ TEST_CASE("Scheduler charges stateless admission prompt plus decode budget",
   GlobalMetrics().SetBackend("cpu");
   const int64_t skips_before = ReadBatchTokenBudgetSkipsTotal();
 
-  // Both prompts tokenize to five tokens. The logprobs request runs the
-  // stateless legacy Generate() path and executes its whole decode budget in
-  // the admitted pass, so admission must charge prompt + max_tokens (25),
-  // not the prompt width alone (5). With a 12-token batch budget the pair no
-  // longer fits in one selection once the plain request is admitted.
+  // Both prompts tokenize to five tokens. The structured-output request
+  // runs the stateless legacy Generate() path and executes its whole decode
+  // budget in the admitted pass, so admission must charge prompt +
+  // max_tokens (25), not the prompt width alone (5). With a 12-token batch
+  // budget the pair no longer fits in one selection once the plain request
+  // is admitted. (Logprobs requests joined the phased path in ADR-0007
+  // Stage 1 and reverted to prompt-width admission — covered by their own
+  // test.)
   auto make_request = []() {
     InferenceRequest req;
     req.prompt = "alpha beta gamma delta epsilon";
@@ -1531,7 +1534,7 @@ TEST_CASE("Scheduler charges stateless admission prompt plus decode budget",
   };
   auto plain = make_request();
   auto stateless = make_request();
-  stateless.collect_logprobs = true;
+  stateless.response_format.has_format = true;
 
   auto fut_plain = scheduler.Generate(std::move(plain));
   auto fut_stateless = scheduler.Generate(std::move(stateless));
@@ -2766,6 +2769,11 @@ public:
       if (in.request_logits) {
         out.token = 42;
         out.piece = "x";
+        if (in.logprob_top_n >= 0) {
+          out.step_logprob.token = "x";
+          out.step_logprob.logprob = -1.0f;
+          out.has_step_logprob = true;
+        }
       }
       outputs.push_back(out);
     }
@@ -2888,6 +2896,70 @@ TEST_CASE("Scheduler falls back to full phased prefill when the hybrid prefix "
   REQUIRE(backend->unified_calls > 0);
 }
 
+TEST_CASE("Phased logprobs join the cache path with a kill switch",
+          "[scheduler][cache_usage]") {
+  // ADR-0007 Stage 1 contract: logprobs requests on llama-family backends
+  // take the phased path (sequence admitted, prefix lookup performed,
+  // accepted reuse reported) behind a live kill switch that restores the
+  // legacy full-generate routing.
+  const char *kSwitch = "INFERFLUX_DISABLE_PHASED_LOGPROBS";
+  ::unsetenv(kSwitch);
+  struct EnvGuard {
+    const char *name;
+    ~EnvGuard() { ::unsetenv(name); }
+  } env_guard{kSwitch};
+  for (const std::string mode : {"phased", "kill_switch"}) {
+    CAPTURE(mode);
+    if (mode == "kill_switch") {
+      ::setenv(kSwitch, "1", 1);
+    }
+    SimpleTokenizer tokenizer;
+    auto cache = std::make_shared<PagedKVCache>(
+        32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+    auto router = std::make_shared<SingleModelRouter>();
+    auto backend = std::make_shared<PositionCheckingBackend>();
+    ModelInfo info;
+    info.id = "phased-logprobs";
+    info.backend = "cpu";
+    REQUIRE(router->RegisterModel(info, backend));
+    auto prefix_cache = std::make_shared<RadixPrefixCache>(
+        cache, [](int, std::shared_ptr<BackendInterface>) {},
+        RadixPrefixCacheLimits{1024, 12});
+    REQUIRE(prefix_cache->Insert(backend->TokenizeForCache("seed"),
+                                 {10, 11, 12}, 7, backend));
+    MetricsRegistry metrics;
+    Scheduler::Config config;
+    config.metrics = &metrics;
+    Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(), cache,
+                        router, nullptr, prefix_cache, FairnessConfig{},
+                        DisaggregatedConfig{}, {}, config);
+    InferenceRequest request;
+    request.prompt = "cache usage";
+    request.max_tokens = 2;
+    request.collect_logprobs = true;
+    request.logprob_top_n = 3;
+    const auto result = scheduler.Generate(std::move(request)).get();
+    REQUIRE_FALSE(result.no_backend);
+    if (mode == "phased") {
+      REQUIRE(backend->unified_calls > 0);
+      REQUIRE(backend->generate_calls == 0);
+      // Exact donor accepted: logprobs traffic now reports reuse.
+      REQUIRE(result.cached_prompt_tokens == 39);
+      REQUIRE(result.logprobs.size() ==
+              static_cast<std::size_t>(result.completion_tokens));
+      for (const auto &lp : result.logprobs) {
+        REQUIRE_FALSE(lp.token.empty());
+      }
+    } else {
+      REQUIRE(backend->generate_calls > 0);
+      REQUIRE(backend->unified_calls == 0);
+      REQUIRE(result.cached_prompt_tokens == 0);
+    }
+    REQUIRE(backend->position_violations == 0);
+  }
+  ::unsetenv(kSwitch);
+}
+
 TEST_CASE("Scheduler reports only accepted cache reuse",
           "[scheduler][cache_usage]") {
   for (const std::string mode : {"synchronous", "deferred", "split_decode"}) {
@@ -2945,16 +3017,24 @@ TEST_CASE("Scheduler reports only accepted cache reuse",
       REQUIRE_FALSE(result.no_backend);
       REQUIRE(result.completion_tokens > 0);
       CHECK(result.prompt_tokens == 40);
-      REQUIRE(result.cached_prompt_tokens == (scenario == "exact" ? 39 : 0));
+      // "logprobs" is phased since ADR-0007 Stage 1 and behaves like the
+      // plain scenarios (exact donor => accepted reuse).
+      const bool exact_hit = scenario == "exact" || scenario == "logprobs";
+      REQUIRE(result.cached_prompt_tokens == (exact_hit ? 39 : 0));
       const auto rendered = metrics.RenderPrometheus();
       REQUIRE(rendered.find("inferflux_kv_prefix_reuse_tokens_total " +
                             std::to_string(result.cached_prompt_tokens) +
                             "\n") != std::string::npos);
       REQUIRE(rendered.find("inferflux_kv_prefix_reuse_total " +
-                            std::to_string(scenario == "exact" ? 1 : 0) +
-                            "\n") != std::string::npos);
+                            std::to_string(exact_hit ? 1 : 0) + "\n") !=
+              std::string::npos);
       REQUIRE(backend->position_violations == 0);
-      if (scenario == "logprobs" || scenario == "structured") {
+      if (scenario == "logprobs") {
+        // ADR-0007 Stage 1: logprobs runs the phased unified path.
+        REQUIRE(backend->unified_calls > 0);
+        REQUIRE(backend->generate_calls == 0);
+      }
+      if (scenario == "structured") {
         REQUIRE(backend->generate_calls > 0);
         REQUIRE(backend->unified_calls == 0);
       }
