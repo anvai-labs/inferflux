@@ -306,8 +306,14 @@ bool PhasedLogprobsDisabled() {
   // Read per call (admission rate, not per-token): keeps the switch
   // live-tunable and directly testable in-process.
   const char *env = std::getenv("INFERFLUX_DISABLE_PHASED_LOGPROBS");
-  return env != nullptr && std::string(env) != "0" &&
-         std::string(env) != "false";
+  if (env == nullptr) {
+    return false;
+  }
+  std::string value(env);
+  for (char &c : value) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  return !value.empty() && value != "0" && value != "false" && value != "off";
 }
 
 // ADR-0007 scope boundary: native backends implement their own unified
@@ -319,7 +325,8 @@ bool BackendKeepsLegacyLogprobPath(const std::string &backend_name) {
 
 std::size_t EstimateQueueTokenCost(const InferenceRequest &inference,
                                    bool from_decode,
-                                   const FairnessConfig &fairness_config) {
+                                   const FairnessConfig &fairness_config,
+                                   bool backend_keeps_legacy_logprobs = false) {
   // Prefill items are still charged by prompt width; decode items should be
   // charged by per-iteration decode demand to avoid re-charging full prompts on
   // every fairness requeue.  Exceptions: requests that will run the stateless
@@ -331,7 +338,8 @@ std::size_t EstimateQueueTokenCost(const InferenceRequest &inference,
   // their decode demand is charged from the decode queue like plain traffic.
   const bool stateless_execution =
       inference.has_images || inference.response_format.has_format ||
-      (inference.collect_logprobs && PhasedLogprobsDisabled());
+      (inference.collect_logprobs &&
+       (PhasedLogprobsDisabled() || backend_keeps_legacy_logprobs));
   if (!from_decode) {
     if (stateless_execution) {
       return std::max<std::size_t>(
@@ -604,10 +612,6 @@ void PrimeUnifiedDecodeStepState(InferenceRequest *req) {
     // First-token logprob captured at prefill (ADR-0007 Stage 1): one
     // entry per sampled token, emitted here where the first token is
     // consumed — mirroring legacy Decode()'s prefill entry.
-    fprintf(stderr,
-            "[DBG] prime first-token collect=%d has_lp=%d n_past=%d first=%d\n",
-            (int)req->collect_logprobs, (int)req->has_first_logprob,
-            req->n_past, req->first_token);
     const TokenLogprob *first_lp = nullptr;
     if (req->collect_logprobs && req->has_first_logprob) {
       req->accumulated_logprobs.push_back(req->first_logprob);
@@ -1662,6 +1666,12 @@ void Scheduler::DecodeWorkerLoop() {
             inference->fairness.reported_prompt_tokens >= 0) {
           result.prompt_tokens = inference->fairness.reported_prompt_tokens;
         }
+        if (!use_stepwise_decode && inference->collect_logprobs &&
+            !inference->accumulated_logprobs.empty()) {
+          // Phased executors accumulate logprobs on the request (ADR-0007
+          // Stage 1); carry them into the result on this assembly path too.
+          result.logprobs = std::move(inference->accumulated_logprobs);
+        }
 
         // Return KV memory and sequence slot.  Both must happen together.
         // ExecuteRequest intentionally does NOT call FreeSequence — it leaves
@@ -2024,7 +2034,10 @@ Scheduler::BatchSelection Scheduler::BuildBatchLocked() {
   for (std::size_t i = 0; i < queue_items.size(); ++i) {
     auto &item = queue_items[i].pending;
     std::size_t tokens = EstimateQueueTokenCost(
-        item->inference, queue_items[i].from_decode, fairness_config_);
+        item->inference, queue_items[i].from_decode, fairness_config_,
+        item->resolved_backend &&
+            (BackendKeepsLegacyLogprobPath(item->resolved_backend->Name()) ||
+             !item->resolved_backend->SupportsUnifiedLogprobCapture()));
     if (!selection.pending.empty() &&
         token_budget + tokens >
             static_cast<std::size_t>(config_.max_batch_tokens)) {
@@ -2143,7 +2156,6 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
       }
       if (pending->resolved_backend && pending->resolved_backend->IsReady()) {
         inf.cache_execution_path = "phased";
-        metrics_->RecordCacheExecutionPath(inf.cache_execution_path);
         // Compute BPE tokens for prefix matching (INF-7).  We do this once per
         // request: if bpe_prompt_tokens is already populated (e.g., a retry
         // after channel-full rejection), reuse the cached result.
@@ -2165,9 +2177,12 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         // Images requests keep the legacy path because phased prefill is
         // text-only. Logprobs requests join the phased path (ADR-0007
         // Stage 1) except on native backends and behind the kill switch.
-        const bool backend_keeps_legacy = BackendKeepsLegacyLogprobPath(
-            pending->resolved_backend ? pending->resolved_backend->Name()
-                                      : std::string());
+        const bool backend_keeps_legacy =
+            BackendKeepsLegacyLogprobPath(
+                pending->resolved_backend ? pending->resolved_backend->Name()
+                                          : std::string()) ||
+            (pending->resolved_backend &&
+             !pending->resolved_backend->SupportsUnifiedLogprobCapture());
         if (inf.has_images || inf.response_format.has_format ||
             (inf.collect_logprobs &&
              (backend_keeps_legacy || PhasedLogprobsDisabled()))) {
@@ -2186,6 +2201,10 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
           inf.prefill_offset = 0;
           staged_decode_local.push_back(pending);
           continue;
+        }
+        if (inf.cache_execution_path == "phased") {
+          // Not bypassed: this admission takes the phased path.
+          metrics_->RecordCacheExecutionPath(inf.cache_execution_path);
         }
         // KV prefix reuse (§ Item 5): if we have a warm sequence whose BPE
         // tokens are a strict prefix of this request's BPE prompt tokens, copy

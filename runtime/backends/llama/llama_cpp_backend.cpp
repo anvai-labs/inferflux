@@ -1412,13 +1412,6 @@ LlamaCppBackend::BatchDecodeStep(std::vector<BatchDecodeInput> &inputs) {
     } else {
       results[static_cast<std::size_t>(i)].token = tok;
       results[static_cast<std::size_t>(i)].piece = TokenToString(tok);
-      if (inputs[i].logprob_top_n >= 0) {
-        results[static_cast<std::size_t>(i)].step_logprob =
-            CollectLogprobFromRow(logits, tok,
-                                  results[static_cast<std::size_t>(i)].piece,
-                                  inputs[i].logprob_top_n);
-        results[static_cast<std::size_t>(i)].has_step_logprob = true;
-      }
       LogTokenTrace("batch_decode", -1, inputs[i].sequence_id, "", 0,
                     inputs[i].n_past, tok,
                     results[static_cast<std::size_t>(i)].piece);

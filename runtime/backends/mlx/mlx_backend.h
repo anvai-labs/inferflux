@@ -57,6 +57,8 @@ public:
                     const SamplingParams &sp) override;
   void TeardownSampler() override;
 
+  bool SupportsUnifiedLogprobCapture() const override { return false; }
+
   bool IsReady() const override;
   int TokenCount(const std::string &text) const override;
 

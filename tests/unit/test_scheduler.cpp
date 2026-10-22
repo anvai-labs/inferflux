@@ -2904,6 +2904,10 @@ TEST_CASE("Phased logprobs join the cache path with a kill switch",
   // legacy full-generate routing.
   const char *kSwitch = "INFERFLUX_DISABLE_PHASED_LOGPROBS";
   ::unsetenv(kSwitch);
+  struct EnvGuard {
+    const char *name;
+    ~EnvGuard() { ::unsetenv(name); }
+  } env_guard{kSwitch};
   for (const std::string mode : {"phased", "kill_switch"}) {
     CAPTURE(mode);
     if (mode == "kill_switch") {
@@ -3022,8 +3026,8 @@ TEST_CASE("Scheduler reports only accepted cache reuse",
                             std::to_string(result.cached_prompt_tokens) +
                             "\n") != std::string::npos);
       REQUIRE(rendered.find("inferflux_kv_prefix_reuse_total " +
-                            std::to_string(exact_hit ? 1 : 0) +
-                            "\n") != std::string::npos);
+                            std::to_string(exact_hit ? 1 : 0) + "\n") !=
+              std::string::npos);
       REQUIRE(backend->position_violations == 0);
       if (scenario == "logprobs") {
         // ADR-0007 Stage 1: logprobs runs the phased unified path.

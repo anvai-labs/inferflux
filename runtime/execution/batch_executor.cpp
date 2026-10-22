@@ -59,7 +59,7 @@ bool AppendGeneratedPiece(InferenceRequest *req, std::string_view raw_piece,
       ApplyStop(assembled.text, *completion, req->stop, &emit_piece);
   if (req->on_token && !emit_piece.empty()) {
     metrics->RecordStreamTokens(1);
-    req->on_token(emit_piece, nullptr);
+    req->on_token(emit_piece, lp);
   }
   return stop_hit;
 }
