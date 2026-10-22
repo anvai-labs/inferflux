@@ -4,6 +4,7 @@
 #include "runtime/backends/backend_factory.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
+#include "server/rocr_spin_tamer.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -642,6 +643,10 @@ std::string SingleModelRouter::LoadModel(const ModelLoadSpec &spec) {
                                         info.backend_provider,
                                         info.backend_fallback);
   RecordModelReadyLocked(entry, entry.info.ready);
+  // A load (startup, admin API, or registry hot-reload) can be the first to
+  // initialize HIP and spawn the ROCr busy-spin pollers; queue a coalesced
+  // background scan. No-op unless the ROCr runtime is loaded.
+  TameRuntimeSpinThreadsAsync();
   return info.id;
 }
 

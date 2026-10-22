@@ -1,4 +1,5 @@
 #include "server/http/http_server.h"
+#include "runtime/thread_name.h"
 #include <yaml-cpp/yaml.h>
 
 #include "server/http/completion_payload.h"
@@ -1580,6 +1581,7 @@ void HttpServer::Stop() {
 }
 
 void HttpServer::WorkerLoop() {
+  SetCurrentThreadName("if-http");
   while (true) {
     ClientSession session;
     {
@@ -1607,6 +1609,7 @@ void HttpServer::WorkerLoop() {
 }
 
 void HttpServer::AcceptLoop(Listener &listener) {
+  SetCurrentThreadName("if-accept");
   const int fd = listener.fd.load();
   if (fd < 0) {
     return;

@@ -1,6 +1,7 @@
 #include "server/rocr_spin_tamer.h"
 
 #include "runtime/string_utils.h"
+#include "runtime/thread_name.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
@@ -15,8 +16,10 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -34,12 +37,18 @@ constexpr int kWindowMs = 1200;
 constexpr int kSleepSliceMs = 50;
 constexpr int kMinBusyPercent = 80;
 constexpr long kMaxStimeDeltaTicks = 2;
-constexpr int kMaxConfined = 4; // ROCm spawns 2; cap guards against storms.
+// ROCm spawns 2 pollers; more matches than this trips the burst guard.
+constexpr int kMaxConfined = 4;
 
 struct ThreadSample {
   long utime_ticks = 0;
   long stime_ticks = 0;
   long long voluntary_switches = 0;
+  // From /proc/.../schedstat (CONFIG_SCHED_INFO): ns on CPU and ns runnable
+  // but waiting on a runqueue. Absent on kernels without schedstats.
+  bool has_schedstat = false;
+  unsigned long long run_ns = 0;
+  unsigned long long wait_ns = 0;
 };
 
 pid_t CurrentTid() { return static_cast<pid_t>(syscall(SYS_gettid)); }
@@ -97,11 +106,19 @@ bool ReadVoluntarySwitches(pid_t tid, long long *out) {
   std::string line;
   while (file && std::getline(file, line)) {
     if (line.rfind("voluntary_ctxt_switches:", 0) == 0) {
-      *out = std::strtoll(line.c_str() + 25, nullptr, 10);
+      // strtoll skips the separator whitespace itself, so this does not
+      // depend on the exact /proc padding after the 24-char key.
+      *out = std::strtoll(line.c_str() + 24, nullptr, 10);
       return true;
     }
   }
   return false; // TID vanished; caller skips it.
+}
+
+bool ReadSchedstat(pid_t tid, unsigned long long *run_ns,
+                   unsigned long long *wait_ns) {
+  std::ifstream file("/proc/self/task/" + std::to_string(tid) + "/schedstat");
+  return static_cast<bool>(file >> *run_ns >> *wait_ns);
 }
 
 // Snapshots utime/stime/voluntary counters per thread. Thread comms are
@@ -119,6 +136,7 @@ SampleAllThreads(std::unordered_map<pid_t, std::string> *comms) {
     if (!ReadVoluntarySwitches(tid, &sample.voluntary_switches)) {
       continue;
     }
+    sample.has_schedstat = ReadSchedstat(tid, &sample.run_ns, &sample.wait_ns);
     if (comms) {
       comms->emplace(tid, std::move(comm));
     }
@@ -149,7 +167,10 @@ bool ChooseTameCore(int *tame_core) {
   if (count <= 1) {
     return false; // Nothing to gain from pinning; demote only.
   }
-  int requested = ParseIntEnv("INFERFLUX_ROCR_TAME_CORE", -1, 0, CPU_SETSIZE);
+  // Valid CPU indices are [0, CPU_SETSIZE - 1]; an index of CPU_SETSIZE
+  // would make CPU_ISSET/CPU_SET address past the end of cpu_set_t.
+  const int requested =
+      ParseIntEnv("INFERFLUX_ROCR_TAME_CORE", -1, 0, CPU_SETSIZE - 1);
   if (requested >= 0) {
     if (CPU_ISSET(requested, &allowed)) {
       *tame_core = requested;
@@ -195,8 +216,25 @@ bool ConfineThread(pid_t tid, int index, int tame_core, bool pin) {
   return true;
 }
 
-int TameRuntimeSpinThreadsImpl(const std::atomic<bool> *cancelled) {
+// The pollers only exist once the ROCr runtime is loaded; without it, a
+// matching thread is by definition something else and must not be touched.
+bool HsaRuntimeLoaded() {
+  std::ifstream maps("/proc/self/maps");
+  std::string line;
+  while (maps && std::getline(maps, line)) {
+    if (line.find("libhsa-runtime64") != std::string::npos) {
+      return true;
+    }
+  }
+  return false;
+}
+
+int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
+                               const std::atomic<bool> *cancelled) {
   if (!ParseBoolEnv("INFERFLUX_ROCR_TAME", true)) {
+    return 0;
+  }
+  if (options.require_hsa_runtime && !HsaRuntimeLoaded()) {
     return 0;
   }
   const pid_t pid = getpid();
@@ -214,6 +252,7 @@ int TameRuntimeSpinThreadsImpl(const std::atomic<bool> *cancelled) {
 
   std::unordered_map<pid_t, std::string> comms;
   const auto first = SampleAllThreads(&comms);
+  const auto window_start = std::chrono::steady_clock::now();
 
   for (int slept = 0; slept < kWindowMs; slept += kSleepSliceMs) {
     if (cancelled && cancelled->load(std::memory_order_relaxed)) {
@@ -232,11 +271,14 @@ int TameRuntimeSpinThreadsImpl(const std::atomic<bool> *cancelled) {
   const bool pin = ChooseTameCore(&tame_core);
 
   const auto second = SampleAllThreads(nullptr);
-  int confined = 0;
+  const unsigned long long window_ns = static_cast<unsigned long long>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - window_start)
+          .count());
+  const unsigned long long min_runnable_ns =
+      window_ns / 100 * static_cast<unsigned long long>(kMinBusyPercent);
+  std::vector<pid_t> candidates;
   for (const auto &entry : second) {
-    if (confined >= kMaxConfined) {
-      break;
-    }
     const pid_t tid = entry.first;
     if (tid == pid || tid == self) {
       continue;
@@ -255,14 +297,48 @@ int TameRuntimeSpinThreadsImpl(const std::atomic<bool> *cancelled) {
     const long stime_delta = after.stime_ticks - before.stime_ticks;
     const long long voluntary_delta =
         after.voluntary_switches - before.voluntary_switches;
-    // Pure userspace spin: near-100% user time, no kernel time, and no
-    // voluntary sleeps. Preemption only bumps *non*voluntary switches, so
-    // this discriminator holds even on a fully loaded machine.
-    if (utime_delta >= min_busy_ticks && stime_delta <= kMaxStimeDeltaTicks &&
-        voluntary_delta == 0) {
-      if (ConfineThread(tid, confined, tame_core, pin)) {
-        ++confined;
-      }
+    // "Never blocks": a spinner is runnable for the whole window. With
+    // schedstat that is on-CPU + runqueue-wait time, which stays ~100% of the
+    // window however contended the host is (a starved spinner waits rather
+    // than runs). Without schedstat, fall back to user time, which a heavily
+    // loaded host can push below the threshold (a miss, never a false hit).
+    bool always_runnable;
+    if (before.has_schedstat && after.has_schedstat) {
+      always_runnable =
+          (after.run_ns - before.run_ns) + (after.wait_ns - before.wait_ns) >=
+          min_runnable_ns;
+    } else {
+      always_runnable = utime_delta >= min_busy_ticks;
+    }
+    // Pure userspace spin: always runnable, no kernel time, and no voluntary
+    // sleeps. Preemption only bumps *non*voluntary switches, so the switch
+    // test holds even on a fully loaded machine.
+    if (always_runnable && utime_delta > 0 &&
+        stime_delta <= kMaxStimeDeltaTicks && voluntary_delta == 0) {
+      candidates.push_back(tid);
+    }
+  }
+
+  // Burst guard: the ROCr runtime spawns two pollers. Many simultaneous
+  // matches mean something else is spinning (e.g. a third-party CPU
+  // threadpool mid-compute); demoting those would be irreversible, so
+  // confine nothing rather than a guessed subset.
+  if (static_cast<int>(candidates.size()) > kMaxConfined) {
+    log::Warn(kComponent, std::to_string(candidates.size()) +
+                              " unnamed threads match the spin signature "
+                              "(expected <= " +
+                              std::to_string(kMaxConfined) +
+                              "); confining none");
+    return 0;
+  }
+  if (cancelled && cancelled->load(std::memory_order_relaxed)) {
+    return 0;
+  }
+
+  int confined = 0;
+  for (const pid_t tid : candidates) {
+    if (ConfineThread(tid, confined, tame_core, pin)) {
+      ++confined;
     }
   }
 
@@ -281,49 +357,91 @@ int TameRuntimeSpinThreadsImpl(const std::atomic<bool> *cancelled) {
 #endif // defined(__linux__)
 
 #if defined(__linux__)
-void RunTamerWorker(std::atomic<bool> *cancelled) {
-  TameRuntimeSpinThreadsImpl(cancelled);
-}
+// Lazily started background scanner. Requests set `pending_` and wake the
+// worker; requests landing mid-scan leave `pending_` set, so they coalesce
+// into exactly one follow-up scan. Between scans the worker blocks on the
+// condition variable (never spins).
+class TamerWorker {
+public:
+  ~TamerWorker() {
+    // Runs at exit in reverse construction order: g_metrics and the logger
+    // are constructed before this worker (first request is inside main), so
+    // they are still alive while we join. `cancelled_` cuts an in-flight
+    // scan's sampling window short (<= one 50 ms slice).
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cancelled_.store(true);
+    cv_.notify_all();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+
+  void Request() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (stop_) {
+      return;
+    }
+    pending_ = true;
+    if (!thread_.joinable()) {
+      try {
+        thread_ = std::thread(&TamerWorker::Loop, this);
+      } catch (const std::exception &ex) {
+        pending_ = false;
+        log::Warn(kComponent,
+                  std::string("spin-tamer worker spawn failed: ") + ex.what());
+        return;
+      }
+    }
+    cv_.notify_one();
+  }
+
+private:
+  void Loop() {
+    SetCurrentThreadName("if-rocr-tamer");
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (true) {
+      cv_.wait(lock, [this] { return stop_ || pending_; });
+      if (stop_) {
+        return;
+      }
+      pending_ = false;
+      lock.unlock();
+      try {
+        TameRuntimeSpinThreadsImpl(RocrSpinTamerOptions{}, &cancelled_);
+      } catch (...) {
+        // Best-effort hygiene must never take the server down.
+      }
+      lock.lock();
+    }
+  }
+
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool pending_ = false;
+  bool stop_ = false;
+  std::atomic<bool> cancelled_{false};
+  std::thread thread_;
+};
 #endif
 
 } // namespace
 
-int TameRuntimeSpinThreads() {
+int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options) {
 #if defined(__linux__)
-  return TameRuntimeSpinThreadsImpl(nullptr);
+  return TameRuntimeSpinThreadsImpl(options, nullptr);
 #else
+  (void)options;
   return 0;
 #endif
 }
 
 void TameRuntimeSpinThreadsAsync() {
 #if defined(__linux__)
-  struct TamerWorker {
-    std::thread thread;
-    std::atomic<bool> cancelled{false};
-    std::atomic<bool> started{false};
-
-    ~TamerWorker() {
-      // Runs at exit in reverse construction order: g_metrics and the
-      // logger are constructed before this worker (first call is inside
-      // main), so they are still alive while we join.
-      cancelled.store(true);
-      if (thread.joinable()) {
-        thread.join();
-      }
-    }
-  };
   static TamerWorker worker;
-  if (worker.started.exchange(true)) {
-    return; // Idempotent across re-entry.
-  }
-  try {
-    worker.thread = std::thread(RunTamerWorker, &worker.cancelled);
-  } catch (const std::exception &ex) {
-    worker.started.store(false);
-    log::Warn(kComponent,
-              std::string("spin-tamer worker spawn failed: ") + ex.what());
-  }
+  worker.Request();
 #endif
 }
 

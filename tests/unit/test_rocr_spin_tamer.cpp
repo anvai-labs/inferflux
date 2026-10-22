@@ -5,14 +5,15 @@
 
 #if defined(__linux__)
 #include <sched.h>
-#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <thread>
+#include <vector>
 #endif
 
 using namespace inferflux;
@@ -22,7 +23,9 @@ using namespace inferflux;
 // non-zero, which would break the macOS CI ctest entry).
 TEST_CASE("rocr spin tamer disabled via env returns 0", "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar disable("INFERFLUX_ROCR_TAME", "0");
-  REQUIRE(inferflux::TameRuntimeSpinThreads() == 0);
+  RocrSpinTamerOptions options;
+  options.require_hsa_runtime = false;
+  REQUIRE(inferflux::TameRuntimeSpinThreads(options) == 0);
 }
 
 #if defined(__linux__)
@@ -54,13 +57,53 @@ int CountAllowedCpus() {
   return CPU_COUNT(&set);
 }
 
-// Best-effort hygiene: some kernels restrict unprivileged SCHED_IDLE ->
-// SCHED_OTHER transitions, so restoration results are not asserted.
-void RestoreThread(pid_t tid, const cpu_set_t &original) {
-  sched_param other{};
-  (void)sched_setscheduler(tid, SCHED_OTHER, &other);
-  (void)setpriority(PRIO_PROCESS, tid, 0);
-  (void)sched_setaffinity(tid, sizeof(original), &original);
+// Unnamed pure-userspace spinners (zero syscalls, zero voluntary context
+// switches) that stop and join on scope exit — including when a REQUIRE
+// throws, so a failed assertion can never destroy a joinable std::thread
+// (which would std::terminate the whole test binary).
+class SpinnerGroup {
+public:
+  explicit SpinnerGroup(int count) {
+    tids_ = std::make_unique<std::atomic<pid_t>[]>(count);
+    for (int i = 0; i < count; ++i) {
+      tids_[i].store(0);
+      threads_.emplace_back([this, i] {
+        tids_[i].store(CurrentTid());
+        while (!stop_.load(std::memory_order_relaxed)) {
+        }
+      });
+    }
+    for (int i = 0; i < count; ++i) {
+      while (tids_[i].load() == 0) {
+        std::this_thread::yield();
+      }
+    }
+  }
+
+  ~SpinnerGroup() {
+    stop_.store(true);
+    for (auto &thread : threads_) {
+      if (thread.joinable()) {
+        thread.join();
+      }
+    }
+  }
+
+  SpinnerGroup(const SpinnerGroup &) = delete;
+  SpinnerGroup &operator=(const SpinnerGroup &) = delete;
+
+  pid_t tid(int index) const { return tids_[index].load(); }
+
+private:
+  std::atomic<bool> stop_{false};
+  std::unique_ptr<std::atomic<pid_t>[]> tids_;
+  std::vector<std::thread> threads_;
+};
+
+RocrSpinTamerOptions WithoutHsaGate() {
+  RocrSpinTamerOptions options;
+  options.require_hsa_runtime = false;
+  return options;
 }
 
 } // namespace
@@ -70,29 +113,7 @@ TEST_CASE("rocr spin tamer confines a pure busy-spin thread",
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
 
-  std::atomic<bool> stop{false};
-  std::atomic<pid_t> spinner_tid{0};
-  cpu_set_t original_mask;
-  CPU_ZERO(&original_mask);
-
-  std::thread spinner([&] {
-    // Capture own affinity first, then publish the tid: the seq_cst
-    // store/load pair makes the mask visible to the main thread.
-    cpu_set_t self_mask;
-    CPU_ZERO(&self_mask);
-    if (sched_getaffinity(0, sizeof(self_mask), &self_mask) == 0) {
-      original_mask = self_mask;
-    }
-    spinner_tid.store(CurrentTid());
-    while (!stop.load(std::memory_order_relaxed)) {
-      // Zero syscalls, zero voluntary context switches.
-    }
-  });
-  while (spinner_tid.load() == 0) {
-    std::this_thread::yield();
-  }
-  const pid_t tid = spinner_tid.load();
-
+  SpinnerGroup spinners(1);
   const int ncpu = CountAllowedCpus();
   const int expected_core = HighestAllowedCpu();
 
@@ -100,21 +121,17 @@ TEST_CASE("rocr spin tamer confines a pure busy-spin thread",
   // 80%-of-window utime threshold on the first measurement.
   int confined = 0;
   for (int attempt = 0; attempt < 2 && confined == 0; ++attempt) {
-    confined = inferflux::TameRuntimeSpinThreads();
+    confined = inferflux::TameRuntimeSpinThreads(WithoutHsaGate());
   }
   REQUIRE(confined == 1);
 
   if (ncpu > 1) {
     cpu_set_t now;
     CPU_ZERO(&now);
-    REQUIRE(sched_getaffinity(tid, sizeof(now), &now) == 0);
+    REQUIRE(sched_getaffinity(spinners.tid(0), sizeof(now), &now) == 0);
     REQUIRE(CPU_COUNT(&now) == 1);
     REQUIRE(CPU_ISSET(expected_core, &now));
   }
-
-  RestoreThread(tid, original_mask);
-  stop.store(true);
-  spinner.join();
 }
 
 TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
@@ -127,10 +144,33 @@ TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
   });
-
-  REQUIRE(inferflux::TameRuntimeSpinThreads() == 0);
-
+  // Join before asserting so a failure cannot leave a joinable thread.
+  const int confined = inferflux::TameRuntimeSpinThreads(WithoutHsaGate());
   stop.store(true);
   sleeper.join();
+
+  REQUIRE(confined == 0);
+}
+
+TEST_CASE("rocr spin tamer skips processes without the ROCr runtime",
+          "[rocr_spin_tamer]") {
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  // The test binary never loads libhsa-runtime64, so with the default gate
+  // even a real spinner must be left alone.
+  SpinnerGroup spinners(1);
+  REQUIRE(inferflux::TameRuntimeSpinThreads() == 0);
+}
+
+TEST_CASE("rocr spin tamer confines nothing when too many threads match",
+          "[rocr_spin_tamer]") {
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
+  // Five spinners need five uncontended CPUs to each clear the busy
+  // threshold; on smaller runners the burst cannot be produced reliably.
+  if (CountAllowedCpus() < 8) {
+    SKIP("needs >= 8 allowed CPUs to produce a deterministic burst");
+  }
+  SpinnerGroup spinners(5);
+  REQUIRE(inferflux::TameRuntimeSpinThreads(WithoutHsaGate()) == 0);
 }
 #endif // defined(__linux__)

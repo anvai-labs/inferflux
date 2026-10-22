@@ -1,4 +1,5 @@
 #include "scheduler/scheduler.h"
+#include "runtime/thread_name.h"
 
 #include "runtime/backends/backend_utils.h"
 #include "runtime/execution/batch_executor.h"
@@ -1126,6 +1127,7 @@ void Scheduler::FailAllQueuedLocked() {
 }
 
 void Scheduler::DecodeWorkerLoop() {
+  SetCurrentThreadName("if-decode");
   // Exception envelope: an escapee (e.g. bad_alloc on a huge request) would
   // call std::terminate and take the whole server down; every other worker
   // loop in this file is similarly guarded below.
@@ -1807,6 +1809,7 @@ void Scheduler::UpdateFairnessConfig(const FairnessConfig &config) {
 }
 
 void Scheduler::WorkerLoop() {
+  SetCurrentThreadName("if-sched");
   // Exception envelope: see DecodeWorkerLoop.
   try {
     auto &pc = ParallelContext::Get();
@@ -3381,6 +3384,7 @@ void Scheduler::ReleasePendingRequestResources(PendingRequest *pending,
 }
 
 void Scheduler::EvictionWorkerLoop() {
+  SetCurrentThreadName("if-evict");
   // Periodically evict idle sequences to prevent slot exhaustion.
   // Runs in a separate thread with wakeable 30-second check intervals so
   // teardown doesn't block waiting on sleep_for.

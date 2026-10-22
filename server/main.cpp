@@ -1749,11 +1749,12 @@ int main(int argc, char **argv) {
     inferflux::RunStartupAdvisor(advisor_ctx);
   }
 
-  // ROCr spin-thread tamer (WSL2/ROCm AsyncEventsLoop workaround): the
-  // classifier needs a ~1.2 s measurement window, so spawn async — it must
-  // not block startup. HttpServer threads do not exist yet and every
-  // first-party thread blocks on a cv/sleep here, so the busy-spin
-  // discriminator is unambiguous at this point.
+  // ROCr spin-thread tamer (WSL2/ROCm AsyncEventsLoop workaround). Each
+  // model load already queues a scan; this one covers HIP initialized by
+  // backend probing with no model loaded. Async: the classifier needs a
+  // ~1.2 s window and must not block startup. First-party threads are named
+  // (runtime/thread_name.h), so they are never candidates regardless of
+  // timing.
   inferflux::TameRuntimeSpinThreadsAsync();
 
   int http_workers = 16; // Increased from 4 for better concurrent throughput

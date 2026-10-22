@@ -1,6 +1,7 @@
 #include "runtime/execution/batch_executor.h"
 #include "runtime/backends/backend_utils.h"
 #include "runtime/backends/llama/llama_cpp_backend.h"
+#include "runtime/thread_name.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 #include <future>
@@ -500,6 +501,7 @@ std::vector<InferenceResult> BatchExecutor::ExecuteBatch(
     std::vector<std::future<std::vector<InferenceResult>>> tasks;
     for (auto &[device, group] : device_batches) {
       tasks.push_back(std::async(std::launch::async, [this, group, device] {
+        SetCurrentThreadName("if-batch-group");
         const auto started = std::chrono::steady_clock::now();
         struct Diagnostic {
           std::function<void()> emit;

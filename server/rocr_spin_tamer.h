@@ -13,21 +13,41 @@ namespace inferflux {
 // the cost from N cores to 1. On WSL2 SCHED_IDLE/nice are not enforced, so
 // the affinity pin is the load-bearing mitigation there.
 //
-// Linux-only; both entry points are no-ops elsewhere.
+// Soundness guards (a misclassified thread is demoted for its lifetime):
+//  - Runs only when libhsa-runtime64 is mapped into the process; CPU-only
+//    and CUDA-only processes are never touched.
+//  - Only threads still carrying the process name are candidates. Every
+//    first-party thread names itself on entry (runtime/thread_name.h), so
+//    only third-party runtime threads remain eligible.
+//  - If more than kMaxConfined threads match (e.g. a busy CPU threadpool
+//    rather than the two pollers), nothing is confined and a warning is
+//    logged.
+//
+// Linux-only; every entry point is a no-op elsewhere.
 //
 // Knobs (env-only, see docs/CONFIG_REFERENCE.md section 10):
 //   INFERFLUX_ROCR_TAME       enable/disable (default: enabled)
 //   INFERFLUX_ROCR_TAME_CORE  pin target CPU index (default: highest CPU in
 //                             the process affinity mask; pinning skipped
 //                             when <= 1 CPU is allowed)
-//
-// Returns the number of threads confined (0 when disabled/unsupported).
-int TameRuntimeSpinThreads();
+struct RocrSpinTamerOptions {
+  // Skip the scan unless libhsa-runtime64 is mapped. Tests disable this to
+  // exercise the classifier without a ROCm runtime.
+  bool require_hsa_runtime = true;
+};
 
-// Fire-and-forget wrapper: runs the tamer off the startup path (the
-// classifier needs a ~1.2 s measurement window). Never blocks or throws.
-// The bounded worker is joined via static-destruction ordering, so a
-// fast-failing startup cannot race static teardown.
+// Synchronous scan: samples for ~1.2 s, confines matching threads, and
+// returns the number confined (0 when disabled, unsupported, no ROCr
+// runtime is loaded, or the burst guard tripped).
+int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options = {});
+
+// Requests a background scan and returns immediately; never blocks or
+// throws. Called after startup and after every successful model load, since
+// a model loaded at runtime can be the first to initialize HIP. Requests
+// arriving while a scan runs coalesce into exactly one follow-up scan, so
+// pollers spawned mid-window are still caught. Threads already confined are
+// renamed and therefore never re-matched. The worker blocks on a condition
+// variable between scans and is joined at static destruction.
 void TameRuntimeSpinThreadsAsync();
 
 } // namespace inferflux
