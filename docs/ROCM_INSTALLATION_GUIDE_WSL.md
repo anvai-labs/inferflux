@@ -273,10 +273,11 @@ and no HSA environment knob disables the loop (`HSA_ENABLE_SLEEP`,
 nice are additionally not enforced for service-cgroup threads, so CPU
 affinity is the only effective mitigation.
 
-`inferfluxd` applies it automatically after every model load attempt
-(startup, admin API, or registry hot-reload), again ~10 s later, and then
-every ~5 min while `libhsa-runtime64` is loaded, so pollers created lazily
-after a load are still caught. Over a ~1.2 s window it shortlists threads
+`inferfluxd` applies it automatically from a background thread that scans
+at startup (after models load), again after ~10 s and ~60 s, and then every
+~5 min, so pollers created lazily or by a model loaded at runtime are caught
+within one period. Without `libhsa-runtime64` loaded a scan is a single
+`dlopen` check. Over a ~1.2 s window it shortlists threads
 that never block: runnable for the whole window (on-CPU plus run-queue time
 from `/proc/.../schedstat`, so the check holds on a busy host), ~no kernel
 time, and zero voluntary context switches. Thread names are ignored (Linux
@@ -284,9 +285,10 @@ threads inherit their creator's name). Each shortlisted thread is then
 interrupted with a probe signal (up to 3 times; threads that block or
 ignore it are never signalled) and confined only if at least 2 sampled
 instruction pointers resolve into `libhsa-runtime64`. A busy CPU threadpool
-or any other non-ROCr thread is never confined; once proven non-ROCr it is
-remembered and never probed again (at most 2 `SA_RESTART` probe signals per
-thread lifetime). InferFlux's own threads are named `if-*` for
+or any other non-ROCr thread is never confined; a thread that is not proven
+backs off for 1, 2, 4, ... up to 12 scans (~1 h) before it is probed again,
+so it receives at most 2 `SA_RESTART` probe signals per back-off period. At
+most 8 threads are ever confined per process. InferFlux's own threads are named `if-*` for
 `top -H` readability. Confined
 threads are demoted (nice 19 + `SCHED_IDLE`) and co-pinned onto a single
 core, bounding the cost from 2 cores to 1. GPU sync latency is unaffected

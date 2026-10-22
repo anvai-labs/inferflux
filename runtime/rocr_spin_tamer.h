@@ -19,20 +19,23 @@ namespace inferflux {
 // irreversible:
 //  1. Prefilter (selects threads to probe): over a ~1.2 s window the thread
 //     never blocks (runnable for >= 80% of the window by schedstat, which is
-//     immune to host load), spends ~no time in the kernel, and makes zero
-//     voluntary context switches. Thread names are ignored: Linux threads
-//     inherit their creator's name.
+//     immune to host load; user time when schedstat is absent or inert),
+//     spends ~no time in the kernel, and makes zero voluntary context
+//     switches. Thread names are ignored: threads inherit their creator's.
 //  2. Proof (decides confinement): the thread is interrupted with a probe
 //     signal up to 3 times and confined only if at least 2 sampled
 //     instruction pointers resolve (dladdr) into the ROCr runtime library.
-//     Threads that block or ignore the probe signal are never signalled.
-//     A thread proven not to be ROCr is remembered and never probed again,
-//     so a busy third-party worker (ggml/OpenMP/BLAS) receives at most two
-//     SA_RESTART probe signals per lifetime and is never confined.
-// Confined threads are remembered by (tid, start time); a TID reused before
-// confinement is detected by re-checking the start time. If the probe
-// signal is owned by another handler or the architecture is unsupported,
-// nothing is confined.
+//     A thread whose signal mask blocks or ignores the probe is never
+//     signalled.
+// A thread not proven (other code, or no reply) backs off for 1, 2, 4, ...
+// up to 12 scans before it is probed again, so a busy third-party worker
+// (ggml/OpenMP/BLAS) receives at most 2 SA_RESTART probe signals per
+// back-off period and is never confined, while a real poller that was
+// unlucky once is still caught later. Confined threads are remembered by
+// (tid, start time); a TID reused before confinement is detected by
+// re-checking the start time. At most 8 threads are confined per process
+// lifetime. If the probe signal is owned by another handler or the
+// architecture is unsupported, nothing is confined.
 //
 // Linux-only; every entry point is a no-op elsewhere.
 //
@@ -42,6 +45,10 @@ namespace inferflux {
 //                             the process affinity mask; invalid values warn
 //                             and fall back; pinning skipped when <= 1 CPU
 //                             is allowed)
+
+// The PC probe uses SIGRTMIN + this offset (exposed for tests).
+constexpr int kRocrTamerProbeSignalOffset = 5;
+
 struct RocrSpinTamerOptions {
   // Fast path: skip the scan unless the ROCr runtime is loaded. Tests
   // disable it to exercise the scanner without a ROCm runtime.
@@ -49,8 +56,7 @@ struct RocrSpinTamerOptions {
   // A sampled instruction pointer counts as the owner's when it lies in a
   // loaded object whose path contains this substring.
   std::string code_owner = "libhsa-runtime64";
-  // Test seam: when set, decides PC ownership instead of `code_owner`, and
-  // proven-not-owner verdicts are not remembered (they are owner-specific).
+  // Test seam: when set, decides PC ownership instead of `code_owner`.
   std::function<bool(std::uintptr_t pc)> pc_owner;
 };
 
@@ -58,15 +64,15 @@ struct RocrSpinTamerOptions {
 // returns the number confined (0 when disabled, unsupported, or none found).
 int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options = {});
 
-// Requests a background scan and returns immediately; never blocks or
-// throws, from any thread. Called at the end of every model load attempt
-// (success or failure), since any load can be the first to initialize HIP.
-// After a requested scan the worker rescans once ~10 s later and then every
-// ~5 min while the ROCr runtime stays loaded, catching pollers created
-// lazily after a load. Requests arriving mid-scan coalesce into one
-// follow-up scan. Between scans the worker blocks on a condition variable.
-// It is never destroyed: an atexit hook stops and joins it, and later
-// requests are ignored — safe even when a load races process exit.
-void TameRuntimeSpinThreadsAsync();
+// Starts the background tamer once (idempotent; never blocks or throws).
+// Call after startup has initialized backends. The worker scans
+// immediately, again after ~10 s and ~60 s, then every ~5 min for the
+// process lifetime, so pollers created lazily or by a model loaded at
+// runtime are caught within one period. When the ROCr runtime is not
+// loaded a scan is a single dlopen(RTLD_NOLOAD) check. Does nothing when
+// INFERFLUX_ROCR_TAME is disabled. The worker blocks on a condition
+// variable between scans and is never destroyed: an atexit hook stops and
+// joins it before the logger and metrics registry are torn down.
+void StartRuntimeSpinTamer() noexcept;
 
 } // namespace inferflux

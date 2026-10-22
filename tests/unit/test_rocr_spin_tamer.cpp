@@ -5,14 +5,19 @@
 #include "support/scoped_env.h"
 
 #if defined(__linux__)
+#include <pthread.h>
 #include <sched.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <memory>
+#include <string>
 #include <thread>
 #include <vector>
 #endif
@@ -52,6 +57,8 @@ bool InTestSpinLoop(std::uintptr_t pc) {
          pc < reinterpret_cast<std::uintptr_t>(__stop_rocr_tamer_test_spin);
 }
 
+int ProbeSignal() { return SIGRTMIN + kRocrTamerProbeSignalOffset; }
+
 int HighestAllowedCpu() {
   cpu_set_t set;
   CPU_ZERO(&set);
@@ -76,19 +83,46 @@ int CountAllowedCpus() {
   return CPU_COUNT(&set);
 }
 
+// True when `tid` has the probe signal pending (queued but undelivered).
+bool ProbePending(pid_t tid) {
+  std::ifstream file("/proc/self/task/" + std::to_string(tid) + "/status");
+  std::string line;
+  while (std::getline(file, line)) {
+    if (line.rfind("SigPnd:", 0) == 0) {
+      const unsigned long long pending =
+          std::strtoull(line.c_str() + 7, nullptr, 16);
+      return (pending & (1ULL << (ProbeSignal() - 1))) != 0;
+    }
+  }
+  return false;
+}
+
 // Pure-userspace spinners (zero syscalls, zero voluntary context switches,
 // executing only RocrTamerTestSpinUntil) that stop and join on scope exit —
 // including when a REQUIRE throws, so a failed assertion can never destroy a
 // joinable std::thread (which would std::terminate the whole test binary).
 class SpinnerGroup {
 public:
-  explicit SpinnerGroup(int count, const char *name = nullptr) {
+  struct Options {
+    const char *name = nullptr; // Thread name to set before spinning.
+    bool block_probe = false;   // Block the probe signal before spinning.
+  };
+
+  explicit SpinnerGroup(int count) : SpinnerGroup(count, Options{}) {}
+
+  SpinnerGroup(int count, Options options) {
     tids_ = std::make_unique<std::atomic<pid_t>[]>(count);
     for (int i = 0; i < count; ++i) {
       tids_[i].store(0);
-      threads_.emplace_back([this, i, name] {
-        if (name) {
-          inferflux::SetCurrentThreadName(name);
+      threads_.emplace_back([this, i, options] {
+        if (options.name) {
+          inferflux::SetCurrentThreadName(options.name);
+        }
+        if (options.block_probe) {
+          sigset_t set;
+          sigemptyset(&set);
+          sigaddset(&set, ProbeSignal());
+          pthread_sigmask(SIG_BLOCK, &set, nullptr);
         }
         tids_[i].store(inferflux::CurrentThreadId());
         RocrTamerTestSpinUntil(&stop_);
@@ -121,21 +155,39 @@ private:
   std::vector<std::thread> threads_;
 };
 
-// Scan without the ROCr-runtime fast path, with PC ownership decided by
-// `owner`. Owning only the test spin loop also makes any real ROCr pollers
-// in a ROCm-build test process ineligible, keeping these cases hermetic.
-RocrSpinTamerOptions OwnedBy(std::function<bool(std::uintptr_t)> owner) {
+// Ownership predicate that counts every replied sample it is asked about,
+// so tests can prove the probe really ran. Answers "owned" for the first
+// `owned` calls on test-loop PCs and "not owned" after that.
+struct CountingOwner {
+  std::shared_ptr<std::atomic<int>> calls =
+      std::make_shared<std::atomic<int>>(0);
+  int owned = 0;
+
+  RocrSpinTamerOptions Options() const {
+    RocrSpinTamerOptions options;
+    options.require_hsa_runtime = false;
+    auto counter = calls;
+    const int limit = owned;
+    options.pc_owner = [counter, limit](std::uintptr_t pc) {
+      const int call = counter->fetch_add(1);
+      return InTestSpinLoop(pc) && call < limit;
+    };
+    return options;
+  }
+};
+
+RocrSpinTamerOptions OwnedByTestLoop() {
   RocrSpinTamerOptions options;
   options.require_hsa_runtime = false;
-  options.pc_owner = std::move(owner);
+  options.pc_owner = InTestSpinLoop;
   return options;
 }
 
 // Retries absorb a loaded few-core CI runner where the spinner misses the
-// window threshold once; the total must still be exactly `expected`.
+// window threshold; the total must still be exactly `expected`.
 int ScanUntil(int expected, const RocrSpinTamerOptions &options) {
   int total = 0;
-  for (int attempt = 0; attempt < 3 && total < expected; ++attempt) {
+  for (int attempt = 0; attempt < 4 && total < expected; ++attempt) {
     total += inferflux::TameRuntimeSpinThreads(options);
   }
   return total;
@@ -152,7 +204,7 @@ TEST_CASE("rocr spin tamer confines a spinner proven to run owner code",
   const int ncpu = CountAllowedCpus();
   const int expected_core = HighestAllowedCpu();
 
-  REQUIRE(ScanUntil(1, OwnedBy(InTestSpinLoop)) == 1);
+  REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
 
   if (ncpu > 1) {
     cpu_set_t now;
@@ -166,17 +218,49 @@ TEST_CASE("rocr spin tamer confines a spinner proven to run owner code",
 TEST_CASE("rocr spin tamer refuses spinners running other code",
           "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
-  // Several spinners pass the never-blocks prefilter, but none executes in
-  // the code owner, so the PC proof must reject all of them — the case of a
-  // busy third-party CPU threadpool in a ROCm process.
+  // Spinners pass the never-blocks prefilter and are probed (the predicate
+  // is consulted), but none is proven to run owner code — the case of a busy
+  // third-party CPU threadpool in a ROCm process.
   SpinnerGroup spinners(3);
-  REQUIRE(inferflux::TameRuntimeSpinThreads(
-              OwnedBy([](std::uintptr_t) { return false; })) == 0);
+  CountingOwner never_owned; // owned = 0
+  int confined = 0;
+  for (int attempt = 0; attempt < 4 && never_owned.calls->load() == 0;
+       ++attempt) {
+    confined += inferflux::TameRuntimeSpinThreads(never_owned.Options());
+  }
+  REQUIRE(never_owned.calls->load() > 0);
+  REQUIRE(confined == 0);
+}
+
+TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
+          "[rocr_spin_tamer]") {
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
+  {
+    // Only 1 of 3 samples owned: probed (3 replies), rejected.
+    SpinnerGroup spinners(1);
+    CountingOwner one_owned;
+    one_owned.owned = 1;
+    int confined = 0;
+    for (int attempt = 0; attempt < 4 && one_owned.calls->load() == 0;
+         ++attempt) {
+      confined += inferflux::TameRuntimeSpinThreads(one_owned.Options());
+    }
+    REQUIRE(one_owned.calls->load() == 3);
+    REQUIRE(confined == 0);
+  }
+  {
+    // 2 of 3 owned: confined after exactly 2 samples.
+    SpinnerGroup spinners(1);
+    CountingOwner two_owned;
+    two_owned.owned = 2;
+    REQUIRE(ScanUntil(1, two_owned.Options()) == 1);
+    REQUIRE(two_owned.calls->load() == 2);
+  }
 }
 
 TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
-
   std::atomic<bool> stop{false};
   std::thread sleeper([&] {
     while (!stop.load(std::memory_order_relaxed)) {
@@ -184,8 +268,9 @@ TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
     }
   });
   // Join before asserting so a failure cannot leave a joinable thread.
-  const int confined =
-      inferflux::TameRuntimeSpinThreads(OwnedBy(InTestSpinLoop));
+  CountingOwner any_owner;
+  any_owner.owned = 1000;
+  const int confined = inferflux::TameRuntimeSpinThreads(any_owner.Options());
   stop.store(true);
   sleeper.join();
 
@@ -196,13 +281,13 @@ TEST_CASE("rocr spin tamer does not re-confine an already confined thread",
           "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
-
   SpinnerGroup spinners(1);
-  REQUIRE(ScanUntil(1, OwnedBy(InTestSpinLoop)) == 1);
-  // Repeat scans (one per model load) must leave it alone rather than
-  // re-confine and double count; it is remembered by (tid, start time).
-  REQUIRE(inferflux::TameRuntimeSpinThreads(OwnedBy(InTestSpinLoop)) == 0);
+  REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
+  // Later scans must leave it alone rather than re-confine and double count;
+  // it is remembered by (tid, start time).
+  REQUIRE(inferflux::TameRuntimeSpinThreads(OwnedByTestLoop()) == 0);
 }
+
 TEST_CASE("rocr spin tamer confines a poller that inherited a thread name",
           "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
@@ -210,34 +295,53 @@ TEST_CASE("rocr spin tamer confines a poller that inherited a thread name",
   // Linux threads inherit their creator's name: ROCr pollers spawned while a
   // registry reload or admin load runs on "if-registry"/"if-http" carry that
   // name. Names must not exclude them; only the PC proof decides.
-  SpinnerGroup spinners(1, "if-registry");
-  REQUIRE(ScanUntil(1, OwnedBy(InTestSpinLoop)) == 1);
+  SpinnerGroup::Options named;
+  named.name = "if-registry";
+  SpinnerGroup spinners(1, named);
+  REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
 }
-TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
+
+TEST_CASE("rocr spin tamer never signals a thread that blocks the probe",
+          "[rocr_spin_tamer]") {
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
+  // RT signals queue instead of coalescing; probing a thread that blocks the
+  // signal would pile them up against RLIMIT_SIGPENDING.
+  SpinnerGroup::Options blocking;
+  blocking.block_probe = true;
+  SpinnerGroup spinners(1, blocking);
+  CountingOwner owner;
+  owner.owned = 1000;
+  int confined = 0;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    confined += inferflux::TameRuntimeSpinThreads(owner.Options());
+  }
+  REQUIRE_FALSE(ProbePending(spinners.tid(0)));
+  REQUIRE(owner.calls->load() == 0);
+  REQUIRE(confined == 0);
+}
+
+TEST_CASE("rocr spin tamer backs off a rejected thread, then re-probes it",
           "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
-  // The predicate is consulted once per replied sample, so its call count
-  // also proves the probe really sampled the thread. A spinner running owner
-  // code for only 1 of 3 samples is rejected; 2 of 3 is enough.
-  auto first_n_owned = [](int n) {
-    auto calls = std::make_shared<std::atomic<int>>(0);
-    return OwnedBy([calls, n](std::uintptr_t pc) {
-      return InTestSpinLoop(pc) && calls->fetch_add(1) < n;
-    });
-  };
-  {
-    SpinnerGroup spinners(1);
-    REQUIRE(inferflux::TameRuntimeSpinThreads(first_n_owned(1)) == 0);
+  SpinnerGroup spinners(1);
+
+  // First verdict: not proven (owner rejects every sample).
+  CountingOwner rejecting;
+  for (int attempt = 0; attempt < 4 && rejecting.calls->load() == 0;
+       ++attempt) {
+    REQUIRE(inferflux::TameRuntimeSpinThreads(rejecting.Options()) == 0);
   }
-  {
-    SpinnerGroup spinners(1);
-    // Retry with a fresh predicate: a loaded runner may miss the window.
-    int confined = 0;
-    for (int attempt = 0; attempt < 3 && confined == 0; ++attempt) {
-      confined = inferflux::TameRuntimeSpinThreads(first_n_owned(2));
-    }
-    REQUIRE(confined == 1);
-  }
+  REQUIRE(rejecting.calls->load() > 0);
+
+  // The very next scan skips it (back-off): it is not even probed.
+  CountingOwner accepting;
+  accepting.owned = 1000;
+  REQUIRE(inferflux::TameRuntimeSpinThreads(accepting.Options()) == 0);
+  REQUIRE(accepting.calls->load() == 0);
+
+  // Back-off is not a permanent blacklist: a later scan re-probes and, now
+  // that the evidence says owner code, confines it.
+  REQUIRE(ScanUntil(1, accepting.Options()) == 1);
 }
 #endif // defined(__linux__)

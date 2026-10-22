@@ -2,7 +2,6 @@
 
 #include "model/model_format.h"
 #include "runtime/backends/backend_factory.h"
-#include "runtime/rocr_spin_tamer.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 
@@ -283,13 +282,6 @@ std::string SingleModelRouter::LoadModel(const std::string &path,
 }
 
 std::string SingleModelRouter::LoadModel(const ModelLoadSpec &spec) {
-  // Any load attempt (startup, admin API, registry hot-reload), including a
-  // failed or fallback one, can be the first to initialize HIP and spawn the
-  // ROCr busy-spin pollers. Queue a coalesced background scan on every exit.
-  // Declared before the locks so it fires after they are released.
-  struct SpinScanOnExit {
-    ~SpinScanOnExit() { TameRuntimeSpinThreadsAsync(); }
-  } spin_scan_on_exit;
   std::lock_guard<std::mutex> admission(load_mutex_);
   const auto &path = spec.path;
   const auto &requested_id = spec.id;
