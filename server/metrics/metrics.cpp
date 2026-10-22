@@ -494,6 +494,13 @@ void MetricsRegistry::RecordMoERequest() {
   moe_requests_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void MetricsRegistry::RecordRuntimeSpinThreadsConfined(int confined) {
+  if (confined > 0) {
+    runtime_spin_threads_confined_.fetch_add(static_cast<uint64_t>(confined),
+                                             std::memory_order_relaxed);
+  }
+}
+
 void MetricsRegistry::SetFlashAttentionEnabled(bool enabled) {
   flash_attention_enabled_.store(enabled ? 1 : 0, std::memory_order_relaxed);
 }
@@ -2780,6 +2787,13 @@ std::string MetricsRegistry::RenderPrometheus() const {
           << from << "\",to_kernel=\"" << to << "\"} " << count << "\n";
     }
   }
+
+  // --- Runtime hygiene (rocr spin tamer) ---
+  out << "# HELP inferflux_runtime_spin_threads_confined_total Runtime "
+         "busy-spin threads demoted and co-parked by the ROCr spin tamer\n";
+  out << "# TYPE inferflux_runtime_spin_threads_confined_total counter\n";
+  out << "inferflux_runtime_spin_threads_confined_total "
+      << runtime_spin_threads_confined_.load() << "\n";
 
   return out.str();
 }
