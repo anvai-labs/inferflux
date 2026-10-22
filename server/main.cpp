@@ -28,6 +28,7 @@
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 #include "server/policy/guardrail.h"
+#include "server/rocr_spin_tamer.h"
 #include "server/startup_advisor.h"
 
 #include <algorithm>
@@ -1747,6 +1748,13 @@ int main(int argc, char **argv) {
     advisor_ctx.config.speculative_enabled = speculative_enabled;
     inferflux::RunStartupAdvisor(advisor_ctx);
   }
+
+  // ROCr spin-thread tamer (WSL2/ROCm AsyncEventsLoop workaround): the
+  // classifier needs a ~1.2 s measurement window, so spawn async — it must
+  // not block startup. HttpServer threads do not exist yet and every
+  // first-party thread blocks on a cv/sleep here, so the busy-spin
+  // discriminator is unambiguous at this point.
+  inferflux::TameRuntimeSpinThreadsAsync();
 
   int http_workers = 16; // Increased from 4 for better concurrent throughput
   if (const char *env_workers = std::getenv("INFERFLUX_HTTP_WORKERS")) {

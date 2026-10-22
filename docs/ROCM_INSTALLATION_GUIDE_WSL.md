@@ -262,6 +262,33 @@ swap=8GB
 
 Then restart WSL: `wsl --shutdown` from PowerShell.
 
+### ROCr runtime spin threads (2 CPUs burned at idle)
+
+ROCm 7.x `libhsa-runtime64` starts two unnamed poller threads at `hipInit()`
+(the AsyncEventsLoop) that busy-spin at 100% CPU each for the life of the
+process. The upstream fix (rocm-systems#7898) is not in a released ROCm yet,
+and no HSA environment knob disables the loop (`HSA_ENABLE_SLEEP`,
+`HSA_ENABLE_INTERRUPT`, `HSA_ENABLE_SCRATCH_ASYNC_RECLAIM`, and
+`HSA_ENABLE_SDMA` were all tested without effect). On WSL2, `SCHED_IDLE` and
+nice are additionally not enforced for service-cgroup threads, so CPU
+affinity is the only effective mitigation.
+
+`inferfluxd` applies it automatically shortly after models load: unnamed
+threads with ~100% user CPU, ~zero syscalls, and zero voluntary context
+switches are demoted (nice 19 + `SCHED_IDLE`) and co-pinned onto a single
+core, bounding the cost from 2 cores to 1. GPU sync latency is unaffected
+(verified empirically under full CPU contention).
+
+Knobs (see `docs/CONFIG_REFERENCE.md` section 10):
+
+- `INFERFLUX_ROCR_TAME=0` disables the tamer.
+- `INFERFLUX_ROCR_TAME_CORE=<n>` pins the spin threads to CPU `n` (default:
+  highest CPU in the server's affinity mask).
+
+Verify: `top -H -p $(pidof inferfluxd)` — two `rocr-spin-N` threads should
+share a single core (~100% combined instead of ~200%), and
+`inferflux_runtime_spin_threads_confined_total` appears in `/metrics`.
+
 ## Supported AMD GPUs
 
 The InferFlux ROCm backend supports FlashAttention-2 on these architectures:

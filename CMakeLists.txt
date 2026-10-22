@@ -177,6 +177,8 @@ add_library(inferflux_core STATIC
   server/startup_advisor_rocm.cpp
   server/startup_advisor.cpp
   server/startup_advisor.h
+  server/rocr_spin_tamer.cpp
+  server/rocr_spin_tamer.h
   policy/policy_store.cpp
   policy/policy_store.h
   policy/opa_client.cpp
@@ -782,6 +784,7 @@ add_executable(inferflux_tests
   tests/unit/test_kv_cache_planner.cpp
   tests/unit/test_tokenizer_factory.cpp
   tests/unit/test_startup_advisor.cpp
+  tests/unit/test_rocr_spin_tamer.cpp
   tests/unit/test_quantization_detector.cpp
   tests/unit/test_result.cpp
   tests/unit/test_reasoning_splitter.cpp
@@ -902,6 +905,8 @@ add_test(NAME FlashAttnTests COMMAND inferflux_tests "[flash_attn]")
 set_tests_properties(FlashAttnTests PROPERTIES LABELS flash_attn)
 add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
 set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
+add_test(NAME RocrSpinTamerTests COMMAND inferflux_tests "[rocr_spin_tamer]")
+set_tests_properties(RocrSpinTamerTests PROPERTIES LABELS rocr_spin_tamer)
 # Isolated real-TLS fixture; no model or GPU runtime is needed.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
