@@ -276,13 +276,15 @@ affinity is the only effective mitigation.
 `inferfluxd` applies it automatically after startup and after every model
 load attempt (startup, admin API, or registry hot-reload), when
 `libhsa-runtime64` is loaded. Over a ~1.2 s window it shortlists threads
-that never block: still carrying the process name (every InferFlux thread
-names itself `if-*`), runnable for the whole window (on-CPU plus run-queue
-time from `/proc/.../schedstat`, so the check holds on a busy host), ~no
-kernel time, and zero voluntary context switches. Each shortlisted thread is
-then interrupted with a probe signal; it is confined only if every sampled
-instruction pointer resolves into `libhsa-runtime64`, so a busy CPU
-threadpool or any other non-ROCr thread can never be touched. Confined
+that never block: runnable for the whole window (on-CPU plus run-queue time
+from `/proc/.../schedstat`, so the check holds on a busy host), ~no kernel
+time, and zero voluntary context switches. Thread names are ignored (Linux
+threads inherit their creator's name). Each shortlisted thread is then
+interrupted with a probe signal five times; it is confined only if a
+majority of the sampled instruction pointers resolve into
+`libhsa-runtime64`, so a busy CPU threadpool or any other non-ROCr thread
+can never be touched. InferFlux's own threads are named `if-*` for
+`top -H` readability. Confined
 threads are demoted (nice 19 + `SCHED_IDLE`) and co-pinned onto a single
 core, bounding the cost from 2 cores to 1. GPU sync latency is unaffected
 (verified empirically under full CPU contention).

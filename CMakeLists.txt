@@ -570,6 +570,8 @@ target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto OpenSSL::SSL yaml-cp
 if(UNIX AND NOT APPLE)
   target_link_libraries(inferflux_core PUBLIC rt)
 endif()
+# dlopen/dladdr (server/rocr_spin_tamer.cpp) live in libdl on glibc < 2.34.
+target_link_libraries(inferflux_core PUBLIC ${CMAKE_DL_LIBS})
 
 # §2.2 Multimodal support via libmtmd (ENABLE_MTMD=OFF by default)
 if(ENABLE_MTMD)

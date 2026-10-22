@@ -20,14 +20,15 @@
 #include <cerrno>
 #include <chrono>
 #include <condition_variable>
-#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <set>
 #include <sstream>
-#include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #endif
 
@@ -41,14 +42,18 @@ constexpr int kWindowMs = 1200;
 constexpr int kSleepSliceMs = 50;
 constexpr int kMinRunnablePercent = 80;
 constexpr long kMaxStimeDeltaTicks = 2;
-// Every sampled PC must land in the code owner; one stray sample rejects.
-constexpr int kPcSamples = 3;
-constexpr int kPcReplyTimeoutMs = 100;
+// PC proof: a strict majority of samples must land in the code owner; the
+// rest may be vDSO/libc helpers the spin loop calls without a syscall.
+constexpr int kPcSamples = 5;
+constexpr int kPcOwnedRequired = 3;
+// Generous: a runnable-but-starved spinner on a loaded host may wait on a
+// runqueue before the handler runs. Scans are background work.
+constexpr int kPcReplyTimeoutMs = 500;
 // The ROCr runtime spawns 2 pollers; this only bounds work and log noise.
 constexpr int kMaxConfined = 8;
 // Offset from SIGRTMIN for the PC probe. glibc reserves the RT signals below
 // its SIGRTMIN; nothing in InferFlux or llama.cpp/ggml uses RT signals, and
-// a foreign handler found at install time disables probing entirely.
+// a foreign handler (at install time or any later scan) disables probing.
 constexpr int kProbeSignalOffset = 5;
 
 struct ThreadSample {
@@ -89,19 +94,15 @@ std::vector<pid_t> ListThreads() {
 // comm may contain spaces/parens, so parse fields after the LAST ')'. Field
 // N of the stat format is tokens[N - 3]: utime(14), stime(15),
 // starttime(22).
-bool ReadThreadStat(pid_t tid, std::string *comm, ThreadSample *out) {
+bool ReadThreadStat(pid_t tid, ThreadSample *out) {
   std::ifstream file(TaskPath(tid, "stat"));
   std::string line;
   if (!file || !std::getline(file, line)) {
     return false; // TID vanished mid-sample; caller skips it.
   }
-  const std::size_t open = line.find('(');
   const std::size_t close = line.rfind(')');
-  if (open == std::string::npos || close == std::string::npos || close < open) {
+  if (close == std::string::npos) {
     return false;
-  }
-  if (comm) {
-    *comm = line.substr(open + 1, close - open - 1);
   }
   std::istringstream fields(line.substr(close + 1));
   std::vector<std::string> tokens;
@@ -138,24 +139,15 @@ bool ReadSchedstat(pid_t tid, unsigned long long *run_ns,
   return static_cast<bool>(file >> *run_ns >> *wait_ns);
 }
 
-// Snapshots counters per thread. Comms are read on the first snapshot only:
-// classification keys off the name the thread had when the window opened.
-std::unordered_map<pid_t, ThreadSample>
-SampleAllThreads(std::unordered_map<pid_t, std::string> *comms) {
+std::unordered_map<pid_t, ThreadSample> SampleAllThreads() {
   std::unordered_map<pid_t, ThreadSample> samples;
   for (const pid_t tid : ListThreads()) {
     ThreadSample sample;
-    std::string comm;
-    if (!ReadThreadStat(tid, comms ? &comm : nullptr, &sample)) {
-      continue;
-    }
-    if (!ReadVoluntarySwitches(tid, &sample.voluntary_switches)) {
+    if (!ReadThreadStat(tid, &sample) ||
+        !ReadVoluntarySwitches(tid, &sample.voluntary_switches)) {
       continue;
     }
     sample.has_schedstat = ReadSchedstat(tid, &sample.run_ns, &sample.wait_ns);
-    if (comms) {
-      comms->emplace(tid, std::move(comm));
-    }
     samples.emplace(tid, sample);
   }
   return samples;
@@ -171,6 +163,16 @@ bool HsaRuntimeLoaded() {
     }
   }
   return false;
+}
+
+// Threads already confined, by (tid, starttime): never re-confined or double
+// counted, and immune to TID reuse.
+std::mutex g_confined_mutex;
+std::set<std::pair<pid_t, unsigned long long>> g_confined;
+
+bool AlreadyConfined(pid_t tid, unsigned long long starttime) {
+  std::lock_guard<std::mutex> lock(g_confined_mutex);
+  return g_confined.count({tid, starttime}) != 0;
 }
 
 // --- Instruction-pointer probe ---------------------------------------------
@@ -203,44 +205,51 @@ void ProbeHandler(int /*sig*/, siginfo_t * /*info*/, void *raw_context) {
 
 std::mutex g_probe_mutex; // Serializes the single probe slot.
 
-// Installs the probe handler once and keeps it installed for the process
+bool HandlerIsOurs(int sig) {
+  struct sigaction current{};
+  return sigaction(sig, nullptr, &current) == 0 &&
+         (current.sa_flags & SA_SIGINFO) != 0 &&
+         current.sa_sigaction == ProbeHandler;
+}
+
+// Returns the probe signal with our handler installed, or 0 when probing is
+// unavailable. The handler is installed once and kept for the process
 // lifetime: restoring SIG_DFL would let a late-delivered probe terminate the
-// process (the default action for RT signals). Returns the signal number, or
-// 0 when probing is unavailable. Caller holds g_probe_mutex.
-int EnsureProbeSignal() {
+// process (the default action for RT signals). Ownership is re-verified on
+// every call, so a library that later claims the signal disables probing
+// instead of receiving our probes. Caller holds g_probe_mutex.
+int ProbeSignal() {
 #if !defined(__x86_64__) && !defined(__aarch64__)
   return 0;
 #else
-  static int installed = -1; // -1 unknown, 0 unavailable, else signal.
-  if (installed >= 0) {
-    return installed;
-  }
+  static bool install_attempted = false;
   const int sig = SIGRTMIN + kProbeSignalOffset;
   if (sig > SIGRTMAX) {
-    installed = 0;
-    return installed;
+    return 0;
   }
-  struct sigaction current{};
-  if (sigaction(sig, nullptr, &current) != 0) {
-    installed = 0;
-    return installed;
+  if (!install_attempted) {
+    install_attempted = true;
+    struct sigaction current{};
+    if (sigaction(sig, nullptr, &current) == 0 &&
+        (current.sa_flags & SA_SIGINFO) == 0 && current.sa_handler == SIG_DFL) {
+      struct sigaction action{};
+      action.sa_sigaction = ProbeHandler;
+      action.sa_flags = SA_SIGINFO | SA_RESTART;
+      sigemptyset(&action.sa_mask);
+      (void)sigaction(sig, &action, nullptr);
+    }
   }
-  const bool foreign = (current.sa_flags & SA_SIGINFO)
-                           ? current.sa_sigaction != ProbeHandler
-                           : current.sa_handler != SIG_DFL;
-  if (foreign) {
-    log::Warn(kComponent, "probe signal SIGRTMIN+" +
-                              std::to_string(kProbeSignalOffset) +
-                              " already has a handler; spin tamer disabled");
-    installed = 0;
-    return installed;
+  if (!HandlerIsOurs(sig)) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      log::Warn(kComponent, "probe signal SIGRTMIN+" +
+                                std::to_string(kProbeSignalOffset) +
+                                " is owned by another handler; spin tamer "
+                                "disabled");
+    }
+    return 0;
   }
-  struct sigaction action{};
-  action.sa_sigaction = ProbeHandler;
-  action.sa_flags = SA_SIGINFO | SA_RESTART;
-  sigemptyset(&action.sa_mask);
-  installed = sigaction(sig, &action, nullptr) == 0 ? sig : 0;
-  return installed;
+  return sig;
 #endif
 }
 
@@ -262,25 +271,43 @@ std::uintptr_t SamplePc(pid_t pid, pid_t tid, int sig) {
   return pc;
 }
 
-// True only when every sampled PC of `tid` resolves into a loaded object
-// whose path contains `code_owner`.
-bool ExecutesOnlyIn(pid_t pid, pid_t tid, const std::string &code_owner) {
+bool PcOwned(std::uintptr_t pc, const RocrSpinTamerOptions &options) {
+  if (options.pc_owner) {
+    return options.pc_owner(pc);
+  }
+  Dl_info info{};
+  return dladdr(reinterpret_cast<void *>(pc), &info) != 0 &&
+         info.dli_fname != nullptr &&
+         std::strstr(info.dli_fname, options.code_owner.c_str()) != nullptr;
+}
+
+// True when a majority of sampled PCs of `tid` belong to the code owner.
+bool ProvenOwnerThread(pid_t pid, pid_t tid,
+                       const RocrSpinTamerOptions &options,
+                       const std::atomic<bool> *cancelled) {
   std::lock_guard<std::mutex> lock(g_probe_mutex);
-  const int sig = EnsureProbeSignal();
+  const int sig = ProbeSignal();
   if (sig == 0) {
     return false;
   }
+  int owned = 0;
   for (int i = 0; i < kPcSamples; ++i) {
-    const std::uintptr_t pc = SamplePc(pid, tid, sig);
-    Dl_info info{};
-    if (pc == 0 || dladdr(reinterpret_cast<void *>(pc), &info) == 0 ||
-        info.dli_fname == nullptr ||
-        std::strstr(info.dli_fname, code_owner.c_str()) == nullptr) {
+    if (cancelled && cancelled->load(std::memory_order_relaxed)) {
       return false;
+    }
+    const std::uintptr_t pc = SamplePc(pid, tid, sig);
+    if (pc != 0 && PcOwned(pc, options)) {
+      ++owned;
+    }
+    if (owned >= kPcOwnedRequired) {
+      return true;
+    }
+    if (owned + (kPcSamples - 1 - i) < kPcOwnedRequired) {
+      return false; // Majority no longer reachable.
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
-  return true;
+  return false;
 }
 
 // Resolves the pin target. Returns false when pinning must be skipped
@@ -325,7 +352,8 @@ bool ChooseTameCore(int *tame_core) {
 
 std::atomic<int> g_next_spin_name{0}; // Unique rocr-spin-N across scans.
 
-bool ConfineThread(pid_t tid, int tame_core, bool pin) {
+bool ConfineThread(pid_t tid, unsigned long long starttime, int tame_core,
+                   bool pin) {
   int demoted = 0;
   // PRIO_PROCESS with a tid targets that thread's nice value on Linux.
   if (setpriority(PRIO_PROCESS, tid, 19) == 0) {
@@ -338,6 +366,10 @@ bool ConfineThread(pid_t tid, int tame_core, bool pin) {
   if (demoted == 0) {
     return false; // ESRCH (thread exited) or EPERM: give up on this one.
   }
+  {
+    std::lock_guard<std::mutex> lock(g_confined_mutex);
+    g_confined.insert({tid, starttime});
+  }
   if (pin) {
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -347,9 +379,8 @@ bool ConfineThread(pid_t tid, int tame_core, bool pin) {
                                 " failed: " + std::strerror(errno));
     }
   }
-  // Best-effort rename for observability (and so later scans skip it):
-  // same-tgid comm writes need no capabilities, and "rocr-spin-N" fits the
-  // 15-char TASK_COMM_LEN limit.
+  // Best-effort rename for observability: same-tgid comm writes need no
+  // capabilities, and "rocr-spin-N" fits the 15-char TASK_COMM_LEN limit.
   std::ofstream comm(TaskPath(tid, "comm"));
   if (comm) {
     comm << "rocr-spin-" << g_next_spin_name.fetch_add(1) << "\n";
@@ -365,31 +396,21 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   if (options.require_hsa_runtime && !HsaRuntimeLoaded()) {
     return 0;
   }
-  if (options.code_owner.empty()) {
+  if (!options.pc_owner && options.code_owner.empty()) {
     return 0; // An empty owner would match every object.
   }
   const pid_t pid = getpid();
   const pid_t self = CurrentTid();
 
-  std::ifstream comm_file("/proc/self/comm");
-  std::string process_comm;
-  std::getline(comm_file, process_comm);
-  if (process_comm.empty()) {
-    return 0; // No comm baseline to discriminate against; do nothing.
-  }
-
-  std::unordered_map<pid_t, std::string> comms;
-  const auto first = SampleAllThreads(&comms);
+  const auto first = SampleAllThreads();
   const auto window_start = std::chrono::steady_clock::now();
-
   for (int slept = 0; slept < kWindowMs; slept += kSleepSliceMs) {
     if (cancelled && cancelled->load(std::memory_order_relaxed)) {
       return 0; // Process is exiting: don't touch metrics or statics.
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kSleepSliceMs));
   }
-
-  const auto second = SampleAllThreads(nullptr);
+  const auto second = SampleAllThreads();
   const long long window_ns =
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - window_start)
@@ -402,17 +423,15 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
       window_ns / 1000000 * ticks_per_second * kMinRunnablePercent / 100000);
 
   // Stage 1 prefilter: threads that never blocked during the window.
-  std::vector<pid_t> candidates;
+  std::vector<std::pair<pid_t, unsigned long long>> candidates;
   for (const auto &entry : second) {
     const pid_t tid = entry.first;
     if (tid == pid || tid == self) {
       continue;
     }
     const auto it_before = first.find(tid);
-    const auto it_comm = comms.find(tid);
-    if (it_before == first.end() || it_comm == comms.end() ||
-        it_comm->second != process_comm) {
-      continue; // New mid-window, or named (first-party / already confined).
+    if (it_before == first.end()) {
+      continue; // Appeared mid-window; a later scan will see it whole.
     }
     const ThreadSample &before = it_before->second;
     const ThreadSample &after = entry.second;
@@ -421,6 +440,9 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
         after.stime_ticks < before.stime_ticks ||
         after.voluntary_switches < before.voluntary_switches) {
       continue; // TID reused by a different thread inside the window.
+    }
+    if (AlreadyConfined(tid, after.starttime)) {
+      continue;
     }
     const long utime_delta = after.utime_ticks - before.utime_ticks;
     const long stime_delta = after.stime_ticks - before.stime_ticks;
@@ -432,17 +454,17 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     // time against the measured window; a loaded host can push that below
     // the threshold, which is a miss, never a false confinement.
     bool always_runnable = false;
-    if (before.has_schedstat && after.has_schedstat &&
-        after.run_ns >= before.run_ns && after.wait_ns >= before.wait_ns) {
+    if (before.has_schedstat && after.has_schedstat) {
       always_runnable =
+          after.run_ns >= before.run_ns && after.wait_ns >= before.wait_ns &&
           (after.run_ns - before.run_ns) + (after.wait_ns - before.wait_ns) >=
-          min_runnable_ns;
-    } else if (!before.has_schedstat || !after.has_schedstat) {
+              min_runnable_ns;
+    } else {
       always_runnable = utime_delta >= min_busy_ticks;
     }
     if (always_runnable && utime_delta > 0 &&
         stime_delta <= kMaxStimeDeltaTicks && voluntary_delta == 0) {
-      candidates.push_back(tid);
+      candidates.emplace_back(tid, after.starttime);
     }
   }
   if (candidates.empty()) {
@@ -453,13 +475,13 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   int tame_core = -1;
   const bool pin = ChooseTameCore(&tame_core);
   int confined = 0;
-  for (const pid_t tid : candidates) {
+  for (const auto &[tid, starttime] : candidates) {
     if (confined >= kMaxConfined ||
         (cancelled && cancelled->load(std::memory_order_relaxed))) {
       break;
     }
-    if (ExecutesOnlyIn(pid, tid, options.code_owner) &&
-        ConfineThread(tid, tame_core, pin)) {
+    if (ProvenOwnerThread(pid, tid, options, cancelled) &&
+        ConfineThread(tid, starttime, tame_core, pin)) {
       ++confined;
     }
   }
@@ -477,26 +499,25 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   return confined;
 }
 
-// Lazily started background scanner. Requests set `pending_` and wake the
-// worker; requests landing mid-scan leave `pending_` set, so they coalesce
-// into exactly one follow-up scan. Between scans the worker blocks on the
-// condition variable (never spins).
+// Background scanner. Requests set `pending_` and wake the worker; requests
+// landing mid-scan leave `pending_` set, so they coalesce into exactly one
+// follow-up scan. Between scans the worker blocks on the condition variable
+// (never spins). Never destroyed (see Instance()).
 class TamerWorker {
 public:
-  ~TamerWorker() {
-    // Runs at exit in reverse construction order: g_metrics and the logger
-    // are constructed before this worker (first request is inside main), so
-    // they are still alive while we join. `cancelled_` cuts an in-flight
-    // scan short (<= one 50 ms slice, or one PC probe).
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      stop_ = true;
-    }
-    cancelled_.store(true);
-    cv_.notify_all();
-    if (thread_.joinable()) {
-      thread_.join();
-    }
+  // Leaked on purpose: Request() may run on any thread (HTTP workers, the
+  // registry watcher) while the process exits, so the object must outlive
+  // static destruction. The atexit hook is registered after GlobalMetrics()
+  // and the logger exist (first use is inside main), so it runs before they
+  // are torn down: it stops and joins the worker, and later Request() calls
+  // see stop_ and return.
+  static TamerWorker &Instance() {
+    static TamerWorker *instance = [] {
+      auto *worker = new TamerWorker();
+      std::atexit([] { Instance().Shutdown(); });
+      return worker;
+    }();
+    return *instance;
   }
 
   void Request() {
@@ -519,6 +540,25 @@ public:
   }
 
 private:
+  TamerWorker() = default;
+
+  void Shutdown() {
+    std::thread worker;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+      worker = std::move(thread_);
+    }
+    // Cuts an in-flight scan short (<= one 50 ms slice or one PC probe).
+    cancelled_.store(true);
+    cv_.notify_all();
+    if (worker.joinable() && worker.get_id() != std::this_thread::get_id()) {
+      worker.join();
+    } else if (worker.joinable()) {
+      worker.detach(); // exit() called from the worker itself.
+    }
+  }
+
   void Loop() {
     SetCurrentThreadName("if-rocr-tamer");
     std::unique_lock<std::mutex> lock(mutex_);
@@ -560,8 +600,7 @@ int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options) {
 
 void TameRuntimeSpinThreadsAsync() {
 #if defined(__linux__)
-  static TamerWorker worker;
-  worker.Request();
+  TamerWorker::Instance().Request();
 #endif
 }
 

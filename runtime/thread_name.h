@@ -7,10 +7,10 @@
 namespace inferflux {
 
 /// Name the calling thread (visible in `top -H`, /proc/<pid>/task/*/comm,
-/// gdb and profilers). Every first-party thread should call this on entry:
-/// the ROCr spin tamer (server/rocr_spin_tamer.h) treats threads that still
-/// carry the process name as third-party runtime threads, so an unnamed
-/// first-party thread could be misclassified while busy.
+/// gdb and profilers). Long-lived first-party threads call this on entry
+/// for observability; skip it for short-lived per-request threads (each call
+/// is a syscall). Correctness never depends on names: Linux threads inherit
+/// their creator's name, so a name proves nothing about who owns a thread.
 ///
 /// Linux limits names to 15 characters plus NUL; longer names are rejected
 /// by the kernel, so keep names short (convention: "if-<role>").

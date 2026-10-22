@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+#include <functional>
 #include <string>
 
 namespace inferflux {
@@ -17,13 +19,18 @@ namespace inferflux {
 // irreversible:
 //  1. Prefilter (selects threads to probe): over a ~1.2 s window the thread
 //     never blocks (runnable for >= 80% of the window by schedstat, which is
-//     immune to host load), spends ~no time in the kernel, makes zero
-//     voluntary context switches, and still carries the process name.
+//     immune to host load), spends ~no time in the kernel, and makes zero
+//     voluntary context switches. Thread names are deliberately ignored:
+//     Linux threads inherit their creator's name, so pollers spawned from a
+//     named thread (e.g. a registry reload) would otherwise be missed.
 //  2. Proof (decides confinement): the thread is interrupted with a probe
-//     signal several times; every sampled instruction pointer must resolve
-//     (dladdr) into the ROCr runtime library. A busy third-party worker
+//     signal 5 times; a majority of the sampled instruction pointers must
+//     resolve (dladdr) into the ROCr runtime library (the rest may be vDSO
+//     or libc helpers the loop calls). A busy third-party worker
 //     (ggml/OpenMP/BLAS) or first-party thread executes elsewhere and can
 //     never be confined, however it is named or loaded.
+// Threads already confined are remembered by (tid, start time) and never
+// re-confined or double counted.
 // If the probe signal is unavailable (foreign handler installed) or the
 // architecture is unsupported, nothing is confined.
 //
@@ -38,10 +45,12 @@ struct RocrSpinTamerOptions {
   // Fast path: skip the scan unless the ROCr runtime is loaded. Tests
   // disable it to exercise the scanner without a ROCm runtime.
   bool require_hsa_runtime = true;
-  // A thread is confined only when every sampled instruction pointer lies
-  // in a loaded object whose path contains this substring. Tests point it at
-  // their own binary.
+  // A sampled instruction pointer counts as the owner's when it lies in a
+  // loaded object whose path contains this substring.
   std::string code_owner = "libhsa-runtime64";
+  // Test seam: when set, decides PC ownership instead of `code_owner`
+  // (tests pass the exact address range of their spin loop).
+  std::function<bool(std::uintptr_t pc)> pc_owner;
 };
 
 // Synchronous scan: samples for ~1.2 s, confines proven ROCr spinners, and
@@ -49,11 +58,13 @@ struct RocrSpinTamerOptions {
 int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options = {});
 
 // Requests a background scan and returns immediately; never blocks or
-// throws. Called after startup and at the end of every model load attempt
-// (success or failure), since any load can be the first to initialize HIP.
-// Requests arriving while a scan runs coalesce into exactly one follow-up
-// scan. Confined threads are renamed and never re-matched. The worker blocks
-// on a condition variable between scans and is joined at static destruction.
+// throws, from any thread. Called after startup and at the end of every
+// model load attempt (success or failure), since any load can be the first
+// to initialize HIP. Requests arriving while a scan runs coalesce into
+// exactly one follow-up scan. The worker blocks on a condition variable
+// between scans. It is never destroyed: an atexit hook (registered on first
+// use, so it runs before metrics/logger teardown) stops and joins it, and
+// later requests are ignored — safe even when a load races process exit.
 void TameRuntimeSpinThreadsAsync();
 
 } // namespace inferflux
