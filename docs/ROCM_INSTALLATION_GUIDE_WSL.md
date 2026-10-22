@@ -276,8 +276,8 @@ affinity is the only effective mitigation.
 `inferfluxd` applies it automatically from a background thread that scans
 at startup (after models load), again after ~10 s and ~60 s, and then every
 ~5 min, so pollers created lazily or by a model loaded at runtime are caught
-within one period. Without `libhsa-runtime64` loaded a scan is a single
-`dlopen` check. Over a ~1.2 s window it shortlists threads
+within one period. Processes without `libhsa-runtime64` loaded (CPU-only
+and CUDA-only builds) start no tamer thread at all. Over a ~1.2 s window it shortlists threads
 that never block: runnable for the whole window (on-CPU plus run-queue time
 from `/proc/.../schedstat`, so the check holds on a busy host), ~no kernel
 time, and zero voluntary context switches. Thread names are ignored (Linux
@@ -290,8 +290,9 @@ backs off for 1, 2, 4, ... up to 12 scans (~1 h) before it is probed again,
 so it receives at most 2 `SA_RESTART` probe signals per back-off period. At most 8 live
 threads are confined at once. InferFlux's own threads are named `if-*` for
 `top -H` readability. Confined
-threads are demoted (nice 19 + `SCHED_IDLE`) and co-pinned onto a single
-core, bounding the cost from 2 cores to 1. GPU sync latency is unaffected
+threads are co-pinned onto a single core, bounding the cost from 2 cores to
+1, and set to nice 19 (not `SCHED_IDLE`, which on native Linux can starve
+the HSA signal-handler thread these pollers also run). GPU sync latency is unaffected
 (verified empirically under full CPU contention).
 
 Knobs (see `docs/CONFIG_REFERENCE.md` section 10):

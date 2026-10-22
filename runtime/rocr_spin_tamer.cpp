@@ -57,20 +57,18 @@ constexpr int kPcOwnedRequired = 2;
 constexpr int kPcReplyTimeoutMs = 500;
 // Upper bound for an in-flight handler to finish after its probe ended.
 constexpr int kHandlerDrainTimeoutMs = 1000;
-// A thread not proven waits 1, 2, 4, ... scans (capped) before re-probing.
+// A thread not proven waits 1, 2, 4, 8, then 12 scans before re-probing.
 constexpr unsigned long long kMaxBackoffScans = 12;
 // The ROCr runtime spawns 2 pollers; caps blast radius if anything misfires.
 // Counts threads confined and still alive, so a runtime that is torn down
 // and re-initialized (new pollers) never exhausts it.
 constexpr std::size_t kMaxConfinedAlive = 8;
-// Offset from SIGRTMIN for the PC probe. glibc reserves the RT signals below
-// its SIGRTMIN; nothing in InferFlux or llama.cpp/ggml uses RT signals, and
-// a foreign handler (at install time or any later scan) disables probing.
 constexpr int kProbeSignalOffset = kRocrTamerProbeSignalOffset;
 
 using ThreadKey = std::pair<pid_t, unsigned long long>; // (tid, starttime)
 
 struct ThreadSample {
+  char state = '\0';                // stat field 3; 'R' = running/runnable.
   unsigned long long starttime = 0; // Distinguishes a reused TID.
   long utime_ticks = 0;
   long stime_ticks = 0;
@@ -81,6 +79,10 @@ struct ThreadSample {
   unsigned long long run_ns = 0;
   unsigned long long wait_ns = 0;
 };
+
+bool Cancelled(const std::atomic<bool> *cancelled) {
+  return cancelled && cancelled->load(std::memory_order_relaxed);
+}
 
 std::string TaskPath(pid_t tid, const char *leaf) {
   return "/proc/self/task/" + std::to_string(tid) + "/" + leaf;
@@ -104,7 +106,7 @@ std::vector<pid_t> ListThreads() {
 }
 
 // comm may contain spaces/parens, so parse fields after the LAST ')'. Field
-// N of the stat format is tokens[N - 3]: utime(14), stime(15),
+// N of the stat format is tokens[N - 3]: state(3), utime(14), stime(15),
 // starttime(22).
 bool ReadThreadStat(pid_t tid, ThreadSample *out) {
   std::ifstream file(TaskPath(tid, "stat"));
@@ -122,33 +124,19 @@ bool ReadThreadStat(pid_t tid, ThreadSample *out) {
   while (fields >> token) {
     tokens.push_back(token);
   }
-  if (tokens.size() < 20) {
+  if (tokens.size() < 20 || tokens[0].empty()) {
     return false;
   }
+  out->state = tokens[0][0];
   out->utime_ticks = std::strtol(tokens[11].c_str(), nullptr, 10);
   out->stime_ticks = std::strtol(tokens[12].c_str(), nullptr, 10);
   out->starttime = std::strtoull(tokens[19].c_str(), nullptr, 10);
   return true;
 }
 
-// Reads one "Key:\tvalue" line of /proc/.../status. strtoull skips the
-// separator whitespace itself, so this does not depend on /proc padding.
-bool ReadStatusField(pid_t tid, const char *key, int base,
-                     unsigned long long *out) {
-  std::ifstream file(TaskPath(tid, "status"));
-  const std::size_t key_len = std::strlen(key);
-  std::string line;
-  while (file && std::getline(file, line)) {
-    if (line.compare(0, key_len, key) == 0) {
-      *out = std::strtoull(line.c_str() + key_len, nullptr, base);
-      return true;
-    }
-  }
-  return false; // TID vanished; caller skips it.
-}
-
-// Reads several "Key:" fields of /proc/.../status in one pass. Returns
-// false unless every key was found.
+// Reads several "Key:" fields of /proc/.../status in one pass. strtoull
+// skips the separator whitespace itself, so this does not depend on /proc
+// padding. Returns false unless every key was found.
 bool ReadStatusFields(pid_t tid,
                       std::initializer_list<std::pair<const char *, int>> keys,
                       unsigned long long *out) {
@@ -169,18 +157,6 @@ bool ReadStatusFields(pid_t tid,
   return found == keys.size();
 }
 
-// The scheduler state letter (stat field 3): 'R' = running or runnable.
-char ReadThreadState(pid_t tid) {
-  std::ifstream file(TaskPath(tid, "stat"));
-  std::string line;
-  if (!file || !std::getline(file, line)) {
-    return '\0';
-  }
-  const std::size_t close = line.rfind(')');
-  return close != std::string::npos && close + 2 < line.size() ? line[close + 2]
-                                                               : '\0';
-}
-
 bool ReadSchedstat(pid_t tid, unsigned long long *run_ns,
                    unsigned long long *wait_ns) {
   std::ifstream file(TaskPath(tid, "schedstat"));
@@ -193,7 +169,8 @@ std::unordered_map<pid_t, ThreadSample> SampleAllThreads() {
     ThreadSample sample;
     unsigned long long voluntary = 0;
     if (!ReadThreadStat(tid, &sample) ||
-        !ReadStatusField(tid, "voluntary_ctxt_switches:", 10, &voluntary)) {
+        !ReadStatusFields(tid, {{"voluntary_ctxt_switches:", 10}},
+                          &voluntary)) {
       continue;
     }
     sample.voluntary_switches = static_cast<long long>(voluntary);
@@ -203,7 +180,7 @@ std::unordered_map<pid_t, ThreadSample> SampleAllThreads() {
   return samples;
 }
 
-// O(1) fast path: is the ROCr runtime loaded at all? RTLD_NOLOAD never loads
+// O(1) check: is the ROCr runtime loaded at all? RTLD_NOLOAD never loads
 // anything; it only returns a handle when the library is already mapped.
 bool HsaRuntimeLoaded() {
   for (const char *soname : {"libhsa-runtime64.so.1", "libhsa-runtime64.so"}) {
@@ -218,6 +195,8 @@ bool HsaRuntimeLoaded() {
 // --- Verdict memory --------------------------------------------------------
 // Keyed by (tid, starttime) so a reused TID starts fresh; entries for
 // threads no longer alive are pruned every scan, bounding the memory.
+// Back-off is counted in scans; in production the background worker is the
+// only scanner (the synchronous entry point exists for tests).
 struct Backoff {
   unsigned long long strikes = 0;
   unsigned long long skip_through_scan = 0; // Skip scans <= this sequence.
@@ -259,20 +238,42 @@ bool SkipThisScan(const ThreadKey &key, unsigned long long scan) {
 void RecordNotProven(const ThreadKey &key, unsigned long long scan) {
   std::lock_guard<std::mutex> lock(g_memory_mutex);
   Backoff &backoff = g_backoff[key];
-  const unsigned long long shift = std::min<unsigned long long>(
-      backoff.strikes, 4); // 1, 2, 4, 8, then capped.
+  const unsigned long long shift =
+      std::min<unsigned long long>(backoff.strikes, 4); // 1, 2, 4, 8, 12.
   backoff.strikes += 1;
   backoff.skip_through_scan =
       scan + std::min<unsigned long long>(1ULL << shift, kMaxBackoffScans);
 }
 
+enum class Claim { kClaimed, kAlreadyConfined, kCapReached };
+
+// Atomically claims `key` for confinement: concurrent scans (the background
+// worker and a synchronous caller) can never confine or count it twice.
+Claim ClaimConfinement(const ThreadKey &key) {
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  if (g_confined.count(key) != 0) {
+    return Claim::kAlreadyConfined;
+  }
+  if (g_confined.size() >= kMaxConfinedAlive) {
+    return Claim::kCapReached;
+  }
+  g_confined.insert(key);
+  return Claim::kClaimed;
+}
+
+void UnclaimConfinement(const ThreadKey &key) {
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  g_confined.erase(key);
+}
+
 // --- Instruction-pointer probe ---------------------------------------------
 // The handler only stores the interrupted PC of the targeted thread; all
-// interpretation (dladdr) happens on the scanning thread. Every handler
-// invocation counts itself in g_probe_inflight, and the scanner drains that
-// count to zero after clearing g_probe_tid and before arming the next probe,
-// so a handler that passed the tid check for thread T can never store into
-// a later probe of thread U. All atomics are lock-free (async-signal-safe).
+// interpretation (dladdr) happens on the scanning thread. The handler's tid
+// check and its store are not atomic together, so every invocation counts
+// itself in g_probe_inflight and the scanner drains that count to zero after
+// clearing g_probe_tid and before arming the next probe: a handler that
+// passed the check for thread T can never store into a later probe of
+// thread U. All atomics are lock-free (async-signal-safe).
 static_assert(std::atomic<pid_t>::is_always_lock_free,
               "probe tid slot must be lock-free");
 static_assert(std::atomic<std::uintptr_t>::is_always_lock_free,
@@ -302,75 +303,75 @@ void ProbeHandler(int /*sig*/, siginfo_t * /*info*/, void *raw_context) {
 
 std::mutex g_probe_mutex; // Serializes the single probe slot.
 
-bool HandlerIsOurs(int sig) {
-  struct sigaction current{};
-  return sigaction(sig, nullptr, &current) == 0 &&
-         (current.sa_flags & SA_SIGINFO) != 0 &&
-         current.sa_sigaction == ProbeHandler;
-}
-
 // Returns the probe signal with our handler installed, or 0 when probing is
-// unavailable. The handler is installed once and kept for the process
-// lifetime: restoring SIG_DFL would let a late-delivered probe terminate the
-// process (the default action for RT signals). Ownership is re-verified on
-// every call, so a library that later claims the signal disables probing
-// instead of receiving our probes. Caller holds g_probe_mutex.
+// unavailable this scan. Our handler, once installed, is kept for the
+// process lifetime: restoring SIG_DFL would let a late-delivered probe
+// terminate the process (the default action for RT signals). Ownership is
+// re-checked every call: a foreign handler disables probing for that scan
+// (never receiving our probes), and if it later releases the signal
+// (SIG_DFL again) ours is installed then. Caller holds g_probe_mutex.
 int ProbeSignal() {
 #if !defined(__x86_64__) && !defined(__aarch64__)
   return 0;
 #else
-  static bool install_attempted = false;
   const int sig = SIGRTMIN + kProbeSignalOffset;
   if (sig > SIGRTMAX) {
     return 0;
   }
-  if (!install_attempted) {
-    install_attempted = true;
-    struct sigaction current{};
-    if (sigaction(sig, nullptr, &current) == 0 &&
-        (current.sa_flags & SA_SIGINFO) == 0 && current.sa_handler == SIG_DFL) {
-      struct sigaction action{};
-      action.sa_sigaction = ProbeHandler;
-      action.sa_flags = SA_SIGINFO | SA_RESTART;
-      sigemptyset(&action.sa_mask);
-      (void)sigaction(sig, &action, nullptr);
-    }
-  }
-  if (!HandlerIsOurs(sig)) {
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true)) {
-      log::Warn(kComponent, "probe signal SIGRTMIN+" +
-                                std::to_string(kProbeSignalOffset) +
-                                " is owned by another handler; spin tamer "
-                                "disabled");
-    }
+  struct sigaction current{};
+  if (sigaction(sig, nullptr, &current) != 0) {
     return 0;
   }
-  return sig;
+  if ((current.sa_flags & SA_SIGINFO) != 0 &&
+      current.sa_sigaction == ProbeHandler) {
+    return sig;
+  }
+  if ((current.sa_flags & SA_SIGINFO) == 0 && current.sa_handler == SIG_DFL) {
+    struct sigaction action{};
+    action.sa_sigaction = ProbeHandler;
+    action.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&action.sa_mask);
+    return sigaction(sig, &action, nullptr) == 0 ? sig : 0;
+  }
+  static std::atomic<bool> warned{false};
+  if (!warned.exchange(true)) {
+    log::Warn(kComponent, "probe signal SIGRTMIN+" +
+                              std::to_string(kProbeSignalOffset) +
+                              " is owned by another handler; spin tamer "
+                              "paused until it is released");
+  }
+  return 0;
 #endif
 }
 
 // Checked immediately before every probe signal:
-//  - a thread that blocks or ignores the probe would queue RT signals (they
-//    do not coalesce) or drop them;
-//  - a thread that is not running/runnable ('R') is parked in a syscall
-//    (epoll_wait, sem_timedwait, ...), where a signal could surface as EINTR
-//    even with SA_RESTART. Spinners are always 'R', so nothing is lost.
-bool SafeToProbe(pid_t tid, int sig) {
-  if (ReadThreadState(tid) != 'R') {
+//  - the TID must still name the candidate (same start time);
+//  - the thread must be running/runnable ('R'): one parked in a syscall
+//    (epoll_wait, sem_timedwait, ...) could see EINTR even with SA_RESTART.
+//    The check and the signal cannot be made atomic from user space, so this
+//    minimizes rather than eliminates that window; spinners are always 'R';
+//  - its mask must neither block (RT signals queue rather than coalesce) nor
+//    ignore the probe.
+bool SafeToProbe(const ThreadKey &key, int sig) {
+  ThreadSample now;
+  if (!ReadThreadStat(key.first, &now) || now.starttime != key.second ||
+      now.state != 'R') {
     return false;
   }
   const unsigned long long bit = 1ULL << (sig - 1);
   unsigned long long masks[2] = {0, 0}; // SigBlk, SigIgn
-  return ReadStatusFields(tid, {{"SigBlk:", 16}, {"SigIgn:", 16}}, masks) &&
+  return ReadStatusFields(key.first, {{"SigBlk:", 16}, {"SigIgn:", 16}},
+                          masks) &&
          (masks[0] & bit) == 0 && (masks[1] & bit) == 0;
 }
 
-bool DrainHandlers() {
-  const auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(kHandlerDrainTimeoutMs);
-  while (g_probe_inflight.load() != 0) {
-    if (std::chrono::steady_clock::now() >= deadline) {
+// Waits for `done()` up to `timeout_ms`, giving up early on cancellation.
+template <typename Done>
+bool WaitFor(Done done, int timeout_ms, const std::atomic<bool> *cancelled) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+  while (!done()) {
+    if (Cancelled(cancelled) || std::chrono::steady_clock::now() >= deadline) {
       return false;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -380,27 +381,26 @@ bool DrainHandlers() {
 
 enum class SampleResult { kPc, kNoReply, kSlotUnsafe };
 
-// Interrupts `tid` and reports the PC it was executing. kNoReply: thread
-// exited, is not safe to signal now, or did not run the handler in time.
-// kSlotUnsafe: an in-flight handler did not finish, so the probe slot must
-// not be reused this scan. Caller holds g_probe_mutex.
-SampleResult SamplePc(pid_t pid, pid_t tid, int sig, std::uintptr_t *pc) {
+// Interrupts the candidate and reports the PC it was executing. kNoReply:
+// thread exited, is not safe to signal now, or did not run the handler in
+// time. kSlotUnsafe: an in-flight handler did not finish (or the process is
+// exiting), so the probe slot must not be reused this scan. Caller holds
+// g_probe_mutex.
+SampleResult SamplePc(pid_t pid, const ThreadKey &key, int sig,
+                      const std::atomic<bool> *cancelled, std::uintptr_t *pc) {
   *pc = 0;
-  if (!SafeToProbe(tid, sig)) {
+  if (!SafeToProbe(key, sig)) {
     return SampleResult::kNoReply;
   }
   g_probe_pc.store(0);
-  g_probe_tid.store(tid);
-  if (syscall(SYS_tgkill, pid, tid, sig) == 0) {
-    const auto deadline = std::chrono::steady_clock::now() +
-                          std::chrono::milliseconds(kPcReplyTimeoutMs);
-    while ((*pc = g_probe_pc.load()) == 0 &&
-           std::chrono::steady_clock::now() < deadline) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
+  g_probe_tid.store(key.first);
+  if (syscall(SYS_tgkill, pid, key.first, sig) == 0) {
+    WaitFor([pc] { return (*pc = g_probe_pc.load()) != 0; }, kPcReplyTimeoutMs,
+            cancelled);
   }
   g_probe_tid.store(0);
-  if (!DrainHandlers()) {
+  if (!WaitFor([] { return g_probe_inflight.load() == 0; },
+               kHandlerDrainTimeoutMs, cancelled)) {
     return SampleResult::kSlotUnsafe;
   }
   return *pc != 0 ? SampleResult::kPc : SampleResult::kNoReply;
@@ -418,8 +418,9 @@ bool PcOwned(std::uintptr_t pc, const RocrSpinTamerOptions &options) {
 
 enum class Verdict { kOwner, kNotProven, kAbortScan };
 
-// Samples `tid`'s PC until ownership is decided.
-Verdict ProveOwner(pid_t pid, pid_t tid, const RocrSpinTamerOptions &options,
+// Samples the candidate's PC until ownership is decided.
+Verdict ProveOwner(pid_t pid, const ThreadKey &key,
+                   const RocrSpinTamerOptions &options,
                    const std::atomic<bool> *cancelled) {
   std::lock_guard<std::mutex> lock(g_probe_mutex);
   const int sig = ProbeSignal();
@@ -428,11 +429,11 @@ Verdict ProveOwner(pid_t pid, pid_t tid, const RocrSpinTamerOptions &options,
   }
   int owned = 0;
   for (int i = 0; i < kPcSamples; ++i) {
-    if (cancelled && cancelled->load(std::memory_order_relaxed)) {
+    if (Cancelled(cancelled)) {
       return Verdict::kAbortScan;
     }
     std::uintptr_t pc = 0;
-    const SampleResult result = SamplePc(pid, tid, sig, &pc);
+    const SampleResult result = SamplePc(pid, key, sig, cancelled, &pc);
     if (result == SampleResult::kSlotUnsafe) {
       return Verdict::kAbortScan;
     }
@@ -450,16 +451,16 @@ Verdict ProveOwner(pid_t pid, pid_t tid, const RocrSpinTamerOptions &options,
   return Verdict::kNotProven;
 }
 
-// Resolves the pin target. Returns false when pinning must be skipped
-// (single-CPU mask). An invalid INFERFLUX_ROCR_TAME_CORE (unparseable, out
-// of range, or outside the process affinity mask) warns and falls back to
-// the highest allowed CPU.
-bool ChooseTameCore(int *tame_core) {
+// Resolves the pin target from the confined thread's own affinity mask (the
+// ROCr runtime widens its threads to every CPU the process may use; the
+// main thread's mask can be narrower). Returns false when pinning must be
+// skipped (single-CPU mask). An invalid INFERFLUX_ROCR_TAME_CORE
+// (unparseable, out of range, or outside the mask) warns once and falls
+// back to the highest allowed CPU.
+bool ChooseTameCore(pid_t tid, int *tame_core) {
   cpu_set_t allowed;
   CPU_ZERO(&allowed);
-  if (sched_getaffinity(getpid(), sizeof(allowed), &allowed) != 0) {
-    log::Warn(kComponent,
-              std::string("sched_getaffinity failed: ") + std::strerror(errno));
+  if (sched_getaffinity(tid, sizeof(allowed), &allowed) != 0) {
     return false;
   }
   int highest = -1;
@@ -471,17 +472,17 @@ bool ChooseTameCore(int *tame_core) {
     }
   }
   if (count <= 1) {
-    return false; // Nothing to gain from pinning; demote only.
+    return false; // Nothing to gain from pinning.
   }
   // Valid CPU indices are [0, CPU_SETSIZE - 1]; an index of CPU_SETSIZE
   // would make CPU_ISSET/CPU_SET address past the end of cpu_set_t.
   const int requested =
       ParseIntEnv("INFERFLUX_ROCR_TAME_CORE", -1, 0, CPU_SETSIZE - 1);
-  const char *raw = std::getenv("INFERFLUX_ROCR_TAME_CORE");
   if (requested >= 0 && CPU_ISSET(requested, &allowed)) {
     *tame_core = requested;
     return true;
   }
+  const char *raw = std::getenv("INFERFLUX_ROCR_TAME_CORE");
   static std::atomic<bool> warned_invalid{false};
   if (raw != nullptr && *raw != '\0' && !warned_invalid.exchange(true)) {
     log::Warn(kComponent, std::string("INFERFLUX_ROCR_TAME_CORE=") + raw +
@@ -494,29 +495,16 @@ bool ChooseTameCore(int *tame_core) {
 
 std::atomic<int> g_next_spin_name{0}; // Unique rocr-spin-N across scans.
 
-enum class Claim { kClaimed, kAlreadyConfined, kCapReached };
-
-// Atomically claims `key` for confinement: concurrent scans (the background
-// worker and a synchronous caller) can never confine or count it twice.
-Claim ClaimConfinement(const ThreadKey &key) {
-  std::lock_guard<std::mutex> lock(g_memory_mutex);
-  if (g_confined.count(key) != 0) {
-    return Claim::kAlreadyConfined;
-  }
-  if (g_confined.size() >= kMaxConfinedAlive) {
-    return Claim::kCapReached;
-  }
-  g_confined.insert(key);
-  return Claim::kClaimed;
-}
-
-void UnclaimConfinement(const ThreadKey &key) {
-  std::lock_guard<std::mutex> lock(g_memory_mutex);
-  g_confined.erase(key);
-}
-
-bool ConfineThread(const ThreadKey &key, int tame_core, bool pin) {
+// Confines a proven poller: pins it to one core (the load-bearing bound:
+// 2 cores -> 1) and lowers its nice value to 19. Deliberately not
+// SCHED_IDLE: the ROCr AsyncEventsLoop also runs HSA async signal handlers,
+// and on native Linux SCHED_IDLE can starve it indefinitely under load,
+// whereas a nice-19 thread is deprioritized but still gets a share of every
+// CFS period. Returns the CPU pinned to (or -1 if pinning was skipped) via
+// `pinned_cpu`.
+bool ConfineThread(const ThreadKey &key, int *pinned_cpu) {
   const pid_t tid = key.first;
+  *pinned_cpu = -1;
   // The proof can take a while; refuse if the TID now names another thread.
   ThreadSample now;
   if (!ReadThreadStat(tid, &now) || now.starttime != key.second) {
@@ -537,27 +525,27 @@ bool ConfineThread(const ThreadKey &key, int tame_core, bool pin) {
   case Claim::kClaimed:
     break;
   }
-  int demoted = 0;
-  // PRIO_PROCESS with a tid targets that thread's nice value on Linux.
-  if (setpriority(PRIO_PROCESS, tid, 19) == 0) {
-    ++demoted;
-  }
-  sched_param idle{};
-  if (sched_setscheduler(tid, SCHED_IDLE, &idle) == 0) {
-    ++demoted;
-  }
-  if (demoted == 0) {
-    UnclaimConfinement(key); // ESRCH (thread exited) or EPERM.
-    return false;
-  }
-  if (pin) {
+  int tame_core = -1;
+  bool applied = false;
+  if (ChooseTameCore(tid, &tame_core)) {
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(tame_core, &set);
-    if (sched_setaffinity(tid, sizeof(set), &set) != 0) {
+    if (sched_setaffinity(tid, sizeof(set), &set) == 0) {
+      applied = true;
+      *pinned_cpu = tame_core;
+    } else {
       log::Warn(kComponent, "affinity pin of tid " + std::to_string(tid) +
                                 " failed: " + std::strerror(errno));
     }
+  }
+  // PRIO_PROCESS with a tid targets that thread's nice value on Linux.
+  if (setpriority(PRIO_PROCESS, tid, 19) == 0) {
+    applied = true;
+  }
+  if (!applied) {
+    UnclaimConfinement(key); // ESRCH (thread exited) or EPERM.
+    return false;
   }
   // Best-effort rename for observability: same-tgid comm writes need no
   // capabilities, and "rocr-spin-N" fits the 15-char TASK_COMM_LEN limit.
@@ -606,7 +594,7 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   const auto first = SampleAllThreads();
   const auto window_start = std::chrono::steady_clock::now();
   for (int slept = 0; slept < kWindowMs; slept += kSleepSliceMs) {
-    if (cancelled && cancelled->load(std::memory_order_relaxed)) {
+    if (Cancelled(cancelled)) {
       return 0; // Process is exiting: don't touch metrics or statics.
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kSleepSliceMs));
@@ -662,13 +650,10 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   }
 
   // Stage 2 proof: only threads provably executing the code owner's code.
-  // The pin target is resolved lazily, on the first proven thread.
-  bool core_resolved = false;
-  bool pin = false;
-  int tame_core = -1;
   int confined = 0;
+  int last_pinned_cpu = -1;
   for (const ThreadKey &key : candidates) {
-    const Verdict verdict = ProveOwner(pid, key.first, options, cancelled);
+    const Verdict verdict = ProveOwner(pid, key, options, cancelled);
     if (verdict == Verdict::kAbortScan) {
       break;
     }
@@ -676,24 +661,24 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
       RecordNotProven(key, scan);
       continue;
     }
-    if (!core_resolved) {
-      pin = ChooseTameCore(&tame_core);
-      core_resolved = true;
-    }
-    if (ConfineThread(key, tame_core, pin)) {
+    int pinned_cpu = -1;
+    if (ConfineThread(key, &pinned_cpu)) {
       ++confined;
+      if (pinned_cpu >= 0) {
+        last_pinned_cpu = pinned_cpu;
+      }
     }
   }
 
   if (confined > 0) {
     GlobalMetrics().RecordRuntimeSpinThreadsConfined(confined);
-    log::Info(
-        kComponent,
-        "confined " + std::to_string(confined) +
-            " busy-spin runtime thread(s) (nice 19, SCHED_IDLE" +
-            (pin ? std::string(", pinned to CPU ") + std::to_string(tame_core)
-                 : std::string(", pin skipped")) +
-            ")");
+    log::Info(kComponent,
+              "confined " + std::to_string(confined) +
+                  " busy-spin runtime thread(s) (nice 19" +
+                  (last_pinned_cpu >= 0 ? std::string(", pinned to CPU ") +
+                                              std::to_string(last_pinned_cpu)
+                                        : std::string(", pin skipped")) +
+                  ")");
   } else {
     log::Debug(kComponent, std::to_string(candidates.size()) +
                                " never-blocking thread(s) found; none proven "
@@ -740,7 +725,8 @@ private:
       stop_ = true;
       worker = std::move(thread_);
     }
-    // Cuts an in-flight scan short (<= one 50 ms slice or one PC probe).
+    // Every wait in a scan (window slices, probe replies, handler drain)
+    // checks this, so an in-flight scan ends within ~50 ms.
     cancelled_.store(true);
     cv_.notify_all();
     if (worker.joinable() && worker.get_id() != std::this_thread::get_id()) {

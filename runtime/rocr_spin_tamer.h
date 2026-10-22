@@ -11,9 +11,14 @@ namespace inferflux {
 // ROCm 7.x libhsa-runtime64 spawns two poller threads at hipInit() that
 // busy-spin at 100% CPU each for the process lifetime (upstream fix
 // rocm-systems#7898 unreleased; no env knob disables the loop). The tamer
-// demotes them (nice 19 + SCHED_IDLE) and co-pins them onto one core,
-// bounding the cost from 2 cores to 1. On WSL2 SCHED_IDLE/nice are not
-// enforced, so the affinity pin is the load-bearing mitigation there.
+// co-pins them onto one core (bounding the cost from 2 cores to 1) and sets
+// nice 19. Not SCHED_IDLE: the same thread runs HSA async signal handlers,
+// and native Linux enforces SCHED_IDLE strictly enough to starve it; a
+// nice-19 thread still gets a share of every CFS period. (WSL2 enforces
+// neither for service-cgroup threads; the pin is the load-bearing part.)
+// Pinning the caller around hipInit() instead is not viable: ROCr widens its
+// threads' affinity to every CPU, and disabling that override
+// (HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0) under a pinned caller aborts.
 //
 // Identification is positive, not heuristic, because confinement is
 // irreversible:
@@ -25,9 +30,12 @@ namespace inferflux {
 //  2. Proof (decides confinement): the thread is interrupted with a probe
 //     signal up to 3 times and confined only if at least 2 sampled
 //     instruction pointers resolve (dladdr) into the ROCr runtime library.
-//     A thread is signalled only while it is running/runnable and its
-//     signal mask neither blocks nor ignores the probe, so a thread parked
-//     in a syscall never sees EINTR from it.
+//     Before each signal the thread must still be the same thread (start
+//     time), running/runnable, and neither block nor ignore the probe.
+//     Residual risk, minimized not eliminated: the state check and the
+//     signal are not atomic, and a probe that times out stays pending, so a
+//     non-ROCr spinner that enters a syscall in that window can see one
+//     EINTR (SA_RESTART covers most calls; epoll/poll/timed waits do not).
 // A thread not proven (other code, or no reply) backs off for 1, 2, 4, ...
 // up to 12 scans before it is probed again, so a busy third-party worker
 // (ggml/OpenMP/BLAS) receives at most 2 SA_RESTART probe signals per
@@ -35,7 +43,8 @@ namespace inferflux {
 // unlucky once is still caught later. Confined threads are remembered by
 // (tid, start time); a TID reused before confinement is detected by
 // re-checking the start time. At most 8 live threads are confined at once
-// (slots free up when confined threads exit). If the probe signal is owned by
+// (slots free up when confined threads exit). The pin target comes from the
+// confined thread's own affinity mask. If the probe signal is owned by
 // another handler or the architecture is unsupported, nothing is confined.
 //
 // Linux-only; every entry point is a no-op elsewhere.

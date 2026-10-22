@@ -45,13 +45,13 @@ extern const char __start_rocr_tamer_test_spin[];
 extern const char __stop_rocr_tamer_test_spin[];
 }
 
+namespace {
+
 __attribute__((noinline, section("rocr_tamer_test_spin"))) void
 RocrTamerTestSpinUntil(const std::atomic<bool> *stop) {
   while (!stop->load(std::memory_order_relaxed)) {
   }
 }
-
-namespace {
 
 bool InTestSpinLoop(std::uintptr_t pc) {
   return pc >= reinterpret_cast<std::uintptr_t>(__start_rocr_tamer_test_spin) &&
@@ -262,12 +262,20 @@ TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
   }
   {
     // 2 of 3 owned: confined once 2 replied samples are owned (a sample
-    // that times out never reaches the predicate).
+    // that times out never reaches the predicate). Each attempt gets a fresh
+    // predicate, and there is headroom for a back-off skip if one attempt
+    // ends unproven on a loaded runner.
     SpinnerGroup spinners(1);
-    CountingOwner two_owned;
-    two_owned.owned = 2;
-    REQUIRE(ScanUntil(1, two_owned.Options()) == 1);
-    REQUIRE(two_owned.calls->load() == 2);
+    int confined = 0;
+    int calls_on_success = 0;
+    for (int attempt = 0; attempt < 6 && confined == 0; ++attempt) {
+      CountingOwner two_owned;
+      two_owned.owned = 2;
+      confined = inferflux::TameRuntimeSpinThreads(two_owned.Options());
+      calls_on_success = two_owned.calls->load();
+    }
+    REQUIRE(confined == 1);
+    REQUIRE(calls_on_success == 2);
   }
 }
 
