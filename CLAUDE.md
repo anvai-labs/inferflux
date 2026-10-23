@@ -98,14 +98,18 @@ packaging, and compile-only jobs on GitHub-hosted runners. The registered runner
 is `aiserver1-dual-gpu` in group `inferflux-gpu-trusted-staging`, with CUDA and
 ROCm labels. Do not register two runner agents against these shared devices.
 
-This runner is managed through a durable terminal, not `svc.sh`. Host systemd
-availability does not change its registration or management mode. After every
-host restart, start the listener in a durable terminal and leave it running; see
+This runner is managed through a transient user systemd unit, not `svc.sh`.
+After every host restart, start the listener with the GPU tool directories on
+PATH — the same-process dual gate resolves `nvcc` from the runner's
+environment and has no tool-export step of its own. Leave it running; see
 `docs/GPU_CI_BOOTSTRAP.md` for the current host lifecycle and test-port contract:
 
 ```bash
-cd /home/vsingh/actions-runner-inferflux-gpu
-./run.sh
+systemd-run --user --unit=inferflux-gpu-runner \
+  --working-directory=/home/vsingh/actions-runner-inferflux-gpu \
+  --setenv=PATH=/usr/lib/wsl/lib:/usr/local/cuda/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  ./run.sh
+# Logs: journalctl --user -u inferflux-gpu-runner
 
 # Verify from another terminal
 gh api orgs/anvai-labs/actions/runners/9054 \

@@ -67,18 +67,26 @@ it is required by the release process for the exact promoted SHA.
 
 ## WSL Listener Lifecycle
 
-The existing runner uses a durable host terminal. Registration persists, but
-the listener needs restarting after a host reboot. Systemd availability varies
-with the WSL deployment; the October 2026 host runs InferFlux as a user service,
-which does not make this runner systemd-managed. Preserve the existing runner
-registration and start it with:
+The runner registration persists; the listener needs starting again after a
+host reboot. Run it as a transient user systemd unit, not from a terminal: a
+`setsid nohup` listener died with the agent session that started it
+(2026-10-23, failing a running job on lease expiry), and the unit also pins
+the GPU tool directories into PATH — the same-process dual gate has no
+"Expose installed GPU tools" step of its own and resolves `nvcc` and `hipcc`
+from the runner's environment (2026-10-23: a default-PATH unit failed its
+mixed configure with `No CMAKE_CUDA_COMPILER could be found`):
 
 ```bash
-cd /home/vsingh/actions-runner-inferflux-gpu
-PATH="/usr/lib/wsl/lib:/usr/local/cuda/bin:/opt/rocm/bin:$PATH" ./run.sh
+systemd-run --user --unit=inferflux-gpu-runner \
+  --working-directory=/home/vsingh/actions-runner-inferflux-gpu \
+  --setenv=PATH=/usr/lib/wsl/lib:/usr/local/cuda/bin:/opt/rocm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  ./run.sh
 ```
 
-Keep that command in a durable host terminal. Confirm GitHub reports the runner
+The unit vanishes on reboot, so re-run the command after one; if the unit
+still exists (for example after a manual stop), start it again with
+`systemctl --user start inferflux-gpu-runner`. Logs:
+`journalctl --user -u inferflux-gpu-runner`. Confirm GitHub reports the runner
 online before enabling a gate:
 
 ```bash
@@ -86,9 +94,9 @@ gh api orgs/anvai-labs/actions/runners/9054 \
   --jq '{name,status,busy,labels:[.labels[].name]}'
 ```
 
-The listener inherits its launch environment. A minimal non-login PATH may omit
-WSL's `nvidia-smi` even though the driver and models are present; `.path` alone does
-not repair an already-running interactive listener. The GPU workflow adds existing
+The listener inherits its launch environment, so the unit's PATH matters
+beyond the dual gate: a minimal non-login PATH may omit WSL's `nvidia-smi`
+even though the driver and models are present. The GPU workflow adds existing
 WSL/CUDA/ROCm tool directories to `GITHUB_PATH` before device checks, so each job can
 resolve the installed tools without a privileged system-wide symlink.
 Wait until the existing listener is idle before restarting it; preserve its registration.
