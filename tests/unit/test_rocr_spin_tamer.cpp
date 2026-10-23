@@ -55,8 +55,11 @@ extern const char __stop_rocr_tamer_test_spin[];
 namespace {
 
 __attribute__((noinline, section("rocr_tamer_test_spin"))) void
-RocrTamerTestSpinUntil(const std::atomic<bool> *stop) {
-  while (!stop->load(std::memory_order_relaxed)) {
+RocrTamerTestSpinUntil(const bool *stop) {
+  // A GCC atomic builtin, never an out-of-line call: with std::atomic at
+  // -O0 (the Coverage CI job) load() is a real function outside this
+  // section, so the sampled PCs would not land in the owned range.
+  while (!__atomic_load_n(stop, __ATOMIC_RELAXED)) {
   }
 }
 
@@ -164,7 +167,7 @@ public:
   }
 
   ~SpinnerGroup() {
-    stop_.store(true);
+    __atomic_store_n(&stop_, true, __ATOMIC_RELAXED);
     for (auto &thread : threads_) {
       if (thread.joinable()) {
         thread.join();
@@ -178,7 +181,7 @@ public:
   pid_t tid(int index) const { return tids_[index].load(); }
 
 private:
-  std::atomic<bool> stop_{false};
+  bool stop_ = false; // Accessed only through __atomic builtins.
   std::unique_ptr<std::atomic<pid_t>[]> tids_;
   std::vector<std::thread> threads_;
 };

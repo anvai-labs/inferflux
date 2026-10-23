@@ -344,7 +344,7 @@ int ProbeSignal() {
   if (sig > SIGRTMAX) {
     return 0;
   }
-  struct sigaction current{};
+  struct sigaction current {};
   if (sigaction(sig, nullptr, &current) != 0) {
     return 0;
   }
@@ -353,7 +353,7 @@ int ProbeSignal() {
     return sig;
   }
   if ((current.sa_flags & SA_SIGINFO) == 0 && current.sa_handler == SIG_DFL) {
-    struct sigaction action{};
+    struct sigaction action {};
     action.sa_sigaction = ProbeHandler;
     action.sa_flags = SA_SIGINFO | SA_RESTART;
     sigemptyset(&action.sa_mask);
