@@ -1,7 +1,6 @@
 #include "runtime/rocr_spin_tamer.h"
 
 #include "runtime/string_utils.h"
-#include "runtime/thread_name.h"
 #include "server/logging/logger.h"
 
 #include <atomic>
@@ -107,28 +106,31 @@ int ResolveCore() {
   return g_core.load(std::memory_order_acquire);
 }
 
-// Records the load range of the object containing `base` (dl_iterate_phdr,
-// once), so later classifications avoid dladdr.
+// Records the load range (all PT_LOAD segments) of the object containing
+// `*data`, once, so later classifications avoid dladdr. Matched by
+// containment, not by base address: dli_fbase and dlpi_addr differ for
+// objects whose first PT_LOAD has a nonzero vaddr.
 int CacheRangeCallback(dl_phdr_info *info, size_t, void *data) {
-  const auto base = *static_cast<std::uintptr_t *>(data);
-  if (static_cast<std::uintptr_t>(info->dlpi_addr) != base) {
-    return 0;
-  }
+  const auto addr = *static_cast<std::uintptr_t *>(data);
   std::uintptr_t lo = UINTPTR_MAX;
   std::uintptr_t hi = 0;
+  bool contains = false;
   for (int i = 0; i < info->dlpi_phnum; ++i) {
     const ElfW(Phdr) &ph = info->dlpi_phdr[i];
     if (ph.p_type != PT_LOAD) {
       continue;
     }
     const std::uintptr_t start = info->dlpi_addr + ph.p_vaddr;
+    const std::uintptr_t end = start + ph.p_memsz;
+    contains = contains || (addr >= start && addr < end);
     lo = start < lo ? start : lo;
-    hi = start + ph.p_memsz > hi ? start + ph.p_memsz : hi;
+    hi = end > hi ? end : hi;
   }
-  if (hi > lo) {
-    g_runtime_lo.store(lo, std::memory_order_relaxed);
-    g_runtime_hi.store(hi, std::memory_order_release);
+  if (!contains) {
+    return 0;
   }
+  g_runtime_lo.store(lo, std::memory_order_relaxed);
+  g_runtime_hi.store(hi, std::memory_order_release);
   return 1;
 }
 
@@ -203,8 +205,8 @@ bool IsRocrRuntimeAddress(const void *addr) noexcept {
       !IsRocrRuntimeObjectPath(info.dli_fname)) {
     return false;
   }
-  auto base = reinterpret_cast<std::uintptr_t>(info.dli_fbase);
-  dl_iterate_phdr(&CacheRangeCallback, &base);
+  std::uintptr_t probe = value;
+  dl_iterate_phdr(&CacheRangeCallback, &probe);
   return true;
 }
 
@@ -275,6 +277,22 @@ bool CurrentThreadIsTamedRocrThread() noexcept { return t_tamed_cpu >= 0; }
 
 int CurrentTamedRocrThreadCpu() noexcept { return t_tamed_cpu; }
 
+int InheritedPinToUndo(const pthread_attr_t *attr) noexcept {
+  const int creator_cpu = t_tamed_cpu;
+  if (creator_cpu < 0 || attr == nullptr) {
+    return creator_cpu;
+  }
+  // glibc reports "no cpuset in the attribute" as all CPUs, so a single-CPU
+  // answer equal to the creator's pin is an explicit request to keep.
+  cpu_set_t requested;
+  CPU_ZERO(&requested);
+  if (pthread_attr_getaffinity_np(attr, sizeof(requested), &requested) == 0 &&
+      CPU_COUNT(&requested) == 1 && CPU_ISSET(creator_cpu, &requested)) {
+    return -1;
+  }
+  return creator_cpu;
+}
+
 void RestoreInheritedScheduling(int creator_cpu) noexcept {
   const int saved_errno = errno;
   cpu_set_t own;
@@ -309,9 +327,11 @@ void ReportRocrTamerStatus() {
 #if defined(__linux__)
   if (!Enabled()) {
     if (HsaRuntimeLoaded()) {
-      log::Info(kComponent, "ROCr runtime loaded; set INFERFLUX_ROCR_TAME=1 "
-                            "to confine its busy-spin poller threads (see "
-                            "docs/ROCM_INSTALLATION_GUIDE_WSL.md)");
+      log::Info(kComponent,
+                "ROCr runtime loaded; if its poller threads busy-spin at idle "
+                "(WSL2, ROCm without rocm-systems#7898), set "
+                "INFERFLUX_ROCR_TAME=1 or use the patched runtime (see "
+                "docs/ROCM_INSTALLATION_GUIDE_WSL.md)");
     }
     return;
   }
@@ -347,6 +367,13 @@ void ReportRocrTamerStatus() {
           " allotted) at creation; tamed so far: " +
           std::to_string(RocrTamedThreadCount()) +
           (HsaRuntimeLoaded() ? "" : " (libhsa-runtime64 not loaded yet)"));
+  if (RocrTamedThreadCount() == 0 && RocrSkippedThreadCount() == 0 &&
+      HsaRuntimeLoaded()) {
+    log::Warn(kComponent,
+              "libhsa-runtime64 is loaded but no ROCr thread has been tamed; "
+              "if `top -H` shows unnamed threads at 100% CPU, the runtime is "
+              "bypassing this binary's pthread_create (e.g. RTLD_DEEPBIND)");
+  }
   if (RocrSkippedThreadCount() > 0) {
     log::Warn(kComponent, std::to_string(RocrSkippedThreadCount()) +
                               " ROCr runtime thread(s) could not be pinned "

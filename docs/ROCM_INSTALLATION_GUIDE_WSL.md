@@ -313,12 +313,21 @@ Verify: the startup log line from `rocr_tamer` reports the core and that the
 interposer is active; `top -H -p $(pidof inferfluxd)` shows the `rocr-hsa-N`
 pollers sharing a single core (~100% combined instead of ~200%); and
 `inferflux_runtime_spin_threads_confined_total` in `/metrics` counts the
-tamed threads.
+tamed threads (`inferflux_runtime_spin_threads_unconfined_total` counts ROCr
+threads whose own CPU mask had no allotted CPU, which are left alone).
+
+Enable it on ROCm hosts only: on other hosts every thread creation pays one
+`dladdr` lookup for nothing.
 
 Limits: a cgroup cpuset later shrunk to exclude the chosen core moves the
-threads off it; a future ROCr that starts threads via `std::thread` would not
-be recognized (nothing is tamed, nothing breaks); sanitizer builds compile
-the interposer out (the startup log says so).
+threads off it; a future ROCr that starts threads via `std::thread`, or that
+is loaded with `RTLD_DEEPBIND`, would not be recognized (nothing is tamed,
+nothing breaks; the startup log warns when ROCr is loaded but nothing was
+tamed); the allotment is read after shared-library constructors, so
+`OMP_PROC_BIND` narrowing the main thread first can shrink it (fails safe);
+the cached ROCr address range assumes libhsa is never unloaded (InferFlux
+never unloads its backends); sanitizer builds compile the interposer out
+(the startup log says so).
 
 ## Supported AMD GPUs
 

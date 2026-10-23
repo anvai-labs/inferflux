@@ -34,7 +34,7 @@ flowchart LR
 | Distributed KV health | `inferflux_disagg_kv_tickets_total{stage=...}`, `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt` |
 | Cache execution path | `inferflux_cache_execution_path_total{path=...}` | `phased`, `full_generate`, `full_generate_images` -- the bypass population is visible directly; `INFERFLUX_DISABLE_PHASED_LOGPROBS=1` moves logprobs traffic back to `full_generate` (ADR-0007 Stage 1) |
 | Cache reuse | `inferflux_prefix_hits_total`, `inferflux_prefix_partial_hits_total`, `inferflux_prefix_matched_tokens_total`, `inferflux_kv_prefix_reuse_total` |
-| ROCr thread confinement | `inferflux_runtime_spin_threads_confined_total` — threads started by `libhsa-runtime64` that were pinned to the shared tame core at creation (opt-in `INFERFLUX_ROCR_TAME=1`); cumulative — grows by about 3 per ROCr runtime initialization on WSL2/gfx1201, stays `0` elsewhere. Tamed threads appear as `rocr-hsa-N` in `top -H`; the `rocr_tamer` startup log line reports the core (`docs/ROCM_INSTALLATION_GUIDE_WSL.md`) |
+| ROCr thread confinement | `inferflux_runtime_spin_threads_confined_total` — threads started by `libhsa-runtime64` that were pinned to the shared tame core at creation (opt-in `INFERFLUX_ROCR_TAME=1`); cumulative — grows by about 3 per ROCr runtime initialization on WSL2/gfx1201, stays `0` elsewhere. Tamed threads appear as `rocr-hsa-N` in `top -H`; the `rocr_tamer` startup log line reports the core (`docs/ROCM_INSTALLATION_GUIDE_WSL.md`). `inferflux_runtime_spin_threads_unconfined_total` counts ROCr threads left unpinned because their own CPU mask had no allotted CPU (expect `0`) |
 
 ## Cache counter scopes
 

@@ -61,7 +61,7 @@ struct TameBox {
   void *arg;
   int core;        // >= 0: tame this ROCr thread onto `core`.
   int creator_cpu; // >= 0: non-ROCr child of a tamed thread; undo the
-                   // pin and nice it inherited.
+                   // single-CPU pin it inherited.
 };
 
 // Deliberately NOT noexcept, with no try/catch and no RAII objects:
@@ -102,10 +102,9 @@ pthread_create(pthread_t *__restrict thread,
   const int saved_errno = errno;
   const PthreadCreateFn real = RealPthreadCreate();
   const int core = inferflux::RocrTameCoreForNewThread(start_routine);
-  // A tamed thread's children inherit its single-CPU mask; any
-  // that are not ROCr threads themselves get them undone in the trampoline.
-  const int creator_cpu =
-      core < 0 ? inferflux::CurrentTamedRocrThreadCpu() : -1;
+  // A tamed thread's children inherit its single-CPU mask; any that are not
+  // ROCr threads themselves get it undone in the trampoline.
+  const int creator_cpu = core < 0 ? inferflux::InheritedPinToUndo(attr) : -1;
   if (core >= 0 || creator_cpu >= 0) {
     if (auto *box = static_cast<TameBox *>(std::malloc(sizeof(TameBox)))) {
       *box = TameBox{start_routine, arg, core, creator_cpu};

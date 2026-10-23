@@ -2,6 +2,10 @@
 
 #include <vector>
 
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 namespace inferflux {
 
 // ROCr thread tamer (WSL2/ROCm AsyncEventsLoop workaround).
@@ -52,7 +56,9 @@ namespace inferflux {
 // until the first ROCr thread is identified, each creation costs one dladdr
 // (it takes the dynamic loader's lock), after which a cached address range
 // is used; a future ROCr starting threads via std::thread (start routine in
-// libstdc++) would not be recognized (fails safe: nothing tamed); sanitizer
+// libstdc++), or loaded with RTLD_DEEPBIND, would not be recognized (fails
+// safe: nothing tamed; the report warns); the cached range assumes libhsa is
+// never unloaded (InferFlux never unloads its backends); sanitizer
 // builds and non-x86_64/aarch64 targets compile the interposer out.
 //
 // Knobs (env-only, see docs/CONFIG_REFERENCE.md section 10):
@@ -89,9 +95,14 @@ bool CurrentThreadIsTamedRocrThread() noexcept;
 // CPU a tamed thread is pinned to (-1 if the calling thread is not tamed).
 int CurrentTamedRocrThreadCpu() noexcept;
 
+// Creator side, for a non-ROCr thread being created: the CPU whose inherited
+// pin its trampoline should undo, or -1. -1 when the caller is not a tamed
+// thread, or when `attr` explicitly requests exactly the caller's CPU.
+int InheritedPinToUndo(const pthread_attr_t *attr) noexcept;
+
 // Runs in a non-ROCr thread created by a tamed thread pinned to
-// `creator_cpu`: if its mask is exactly the creator's single CPU (inherited
-// rather than set by its attribute), restores the allotment mask.
+// `creator_cpu`: if its mask is still exactly that CPU, restores the
+// allotment mask.
 void RestoreInheritedScheduling(int creator_cpu) noexcept;
 #endif
 

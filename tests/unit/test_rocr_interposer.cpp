@@ -162,8 +162,11 @@ TEST_CASE("interposer: tames runtime threads at creation",
   CHECK(report.nice == OwnNice()); // Pin only: priority is never changed.
   CHECK(IsTamedName(report.name));
   CHECK(inferflux::RocrTamedThreadCount() == before + 1);
-  CHECK(inferflux::GlobalMetrics().RenderPrometheus().find(
-            "inferflux_runtime_spin_threads_confined_total") !=
+  const std::string metrics = inferflux::GlobalMetrics().RenderPrometheus();
+  CHECK(metrics.find("inferflux_runtime_spin_threads_confined_total " +
+                     std::to_string(inferflux::RocrTamedThreadCount())) !=
+        std::string::npos);
+  CHECK(metrics.find("inferflux_runtime_spin_threads_unconfined_total") !=
         std::string::npos);
 }
 
@@ -387,6 +390,17 @@ TEST_CASE("interposer: a tamed thread's children do not inherit the pin",
     CHECK(IsTamedName(parent.name));
     CHECK(child.cpu_count == static_cast<int>(cpus.size()));
     CHECK(child.nice == OwnNice());
+  }
+  SECTION("an explicit attribute affinity on the tame core is kept") {
+    ChildReport child;
+    FakeHsaReport parent{};
+    pthread_t thread{};
+    REQUIRE(Fake().spawn_parent(&thread, &parent, &FillChildReport, &child,
+                                /*child_attr_cpu=*/cpus.back()) == 0);
+    REQUIRE(pthread_join(thread, nullptr) == 0);
+    CHECK(parent.only_cpu == cpus.back()); // Parent is pinned there too.
+    CHECK(child.cpu_count == 1);
+    CHECK(child.only_cpu == cpus.back());
   }
   SECTION("an explicit attribute affinity is kept") {
     ChildReport child;

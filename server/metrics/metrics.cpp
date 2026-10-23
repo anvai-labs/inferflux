@@ -2791,6 +2791,12 @@ std::string MetricsRegistry::RenderPrometheus() const {
   // be created before or after this registry's lifetime.
   out << "inferflux_runtime_spin_threads_confined_total "
       << RocrTamedThreadCount() << "\n";
+  out << "# HELP inferflux_runtime_spin_threads_unconfined_total ROCr runtime "
+         "threads the tamer could not pin (their own CPU mask has no allotted "
+         "CPU)\n";
+  out << "# TYPE inferflux_runtime_spin_threads_unconfined_total counter\n";
+  out << "inferflux_runtime_spin_threads_unconfined_total "
+      << RocrSkippedThreadCount() << "\n";
 
   return out.str();
 }
