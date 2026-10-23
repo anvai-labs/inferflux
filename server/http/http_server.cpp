@@ -13,6 +13,7 @@
 #include "runtime/multimodal/image_preprocessor.h"
 #include "runtime/string_utils.h"
 #include "runtime/text/response_splitter.h"
+#include "runtime/thread_name.h"
 #include "scheduler/model_selection.h"
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
@@ -1580,6 +1581,7 @@ void HttpServer::Stop() {
 }
 
 void HttpServer::WorkerLoop() {
+  SetCurrentThreadName("if-http");
   while (true) {
     ClientSession session;
     {
@@ -1607,6 +1609,7 @@ void HttpServer::WorkerLoop() {
 }
 
 void HttpServer::AcceptLoop(Listener &listener) {
+  SetCurrentThreadName("if-accept");
   const int fd = listener.fd.load();
   if (fd < 0) {
     return;

@@ -1,0 +1,8 @@
+/* inferfluxd (and rocr_interposer_tests) define pthread_create
+ * (server/rocr_pthread_interposer.cpp) and must export it, so that
+ * libhsa-runtime64 -- loaded as a dependency of libamdhip64, or dlopen'd
+ * RTLD_LOCAL through ggml-hip -- binds to it. The ROCr thread tamer relies
+ * on this; see runtime/rocr_spin_tamer.h. */
+{
+  pthread_create;
+};

@@ -1,136 +1,105 @@
 #include <catch2/catch_amalgamated.hpp>
 
-#include "server/rocr_spin_tamer.h"
+#include "runtime/rocr_spin_tamer.h"
+#include "runtime/string_utils.h"
 #include "support/scoped_env.h"
 
-#if defined(__linux__)
-#include <sched.h>
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-#include <atomic>
-#include <chrono>
-#include <thread>
-#endif
+#include <vector>
 
 using namespace inferflux;
 
-// Runs on every platform so the [rocr_spin_tamer] tag always matches at
-// least one test case (an empty match makes the Catch2 binary exit
-// non-zero, which would break the macOS CI ctest entry).
-TEST_CASE("rocr spin tamer disabled via env returns 0", "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar disable("INFERFLUX_ROCR_TAME", "0");
-  REQUIRE(inferflux::TameRuntimeSpinThreads() == 0);
+// Pure decision logic; runs on every platform (keeps the [rocr_spin_tamer]
+// tag non-empty on macOS, where an empty tag match fails the ctest entry).
+// The pthread_create interposer itself is exercised in its own executable
+// (tests/unit/test_rocr_interposer.cpp).
+
+TEST_CASE("rocr tamer core: fewer than two allotted CPUs never pin",
+          "[rocr_spin_tamer]") {
+  CHECK(ChooseRocrTameCore({}, nullptr) == -1);
+  CHECK(ChooseRocrTameCore({3}, nullptr) == -1);
+  CHECK(ChooseRocrTameCore({3}, "3") == -1);
+}
+
+TEST_CASE("rocr tamer core: highest allotted CPU by default",
+          "[rocr_spin_tamer]") {
+  bool rejected = true;
+  CHECK(ChooseRocrTameCore({0, 5, 2}, nullptr, &rejected) == 5);
+  CHECK_FALSE(rejected);
+  CHECK(ChooseRocrTameCore({0, 5, 2}, "", &rejected) == 5);
+  CHECK_FALSE(rejected); // An empty value means "not set".
+}
+
+TEST_CASE("rocr tamer core: a valid allotted override wins",
+          "[rocr_spin_tamer]") {
+  bool rejected = true;
+  CHECK(ChooseRocrTameCore({0, 5, 2}, "2", &rejected) == 2);
+  CHECK_FALSE(rejected);
+  CHECK(ChooseRocrTameCore({1, 2}, "1", &rejected) == 1);
+  CHECK_FALSE(rejected);
+}
+
+TEST_CASE("rocr tamer core: invalid overrides fall back and are reported",
+          "[rocr_spin_tamer]") {
+  for (const char *bad :
+       {"4", "abc", "2x", "-1", "99999999999", " 2", "+2", "2 "}) {
+    bool rejected = false;
+    CHECK(ChooseRocrTameCore({0, 5, 2}, bad, &rejected) == 5);
+    CHECK(rejected);
+  }
+}
+
+TEST_CASE("rocr tamer: env truthiness matches ParseBool without allocating",
+          "[rocr_spin_tamer]") {
+  for (const char *yes : {"1", "true", "TRUE", "Yes", "on", "On"}) {
+    CHECK(IsTruthyCStr(yes));
+    CHECK(ParseBool(yes));
+  }
+  for (const char *no :
+       {"", "0", "false", "off", "no", "tru", "truee", " 1", "enabled"}) {
+    CHECK_FALSE(IsTruthyCStr(no));
+    CHECK_FALSE(ParseBool(no));
+  }
+  CHECK_FALSE(IsTruthyCStr(nullptr));
+}
+
+TEST_CASE("rocr tamer: recognizes the runtime by object basename",
+          "[rocr_spin_tamer]") {
+  CHECK(IsRocrRuntimeObjectPath("/opt/rocm/lib/libhsa-runtime64.so.1"));
+  CHECK(IsRocrRuntimeObjectPath("libhsa-runtime64.so"));
+  CHECK(IsRocrRuntimeObjectPath("/b/tests/libhsa-runtime64-inferflux-test.so"));
+  CHECK_FALSE(IsRocrRuntimeObjectPath("/opt/libhsa-runtime64/libfoo.so"));
+  CHECK_FALSE(IsRocrRuntimeObjectPath("/opt/rocm/lib/libamdhip64.so.7"));
+  CHECK_FALSE(IsRocrRuntimeObjectPath(""));
+  CHECK_FALSE(IsRocrRuntimeObjectPath(nullptr));
 }
 
 #if defined(__linux__)
 namespace {
+void *LocalStartRoutine(void *arg) { return arg; }
 
-pid_t CurrentTid() { return static_cast<pid_t>(syscall(SYS_gettid)); }
-
-int HighestAllowedCpu() {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  if (sched_getaffinity(0, sizeof(set), &set) != 0) {
-    return -1;
-  }
-  int highest = -1;
-  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-    if (CPU_ISSET(cpu, &set)) {
-      highest = cpu;
-    }
-  }
-  return highest;
-}
-
-int CountAllowedCpus() {
-  cpu_set_t set;
-  CPU_ZERO(&set);
-  if (sched_getaffinity(0, sizeof(set), &set) != 0) {
-    return 0;
-  }
-  return CPU_COUNT(&set);
-}
-
-// Best-effort hygiene: some kernels restrict unprivileged SCHED_IDLE ->
-// SCHED_OTHER transitions, so restoration results are not asserted.
-void RestoreThread(pid_t tid, const cpu_set_t &original) {
-  sched_param other{};
-  (void)sched_setscheduler(tid, SCHED_OTHER, &other);
-  (void)setpriority(PRIO_PROCESS, tid, 0);
-  (void)sched_setaffinity(tid, sizeof(original), &original);
-}
-
+struct ResetOnExit {
+  ~ResetOnExit() { ResetRocrTamerForTesting(); }
+};
 } // namespace
 
-TEST_CASE("rocr spin tamer confines a pure busy-spin thread",
+TEST_CASE("rocr tamer: threads started from this binary are never tamed",
           "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
-  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
-
-  std::atomic<bool> stop{false};
-  std::atomic<pid_t> spinner_tid{0};
-  cpu_set_t original_mask;
-  CPU_ZERO(&original_mask);
-
-  std::thread spinner([&] {
-    // Capture own affinity first, then publish the tid: the seq_cst
-    // store/load pair makes the mask visible to the main thread.
-    cpu_set_t self_mask;
-    CPU_ZERO(&self_mask);
-    if (sched_getaffinity(0, sizeof(self_mask), &self_mask) == 0) {
-      original_mask = self_mask;
-    }
-    spinner_tid.store(CurrentTid());
-    while (!stop.load(std::memory_order_relaxed)) {
-      // Zero syscalls, zero voluntary context switches.
-    }
-  });
-  while (spinner_tid.load() == 0) {
-    std::this_thread::yield();
+  ResetOnExit reset_on_exit; // Destroyed after the env is restored.
+  for (const char *tame : {"0", "1"}) {
+    inferflux::test::ScopedEnvVar env("INFERFLUX_ROCR_TAME", tame);
+    ResetRocrTamerForTesting();
+    CHECK_FALSE(IsRocrRuntimeAddress(
+        reinterpret_cast<const void *>(&LocalStartRoutine)));
+    CHECK(RocrTameCoreForNewThread(&LocalStartRoutine) == -1);
   }
-  const pid_t tid = spinner_tid.load();
-
-  const int ncpu = CountAllowedCpus();
-  const int expected_core = HighestAllowedCpu();
-
-  // Retry once: on a loaded few-core CI runner the spinner may miss the
-  // 80%-of-window utime threshold on the first measurement.
-  int confined = 0;
-  for (int attempt = 0; attempt < 2 && confined == 0; ++attempt) {
-    confined = inferflux::TameRuntimeSpinThreads();
-  }
-  REQUIRE(confined == 1);
-
-  if (ncpu > 1) {
-    cpu_set_t now;
-    CPU_ZERO(&now);
-    REQUIRE(sched_getaffinity(tid, sizeof(now), &now) == 0);
-    REQUIRE(CPU_COUNT(&now) == 1);
-    REQUIRE(CPU_ISSET(expected_core, &now));
-  }
-
-  RestoreThread(tid, original_mask);
-  stop.store(true);
-  spinner.join();
 }
 
-TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
-  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", nullptr);
-  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
-
-  std::atomic<bool> stop{false};
-  std::thread sleeper([&] {
-    while (!stop.load(std::memory_order_relaxed)) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-  });
-
-  REQUIRE(inferflux::TameRuntimeSpinThreads() == 0);
-
-  stop.store(true);
-  sleeper.join();
+TEST_CASE("rocr tamer: status report is safe without an interposer",
+          "[rocr_spin_tamer]") {
+  ResetOnExit reset_on_exit;
+  inferflux::test::ScopedEnvVar env("INFERFLUX_ROCR_TAME", "1");
+  ResetRocrTamerForTesting();
+  // inferflux_tests does not link the interposer: this must warn, not fail.
+  CHECK_NOTHROW(ReportRocrTamerStatus());
 }
-#endif // defined(__linux__)
+#endif

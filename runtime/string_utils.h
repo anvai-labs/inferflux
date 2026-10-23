@@ -26,6 +26,28 @@ inline std::string Trim(const std::string &s) {
   return s.substr(start, end - start + 1);
 }
 
+/// True for the C strings ParseBool/ParseBoolEnv accept as true ("true",
+/// "1", "yes", "on"; ASCII case-insensitive). Allocation-free, for code that
+/// must not allocate (e.g. inside an interposed pthread_create).
+inline bool IsTruthyCStr(const char *val) noexcept {
+  if (val == nullptr) {
+    return false;
+  }
+  for (const char *yes : {"true", "1", "yes", "on"}) {
+    const char *a = val;
+    const char *b = yes;
+    while (*a != '\0' && *b != '\0' &&
+           std::tolower(static_cast<unsigned char>(*a)) == *b) {
+      ++a;
+      ++b;
+    }
+    if (*a == '\0' && *b == '\0') {
+      return true;
+    }
+  }
+  return false;
+}
+
 /// Parse a boolean from string.
 /// Recognises "true"/"1"/"yes"/"on" (case-insensitive) as true,
 /// "false"/"0"/"no"/"off" as false.  Any other value returns false.
@@ -41,9 +63,9 @@ inline bool ParseBoolEnv(const char *env_name, bool fallback) {
   const char *val = std::getenv(env_name);
   if (!val || *val == '\0')
     return fallback;
-  std::string lower = ToLower(val);
-  if (lower == "1" || lower == "true" || lower == "yes" || lower == "on")
+  if (IsTruthyCStr(val))
     return true;
+  std::string lower = ToLower(val);
   if (lower == "0" || lower == "false" || lower == "no" || lower == "off")
     return false;
   return fallback;

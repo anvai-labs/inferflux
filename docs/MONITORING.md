@@ -34,6 +34,7 @@ flowchart LR
 | Distributed KV health | `inferflux_disagg_kv_tickets_total{stage=...}`, `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt` |
 | Cache execution path | `inferflux_cache_execution_path_total{path=...}` | `phased`, `full_generate`, `full_generate_images` -- the bypass population is visible directly; `INFERFLUX_DISABLE_PHASED_LOGPROBS=1` moves logprobs traffic back to `full_generate` (ADR-0007 Stage 1) |
 | Cache reuse | `inferflux_prefix_hits_total`, `inferflux_prefix_partial_hits_total`, `inferflux_prefix_matched_tokens_total`, `inferflux_kv_prefix_reuse_total` |
+| ROCr thread confinement | `inferflux_runtime_spin_threads_confined_total` — threads started by `libhsa-runtime64` that were pinned to the shared tame core at creation (opt-in `INFERFLUX_ROCR_TAME=1`); cumulative — grows by about 3 per ROCr runtime initialization on WSL2/gfx1201, stays `0` elsewhere. Tamed threads appear as `rocr-hsa-N` in `top -H`; the `rocr_tamer` startup log line reports the core (`docs/ROCM_INSTALLATION_GUIDE_WSL.md`). `inferflux_runtime_spin_threads_unconfined_total` counts ROCr threads left unpinned because their own CPU mask had no allotted CPU or the kernel refused the pin, e.g. after a cpuset change (expect `0`) |
 
 ## Cache counter scopes
 
@@ -241,6 +242,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 | VRAM pressure | native KV planning metrics + dequant policy | tighten budget or keep memory-first dequant policy |
 | Cache not helping | prefix/kv reuse counters | validate warmup patterns and prefix-affinity policy |
 | Selected operator never executes | dispatch divergence metric plus `parse_dispatch_trace.py` | check `dispatch_catalog.h`, the executor allowlist, and `/readyz` down-rank fields |
+| Idle ROCm server burns ~2 CPU cores | `top -H -p $(pidof inferfluxd)` for threads at ~100% CPU; `inferflux_runtime_spin_threads_confined_total`; the `rocr_tamer` startup log line | with `INFERFLUX_ROCR_TAME=1`, expect `rocr-hsa-N` threads sharing one core from startup; if the counter stays `0`, check the env var and the startup line ("the pthread_create interposer is not in this binary" means a CUDA-only, CPU, non-x86_64/aarch64 or sanitizer build; a single-CPU allotment pins nothing). With the tamer off, untamed spinners started from a first-party thread inherit its `if-*` name |
 
 ## 9) Related Docs
 
