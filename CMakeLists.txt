@@ -641,9 +641,11 @@ endif()
 # The dynamic list exports the symbol so libhsa binds to it.
 set(INFERFLUX_ROCR_INTERPOSER_DYNLIST
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocr_pthread_interposer.dynlist")
-# Only ROCm-enabled server builds carry the interposer: CUDA-only and CPU
-# deployments never route thread creation through it.
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ENABLE_ROCM)
+# Only server builds with ROCm actually found carry the interposer (GGML_HIP
+# is forced OFF when the toolkit is missing, even with the default
+# ENABLE_ROCM=ON): CUDA-only and CPU deployments never route thread creation
+# through it.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND GGML_HIP)
   target_sources(inferfluxd PRIVATE server/rocr_pthread_interposer.cpp)
   target_link_options(inferfluxd PRIVATE
     "LINKER:--dynamic-list=${INFERFLUX_ROCR_INTERPOSER_DYNLIST}")

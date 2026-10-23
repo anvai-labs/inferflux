@@ -1,6 +1,7 @@
 #include <catch2/catch_amalgamated.hpp>
 
 #include "runtime/rocr_spin_tamer.h"
+#include "runtime/string_utils.h"
 #include "support/scoped_env.h"
 
 #include <vector>
@@ -45,6 +46,20 @@ TEST_CASE("rocr tamer core: invalid overrides fall back and are reported",
     CHECK(ChooseRocrTameCore({0, 5, 2}, bad, &rejected) == 5);
     CHECK(rejected);
   }
+}
+
+TEST_CASE("rocr tamer: env truthiness matches ParseBool without allocating",
+          "[rocr_spin_tamer]") {
+  for (const char *yes : {"1", "true", "TRUE", "Yes", "on", "On"}) {
+    CHECK(IsTruthyCStr(yes));
+    CHECK(ParseBool(yes));
+  }
+  for (const char *no :
+       {"", "0", "false", "off", "no", "tru", "truee", " 1", "enabled"}) {
+    CHECK_FALSE(IsTruthyCStr(no));
+    CHECK_FALSE(ParseBool(no));
+  }
+  CHECK_FALSE(IsTruthyCStr(nullptr));
 }
 
 TEST_CASE("rocr tamer: recognizes the runtime by object basename",

@@ -4,6 +4,7 @@
 #include "runtime/thread_name.h"
 #include "server/logging/logger.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <climits>
@@ -17,7 +18,6 @@
 #include <link.h>
 #include <pthread.h>
 #include <sched.h>
-#include <strings.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -27,6 +27,36 @@ namespace inferflux {
 namespace {
 
 constexpr const char *kRuntimeBasenamePrefix = "libhsa-runtime64";
+
+// The core rule, allocation-free (it also runs inside pthread_create):
+// fewer than two allotted CPUs -> -1; a digits-only `core_env` naming an
+// allotted CPU wins; otherwise the highest allotted CPU.
+template <typename Contains>
+int ChooseCore(std::size_t count, int highest, Contains contains,
+               const char *core_env, bool *core_env_rejected) {
+  if (core_env_rejected) {
+    *core_env_rejected = false;
+  }
+  if (count < 2) {
+    return -1; // Nothing to bound, or no allotment: never pin.
+  }
+  if (core_env == nullptr || *core_env == '\0') {
+    return highest;
+  }
+  char *end = nullptr;
+  errno = 0;
+  // Digits only: strtol alone would also accept leading spaces and a sign.
+  const bool digits = *core_env >= '0' && *core_env <= '9';
+  const long requested = digits ? std::strtol(core_env, &end, 10) : -1;
+  if (digits && errno == 0 && *end == '\0' && requested <= INT_MAX &&
+      contains(requested)) {
+    return static_cast<int>(requested);
+  }
+  if (core_env_rejected) {
+    *core_env_rejected = true;
+  }
+  return highest;
+}
 
 // All constant-initialized: the interposer can call in from threads created
 // by library constructors, before any dynamic initializer here has run.
@@ -113,16 +143,7 @@ std::vector<int> AllottedCpus() {
 // can come from pthread_create in a library constructor or while an
 // allocator holds its own locks.
 bool ParseTameEnv() noexcept {
-  const char *val = std::getenv("INFERFLUX_ROCR_TAME");
-  if (val == nullptr) {
-    return false;
-  }
-  for (const char *yes : {"1", "true", "yes", "on"}) {
-    if (strcasecmp(val, yes) == 0) {
-      return true;
-    }
-  }
-  return false;
+  return IsTruthyCStr(std::getenv("INFERFLUX_ROCR_TAME"));
 }
 
 bool Enabled() noexcept {
@@ -142,13 +163,32 @@ bool OnlyInheritedPin(const InheritedState &inherited, const cpu_set_t &own) {
          CPU_COUNT(&inherited.mask) > 0;
 }
 
+int ChooseMaskCore(const cpu_set_t &mask, const char *core_env,
+                   bool *core_env_rejected) {
+  int highest = -1;
+  for (int cpu = CPU_SETSIZE - 1; cpu >= 0; --cpu) {
+    if (CPU_ISSET(cpu, &mask)) {
+      highest = cpu;
+      break;
+    }
+  }
+  return ChooseCore(
+      static_cast<std::size_t>(CPU_COUNT(&mask)), highest,
+      [&](long cpu) { return cpu < CPU_SETSIZE && CPU_ISSET(cpu, &mask); },
+      core_env, core_env_rejected);
+}
+
 int ResolveCore() {
   int core = g_core.load(std::memory_order_acquire);
   if (core != kUnresolved) {
     return core;
   }
-  core = ChooseRocrTameCore(AllottedCpus(),
-                            std::getenv("INFERFLUX_ROCR_TAME_CORE"));
+  // No allocation here: this runs inside pthread_create.
+  cpu_set_t mask;
+  if (!AllotmentMask(&mask)) {
+    CPU_ZERO(&mask);
+  }
+  core = ChooseMaskCore(mask, std::getenv("INFERFLUX_ROCR_TAME_CORE"), nullptr);
   int expected = kUnresolved; // Deterministic; a racing resolver agrees.
   g_core.compare_exchange_strong(expected, core);
   return g_core.load(std::memory_order_acquire);
@@ -169,37 +209,17 @@ bool HsaRuntimeLoaded() {
 
 int ChooseRocrTameCore(const std::vector<int> &allotted, const char *core_env,
                        bool *core_env_rejected) {
-  if (core_env_rejected) {
-    *core_env_rejected = false;
-  }
-  if (allotted.size() < 2) {
-    return -1; // Nothing to bound, or no allotment: never pin.
-  }
-  int highest = allotted.front();
+  int highest = -1;
   for (int cpu : allotted) {
     highest = cpu > highest ? cpu : highest;
   }
-  if (core_env == nullptr || *core_env == '\0') {
-    return highest;
-  }
-  char *end = nullptr;
-  errno = 0;
-  // Digits only: strtol alone would also accept leading spaces and a sign.
-  const bool digits = *core_env >= '0' && *core_env <= '9';
-  const long requested = digits ? std::strtol(core_env, &end, 10) : -1;
-  const bool parsed = digits && errno == 0 && *end == '\0' && requested >= 0 &&
-                      requested <= INT_MAX;
-  if (parsed) {
-    for (int cpu : allotted) {
-      if (cpu == requested) {
-        return cpu;
-      }
-    }
-  }
-  if (core_env_rejected) {
-    *core_env_rejected = true;
-  }
-  return highest;
+  return ChooseCore(
+      allotted.size(), highest,
+      [&](long cpu) {
+        return std::find(allotted.begin(), allotted.end(), cpu) !=
+               allotted.end();
+      },
+      core_env, core_env_rejected);
 }
 
 bool IsRocrRuntimeObjectPath(const char *object_path) {
@@ -421,7 +441,8 @@ void ReportRocrTamerStatus() {
   if (RocrSkippedThreadCount() > 0) {
     log::Warn(kComponent, std::to_string(RocrSkippedThreadCount()) +
                               " ROCr runtime thread(s) could not be pinned "
-                              "(their own CPU mask has no allotted CPU)");
+                              "(no allotted CPU in their own mask, or the "
+                              "kernel refused the pin, e.g. a cpuset change)");
   }
 #endif
 }
