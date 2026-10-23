@@ -1,4 +1,5 @@
 #include "runtime/execution/unified_batch_lane_dispatcher.h"
+#include "runtime/thread_name.h"
 
 #include <algorithm>
 #include <exception>
@@ -182,6 +183,7 @@ std::size_t UnifiedBatchLaneDispatcher::SweepAbandoned(
 }
 
 void UnifiedBatchLaneDispatcher::WorkerLoop(bool decode_lane) {
+  SetCurrentThreadName(decode_lane ? "if-lane-decode" : "if-lane-prefill");
   while (true) {
     WorkItem item;
     bool have_item = false;

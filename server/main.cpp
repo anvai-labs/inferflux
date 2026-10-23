@@ -11,6 +11,7 @@
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/prefix_cache/prefix_cache.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
+#include "runtime/rocr_spin_tamer.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "runtime/string_utils.h"
 #include "scheduler/model_registry.h"
@@ -28,7 +29,6 @@
 #include "server/logging/logger.h"
 #include "server/metrics/metrics.h"
 #include "server/policy/guardrail.h"
-#include "server/rocr_spin_tamer.h"
 #include "server/startup_advisor.h"
 
 #include <algorithm>
@@ -1749,12 +1749,11 @@ int main(int argc, char **argv) {
     inferflux::RunStartupAdvisor(advisor_ctx);
   }
 
-  // ROCr spin-thread tamer (WSL2/ROCm AsyncEventsLoop workaround): the
-  // classifier needs a ~1.2 s measurement window, so spawn async — it must
-  // not block startup. HttpServer threads do not exist yet and every
-  // first-party thread blocks on a cv/sleep here, so the busy-spin
-  // discriminator is unambiguous at this point.
-  inferflux::TameRuntimeSpinThreadsAsync();
+  // ROCr thread tamer (WSL2/ROCm AsyncEventsLoop workaround): threads started
+  // by libhsa-runtime64 are confined at creation by inferfluxd's
+  // pthread_create (server/rocr_pthread_interposer.cpp). This only reports
+  // the configuration and how many threads were tamed so far.
+  inferflux::ReportRocrTamerStatus();
 
   int http_workers = 16; // Increased from 4 for better concurrent throughput
   if (const char *env_workers = std::getenv("INFERFLUX_HTTP_WORKERS")) {

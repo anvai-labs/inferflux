@@ -1,5 +1,6 @@
 #include "scheduler/model_registry.h"
 #include "model/model_format.h"
+#include "runtime/thread_name.h"
 #include "server/logging/logger.h"
 
 #include <yaml-cpp/yaml.h>
@@ -176,6 +177,7 @@ int ModelRegistry::ApplyEntries(const std::vector<RegistryEntry> &entries) {
 }
 
 void ModelRegistry::WatchLoop() {
+  SetCurrentThreadName("if-registry");
   while (running_.load()) {
     // Sleep in short intervals so Stop() is responsive.
     for (int i = 0; i < poll_interval_ms_ / 100 && running_.load(); ++i) {

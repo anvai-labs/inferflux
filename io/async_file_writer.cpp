@@ -1,5 +1,7 @@
 #include "io/async_file_writer.h"
 
+#include "runtime/thread_name.h"
+
 #include <fstream>
 
 namespace inferflux {
@@ -76,6 +78,7 @@ void AsyncFileWriter::Enqueue(AsyncWriteTask task) {
 }
 
 void AsyncFileWriter::Worker() {
+  SetCurrentThreadName("if-kv-writer");
   while (true) {
     AsyncWriteTask task;
     {
