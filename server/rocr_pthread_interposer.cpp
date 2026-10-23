@@ -1,10 +1,11 @@
 // Defines pthread_create for the executable it is linked into, so the ROCr
 // thread tamer can recognize threads started by libhsa-runtime64 at creation
 // (see runtime/rocr_spin_tamer.h). Linked ONLY into ROCm-enabled
-// (ENABLE_ROCM) inferfluxd builds and rocr_interposer_tests -- never into inferflux_core, which inferctl, the
-// benchmarks and the other tests also link. The symbol is exported with
-// cmake/rocr_pthread_interposer.dynlist so libraries (libhsa-runtime64,
-// loaded as a dependency or dlopen'd RTLD_LOCAL via ggml-hip) bind to it.
+// (ENABLE_ROCM) inferfluxd builds and rocr_interposer_tests -- never into
+// inferflux_core, which inferctl, the benchmarks and the other tests also link.
+// The symbol is exported with cmake/rocr_pthread_interposer.dynlist so
+// libraries (libhsa-runtime64, loaded as a dependency or dlopen'd RTLD_LOCAL
+// via ggml-hip) bind to it.
 
 #if defined(__has_feature)
 #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) ||     \
