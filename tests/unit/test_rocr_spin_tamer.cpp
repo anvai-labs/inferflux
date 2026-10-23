@@ -479,10 +479,17 @@ TEST_CASE("rocr spin tamer never pins onto a single-CPU allotment",
   CPU_SET(LowestAllowedCpu(), &one);
   REQUIRE(sched_setaffinity(0, sizeof(one), &one) == 0);
   inferflux::ResetRuntimeSpinTamerPinForTesting();
+  CountingOwner owner;
+  owner.owned = 1000;
   int confined = 0;
-  for (int attempt = 0; attempt < 2; ++attempt) {
-    confined += inferflux::TameRuntimeSpinThreads(OwnedByTestLoop());
+  for (int attempt = 0; attempt < 4 && owner.calls->load() == 0; ++attempt) {
+    confined += inferflux::TameRuntimeSpinThreads(owner.Options());
   }
+  // Proven but not confinable: the next scan backs off instead of probing
+  // it again.
+  const int calls_after_proof = owner.calls->load();
+  confined += inferflux::TameRuntimeSpinThreads(owner.Options());
+  const int calls_after_next_scan = owner.calls->load();
   cpu_set_t spinner_mask;
   CPU_ZERO(&spinner_mask);
   const bool read = sched_getaffinity(spinners.tid(0), sizeof(spinner_mask),
@@ -491,6 +498,8 @@ TEST_CASE("rocr spin tamer never pins onto a single-CPU allotment",
   sched_setaffinity(0, sizeof(original), &original);
   inferflux::ResetRuntimeSpinTamerPinForTesting();
   REQUIRE(confined == 0);
+  REQUIRE(calls_after_proof > 0);
+  REQUIRE(calls_after_next_scan == calls_after_proof);
   REQUIRE(read);
   REQUIRE(CPU_COUNT(&spinner_mask) == CPU_COUNT(&original));
 }

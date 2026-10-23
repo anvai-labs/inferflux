@@ -52,9 +52,10 @@ namespace inferflux {
 // thread whose mask excludes the chosen core is left unconfined rather than
 // pinned elsewhere; a
 // thread counts as confined only once pinned (the pin is the bound; nice is
-// not enforced on WSL2), or when its mask already allows a single CPU. If
-// the probe signal is owned by another handler or the architecture is
-// unsupported, nothing is confined.
+// not enforced on WSL2). A proven poller that cannot be confined backs off
+// like an unproven thread instead of being re-probed every scan. If the
+// probe signal is owned by another handler (or set to SIG_IGN) or the
+// architecture is unsupported, nothing is confined.
 //
 // Known limit (why the tamer is opt-in): the proof shows a thread executes
 // ROCr code, not which ROCr role it plays. InferFlux's own threads are

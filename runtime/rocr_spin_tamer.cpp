@@ -256,16 +256,24 @@ BeginScan(const std::unordered_map<pid_t, ThreadSample> &alive) {
 // again (e.g. by the runtime after a re-initialization), so a thread
 // reported as confined stays bounded. Reads affinity outside the lock.
 void MaintainPins() {
-  std::vector<std::pair<pid_t, int>> pinned;
+  std::vector<std::pair<ThreadKey, int>> pinned;
   {
     std::lock_guard<std::mutex> lock(g_memory_mutex);
     for (const auto &entry : g_confined) {
       if (entry.second >= 0) {
-        pinned.emplace_back(entry.first.first, entry.second);
+        pinned.emplace_back(entry.first, entry.second);
       }
     }
   }
-  for (const auto &[tid, core] : pinned) {
+  for (const auto &[key, core] : pinned) {
+    const pid_t tid = key.first;
+    // Act only on the very thread that was confined: a TID reused by
+    // another thread (possibly InferFlux's own) must never be pinned.
+    ThreadSample same;
+    if (!ReadThreadStat(tid, &same) || same.starttime != key.second ||
+        IsFirstPartyThread(tid)) {
+      continue; // Exited or reused; pruned by the next scan.
+    }
     cpu_set_t now;
     CPU_ZERO(&now);
     if (sched_getaffinity(tid, sizeof(now), &now) != 0) {
@@ -421,10 +429,15 @@ int ProbeSignal() {
   }
   static std::atomic<bool> warned{false};
   if (!warned.exchange(true)) {
-    log::Warn(kComponent, "probe signal SIGRTMIN+" +
-                              std::to_string(kRocrTamerProbeSignalOffset) +
-                              " is owned by another handler; spin tamer "
-                              "paused until it is released");
+    const bool ignored =
+        (current.sa_flags & SA_SIGINFO) == 0 && current.sa_handler == SIG_IGN;
+    log::Warn(kComponent,
+              "probe signal SIGRTMIN+" +
+                  std::to_string(kRocrTamerProbeSignalOffset) +
+                  (ignored ? std::string(" is set to SIG_IGN (e.g. inherited "
+                                         "from the parent process)")
+                           : std::string(" has another handler installed")) +
+                  "; spin tamer paused until it is reset to SIG_DFL");
   }
   return 0;
 #endif
@@ -569,14 +582,13 @@ void CaptureServerMaskOnce() {
   return true;
 }();
 
-enum class PinPlan { kPin, kSingleCpu, kNotPinnable, kNoAllotment, kError };
+enum class PinPlan { kPin, kNotPinnable, kNoAllotment, kError };
 
 // Resolves the pin target. Every confined thread is pinned to one shared
 // core, chosen once: a valid INFERFLUX_ROCR_TAME_CORE inside the server's
 // allotment, else the highest CPU of that allotment. A thread whose own mask
 // excludes the shared core is not confined (kNotPinnable) rather than pinned
-// elsewhere, so the cost stays bounded to that single core. kSingleCpu: the
-// thread can only run on one CPU, so there is nothing to bound. An invalid
+// elsewhere, so the cost stays bounded to that single core. An invalid
 // INFERFLUX_ROCR_TAME_CORE (unparseable, out of range, or outside the
 // allotment) warns once.
 PinPlan ChooseTameCore(pid_t tid, int *tame_core) {
@@ -584,9 +596,6 @@ PinPlan ChooseTameCore(pid_t tid, int *tame_core) {
   CPU_ZERO(&allowed);
   if (sched_getaffinity(tid, sizeof(allowed), &allowed) != 0) {
     return PinPlan::kError;
-  }
-  if (CPU_COUNT(&allowed) <= 1) {
-    return PinPlan::kSingleCpu;
   }
   CaptureServerMaskOnce();
   std::lock_guard<std::mutex> lock(g_memory_mutex);
@@ -731,8 +740,11 @@ bool AlwaysRunnable(const ThreadSample &before, const ThreadSample &after,
   return utime_delta >= min_busy_ticks;
 }
 
+std::mutex g_scan_mutex; // One scan at a time (worker and synchronous API).
+
 int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
                                const std::atomic<bool> *cancelled) {
+  std::lock_guard<std::mutex> scan_lock(g_scan_mutex);
   if (!ParseBoolEnv("INFERFLUX_ROCR_TAME", kTameEnabledByDefault)) {
     return 0;
   }
@@ -822,9 +834,11 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     int pinned_cpu = -1;
     if (ConfineThread(key, &pinned_cpu)) {
       ++confined;
-      if (pinned_cpu >= 0) {
-        last_pinned_cpu = pinned_cpu;
-      }
+      last_pinned_cpu = pinned_cpu;
+    } else {
+      // Proven but not confinable now (single-CPU allotment, cap, core
+      // outside its mask): back off rather than re-probing every scan.
+      RecordNotProven(key, scan);
     }
   }
 
@@ -861,6 +875,9 @@ public:
   // destroyed; it stops and joins the worker.
   static TamerWorker &Instance() {
     static TamerWorker *instance = [] {
+      // Deliberately immortal (never deleted), not RAII-owned: Request
+      // paths can run on other threads during exit, after static
+      // destructors would have destroyed a static object.
       auto *worker = new TamerWorker();
       std::atexit([] { Instance().Shutdown(); });
       return worker;
