@@ -315,7 +315,8 @@ interposer is active; `top -H -p $(pidof inferfluxd)` shows the `rocr-hsa-N`
 pollers sharing a single core (~100% combined instead of ~200%); and
 `inferflux_runtime_spin_threads_confined_total` in `/metrics` counts the
 tamed threads (`inferflux_runtime_spin_threads_unconfined_total` counts ROCr
-threads whose own CPU mask had no allotted CPU, which are left alone).
+threads that could not be pinned: no allotted CPU in their own mask, or
+the kernel refused the pin; they are left alone).
 
 The interposer is linked only into ROCm-enabled (`ENABLE_ROCM=ON`) server
 builds; CUDA-only and CPU builds never route thread creation through it.

@@ -17,6 +17,7 @@
 #include <link.h>
 #include <pthread.h>
 #include <sched.h>
+#include <strings.h>
 #include <unistd.h>
 
 #include <cstdio>
@@ -73,8 +74,9 @@ void CaptureAllotment() {
 #if defined(DLFO_STRUCT_HAS_EH_DBASE)
 using FindObjectFn = int (*)(void *, dl_find_object *);
 std::atomic<FindObjectFn> g_find_object{nullptr};
-// Once, at static init (dlsym takes the loader lock; nothing else is
-// running yet).
+// Once, at static init (dlsym takes the loader lock, which is acceptable
+// here, off the thread-creation path). Creations before this runs, e.g.
+// from library constructors, use the dladdr fallback.
 [[maybe_unused]] const bool g_find_object_resolved = [] {
   g_find_object.store(
       reinterpret_cast<FindObjectFn>(dlsym(RTLD_DEFAULT, "_dl_find_object")),
@@ -107,13 +109,37 @@ std::vector<int> AllottedCpus() {
   return cpus;
 }
 
-bool Enabled() {
+// Same accepted values as ParseBoolEnv, without allocating: the first call
+// can come from pthread_create in a library constructor or while an
+// allocator holds its own locks.
+bool ParseTameEnv() noexcept {
+  const char *val = std::getenv("INFERFLUX_ROCR_TAME");
+  if (val == nullptr) {
+    return false;
+  }
+  for (const char *yes : {"1", "true", "yes", "on"}) {
+    if (strcasecmp(val, yes) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool Enabled() noexcept {
   int enabled = g_enabled.load(std::memory_order_acquire);
   if (enabled < 0) {
-    enabled = ParseBoolEnv("INFERFLUX_ROCR_TAME", false) ? 1 : 0;
+    enabled = ParseTameEnv() ? 1 : 0;
     g_enabled.store(enabled, std::memory_order_release);
   }
   return enabled == 1;
+}
+
+// True when `own` is exactly the pin inherited from a tamed creator (not an
+// affinity the new thread's attribute asked for).
+bool OnlyInheritedPin(const InheritedState &inherited, const cpu_set_t &own) {
+  return inherited.creator_cpu >= 0 && !inherited.explicit_affinity &&
+         CPU_COUNT(&own) == 1 && CPU_ISSET(inherited.creator_cpu, &own) &&
+         CPU_COUNT(&inherited.mask) > 0;
 }
 
 int ResolveCore() {
@@ -211,13 +237,7 @@ bool IsRocrRuntimeAddress(const void *addr) noexcept {
          IsRocrRuntimeObjectPath(info.dli_fname);
 }
 
-bool RocrTamerEnabled() noexcept {
-  try {
-    return Enabled();
-  } catch (...) {
-    return false;
-  }
-}
+bool RocrTamerEnabled() noexcept { return Enabled(); }
 
 int RocrTameCoreForNewThread(void *(*start_routine)(void *)) noexcept {
   try {
@@ -243,9 +263,7 @@ void TameCurrentRocrThread(int core, const InheritedState &inherited) noexcept {
     // Created by a tamed thread without its own affinity: its mask is the
     // creator's pin; treat the creator's pre-pin mask as its own so that
     // neither the target nor what its children get back is the pin.
-    if (inherited.creator_cpu >= 0 && !inherited.explicit_affinity &&
-        CPU_COUNT(&own) == 1 && CPU_ISSET(inherited.creator_cpu, &own) &&
-        CPU_COUNT(&inherited.mask) > 0) {
+    if (OnlyInheritedPin(inherited, own)) {
       own = inherited.mask;
     }
     if (CPU_ISSET(core, &own)) {
@@ -293,6 +311,11 @@ void TameCurrentRocrThread(int core, const InheritedState &inherited) noexcept {
   } else if (core >= 0) {
     g_skipped.fetch_add(1, std::memory_order_relaxed);
   }
+  if (t_tamed_cpu < 0) {
+    // Not pinned: undo anything inherited from a tamed creator, exactly as
+    // for a non-ROCr child, so it is not left on the creator's core.
+    RestoreInheritedScheduling(inherited);
+  }
   errno = saved_errno;
   (void)pthread_setcancelstate(old_cancel_state, nullptr);
 }
@@ -320,20 +343,17 @@ void CaptureInheritedState(const pthread_attr_t *attr,
 
 void RestoreInheritedScheduling(const InheritedState &inherited) noexcept {
   const int saved_errno = errno;
-  const int creator_cpu = inherited.creator_cpu;
-  const cpu_set_t &restore_mask = inherited.mask;
   // The creator's rocr-hsa-N name was inherited; give back the name it had.
-  if (creator_cpu >= 0 && inherited.name[0] != '\0') {
+  if (inherited.creator_cpu >= 0 && inherited.name[0] != '\0') {
     SetCurrentThreadName(inherited.name);
   }
-  cpu_set_t own;
-  CPU_ZERO(&own);
   // Still exactly the creator's pin and not asked for: give the thread the
   // mask it would have inherited without the tamer.
-  if (creator_cpu >= 0 && !inherited.explicit_affinity &&
-      sched_getaffinity(0, sizeof(own), &own) == 0 && CPU_COUNT(&own) == 1 &&
-      CPU_ISSET(creator_cpu, &own) && CPU_COUNT(&restore_mask) > 0) {
-    (void)sched_setaffinity(0, sizeof(restore_mask), &restore_mask);
+  cpu_set_t own;
+  CPU_ZERO(&own);
+  if (sched_getaffinity(0, sizeof(own), &own) == 0 &&
+      OnlyInheritedPin(inherited, own)) {
+    (void)sched_setaffinity(0, sizeof(inherited.mask), &inherited.mask);
   }
   errno = saved_errno;
 }

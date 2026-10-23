@@ -2792,8 +2792,8 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "inferflux_runtime_spin_threads_confined_total "
       << RocrTamedThreadCount() << "\n";
   out << "# HELP inferflux_runtime_spin_threads_unconfined_total ROCr runtime "
-         "threads the tamer could not pin (their own CPU mask has no allotted "
-         "CPU)\n";
+         "threads the tamer could not pin (no allotted CPU in their own mask, "
+         "or the kernel refused the pin, e.g. a changed cpuset)\n";
   out << "# TYPE inferflux_runtime_spin_threads_unconfined_total counter\n";
   out << "inferflux_runtime_spin_threads_unconfined_total "
       << RocrSkippedThreadCount() << "\n";
