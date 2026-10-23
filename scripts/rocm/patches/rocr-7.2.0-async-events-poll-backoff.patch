@@ -88,8 +88,8 @@ index 0000000..3311dce
 +// Those paths re-scan signal values in userspace and would otherwise burn a
 +// full CPU core. To keep idle cost near zero without penalizing a wait that
 +// completes quickly, the nap between scans starts at a small floor and doubles
-+// up to a ceiling; callers reset to the floor whenever a wait makes progress so
-+// the escalation only compounds within a single idle wait.
++// up to a ceiling; callers reset to the floor at each new wait batch, so the
++// escalation only compounds within a single idle wait batch.
 +
 +#ifndef HSA_RUNTIME_CORE_UTIL_POLL_BACKOFF_H_
 +#define HSA_RUNTIME_CORE_UTIL_POLL_BACKOFF_H_

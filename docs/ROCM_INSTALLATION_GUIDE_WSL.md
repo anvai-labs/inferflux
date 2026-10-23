@@ -385,14 +385,17 @@ stock runtime shadows the patched one. Back up anything already there, once:
 
 ```bash
 D=<release>/runtime/bin
-B="$D/pre-patched-rocr"
-if [ ! -e "$B" ]; then   # Never overwrite the original backup on a redeploy.
-  mkdir "$B"
-  for f in "$D"/libhsa-runtime64.so* "$D"/librocdxg.so*; do
-    [ -e "$f" ] && { cp -a "$f" "$B/" || { echo "backup failed: $f"; exit 1; }; }
-  done
-fi
-cp -a ~/rocr-patched/lib* ~/rocr-patched/PATCHED_ROCR.json "$D/"
+( set -e  # Subshell: a failure stops here without closing your terminal.
+  B="$D/pre-patched-rocr"
+  if [ ! -e "$B" ]; then  # Taken once; a redeploy never overwrites it.
+    T="$(mktemp -d "$D/.pre-patched-rocr.XXXXXX")"
+    for f in "$D"/libhsa-runtime64.so* "$D"/librocdxg.so*; do
+      [ -e "$f" ] && cp -a "$f" "$T/"
+    done
+    mv "$T" "$B"  # Only a complete backup ever gets the final name.
+  fi
+  cp -a ~/rocr-patched/lib* ~/rocr-patched/PATCHED_ROCR.json "$D/"
+) || echo "deploy step failed; nothing was overwritten if the backup failed"
 # systemd unit: Environment=HSA_ENABLE_DXG_DETECTION=1
 ```
 

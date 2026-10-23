@@ -51,13 +51,13 @@ done
 [[ -n "$OUT" ]] || usage 2
 [[ -n "${ROCDXG_SHA256[$ROCDXG_TAG]:-}" ]] ||
   die "no pinned sha256 for librocdxg $ROCDXG_TAG; add one to ROCDXG_SHA256"
-for tool in git curl cmake dpkg-deb readelf sha256sum; do
+for tool in git curl cmake dpkg-deb readelf ldd nproc find sed sha256sum; do
   command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
 # The backport and its ABI assumptions are for ROCm 7.2.0 exactly: refuse to
 # drop a 7.2.0 runtime under a different host HIP.
 HOST_ROCM="$(cat "${ROCM_ROOT}/.info/version" 2>/dev/null || true)"
-[[ "$HOST_ROCM" == "7.2.0" ]] ||
+[[ "$HOST_ROCM" =~ ^7\.2\.0([-+.~].*)?$ ]] ||
   die "host ROCm at ${ROCM_ROOT} is '${HOST_ROCM:-unknown}', not 7.2.0"
 # Absolute path: the build runs in a clean environment (see below), where a
 # cmake from ~/.local/bin or a venv would not be on PATH.
@@ -70,7 +70,9 @@ done
 
 if [[ -z "$WORK" ]]; then
   WORK="$(mktemp -d -t patched-rocr.XXXXXX)"
-  trap 'rm -rf "$WORK"' EXIT # Auto-created: never leave it behind.
+  # Auto-created: removed after a successful run, kept on failure so the
+  # logs die() points at still exist.
+  trap '[[ $? -eq 0 ]] && rm -rf "$WORK"' EXIT
 fi
 mkdir -p "$WORK" "$OUT"
 WORK="$(cd "$WORK" && pwd)"
@@ -82,8 +84,9 @@ echo "build_patched_rocr: work dir ${WORK}"
 # 1. Source: rocr-runtime only, at the exact tag, with the backport applied.
 # A partial or foreign checkout (e.g. an interrupted earlier run) is
 # discarded rather than trusted.
-if [[ -d "${SRC}/.git" ]] &&
-   { [[ ! -f "${SRC}/projects/rocr-runtime/CMakeLists.txt" ]] ||
+if [[ -e "$SRC" ]] &&
+   { [[ ! -d "${SRC}/.git" ]] ||
+     [[ ! -f "${SRC}/projects/rocr-runtime/CMakeLists.txt" ]] ||
      [[ "$(git -C "$SRC" describe --tags --exact-match 2>/dev/null)" != "$ROCM_TAG" ]]; }; then
   rm -rf "$SRC"
 fi
@@ -125,7 +128,7 @@ rm -rf "$BUILD" # Never stage a library left over from an earlier build.
   die "configure failed; see ${WORK}/configure.log"
 "${clean_env[@]}" "$CMAKE" --build "$BUILD" -j"$(nproc)" >"${WORK}/build.log" 2>&1 ||
   die "build failed; see ${WORK}/build.log"
-LIBHSA="$(find "${BUILD}/rocr/lib" -name 'libhsa-runtime64.so.1.*' -type f | head -1)"
+LIBHSA="$(find "$BUILD" -name 'libhsa-runtime64.so.1.*' -type f 2>/dev/null | head -1 || true)"
 [[ -n "$LIBHSA" ]] || die "libhsa-runtime64 not produced"
 # Like the stock runtime: no RUNPATH/RPATH (an empty element would make the
 # loader search the service's working directory), and every dependency
@@ -134,10 +137,13 @@ LIBHSA="$(find "${BUILD}/rocr/lib" -name 'libhsa-runtime64.so.1.*' -type f | hea
 if readelf -d "$LIBHSA" | grep -qE '\((RUNPATH|RPATH)\)'; then
   die "built libhsa-runtime64 carries a RUNPATH/RPATH"
 fi
-MISSING="$(ldd "$LIBHSA" | grep 'not found' || true)"
+# In a clean environment, as the service sees it: only the loader
+# configuration, not this shell's LD_LIBRARY_PATH.
+MISSING="$("${clean_env[@]}" ldd "$LIBHSA" | grep 'not found' || true)"
 [[ -z "$MISSING" ]] || die "unresolved dependencies: ${MISSING}"
 CXX_USED="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "${BUILD}/CMakeCache.txt")"
-CXX_VERSION="$("$CXX_USED" --version | head -1)"
+CXX_VERSION="unknown"
+[[ -x "$CXX_USED" ]] && CXX_VERSION="$("$CXX_USED" --version | head -1)"
 
 # 3. Prebuilt WSL thunk: download, verify, extract (never installed).
 DEB_DIR="${WORK}/rocdxg"
@@ -157,18 +163,21 @@ if ! echo "${ROCDXG_SHA256[$ROCDXG_TAG]}  ${DEB}" | sha256sum --check --quiet; t
 fi
 rm -rf "${DEB_DIR}/x"
 dpkg-deb -x "$DEB" "${DEB_DIR}/x"
-LIBDXG="$(find "${DEB_DIR}/x" -name 'librocdxg.so.*.*' -type f | head -1)"
+LIBDXG="$(find "${DEB_DIR}/x" -name 'librocdxg.so.*.*' -type f 2>/dev/null | head -1 || true)"
 [[ -n "$LIBDXG" ]] || die "librocdxg not found in $(basename "$DEB")"
 
 # 4. Stage with the sonames the loader looks up.
 rm -f "${OUT}"/libhsa-runtime64.so* "${OUT}"/librocdxg.so* "${OUT}/PATCHED_ROCR.json"
 cp "$LIBHSA" "${OUT}/"
-ln -s "$(basename "$LIBHSA")" "${OUT}/libhsa-runtime64.so.1"
+link_as() { # link_as TARGET NAME: skip when the file already has that name.
+  [[ "$1" == "$2" ]] || ln -sfn "$1" "${OUT}/$2"
+}
+link_as "$(basename "$LIBHSA")" libhsa-runtime64.so.1
 cp "$LIBDXG" "${OUT}/"
 DXG_SONAME="$(readelf -d "$LIBDXG" | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p')"
 [[ -n "$DXG_SONAME" ]] || die "librocdxg has no SONAME"
-ln -s "$(basename "$LIBDXG")" "${OUT}/${DXG_SONAME}"
-ln -s "$(basename "$LIBDXG")" "${OUT}/librocdxg.so" # ROCr dlopens this name.
+link_as "$(basename "$LIBDXG")" "$DXG_SONAME"
+link_as "$(basename "$LIBDXG")" librocdxg.so # ROCr dlopens this name.
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 cat > "${OUT}/PATCHED_ROCR.json" <<EOF
