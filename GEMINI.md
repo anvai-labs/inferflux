@@ -56,7 +56,8 @@ The project uses CMake for building. The following scripts are provided for conv
 
 Use the existing `aiserver1-dual-gpu` runner only for trusted-main runtime gates,
 with CUDA and ROCm serialized. Do not run pull-request code on the persistent GPU runner or
-register a second runner. The existing listener runs in a durable terminal,
+register a second runner. The listener runs as a transient user systemd unit
+(`inferflux-gpu-runner`) with the GPU tool PATH the same-process gate needs,
 independently of the host's inference systemd service. Follow
 `docs/GPU_CI_BOOTSTRAP.md` for restart, exact-SHA evidence and test-port isolation;
 do not stop identity services to free their ports.
