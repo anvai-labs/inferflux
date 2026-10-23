@@ -418,14 +418,25 @@ both from the release directory, and idle CPU drops to about 1%
 the stock runtime; c=8 and c=1 throughput and per-request latency unchanged
 (1-token request p50 7.1 ms on both).
 
-The backup is taken once and is the rollback target; after installing a new
-release (fresh `runtime/bin`) or upgrading ROCm, remove a stale
-`pre-patched-rocr/` before deploying again.
+The backup is taken once per `runtime/bin` and is that directory's rollback
+target (a new release has its own `runtime/bin`, so it starts without one);
+after upgrading ROCm, delete `pre-patched-rocr/` there before deploying
+again, since it would restore 7.2.0-era libraries.
 
-`INFERFLUX_ROCR_TAME=1` can stay on alongside it: the threads it pins now
-sleep, and it bounds the cost if the patched library is ever missing.
-Rollback: remove the copied libraries (restoring anything saved in
-`pre-patched-rocr/`) and the `HSA_ENABLE_DXG_DETECTION` line, then restart.
+Every process that loads the patched runtime needs
+`HSA_ENABLE_DXG_DETECTION=1`: without it upstream ROCr does not load
+`librocdxg`, finds no KFD device on WSL2, and the ROCm backend is
+unavailable (the server falls back or fails to start the ROCm model). This
+applies to manual `inferfluxd` runs and tests that put the same directory on
+`LD_LIBRARY_PATH`, not only the service.
+
+`INFERFLUX_ROCR_TAME=1` can stay on alongside it: the `libhsa-runtime64`
+threads it pins now sleep, and it bounds the cost if the patched library is
+ever missing. (Threads that the separate `librocdxg` might start are not
+recognized by the tamer; none are busy at idle in the measurements above.)
+Rollback: remove the copied libraries and `PATCHED_ROCR.json` (restoring
+anything saved in `pre-patched-rocr/`) and the `HSA_ENABLE_DXG_DETECTION`
+line, then restart.
 Retire the patch once a ROCm release includes #7898 (check the release notes
 for rocm-systems#7898 / librocdxg#60).
 

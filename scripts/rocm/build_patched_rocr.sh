@@ -10,7 +10,7 @@
 #
 # Usage:
 #   scripts/rocm/build_patched_rocr.sh --out DIR [--work DIR]
-#       [--rocdxg v1.2.2] [--rocm /opt/rocm]
+#       [--rocm /opt/rocm]
 #
 # Nothing is installed system-wide. DIR receives libhsa-runtime64.so*,
 # librocdxg.so* and PATCHED_ROCR.json. Deploy by copying them into the
@@ -26,7 +26,7 @@ OUT=""
 WORK=""
 ROCM_TAG="rocm-7.2.0" # The patch is a backport onto exactly this tag...
 ROCM_COMMIT="fc0010cf6a5a972d42b276df946510f30343d493" # ...at this commit.
-ROCDXG_TAG="v1.2.2"
+ROCDXG_TAG="v1.2.2" # Fixed until a second package checksum is pinned below.
 ROCM_ROOT="/opt/rocm"
 
 # Pinned prebuilt thunk packages (sha256 of the .deb from the GitHub release).
@@ -44,7 +44,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --out) need_value "$@"; OUT="$2"; shift 2 ;;
     --work) need_value "$@"; WORK="$2"; shift 2 ;;
-    --rocdxg) need_value "$@"; ROCDXG_TAG="$2"; shift 2 ;;
     --rocm) need_value "$@"; ROCM_ROOT="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 2 ;;
@@ -71,24 +70,34 @@ for tool in clang llvm-objcopy; do
     die "missing ${ROCM_ROOT}/llvm/bin/${tool} (ROCm LLVM)"
 done
 
+# Markers: the script only ever deletes inside a work dir it created, and
+# only replaces libraries in an output dir it staged. The deploy step copies
+# libraries and PATCHED_ROCR.json but never these markers.
+WORK_MARK=".build_patched_rocr-work"
+OUT_MARK=".build_patched_rocr-out"
 if [[ -z "$WORK" ]]; then
   WORK="$(mktemp -d -t patched-rocr.XXXXXX)"
-  # Auto-created: removed after a successful run, kept on failure so the
-  # logs die() points at still exist.
-  trap '[[ $? -eq 0 ]] && rm -rf "$WORK"' EXIT
+  touch "${WORK}/${WORK_MARK}"
+  # Auto-created: removed after success, or after a failure that built
+  # nothing; otherwise kept (and named) so its logs can be read.
+  trap 'rc=$?; if [[ $rc -eq 0 || ! -d "${WORK}/build" ]]; then rm -rf "$WORK";
+        else echo "build_patched_rocr: work dir kept for its logs: ${WORK}" >&2; fi' EXIT
+elif [[ -d "$WORK" && ! -f "${WORK}/${WORK_MARK}" ]] &&
+     [[ -n "$(ls -A "$WORK")" ]]; then
+  die "${WORK} is not empty and was not created by this script; pass an empty or new --work directory"
+else
+  mkdir -p "$WORK" && touch "${WORK}/${WORK_MARK}"
 fi
-mkdir -p "$WORK" "$OUT"
+if [[ -d "$OUT" && ! -f "${OUT}/${OUT_MARK}" ]] &&
+   { compgen -G "${OUT}/libhsa-runtime64.so*" >/dev/null ||
+     compgen -G "${OUT}/librocdxg.so*" >/dev/null; }; then
+  die "${OUT} already holds runtime libraries not staged by this script; use an empty directory and deploy with the documented backup step"
+fi
+mkdir -p "$OUT"
 WORK="$(cd "$WORK" && pwd)"
 OUT="$(cd "$OUT" && pwd)"
 SRC="${WORK}/rocm-systems"
 BUILD="${WORK}/build"
-# Only ever replace files this script staged: refuse a directory (e.g. a
-# release's runtime/bin) holding runtime libraries of unknown origin.
-if compgen -G "${OUT}/libhsa-runtime64.so*" >/dev/null ||
-   compgen -G "${OUT}/librocdxg.so*" >/dev/null; then
-  [[ -f "${OUT}/PATCHED_ROCR.json" ]] ||
-    die "${OUT} already holds runtime libraries not staged by this script; use an empty directory and deploy with the documented backup step"
-fi
 echo "build_patched_rocr: work dir ${WORK}"
 
 # 1. Source: rocr-runtime only, at the exact tag, with the backport applied.
@@ -97,7 +106,7 @@ echo "build_patched_rocr: work dir ${WORK}"
 if [[ -e "$SRC" ]] &&
    { [[ ! -d "${SRC}/.git" ]] ||
      [[ ! -f "${SRC}/projects/rocr-runtime/CMakeLists.txt" ]] ||
-     [[ "$(git -C "$SRC" describe --tags --exact-match 2>/dev/null)" != "$ROCM_TAG" ]]; }; then
+     [[ "$(git -C "$SRC" rev-parse HEAD 2>/dev/null)" != "$ROCM_COMMIT" ]]; }; then
   rm -rf "$SRC"
 fi
 if [[ ! -d "${SRC}/.git" ]]; then
@@ -147,7 +156,10 @@ LIBHSA="$(find "$BUILD" -name 'libhsa-runtime64.so.1.*' -type f 2>/dev/null | he
 # loader search the service's working directory), and every dependency
 # (libelf, libdrm, libdrm_amdgpu, libnuma, librocprofiler-register) must
 # resolve through the system loader configuration.
-if readelf -d "$LIBHSA" | grep -qE '\((RUNPATH|RPATH)\)'; then
+# Captured first: under pipefail, grep -q closing the pipe early could make
+# the check pass by mistake.
+DYNAMIC="$(readelf -d "$LIBHSA")"
+if grep -qE '\((RUNPATH|RPATH)\)' <<<"$DYNAMIC"; then
   die "built libhsa-runtime64 carries a RUNPATH/RPATH"
 fi
 # In a clean environment, as the service sees it: only the loader
@@ -156,8 +168,10 @@ MISSING="$("${clean_env[@]}" ldd "$LIBHSA" | grep 'not found' || true)"
 [[ -z "$MISSING" ]] || die "unresolved dependencies: ${MISSING}"
 # The ROCm-provided dependency must come from the install built against.
 PROFREG="$("${clean_env[@]}" ldd "$LIBHSA" | sed -n 's/.*librocprofiler-register[^ ]* => \([^ ]*\).*/\1/p')"
-[[ "$(realpath "$PROFREG")" == "$(realpath "$ROCM_ROOT")"/* ]] ||
+# (Optional in ROCr's CMake: only checked when it is linked.)
+if [[ -n "$PROFREG" && "$(realpath "$PROFREG")" != "$(realpath "$ROCM_ROOT")"/* ]]; then
   die "librocprofiler-register resolves to ${PROFREG}, outside ${ROCM_ROOT}"
+fi
 CXX_USED="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "${BUILD}/CMakeCache.txt")"
 CXX_VERSION="unknown"
 [[ -x "$CXX_USED" ]] && CXX_VERSION="$("$CXX_USED" --version | head -1)"
@@ -185,6 +199,7 @@ LIBDXG="$(find "${DEB_DIR}/x" -name 'librocdxg.so.*.*' -type f 2>/dev/null | hea
 
 # 4. Stage with the sonames the loader looks up.
 rm -f "${OUT}"/libhsa-runtime64.so* "${OUT}"/librocdxg.so* "${OUT}/PATCHED_ROCR.json"
+touch "${OUT}/${OUT_MARK}"
 cp "$LIBHSA" "${OUT}/"
 link_as() { # link_as TARGET NAME: skip when the file already has that name.
   [[ "$1" == "$2" ]] || ln -sfn "$1" "${OUT}/$2"

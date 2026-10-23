@@ -4,7 +4,8 @@ polling-fallback spin on WSL and mixed batches", merged 2026-08-18 as
 
 The runtime.cpp hunks are the upstream change re-fitted to 7.2.0's context
 (the upstream diff does not apply directly); core/util/poll_backoff.h is
-upstream's file verbatim. Upstream's rocrtst unit test is not included.
+upstream's file except for the reworded comments below. Upstream's rocrtst
+unit test is not included.
 
 Two upstream comments are reworded: they justify the 200 us mixed-batch
 ceiling by an interrupt-path poll window that 7.2.0's AsyncEventsLoop does
