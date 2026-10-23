@@ -443,15 +443,14 @@ TEST_CASE("interposer: a runtime-narrowed thread is pinned within its mask",
           "[rocr_interposer]") {
   RequireInterposer();
   const std::vector<int> cpus = AllowedCpus();
-  const long online = sysconf(_SC_NPROCESSORS_ONLN);
-  if (cpus.size() < 3 || cpus.back() != online - 1) {
-    SKIP("needs >= 3 allowed CPUs including the highest online one");
+  if (cpus.size() < 3) {
+    SKIP("needs >= 3 allowed CPUs");
   }
   TamerEnv env("1", nullptr);
   const unsigned long long before = inferflux::RocrTamedThreadCount();
   FakeHsaReport report{};
   pthread_t thread{};
-  // widen_attr=2: every online CPU except the highest, which is the default
+  // widen_attr=2: every allowed CPU except the highest, which is the default
   // pin core -- like ROCr binding a thread to the GPU's NUMA node.
   REQUIRE(Fake().spawn(&thread, &report, kReport, /*widen_attr=*/2, 0) == 0);
   REQUIRE(pthread_join(thread, nullptr) == 0);
@@ -465,9 +464,8 @@ TEST_CASE("interposer: a NUMA-bound tamed thread's children keep its node",
           "[rocr_interposer]") {
   RequireInterposer();
   const std::vector<int> cpus = AllowedCpus();
-  const long online = sysconf(_SC_NPROCESSORS_ONLN);
-  if (cpus.size() < 3 || static_cast<long>(cpus.size()) != online) {
-    SKIP("needs >= 3 CPUs and an unrestricted allotment");
+  if (cpus.size() < 3) {
+    SKIP("needs >= 3 allowed CPUs");
   }
   TamerEnv env("1", nullptr);
   ChildReport child;

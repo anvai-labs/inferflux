@@ -38,8 +38,10 @@ const char *kComponent = "rocr_tamer";
 constexpr int kUnresolved = -2;
 std::atomic<int> g_enabled{-1}; // -1 unknown, else 0/1 (env read once).
 std::atomic<int> g_core{kUnresolved};
-// Double-buffered so a reader never copies a mask mid-write: writers (static
-// init, the test seam) fill the inactive buffer, then publish its index.
+// Double-buffered: a writer (static init, or the test seam) fills the
+// inactive buffer, then publishes its index, so a reader racing one write
+// never copies a half-written mask. Writes are not expected to overlap
+// readers in production (static init runs once).
 cpu_set_t g_allotment_buf[2];
 std::atomic<int> g_allotment_idx{-1}; // -1: not captured yet.
 std::atomic<int> g_next_name{0};
@@ -67,6 +69,19 @@ void CaptureAllotment() {
   CaptureAllotment();
   return true;
 }();
+
+#if defined(DLFO_STRUCT_HAS_EH_DBASE)
+using FindObjectFn = int (*)(void *, dl_find_object *);
+std::atomic<FindObjectFn> g_find_object{nullptr};
+// Once, at static init (dlsym takes the loader lock; nothing else is
+// running yet).
+[[maybe_unused]] const bool g_find_object_resolved = [] {
+  g_find_object.store(
+      reinterpret_cast<FindObjectFn>(dlsym(RTLD_DEFAULT, "_dl_find_object")),
+      std::memory_order_release);
+  return true;
+}();
+#endif
 
 bool AllotmentMask(cpu_set_t *mask) {
   CPU_ZERO(mask);
@@ -178,19 +193,22 @@ bool IsRocrRuntimeAddress(const void *addr) noexcept {
   }
 #if defined(DLFO_STRUCT_HAS_EH_DBASE)
   // glibc >= 2.35: lock-free and async-signal-safe, so thread creation never
-  // waits on the dynamic loader's lock (a concurrent dlopen).
-  dl_find_object found{};
-  if (_dl_find_object(const_cast<void *>(addr), &found) != 0 ||
-      found.dlfo_link_map == nullptr) {
-    return false;
+  // waits on the dynamic loader's lock (a concurrent dlopen). Resolved at
+  // run time, not linked, so the binary still starts on older glibc.
+  if (const FindObjectFn find = g_find_object.load(std::memory_order_acquire)) {
+    dl_find_object found{};
+    if (find(const_cast<void *>(addr), &found) != 0 ||
+        found.dlfo_link_map == nullptr) {
+      return false;
+    }
+    return IsRocrRuntimeObjectPath(found.dlfo_link_map->l_name);
   }
-  return IsRocrRuntimeObjectPath(found.dlfo_link_map->l_name);
-#else
-  // Older glibc: dladdr takes the loader lock (see the residuals).
+#endif
+  // Older glibc, or before static init resolved it: dladdr takes the loader
+  // lock (see the residuals).
   Dl_info info{};
   return dladdr(const_cast<void *>(addr), &info) != 0 &&
          IsRocrRuntimeObjectPath(info.dli_fname);
-#endif
 }
 
 bool RocrTamerEnabled() noexcept {
@@ -376,7 +394,8 @@ void ReportRocrTamerStatus() {
       kComponent,
       "enabled: ROCr runtime threads are pinned to CPU " +
           std::to_string(core) + " (of " + std::to_string(allotted.size()) +
-          " allotted) at creation; tamed so far: " +
+          " allotted) at creation (a thread ROCr bound elsewhere: the highest "
+          "allotted CPU of its own mask); tamed so far: " +
           std::to_string(RocrTamedThreadCount()) +
           (HsaRuntimeLoaded() ? "" : " (libhsa-runtime64 not loaded yet)"));
   if (RocrSkippedThreadCount() > 0) {

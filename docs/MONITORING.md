@@ -242,7 +242,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 | VRAM pressure | native KV planning metrics + dequant policy | tighten budget or keep memory-first dequant policy |
 | Cache not helping | prefix/kv reuse counters | validate warmup patterns and prefix-affinity policy |
 | Selected operator never executes | dispatch divergence metric plus `parse_dispatch_trace.py` | check `dispatch_catalog.h`, the executor allowlist, and `/readyz` down-rank fields |
-| Idle ROCm server burns ~2 CPU cores | `top -H -p $(pidof inferfluxd)` for threads at ~100% CPU; `inferflux_runtime_spin_threads_confined_total`; the `rocr_tamer` startup log line | with `INFERFLUX_ROCR_TAME=1`, expect `rocr-hsa-N` threads sharing one core from startup; if the counter stays `0`, check the env var and the startup line ("interposer is not active" means e.g. a sanitizer build; a single-CPU allotment pins nothing) |
+| Idle ROCm server burns ~2 CPU cores | `top -H -p $(pidof inferfluxd)` for threads at ~100% CPU; `inferflux_runtime_spin_threads_confined_total`; the `rocr_tamer` startup log line | with `INFERFLUX_ROCR_TAME=1`, expect `rocr-hsa-N` threads sharing one core from startup; if the counter stays `0`, check the env var and the startup line ("the pthread_create interposer is not in this binary" means a CUDA-only, CPU, non-x86_64/aarch64 or sanitizer build; a single-CPU allotment pins nothing). With the tamer off, untamed spinners started from a first-party thread inherit its `if-*` name |
 
 ## 9) Related Docs
 

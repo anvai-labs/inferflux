@@ -35,9 +35,22 @@ enum Mode {
   kSpawnChild = 4,
 };
 
-int HighestOnlineCpu() {
-  const long online = sysconf(_SC_NPROCESSORS_ONLN);
-  return online > 0 ? static_cast<int>(online) - 1 : 0;
+// The calling thread's mask (the test's full allotment), optionally without
+// its highest CPU -- like ROCr binding a thread to one NUMA node. Uses real
+// CPU numbers, so offline or non-contiguous CPUs are handled.
+cpu_set_t AllowedMask(bool drop_highest) {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  (void)sched_getaffinity(0, sizeof(mask), &mask);
+  if (drop_highest) {
+    for (int cpu = CPU_SETSIZE - 1; cpu >= 0; --cpu) {
+      if (CPU_ISSET(cpu, &mask)) {
+        CPU_CLR(cpu, &mask);
+        break;
+      }
+    }
+  }
+  return mask;
 }
 
 struct TlsProbe {
@@ -129,8 +142,8 @@ void *FakeHsaMain(void *raw_job) {
 extern "C" {
 
 // Starts a thread the way ROCr does. `widen_attr`: 1 sets an explicit
-// all-online-CPU affinity through the attribute (like ROCr's
-// pthread_attr_setaffinity_np); 2 sets all online CPUs except the highest
+// affinity of every allowed CPU through the attribute (like ROCr's
+// pthread_attr_setaffinity_np); 2 the same minus the highest allowed CPU
 // (like ROCr binding a thread to one NUMA node). Returns pthread_create's
 // result.
 __attribute__((visibility("default"))) int
@@ -140,16 +153,8 @@ fake_hsa_spawn(pthread_t *out, FakeHsaReport *report, int mode, int widen_attr,
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   if (widen_attr) {
-    cpu_set_t all;
-    CPU_ZERO(&all);
-    const long online = sysconf(_SC_NPROCESSORS_ONLN);
-    for (long cpu = 0; cpu < online && cpu < CPU_SETSIZE; ++cpu) {
-      CPU_SET(static_cast<int>(cpu), &all);
-    }
-    if (widen_attr == 2) {
-      CPU_CLR(HighestOnlineCpu(), &all);
-    }
-    pthread_attr_setaffinity_np(&attr, sizeof(all), &all);
+    const cpu_set_t mask = AllowedMask(widen_attr == 2);
+    pthread_attr_setaffinity_np(&attr, sizeof(mask), &mask);
   }
   if (detached) {
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -179,7 +184,7 @@ fake_hsa_spawn_with_attr(pthread_t *out, const pthread_attr_t *attr,
 // Starts a ROCr-style thread that itself starts `child_fn(child_arg)` (code
 // outside this object) and joins it. `child_attr_cpu` >= 0 gives the child
 // an explicit single-CPU attribute affinity.
-// `parent_numa` != 0 binds the parent (via its attribute) to every online
+// `parent_numa` != 0 binds the parent (via its attribute) to every allowed
 // CPU except the highest, like ROCr binding a thread to one NUMA node.
 __attribute__((visibility("default"))) int
 fake_hsa_spawn_parent(pthread_t *out, FakeHsaReport *report,
@@ -189,13 +194,7 @@ fake_hsa_spawn_parent(pthread_t *out, FakeHsaReport *report,
   pthread_attr_t attr;
   pthread_attr_init(&attr);
   if (parent_numa) {
-    cpu_set_t node;
-    CPU_ZERO(&node);
-    const long online = sysconf(_SC_NPROCESSORS_ONLN);
-    for (long cpu = 0; cpu < online && cpu < CPU_SETSIZE; ++cpu) {
-      CPU_SET(static_cast<int>(cpu), &node);
-    }
-    CPU_CLR(HighestOnlineCpu(), &node);
+    const cpu_set_t node = AllowedMask(/*drop_highest=*/true);
     pthread_attr_setaffinity_np(&attr, sizeof(node), &node);
   }
   auto job = std::make_unique<Job>(

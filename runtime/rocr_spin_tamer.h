@@ -55,8 +55,9 @@ namespace inferflux {
 // after shared-library constructors (libgomp with OMP_PROC_BIND can narrow
 // the main thread first; that fails safe: no pin, or a pin inside it); a
 // cgroup cpuset later shrunk to exclude the core moves the threads off it;
-// on glibc < 2.35 (no lock-free _dl_find_object) each creation's dladdr
-// takes the dynamic loader's lock; a future ROCr starting threads via
+// on glibc < 2.35 (no lock-free _dl_find_object), and for creations during
+// static initialization, each classification's dladdr takes the dynamic
+// loader's lock; a future ROCr starting threads via
 // std::thread (start routine in libstdc++), or loaded with RTLD_DEEPBIND,
 // would not be recognized (fails safe: nothing tamed); sanitizer builds and
 // non-x86_64/aarch64 targets compile the interposer out.
