@@ -24,7 +24,8 @@ PATCH="${SCRIPT_DIR}/patches/rocr-7.2.0-async-events-poll-backoff.patch"
 
 OUT=""
 WORK=""
-ROCM_TAG="rocm-7.2.0" # The patch is a backport onto exactly this tag.
+ROCM_TAG="rocm-7.2.0" # The patch is a backport onto exactly this tag...
+ROCM_COMMIT="fc0010cf6a5a972d42b276df946510f30343d493" # ...at this commit.
 ROCDXG_TAG="v1.2.2"
 ROCM_ROOT="/opt/rocm"
 
@@ -35,7 +36,9 @@ declare -A ROCDXG_SHA256=(
 
 usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 die() { echo "build_patched_rocr: $*" >&2; exit 1; }
-need_value() { [[ $# -ge 2 && -n "$2" ]] || { echo "$1 needs a value" >&2; usage 2; }; }
+need_value() {
+  [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { echo "$1 needs a value" >&2; usage 2; }
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -79,6 +82,13 @@ WORK="$(cd "$WORK" && pwd)"
 OUT="$(cd "$OUT" && pwd)"
 SRC="${WORK}/rocm-systems"
 BUILD="${WORK}/build"
+# Only ever replace files this script staged: refuse a directory (e.g. a
+# release's runtime/bin) holding runtime libraries of unknown origin.
+if compgen -G "${OUT}/libhsa-runtime64.so*" >/dev/null ||
+   compgen -G "${OUT}/librocdxg.so*" >/dev/null; then
+  [[ -f "${OUT}/PATCHED_ROCR.json" ]] ||
+    die "${OUT} already holds runtime libraries not staged by this script; use an empty directory and deploy with the documented backup step"
+fi
 echo "build_patched_rocr: work dir ${WORK}"
 
 # 1. Source: rocr-runtime only, at the exact tag, with the backport applied.
@@ -97,6 +107,9 @@ if [[ ! -d "${SRC}/.git" ]]; then
 fi
 git -C "$SRC" checkout --quiet -- .
 git -C "$SRC" clean --quiet -fd -- projects/rocr-runtime
+# Tags can move: pin the exact source that the patch and its validation used.
+[[ "$(git -C "$SRC" rev-parse HEAD)" == "$ROCM_COMMIT" ]] ||
+  die "${ROCM_TAG} resolved to $(git -C "$SRC" rev-parse HEAD), expected ${ROCM_COMMIT}"
 git -C "$SRC" apply --check "$PATCH" || die "patch does not apply to $ROCM_TAG"
 git -C "$SRC" apply "$PATCH"
 
@@ -141,6 +154,10 @@ fi
 # configuration, not this shell's LD_LIBRARY_PATH.
 MISSING="$("${clean_env[@]}" ldd "$LIBHSA" | grep 'not found' || true)"
 [[ -z "$MISSING" ]] || die "unresolved dependencies: ${MISSING}"
+# The ROCm-provided dependency must come from the install built against.
+PROFREG="$("${clean_env[@]}" ldd "$LIBHSA" | sed -n 's/.*librocprofiler-register[^ ]* => \([^ ]*\).*/\1/p')"
+[[ "$(realpath "$PROFREG")" == "$(realpath "$ROCM_ROOT")"/* ]] ||
+  die "librocprofiler-register resolves to ${PROFREG}, outside ${ROCM_ROOT}"
 CXX_USED="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "${BUILD}/CMakeCache.txt")"
 CXX_VERSION="unknown"
 [[ -x "$CXX_USED" ]] && CXX_VERSION="$("$CXX_USED" --version | head -1)"

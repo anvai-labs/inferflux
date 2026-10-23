@@ -385,26 +385,31 @@ stock runtime shadows the patched one. Back up anything already there, once:
 
 ```bash
 D=<release>/runtime/bin
-( set -e  # Subshell: a failure stops here without closing your terminal.
+(  # Subshell: `exit` stops the step without closing your terminal. Each
+   # command checks itself (set -e is ignored in a `( ... ) ||` subshell).
   B="$D/pre-patched-rocr"
   if [ ! -e "$B" ]; then  # Taken once; a redeploy never overwrites it.
-    T="$(mktemp -d "$D/.pre-patched-rocr.XXXXXX")"
+    T="$(mktemp -d "$D/.pre-patched-rocr.XXXXXX")" || exit 1
     for f in "$D"/libhsa-runtime64.so* "$D"/librocdxg.so*; do
-      [ -e "$f" ] && cp -a "$f" "$T/"
+      [ -e "$f" ] || continue
+      cp -a "$f" "$T/" || exit 1
     done
-    mv "$T" "$B"  # Only a complete backup ever gets the final name.
+    mv "$T" "$B" || exit 1  # Only a complete backup gets the final name.
   fi
-  cp -a ~/rocr-patched/lib* ~/rocr-patched/PATCHED_ROCR.json "$D/"
-) || echo "deploy step failed; nothing was overwritten if the backup failed"
+  cp -a ~/rocr-patched/lib* ~/rocr-patched/PATCHED_ROCR.json "$D/" || exit 1
+) || echo "deploy step failed (if the backup failed, nothing was replaced)"
 # systemd unit: Environment=HSA_ENABLE_DXG_DETECTION=1
 ```
 
 `libamdhip64` finds `libhsa-runtime64.so.1` through `LD_LIBRARY_PATH` ahead
 of `/opt/rocm/lib`, so only that process uses the patched runtime. The
-backoff means a completion handled by ROCr's async-event threads (HIP host
-callbacks, async signal handlers) can be observed up to 2 ms late after a
-long idle wait, and within microseconds while busy; synchronous waits
-(`hipStreamSynchronize`) do not go through these threads.
+backoff means events handled by ROCr's async-event threads (HIP host
+callbacks, async signal handlers, and the registration of a new handler,
+which is signalled through the same polled loop) can be observed up to
+~2 ms late after a long idle wait, i.e. on the first one after a pause;
+while busy the nap restarts at its floor (20 µs requested, ~70-100 µs in
+practice with Linux timer slack). Synchronous waits (`hipStreamSynchronize`)
+do not go through these threads.
 
 Verify: `grep -E 'libhsa|librocdxg' /proc/$(pidof inferfluxd)/maps` shows
 both from the release directory, and idle CPU drops to about 1%
@@ -412,6 +417,10 @@ both from the release directory, and idle CPU drops to about 1%
 (gfx1201) with qwen2.5-0.5b: idle 200% → 1.1%; greedy outputs identical to
 the stock runtime; c=8 and c=1 throughput and per-request latency unchanged
 (1-token request p50 7.1 ms on both).
+
+The backup is taken once and is the rollback target; after installing a new
+release (fresh `runtime/bin`) or upgrading ROCm, remove a stale
+`pre-patched-rocr/` before deploying again.
 
 `INFERFLUX_ROCR_TAME=1` can stay on alongside it: the threads it pins now
 sleep, and it bounds the cost if the patched library is ever missing.
