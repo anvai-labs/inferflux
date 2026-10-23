@@ -277,7 +277,7 @@ With `INFERFLUX_ROCR_TAME=1`, `inferfluxd` confines these threads **at
 creation**. The server binary defines `pthread_create`, so every thread
 `libhsa-runtime64` starts goes through it; a thread whose start routine lies
 in `libhsa-runtime64` is started through a small trampoline that, in the new
-thread, pins it to one shared core, sets nice 19, and names it `rocr-hsa-N`.
+thread, pins it to one shared core and names it `rocr-hsa-N`.
 Identification is exact (the start routine's owning library), so no other
 thread — InferFlux's own or a third-party threadpool — is ever touched, and
 there are no signals, `/proc` scans, or background threads. ROCr starts its
@@ -286,10 +286,15 @@ inside the new thread; libhsa never changes a thread's affinity afterwards.
 
 All `libhsa-runtime64` threads are pinned (about three per runtime
 initialization: the two pollers and a short-lived helper), because they share
-one ROCr-internal start routine. Nice 19 rather than `SCHED_IDLE`: on native
-Linux `SCHED_IDLE` can starve the HSA signal-handler work these threads also
-run. GPU sync latency is unaffected (verified empirically under full CPU
-contention).
+one ROCr-internal start routine. If ROCr itself narrows a thread's mask (for
+example to the GPU's NUMA node) and the chosen core is outside it, the thread
+is pinned to the highest allotted CPU inside its own mask instead. The tamer
+only pins: it does not lower priority, because threads inherit their
+creator's nice value and an unprivileged thread cannot raise it back, and
+`SCHED_IDLE` can starve the HSA signal-handler work these threads run on
+native Linux. A thread that a tamed thread starts (and that is not itself a
+ROCr thread) gets the full allotment back unless it asked for an explicit
+affinity, so the pin never leaks. GPU sync latency is unaffected.
 
 The core is chosen from the server's own affinity allotment (its
 `taskset`/cgroup mask, read at process start): a valid

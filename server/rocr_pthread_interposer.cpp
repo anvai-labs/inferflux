@@ -43,16 +43,9 @@ PthreadCreateFn RealPthreadCreate() noexcept {
   if (fn != nullptr) {
     return fn;
   }
-  // dlsym never creates threads, so this cannot recurse.
+  // dlsym never creates threads, so this cannot recurse. It returns the C
+  // library's default pthread_create version.
   fn = reinterpret_cast<PthreadCreateFn>(dlsym(RTLD_NEXT, "pthread_create"));
-  if (fn == nullptr) {
-    fn = reinterpret_cast<PthreadCreateFn>(
-        dlvsym(RTLD_NEXT, "pthread_create", "GLIBC_2.34"));
-  }
-  if (fn == nullptr) {
-    fn = reinterpret_cast<PthreadCreateFn>(
-        dlvsym(RTLD_NEXT, "pthread_create", "GLIBC_2.2.5"));
-  }
   if (fn == nullptr || fn == &pthread_create) {
     static const char kMessage[] =
         "inferflux: cannot resolve the C library's pthread_create\n";
@@ -66,7 +59,9 @@ PthreadCreateFn RealPthreadCreate() noexcept {
 struct TameBox {
   void *(*start_routine)(void *);
   void *arg;
-  int core;
+  int core;        // >= 0: tame this ROCr thread onto `core`.
+  int creator_cpu; // >= 0: non-ROCr child of a tamed thread; undo the
+                   // pin and nice it inherited.
 };
 
 // Deliberately NOT noexcept, with no try/catch and no RAII objects:
@@ -77,7 +72,11 @@ struct TameBox {
 void *RocrTameTrampoline(void *raw_box) {
   const TameBox box = *static_cast<TameBox *>(raw_box);
   std::free(raw_box);
-  inferflux::TameCurrentRocrThread(box.core);
+  if (box.core >= 0) {
+    inferflux::TameCurrentRocrThread(box.core);
+  } else {
+    inferflux::RestoreInheritedScheduling(box.creator_cpu);
+  }
   return box.start_routine(box.arg);
 }
 
@@ -98,12 +97,18 @@ extern "C" __attribute__((visibility("default"), used)) int
 pthread_create(pthread_t *__restrict thread,
                const pthread_attr_t *__restrict attr,
                void *(*start_routine)(void *), void *__restrict arg) noexcept {
+  // Saved first: the lazy dlsym, dladdr, getenv and malloc must not leak
+  // errno to the caller.
+  const int saved_errno = errno;
   const PthreadCreateFn real = RealPthreadCreate();
-  const int saved_errno = errno; // dladdr/getenv/malloc must not leak errno.
   const int core = inferflux::RocrTameCoreForNewThread(start_routine);
-  if (core >= 0) {
+  // A tamed thread's children inherit its single-CPU mask; any
+  // that are not ROCr threads themselves get them undone in the trampoline.
+  const int creator_cpu =
+      core < 0 ? inferflux::CurrentTamedRocrThreadCpu() : -1;
+  if (core >= 0 || creator_cpu >= 0) {
     if (auto *box = static_cast<TameBox *>(std::malloc(sizeof(TameBox)))) {
-      *box = TameBox{start_routine, arg, core};
+      *box = TameBox{start_routine, arg, core, creator_cpu};
       errno = saved_errno;
       const int rc = real(thread, attr, &RocrTameTrampoline, box);
       if (rc != 0) {

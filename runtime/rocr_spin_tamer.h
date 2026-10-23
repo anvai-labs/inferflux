@@ -15,7 +15,7 @@ namespace inferflux {
 // pthread_create (server/rocr_pthread_interposer.cpp, linked only into the
 // server binary), and every thread whose start routine lies in
 // libhsa-runtime64 is started through a trampoline that, in the new thread,
-// pins it to one shared core, sets nice 19 and names it "rocr-hsa-N". No
+// pins it to one shared core and names it "rocr-hsa-N". No
 // signals, no /proc scans, no background thread. Every libhsa-created thread
 // is tamed (they all start through one ROCr-internal routine, so pollers
 // cannot be told apart from ROCr's other, mostly blocked, threads).
@@ -25,10 +25,11 @@ namespace inferflux {
 // inherited, and disabling ROCr's override (HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0)
 // under a pinned creator aborts. libhsa never changes a thread's affinity
 // after creation (its only affinity import is pthread_attr_setaffinity_np).
-// Why nice 19 and not SCHED_IDLE: the same thread runs HSA async signal
-// handlers, and native Linux enforces SCHED_IDLE strictly enough to starve
-// it; nice 19 still gets a share of every CFS period. On WSL2 neither is
-// enforced for service-cgroup threads; the pin is the load-bearing bound.
+// Why a pin only (no nice 19, no SCHED_IDLE): a thread inherits its
+// creator's nice/policy and an unprivileged thread cannot lower its nice
+// again, so a deprioritized ROCr thread would leak that to any thread it
+// creates; SCHED_IDLE can also starve the HSA async signal handlers these
+// threads run on native Linux. The pin is the bound, and it is reversible.
 //
 // Core choice: the server's affinity allotment is the main thread's mask,
 // captured during static initialization (the operator's taskset/cgroup).
@@ -36,10 +37,23 @@ namespace inferflux {
 // onto the server's only CPU). Otherwise a valid INFERFLUX_ROCR_TAME_CORE
 // inside the allotment, else the highest allotted CPU.
 //
-// Residuals: a cgroup cpuset later shrunk to exclude the core moves the
-// threads off it; a future ROCr starting threads via std::thread (start
-// routine in libstdc++) would not be recognized (fails safe: nothing tamed);
-// sanitizer builds compile the interposer out.
+// A ROCr thread whose own (attribute-supplied) mask excludes the chosen core
+// -- e.g. ROCr binding it to the GPU's NUMA node -- is pinned to the highest
+// CPU in its mask that is also allotted, so each such mask still costs one
+// core; with no overlap it is left alone and counted as skipped. Threads that
+// a tamed thread creates (and that are not ROCr threads themselves) get the
+// allotment mask back unless their attribute sets an affinity explicitly,
+// so the pin never leaks to them.
+//
+// Residuals: the allotment is read in this binary's static initialization,
+// after shared-library constructors (libgomp with OMP_PROC_BIND can narrow
+// the main thread first; that fails safe: no pin, or a pin inside it); a
+// cgroup cpuset later shrunk to exclude the core moves the threads off it;
+// until the first ROCr thread is identified, each creation costs one dladdr
+// (it takes the dynamic loader's lock), after which a cached address range
+// is used; a future ROCr starting threads via std::thread (start routine in
+// libstdc++) would not be recognized (fails safe: nothing tamed); sanitizer
+// builds and non-x86_64/aarch64 targets compile the interposer out.
 //
 // Knobs (env-only, see docs/CONFIG_REFERENCE.md section 10):
 //   INFERFLUX_ROCR_TAME       enable with 1 (default off)
@@ -65,9 +79,20 @@ bool IsRocrRuntimeAddress(const void *addr) noexcept;
 // to pin the new thread on, or -1 to create it untouched. No logging.
 int RocrTameCoreForNewThread(void *(*start_routine)(void *)) noexcept;
 
-// Runs in the new thread before its start routine: pin, nice 19, rename,
-// count. No cancellation points, no logging, no allocation.
+// Runs in the new thread before its start routine: pin, rename, count. No
+// cancellation points, no logging, no allocation.
 void TameCurrentRocrThread(int core) noexcept;
+
+// True in a thread that TameCurrentRocrThread pinned.
+bool CurrentThreadIsTamedRocrThread() noexcept;
+
+// CPU a tamed thread is pinned to (-1 if the calling thread is not tamed).
+int CurrentTamedRocrThreadCpu() noexcept;
+
+// Runs in a non-ROCr thread created by a tamed thread pinned to
+// `creator_cpu`: if its mask is exactly the creator's single CPU (inherited
+// rather than set by its attribute), restores the allotment mask.
+void RestoreInheritedScheduling(int creator_cpu) noexcept;
 #endif
 
 // Called by the interposer's static initializer with its own address, so
@@ -75,12 +100,17 @@ void TameCurrentRocrThread(int core) noexcept;
 void NoteRocrPthreadInterposerInstalled(void *interposer_fn) noexcept;
 
 // Called once from main: logs enabled/core/allotment/interposer state and the
-// count so far; warns on a rejected INFERFLUX_ROCR_TAME_CORE, a single-CPU
-// allotment, or an inactive interposer. No-op when disabled.
+// counts so far; warns on a rejected INFERFLUX_ROCR_TAME_CORE, a single-CPU
+// allotment, an inactive interposer, or skipped threads. When disabled it
+// only notes (once) that ROCr is loaded and the tamer is available.
 void ReportRocrTamerStatus();
 
-// Number of threads tamed so far (also counted in GlobalMetrics()).
+// Number of threads tamed so far (rendered as
+// inferflux_runtime_spin_threads_confined_total).
 unsigned long long RocrTamedThreadCount() noexcept;
+
+// ROCr threads left untamed because their own mask had no allotted CPU.
+unsigned long long RocrSkippedThreadCount() noexcept;
 
 // Test seam: re-read the env and re-capture the allotment from the calling
 // thread.

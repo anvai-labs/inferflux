@@ -20,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,6 +42,8 @@ using SpawnFn = int (*)(pthread_t *, FakeHsaReport *, int, int, int);
 using SpawnWithAttrFn = int (*)(pthread_t *, const pthread_attr_t *,
                                 FakeHsaReport *);
 using SymbolFn = void *(*)();
+using SpawnParentFn = int (*)(pthread_t *, FakeHsaReport *, void *(*)(void *),
+                              void *, int);
 
 enum Mode { kReport = 0, kPthreadExit = 1, kCancellable = 2, kThreadLocal = 3 };
 
@@ -48,6 +51,7 @@ struct FakeRuntime {
   SpawnFn spawn = nullptr;
   SpawnWithAttrFn spawn_with_attr = nullptr;
   SymbolFn symbol = nullptr;
+  SpawnParentFn spawn_parent = nullptr;
 };
 
 const FakeRuntime &Fake() {
@@ -62,6 +66,8 @@ const FakeRuntime &Fake() {
       f.spawn_with_attr = reinterpret_cast<SpawnWithAttrFn>(
           dlsym(handle, "fake_hsa_spawn_with_attr"));
       f.symbol = reinterpret_cast<SymbolFn>(dlsym(handle, "fake_hsa_symbol"));
+      f.spawn_parent = reinterpret_cast<SpawnParentFn>(
+          dlsym(handle, "fake_hsa_spawn_parent"));
     }
     return f;
   }();
@@ -153,7 +159,7 @@ TEST_CASE("interposer: tames runtime threads at creation",
   const FakeHsaReport report = SpawnAndJoin();
   CHECK(report.cpu_count == 1);
   CHECK(report.only_cpu == cpus.back());
-  CHECK(report.nice == 19);
+  CHECK(report.nice == OwnNice()); // Pin only: priority is never changed.
   CHECK(IsTamedName(report.name));
   CHECK(inferflux::RocrTamedThreadCount() == before + 1);
   CHECK(inferflux::GlobalMetrics().RenderPrometheus().find(
@@ -254,16 +260,23 @@ TEST_CASE("interposer: pthread_exit, cancellation and thread_local work "
     CHECK(report.tls_dtor_ran == 1);
   }
   SECTION("detached") {
-    FakeHsaReport report{};
+    // Heap-allocated and released if the thread is late: a detached thread
+    // must never write into a returned stack frame.
+    auto report = std::make_unique<FakeHsaReport>();
     pthread_t thread{};
-    REQUIRE(Fake().spawn(&thread, &report, kReport, 1, /*detached=*/1) == 0);
+    REQUIRE(Fake().spawn(&thread, report.get(), kReport, 1,
+                         /*detached=*/1) == 0);
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (__atomic_load_n(&report.done, __ATOMIC_ACQUIRE) == 0 &&
+    while (__atomic_load_n(&report->done, __ATOMIC_ACQUIRE) == 0 &&
            std::chrono::steady_clock::now() < deadline) {
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    CHECK(__atomic_load_n(&report.done, __ATOMIC_ACQUIRE) == 1);
+    const bool done = __atomic_load_n(&report->done, __ATOMIC_ACQUIRE) == 1;
+    if (!done) {
+      (void)report.release(); // Still owned by the running thread.
+    }
+    CHECK(done);
   }
 }
 
@@ -272,8 +285,9 @@ TEST_CASE("interposer: creation failures pass through unchanged",
   TamerEnv env("1", nullptr);
   pthread_attr_t attr;
   pthread_attr_init(&attr);
-  // A stack far larger than any address space can map: creation must fail.
-  REQUIRE(pthread_attr_setstacksize(&attr, 1ULL << 46) == 0);
+  // Larger than the whole user address space (x86_64/aarch64: <= 2^48), so
+  // creation fails whatever the overcommit policy.
+  REQUIRE(pthread_attr_setstacksize(&attr, 1ULL << 52) == 0);
   const unsigned long long before = inferflux::RocrTamedThreadCount();
   FakeHsaReport report{};
   pthread_t thread{};
@@ -328,4 +342,82 @@ TEST_CASE("interposer: concurrent creations are each tamed exactly once",
   }
   CHECK(failures.load() == 0);
   CHECK(inferflux::RocrTamedThreadCount() == before + kCreators * kPerCreator);
+}
+
+namespace {
+struct ChildReport {
+  int cpu_count = 0;
+  int only_cpu = -1;
+  int nice = -100;
+};
+
+void *FillChildReport(void *raw) {
+  auto *report = static_cast<ChildReport *>(raw);
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+    report->cpu_count = CPU_COUNT(&mask);
+    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+      if (CPU_ISSET(cpu, &mask)) {
+        report->only_cpu = cpu;
+        break;
+      }
+    }
+  }
+  report->nice = OwnNice();
+  return nullptr;
+}
+} // namespace
+
+TEST_CASE("interposer: a tamed thread's children do not inherit the pin",
+          "[rocr_interposer]") {
+  const std::vector<int> cpus = AllowedCpus();
+  if (cpus.size() < 2) {
+    SKIP("needs >= 2 allowed CPUs to observe a pin");
+  }
+  TamerEnv env("1", nullptr);
+  SECTION("inherited mask and nice are restored") {
+    ChildReport child;
+    FakeHsaReport parent{};
+    pthread_t thread{};
+    REQUIRE(Fake().spawn_parent(&thread, &parent, &FillChildReport, &child,
+                                /*child_attr_cpu=*/-1) == 0);
+    REQUIRE(pthread_join(thread, nullptr) == 0);
+    CHECK(parent.cpu_count == 1); // The ROCr parent itself is tamed.
+    CHECK(IsTamedName(parent.name));
+    CHECK(child.cpu_count == static_cast<int>(cpus.size()));
+    CHECK(child.nice == OwnNice());
+  }
+  SECTION("an explicit attribute affinity is kept") {
+    ChildReport child;
+    FakeHsaReport parent{};
+    pthread_t thread{};
+    REQUIRE(Fake().spawn_parent(&thread, &parent, &FillChildReport, &child,
+                                /*child_attr_cpu=*/cpus.front()) == 0);
+    REQUIRE(pthread_join(thread, nullptr) == 0);
+    CHECK(child.cpu_count == 1);
+    CHECK(child.only_cpu == cpus.front());
+    CHECK(child.nice == OwnNice());
+  }
+}
+
+TEST_CASE("interposer: a runtime-narrowed thread is pinned within its mask",
+          "[rocr_interposer]") {
+  const std::vector<int> cpus = AllowedCpus();
+  const long online = sysconf(_SC_NPROCESSORS_ONLN);
+  if (cpus.size() < 3 || cpus.back() != online - 1) {
+    SKIP("needs >= 3 allowed CPUs including the highest online one");
+  }
+  TamerEnv env("1", nullptr);
+  const unsigned long long before = inferflux::RocrTamedThreadCount();
+  FakeHsaReport report{};
+  pthread_t thread{};
+  // widen_attr=2: every online CPU except the highest, which is the default
+  // pin core -- like ROCr binding a thread to the GPU's NUMA node.
+  REQUIRE(Fake().spawn(&thread, &report, kReport, /*widen_attr=*/2, 0) == 0);
+  REQUIRE(pthread_join(thread, nullptr) == 0);
+  CHECK(report.cpu_count == 1);
+  CHECK(report.only_cpu == cpus[cpus.size() - 2]); // Highest in its mask.
+  CHECK(IsTamedName(report.name));
+  CHECK(inferflux::RocrTamedThreadCount() == before + 1);
 }

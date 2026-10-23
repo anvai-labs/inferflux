@@ -121,10 +121,6 @@ public:
   void SetRocmMemoryUsageMB(double memory_mb);
   void RecordRocmDeviceProperties(int device_id, const std::string &arch);
 
-  // Runtime hygiene (ROCr thread tamer): libhsa-runtime64 threads pinned to
-  // the shared tame core at creation.
-  void RecordRuntimeSpinThreadsConfined(int confined);
-
   // KV transfer latency (§2.5 item 12): elapsed time from
   // KVPacket::enqueue_time to when a decode worker dequeues it from KVChannel /
   // ShmKVTransport.
@@ -407,10 +403,6 @@ private:
   std::atomic<uint64_t> rocm_flash_attention_requests_{0};
   std::atomic<double> rocm_memory_mb_{0.0};
   std::string rocm_device_arch_{"unknown"};
-
-  // Runtime hygiene (ROCr thread tamer): cumulative ROCr runtime threads
-  // pinned at creation. Plain atomic so MetricsRegistry::Reset() restores it.
-  std::atomic<uint64_t> runtime_spin_threads_confined_{0};
 
   // Latency histograms.
   LatencyHistogram request_latency_;

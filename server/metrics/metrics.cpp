@@ -1,6 +1,7 @@
 #include "server/metrics/metrics.h"
 
 #include "runtime/backends/cuda/native/dispatch_catalog.h"
+#include "runtime/rocr_spin_tamer.h"
 #include "server/diagnostics/crash_handler.h"
 
 #include <algorithm>
@@ -492,13 +493,6 @@ void MetricsRegistry::RecordImagePreprocess(int images, double /*decode_ms*/) {
 
 void MetricsRegistry::RecordMoERequest() {
   moe_requests_.fetch_add(1, std::memory_order_relaxed);
-}
-
-void MetricsRegistry::RecordRuntimeSpinThreadsConfined(int confined) {
-  if (confined > 0) {
-    runtime_spin_threads_confined_.fetch_add(static_cast<uint64_t>(confined),
-                                             std::memory_order_relaxed);
-  }
 }
 
 void MetricsRegistry::SetFlashAttentionEnabled(bool enabled) {
@@ -2793,8 +2787,10 @@ std::string MetricsRegistry::RenderPrometheus() const {
          "(libhsa-runtime64) threads pinned to the shared tame core at "
          "creation\n";
   out << "# TYPE inferflux_runtime_spin_threads_confined_total counter\n";
+  // Read from the tamer's own constant-initialized counter: its threads can
+  // be created before or after this registry's lifetime.
   out << "inferflux_runtime_spin_threads_confined_total "
-      << runtime_spin_threads_confined_.load() << "\n";
+      << RocrTamedThreadCount() << "\n";
 
   return out.str();
 }

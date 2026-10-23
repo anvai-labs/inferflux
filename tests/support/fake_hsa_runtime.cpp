@@ -27,7 +27,18 @@ struct FakeHsaReport {
 
 namespace {
 
-enum Mode { kReport = 0, kPthreadExit = 1, kCancellable = 2, kThreadLocal = 3 };
+enum Mode {
+  kReport = 0,
+  kPthreadExit = 1,
+  kCancellable = 2,
+  kThreadLocal = 3,
+  kSpawnChild = 4,
+};
+
+int HighestOnlineCpu() {
+  const long online = sysconf(_SC_NPROCESSORS_ONLN);
+  return online > 0 ? static_cast<int>(online) - 1 : 0;
+}
 
 struct TlsProbe {
   FakeHsaReport *report = nullptr;
@@ -42,6 +53,10 @@ thread_local TlsProbe g_tls_probe;
 struct Job {
   FakeHsaReport *report;
   int mode;
+  // kSpawnChild: the child this (tamed) thread starts.
+  void *(*child_fn)(void *) = nullptr;
+  void *child_arg = nullptr;
+  int child_attr_cpu = -1; // >= 0: child attribute pins it to this CPU.
 };
 
 void Fill(FakeHsaReport *report) {
@@ -83,6 +98,24 @@ void *FakeHsaMain(void *raw_job) {
     g_tls_probe.report = report;
     Fill(report);
     return report;
+  case kSpawnChild: {
+    // Like a ROCr thread starting a helper whose code lives elsewhere.
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    if (job->child_attr_cpu >= 0) {
+      cpu_set_t one;
+      CPU_ZERO(&one);
+      CPU_SET(job->child_attr_cpu, &one);
+      pthread_attr_setaffinity_np(&attr, sizeof(one), &one);
+    }
+    pthread_t child{};
+    if (pthread_create(&child, &attr, job->child_fn, job->child_arg) == 0) {
+      pthread_join(child, nullptr);
+    }
+    pthread_attr_destroy(&attr);
+    Fill(report);
+    return report;
+  }
   case kReport:
   default:
     Fill(report);
@@ -95,9 +128,11 @@ void *FakeHsaMain(void *raw_job) {
 
 extern "C" {
 
-// Starts a thread the way ROCr does. `widen_attr` sets an explicit
-// all-online-CPU affinity through the attribute, like ROCr's
-// pthread_attr_setaffinity_np. Returns pthread_create's result.
+// Starts a thread the way ROCr does. `widen_attr`: 1 sets an explicit
+// all-online-CPU affinity through the attribute (like ROCr's
+// pthread_attr_setaffinity_np); 2 sets all online CPUs except the highest
+// (like ROCr binding a thread to one NUMA node). Returns pthread_create's
+// result.
 __attribute__((visibility("default"))) int
 fake_hsa_spawn(pthread_t *out, FakeHsaReport *report, int mode, int widen_attr,
                int detached) {
@@ -110,6 +145,9 @@ fake_hsa_spawn(pthread_t *out, FakeHsaReport *report, int mode, int widen_attr,
     const long online = sysconf(_SC_NPROCESSORS_ONLN);
     for (long cpu = 0; cpu < online && cpu < CPU_SETSIZE; ++cpu) {
       CPU_SET(static_cast<int>(cpu), &all);
+    }
+    if (widen_attr == 2) {
+      CPU_CLR(HighestOnlineCpu(), &all);
     }
     pthread_attr_setaffinity_np(&attr, sizeof(all), &all);
   }
@@ -132,6 +170,23 @@ fake_hsa_spawn_with_attr(pthread_t *out, const pthread_attr_t *attr,
   std::memset(report, 0, sizeof(*report));
   auto job = std::make_unique<Job>(Job{report, kReport});
   const int rc = pthread_create(out, attr, &FakeHsaMain, job.get());
+  if (rc == 0) {
+    (void)job.release();
+  }
+  return rc;
+}
+
+// Starts a ROCr-style thread that itself starts `child_fn(child_arg)` (code
+// outside this object) and joins it. `child_attr_cpu` >= 0 gives the child
+// an explicit single-CPU attribute affinity.
+__attribute__((visibility("default"))) int
+fake_hsa_spawn_parent(pthread_t *out, FakeHsaReport *report,
+                      void *(*child_fn)(void *), void *child_arg,
+                      int child_attr_cpu) {
+  std::memset(report, 0, sizeof(*report));
+  auto job = std::make_unique<Job>(
+      Job{report, kSpawnChild, child_fn, child_arg, child_attr_cpu});
+  const int rc = pthread_create(out, nullptr, &FakeHsaMain, job.get());
   if (rc == 0) {
     (void)job.release();
   }
