@@ -37,7 +37,8 @@ declare -A ROCDXG_SHA256=(
 usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 die() { echo "build_patched_rocr: $*" >&2; exit 1; }
 need_value() {
-  [[ $# -ge 2 && -n "$2" && "$2" != -* ]] || { echo "$1 needs a value" >&2; usage 2; }
+  # Values may start with '-' (a path); only another option is refused.
+  [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "$1 needs a value" >&2; usage 2; }
 }
 
 while [[ $# -gt 0 ]]; do
@@ -53,7 +54,7 @@ done
 [[ -n "$OUT" ]] || usage 2
 [[ -n "${ROCDXG_SHA256[$ROCDXG_TAG]:-}" ]] ||
   die "no pinned sha256 for librocdxg $ROCDXG_TAG; add one to ROCDXG_SHA256"
-for tool in git curl cmake dpkg-deb readelf ldd nproc find sed sha256sum; do
+for tool in git curl cmake dpkg-deb readelf ldd nproc find sed grep cut ls mktemp realpath sha256sum; do
   command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
 # The backport and its ABI assumptions are for ROCm 7.2.0 exactly: refuse to
@@ -88,10 +89,8 @@ elif [[ -d "$WORK" && ! -f "${WORK}/${WORK_MARK}" ]] &&
 else
   mkdir -p "$WORK" && touch "${WORK}/${WORK_MARK}"
 fi
-if [[ -d "$OUT" && ! -f "${OUT}/${OUT_MARK}" ]] &&
-   { compgen -G "${OUT}/libhsa-runtime64.so*" >/dev/null ||
-     compgen -G "${OUT}/librocdxg.so*" >/dev/null; }; then
-  die "${OUT} already holds runtime libraries not staged by this script; use an empty directory and deploy with the documented backup step"
+if [[ -d "$OUT" && ! -f "${OUT}/${OUT_MARK}" && -n "$(ls -A "$OUT")" ]]; then
+  die "${OUT} is not empty and was not staged by this script; use an empty or new --out directory (deploy with the documented backup step)"
 fi
 mkdir -p "$OUT"
 WORK="$(cd "$WORK" && pwd)"
@@ -164,17 +163,21 @@ if grep -qE '\((RUNPATH|RPATH)\)' <<<"$DYNAMIC"; then
 fi
 # In a clean environment, as the service sees it: only the loader
 # configuration, not this shell's LD_LIBRARY_PATH.
-MISSING="$("${clean_env[@]}" ldd "$LIBHSA" | grep 'not found' || true)"
+LDD_OUT="$("${clean_env[@]}" ldd "$LIBHSA")"
+MISSING="$(grep 'not found' <<<"$LDD_OUT" || true)"
 [[ -z "$MISSING" ]] || die "unresolved dependencies: ${MISSING}"
 # The ROCm-provided dependency must come from the install built against.
-PROFREG="$("${clean_env[@]}" ldd "$LIBHSA" | sed -n 's/.*librocprofiler-register[^ ]* => \([^ ]*\).*/\1/p')"
+PROFREG="$(sed -n 's/.*librocprofiler-register[^ ]* => \([^ ]*\).*/\1/p' <<<"$LDD_OUT")"
 # (Optional in ROCr's CMake: only checked when it is linked.)
 if [[ -n "$PROFREG" && "$(realpath "$PROFREG")" != "$(realpath "$ROCM_ROOT")"/* ]]; then
   die "librocprofiler-register resolves to ${PROFREG}, outside ${ROCM_ROOT}"
 fi
 CXX_USED="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "${BUILD}/CMakeCache.txt")"
 CXX_VERSION="unknown"
-[[ -x "$CXX_USED" ]] && CXX_VERSION="$("$CXX_USED" --version | head -1)"
+if [[ -x "$CXX_USED" ]]; then # Informational: never fails the build.
+  CXX_BANNER="$("$CXX_USED" --version 2>/dev/null || true)"
+  CXX_VERSION="${CXX_BANNER%%$'\n'*}"
+fi
 
 # 3. Prebuilt WSL thunk: download, verify, extract (never installed).
 DEB_DIR="${WORK}/rocdxg"
@@ -212,11 +215,16 @@ link_as "$(basename "$LIBDXG")" "$DXG_SONAME"
 link_as "$(basename "$LIBDXG")" librocdxg.so # ROCr dlopens this name.
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
+json_str() { # Escape for a JSON string (backslash, quote, control chars).
+  local s="${1//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  printf '%s' "${s//[$'\t\r\n']/ }"
+}
 cat > "${OUT}/PATCHED_ROCR.json" <<EOF
 {
   "rocm_systems_tag": "${ROCM_TAG}",
-  "host_rocm": "${HOST_ROCM}",
-  "host_compiler": "${CXX_VERSION}",
+  "host_rocm": "$(json_str "$HOST_ROCM")",
+  "host_compiler": "$(json_str "$CXX_VERSION")",
   "rocm_systems_commit": "$(git -C "$SRC" rev-parse HEAD)",
   "upstream_fix": "ROCm/rocm-systems#7898 (46558b7af4dc79b8b8014619c1afdb82db079a9f)",
   "patch_sha256": "$(sha "$PATCH")",

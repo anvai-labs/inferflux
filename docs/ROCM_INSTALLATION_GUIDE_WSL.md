@@ -405,11 +405,14 @@ D=<release>/runtime/bin
 of `/opt/rocm/lib`, so only that process uses the patched runtime. The
 backoff means events handled by ROCr's async-event threads (HIP host
 callbacks, async signal handlers, and the registration of a new handler,
-which is signalled through the same polled loop) can be observed up to
-~2 ms late after a long idle wait, i.e. on the first one after a pause;
-while busy the nap restarts at its floor (20 µs requested, ~70-100 µs in
-practice with Linux timer slack). Synchronous waits (`hipStreamSynchronize`)
-do not go through these threads.
+which is signalled through the same polled loop) are observed up to about
+2 ms plus timer slack late whenever the wait they belong to has lasted
+longer than about 2.5 ms (the nap doubles from 20 µs per scan and only
+resets when a wait batch ends), whether the server is idle or busy. Short
+waits see the floor (20 µs requested, ~70-100 µs in practice with Linux
+timer slack). Synchronous waits (`hipStreamSynchronize`), which InferFlux's
+decode path uses, do not go through these threads; the throughput and
+latency measurements below include this effect.
 
 Verify: `grep -E 'libhsa|librocdxg' /proc/$(pidof inferfluxd)/maps` shows
 both from the release directory, and idle CPU drops to about 1%
