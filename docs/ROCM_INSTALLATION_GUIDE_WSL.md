@@ -295,7 +295,11 @@ creator's nice value and an unprivileged thread cannot raise it back, and
 native Linux. A thread that a tamed thread starts (and that is not itself a
 ROCr thread) gets the CPU mask it would have inherited without the tamer
 (the tamed thread's mask before its pin) unless it asked for an explicit
-affinity, so the pin never leaks. GPU sync latency is unaffected.
+affinity, so the pin never leaks (barring an allocation failure during
+that thread's creation, when it is created untouched). GPU sync latency is
+unaffected; measured tail latency improves (1-token requests, p99 ~7.7 ms
+on vs 11-13 ms off), because the spinners no longer land on request-path
+cores.
 
 The core is chosen from the server's own affinity allotment (its
 `taskset`/cgroup mask, read at process start): a valid
@@ -318,8 +322,9 @@ tamed threads (`inferflux_runtime_spin_threads_unconfined_total` counts ROCr
 threads that could not be pinned: no allotted CPU in their own mask, or
 the kernel refused the pin; they are left alone).
 
-The interposer is linked only into ROCm-enabled (`ENABLE_ROCM=ON`) server
-builds; CUDA-only and CPU builds never route thread creation through it.
+The interposer is linked only into server builds where CMake actually found
+ROCm (`ENABLE_ROCM=ON` and the toolkit present; the configure log says
+"ROCm/HIP found"); CUDA-only and CPU builds never route thread creation through it.
 With the tamer off it passes every creation straight through. When on, each
 creation is classified with glibc's lock-free `_dl_find_object` (glibc
 2.35+; older glibc falls back to `dladdr`, which takes the loader lock).

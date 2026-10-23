@@ -126,19 +126,6 @@ bool AllotmentMask(cpu_set_t *mask) {
   return sched_getaffinity(getpid(), sizeof(*mask), mask) == 0;
 }
 
-std::vector<int> AllottedCpus() {
-  cpu_set_t mask;
-  std::vector<int> cpus;
-  if (AllotmentMask(&mask)) {
-    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-      if (CPU_ISSET(cpu, &mask)) {
-        cpus.push_back(cpu);
-      }
-    }
-  }
-  return cpus;
-}
-
 // Same accepted values as ParseBoolEnv, without allocating: the first call
 // can come from pthread_create in a library constructor or while an
 // allocator holds its own locks.
@@ -260,15 +247,11 @@ bool IsRocrRuntimeAddress(const void *addr) noexcept {
 bool RocrTamerEnabled() noexcept { return Enabled(); }
 
 int RocrTameCoreForNewThread(void *(*start_routine)(void *)) noexcept {
-  try {
-    if (!Enabled() ||
-        !IsRocrRuntimeAddress(reinterpret_cast<const void *>(start_routine))) {
-      return -1;
-    }
-    return ResolveCore();
-  } catch (...) {
-    return -1; // Creator-side frame: never fail thread creation over this.
+  if (!Enabled() ||
+      !IsRocrRuntimeAddress(reinterpret_cast<const void *>(start_routine))) {
+    return -1;
   }
+  return ResolveCore(); // Allocation-free; nothing here throws.
 }
 
 void TameCurrentRocrThread(int core, const InheritedState &inherited) noexcept {
@@ -403,10 +386,14 @@ void ReportRocrTamerStatus() {
     }
     return;
   }
+  // Same rule (ChooseMaskCore) as the creations use, for the rejected flag.
   bool core_rejected = false;
-  const std::vector<int> allotted = AllottedCpus();
-  (void)ChooseRocrTameCore(allotted, std::getenv("INFERFLUX_ROCR_TAME_CORE"),
-                           &core_rejected);
+  cpu_set_t allotted;
+  if (!AllotmentMask(&allotted)) {
+    CPU_ZERO(&allotted);
+  }
+  (void)ChooseMaskCore(allotted, std::getenv("INFERFLUX_ROCR_TAME_CORE"),
+                       &core_rejected);
   if (core_rejected) {
     log::Warn(
         kComponent,
@@ -433,7 +420,8 @@ void ReportRocrTamerStatus() {
   log::Info(
       kComponent,
       "enabled: ROCr runtime threads are pinned to CPU " +
-          std::to_string(core) + " (of " + std::to_string(allotted.size()) +
+          std::to_string(core) + " (of " +
+          std::to_string(CPU_COUNT(&allotted)) +
           " allotted) at creation (a thread ROCr bound elsewhere: the highest "
           "allotted CPU of its own mask); tamed so far: " +
           std::to_string(RocrTamedThreadCount()) +

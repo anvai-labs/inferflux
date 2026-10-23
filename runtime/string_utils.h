@@ -26,9 +26,9 @@ inline std::string Trim(const std::string &s) {
   return s.substr(start, end - start + 1);
 }
 
-/// True for the values ParseBool/ParseBoolEnv accept as true ("true", "1",
-/// "yes", "on"; ASCII case-insensitive). Allocation-free, for code that must
-/// not allocate (e.g. inside an interposed pthread_create).
+/// True for the C strings ParseBool/ParseBoolEnv accept as true ("true",
+/// "1", "yes", "on"; ASCII case-insensitive). Allocation-free, for code that
+/// must not allocate (e.g. inside an interposed pthread_create).
 inline bool IsTruthyCStr(const char *val) noexcept {
   if (val == nullptr) {
     return false;
@@ -52,7 +52,8 @@ inline bool IsTruthyCStr(const char *val) noexcept {
 /// Recognises "true"/"1"/"yes"/"on" (case-insensitive) as true,
 /// "false"/"0"/"no"/"off" as false.  Any other value returns false.
 inline bool ParseBool(const std::string &val) {
-  return IsTruthyCStr(val.c_str());
+  std::string lower = ToLower(val);
+  return lower == "true" || lower == "1" || lower == "yes" || lower == "on";
 }
 
 /// Parse a boolean from environment variable with fallback.
