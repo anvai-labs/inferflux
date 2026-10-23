@@ -58,14 +58,22 @@ done
 [[ -n "$OUT" ]] || usage 2
 [[ -n "${ROCDXG_SHA256[$ROCDXG_TAG]:-}" ]] ||
   die "no pinned sha256 for librocdxg $ROCDXG_TAG; add one to ROCDXG_SHA256"
-for tool in git curl cmake dpkg-deb readelf ldd nproc find sed grep cut ls mktemp realpath sha256sum; do
+for tool in git curl cmake dpkg-deb readelf ldd nproc find sed grep cut paste ls mktemp realpath sha256sum; do
   command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
 # The backport and its ABI assumptions are for ROCm 7.2.0 exactly: refuse to
 # drop a 7.2.0 runtime under a different host HIP.
+# The backoff targets WSL2/dxg (no interrupt-backed events). On native Linux
+# it would only add up to 200 us to polling-forced batches: refuse.
+[[ -e /dev/dxg ]] || die "no /dev/dxg: this patched runtime is for WSL2 only"
 HOST_ROCM="$(cat "${ROCM_ROOT}/.info/version" 2>/dev/null || true)"
 [[ "$HOST_ROCM" =~ ^7\.2\.0([-+.~].*)?$ ]] ||
   die "host ROCm at ${ROCM_ROOT} is '${HOST_ROCM:-unknown}', not 7.2.0"
+# The server loads HIP via /opt/rocm and the loader configuration, whatever
+# --rocm says: that install must be 7.2.0 as well.
+SYS_ROCM="$(cat /opt/rocm/.info/version 2>/dev/null || true)"
+[[ "$SYS_ROCM" =~ ^7\.2\.0([-+.~].*)?$ ]] ||
+  die "/opt/rocm (which the server loads HIP from) is '${SYS_ROCM:-missing}', not 7.2.0"
 # Absolute path: the build runs in a clean environment (see below), where a
 # cmake from ~/.local/bin or a venv would not be on PATH.
 CMAKE="$(command -v cmake)"
@@ -83,9 +91,9 @@ OUT_MARK=".build_patched_rocr-out"
 if [[ -z "$WORK" ]]; then
   WORK="$(mktemp -d -t patched-rocr.XXXXXX)"
   touch "${WORK}/${WORK_MARK}"
-  # Auto-created: removed after success, or after a failure that built
-  # nothing; otherwise kept (and named) so its logs can be read.
-  trap 'rc=$?; if [[ $rc -eq 0 || ! -d "${WORK}/build" ]]; then rm -rf "$WORK";
+  # Auto-created: removed after success, or after a failure before any
+  # source was fetched; otherwise kept (and named) for its logs/checkout.
+  trap 'rc=$?; if [[ $rc -eq 0 || ! -d "${WORK}/rocm-systems" ]]; then rm -rf "$WORK";
         else echo "build_patched_rocr: work dir kept for its logs: ${WORK}" >&2; fi' EXIT
 elif [[ -d "$WORK" && ! -f "${WORK}/${WORK_MARK}" ]] &&
      [[ -n "$(ls -A "$WORK")" ]]; then
@@ -113,15 +121,18 @@ if [[ -e "$SRC" ]] &&
   rm -rf "$SRC"
 fi
 if [[ ! -d "${SRC}/.git" ]]; then
-  git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$ROCM_TAG" --filter=blob:none \
-    --sparse https://github.com/ROCm/rocm-systems.git "$SRC"
+  # Fetched by the pinned commit, not the tag, so a moved tag cannot break
+  # (or silently change) the build.
+  git init --quiet "$SRC"
+  git -C "$SRC" remote add origin https://github.com/ROCm/rocm-systems.git
   git -C "$SRC" sparse-checkout set projects/rocr-runtime
+  git -C "$SRC" fetch --quiet --depth 1 --filter=blob:none origin "$ROCM_COMMIT"
+  git -C "$SRC" -c advice.detachedHead=false checkout --quiet FETCH_HEAD
 fi
 git -C "$SRC" checkout --quiet -- .
 git -C "$SRC" clean --quiet -fd -- projects/rocr-runtime
-# Tags can move: pin the exact source that the patch and its validation used.
 [[ "$(git -C "$SRC" rev-parse HEAD)" == "$ROCM_COMMIT" ]] ||
-  die "${ROCM_TAG} resolved to $(git -C "$SRC" rev-parse HEAD), expected ${ROCM_COMMIT}"
+  die "checkout is $(git -C "$SRC" rev-parse HEAD), expected ${ROCM_COMMIT} (${ROCM_TAG})"
 git -C "$SRC" apply --check "$PATCH" || die "patch does not apply to $ROCM_TAG"
 git -C "$SRC" apply "$PATCH"
 
@@ -206,7 +217,8 @@ LIBDXG="$(find "${DEB_DIR}/x" -name 'librocdxg.so.*.*' -type f 2>/dev/null | hea
 # ROCr dlopens it as shipped. AMD's build carries RUNPATH /opt/rocm/lib; an
 # absolute system path is fine, but an empty or relative element (which
 # would search the service's working directory) is refused.
-DXG_RUNPATH="$(readelf -d "$LIBDXG" | sed -n 's/.*(\(RUNPATH\|RPATH\)).*\[\(.*\)\].*/\2/p')"
+# RPATH and RUNPATH may both be present: check every entry of each.
+DXG_RUNPATH="$(readelf -d "$LIBDXG" | sed -n 's/.*(\(RUNPATH\|RPATH\)).*\[\(.*\)\].*/\2/p' | paste -sd: -)"
 if [[ -n "$DXG_RUNPATH" ]]; then
   IFS=':' read -r -a dxg_entries <<<"${DXG_RUNPATH}:"
   [[ "$DXG_RUNPATH" != *: && "$DXG_RUNPATH" != :* && "$DXG_RUNPATH" != *::* ]] ||
@@ -218,15 +230,16 @@ fi
 DXG_MISSING="$(grep 'not found' <<<"$("${clean_env[@]}" ldd "$LIBDXG")" || true)"
 [[ -z "$DXG_MISSING" ]] || die "librocdxg has unresolved dependencies: ${DXG_MISSING}"
 
-# 4. Stage with the sonames the loader looks up.
-rm -f "${OUT}"/libhsa-runtime64.so* "${OUT}"/librocdxg.so* "${OUT}/PATCHED_ROCR.json"
-touch "${OUT}/${OUT_MARK}"
-cp "$LIBHSA" "${OUT}/"
+# 4. Stage with the sonames the loader looks up: assembled completely in
+# ${WORK}/stage first, so a failure never leaves OUT half-replaced.
+STAGE="${WORK}/stage"
+rm -rf "$STAGE" && mkdir -p "$STAGE"
+cp "$LIBHSA" "${STAGE}/"
 link_as() { # link_as TARGET NAME: skip when the file already has that name.
-  [[ "$1" == "$2" ]] || ln -sfn "$1" "${OUT}/$2"
+  [[ "$1" == "$2" ]] || ln -sfn "$1" "${STAGE}/$2"
 }
 link_as "$(basename "$LIBHSA")" libhsa-runtime64.so.1
-cp "$LIBDXG" "${OUT}/"
+cp "$LIBDXG" "${STAGE}/"
 DXG_SONAME="$(readelf -d "$LIBDXG" | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p')"
 [[ -n "$DXG_SONAME" ]] || die "librocdxg has no SONAME"
 link_as "$(basename "$LIBDXG")" "$DXG_SONAME"
@@ -238,7 +251,7 @@ json_str() { # Escape for a JSON string (backslash, quote, control chars).
   s="${s//\"/\\\"}"
   printf '%s' "$s" | tr '\000-\037\177' ' '
 }
-cat > "${OUT}/PATCHED_ROCR.json" <<EOF
+cat > "${STAGE}/PATCHED_ROCR.json" <<EOF
 {
   "rocm_systems_tag": "${ROCM_TAG}",
   "host_rocm": "$(json_str "$HOST_ROCM")",
@@ -248,10 +261,15 @@ cat > "${OUT}/PATCHED_ROCR.json" <<EOF
   "patch_sha256": "$(sha "$PATCH")",
   "rocdxg_tag": "${ROCDXG_TAG}",
   "rocdxg_deb_sha256": "${ROCDXG_SHA256[$ROCDXG_TAG]}",
-  "libhsa_sha256": "$(sha "${OUT}/$(basename "$LIBHSA")")",
-  "librocdxg_sha256": "$(sha "${OUT}/$(basename "$LIBDXG")")",
+  "libhsa_sha256": "$(sha "${STAGE}/$(basename "$LIBHSA")")",
+  "librocdxg_sha256": "$(sha "${STAGE}/$(basename "$LIBDXG")")",
   "required_env": {"HSA_ENABLE_DXG_DETECTION": "1"}
 }
 EOF
+# Swap the complete set into OUT.
+rm -f "${OUT}"/libhsa-runtime64.so* "${OUT}"/librocdxg.so* "${OUT}/PATCHED_ROCR.json"
+touch "${OUT}/${OUT_MARK}"
+cp -a "${STAGE}"/. "${OUT}/"
+rm -rf "$STAGE"
 echo "build_patched_rocr: staged into ${OUT}"
 ls -l "$OUT"
