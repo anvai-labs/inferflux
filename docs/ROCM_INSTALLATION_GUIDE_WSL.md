@@ -319,18 +319,18 @@ threads whose own CPU mask had no allotted CPU, which are left alone).
 
 The interposer is linked only into ROCm-enabled (`ENABLE_ROCM=ON`) server
 builds; CUDA-only and CPU builds never route thread creation through it.
-Enable the tamer on ROCm hosts only: elsewhere every thread creation pays one
-`dladdr` lookup for nothing. Helper threads that a tamed thread starts get
+With the tamer off it passes every creation straight through. When on, each
+creation is classified with glibc's lock-free `_dl_find_object` (glibc
+2.35+; older glibc falls back to `dladdr`, which takes the loader lock).
+Helper threads that a tamed thread starts get
 back its original name and CPU mask.
 
 Limits: a cgroup cpuset later shrunk to exclude the chosen core moves the
 threads off it; a future ROCr that starts threads via `std::thread`, or that
 is loaded with `RTLD_DEEPBIND`, would not be recognized (nothing is tamed,
-nothing breaks), and neither would threads of a second, separately loaded
-copy of `libhsa-runtime64`; the allotment is read after shared-library constructors, so
-`OMP_PROC_BIND` narrowing the main thread first can shrink it (fails safe);
-the cached ROCr address range assumes libhsa is never unloaded (InferFlux
-never unloads its backends); sanitizer builds compile the interposer out
+nothing breaks); the allotment is read after shared-library constructors,
+so `OMP_PROC_BIND` narrowing the main thread first can shrink it (fails
+safe); sanitizer builds compile the interposer out
 (the startup log says so). Linux threads inherit their creator's name, so
 with the tamer off, spinning ROCr threads started from a first-party thread
 show that thread's `if-*` name in `top -H`; the counters are process-wide

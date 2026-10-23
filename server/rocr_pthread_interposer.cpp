@@ -100,16 +100,20 @@ extern "C" __attribute__((visibility("default"), used)) int
 pthread_create(pthread_t *__restrict thread,
                const pthread_attr_t *__restrict attr,
                void *(*start_routine)(void *), void *__restrict arg) noexcept {
-  // Saved first: the lazy dlsym, dladdr, getenv and malloc must not leak
+  // Saved first: the lazy dlsym, getenv, lookups and malloc must not leak
   // errno to the caller.
   const int saved_errno = errno;
   const PthreadCreateFn real = RealPthreadCreate();
+  if (!inferflux::RocrTamerEnabled()) {
+    errno = saved_errno;
+    return real(thread, attr, start_routine, arg); // Opt-in; off by default.
+  }
   const int core = inferflux::RocrTameCoreForNewThread(start_routine);
   // A tamed thread's children inherit its single-CPU mask and name: a
   // non-ROCr child gets them undone in the trampoline, a ROCr child is
   // tamed against what it would have inherited without the tamer.
   inferflux::InheritedState inherited;
-  inherited.creator_cpu = inferflux::InheritedPinToUndo(attr, &inherited);
+  inferflux::CaptureInheritedState(attr, &inherited);
   if (core >= 0 || inherited.creator_cpu >= 0) {
     if (auto *box = static_cast<TameBox *>(std::malloc(sizeof(TameBox)))) {
       *box = TameBox{start_routine, arg, core, inherited};

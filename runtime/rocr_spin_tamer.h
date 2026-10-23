@@ -55,13 +55,11 @@ namespace inferflux {
 // after shared-library constructors (libgomp with OMP_PROC_BIND can narrow
 // the main thread first; that fails safe: no pin, or a pin inside it); a
 // cgroup cpuset later shrunk to exclude the core moves the threads off it;
-// until the first ROCr thread is identified, each creation costs one dladdr
-// (it takes the dynamic loader's lock), after which a cached address range
-// is used; a future ROCr starting threads via std::thread (start routine in
-// libstdc++), or loaded with RTLD_DEEPBIND, or a second copy of libhsa,
-// would not be recognized (fails safe: nothing tamed); the cached range assumes
-// libhsa is never unloaded (InferFlux never unloads its backends); sanitizer
-// builds and non-x86_64/aarch64 targets compile the interposer out.
+// on glibc < 2.35 (no lock-free _dl_find_object) each creation's dladdr
+// takes the dynamic loader's lock; a future ROCr starting threads via
+// std::thread (start routine in libstdc++), or loaded with RTLD_DEEPBIND,
+// would not be recognized (fails safe: nothing tamed); sanitizer builds and
+// non-x86_64/aarch64 targets compile the interposer out.
 //
 // Knobs (env-only, see docs/CONFIG_REFERENCE.md section 10):
 //   INFERFLUX_ROCR_TAME       enable with 1 (default off)
@@ -80,7 +78,7 @@ bool IsRocrRuntimeObjectPath(const char *object_path);
 
 #if defined(__linux__)
 // True when `addr` lies in a loaded object accepted by
-// IsRocrRuntimeObjectPath (dladdr).
+// IsRocrRuntimeObjectPath (_dl_find_object; dladdr on glibc < 2.35).
 bool IsRocrRuntimeAddress(const void *addr) noexcept;
 
 // Creator side, called by the interposer for every pthread_create: the core
@@ -101,12 +99,16 @@ struct InheritedState {
 // tamed creator (creator_cpu -1 if none).
 void TameCurrentRocrThread(int core, const InheritedState &inherited) noexcept;
 
-// Creator side, for every thread being created: when the caller is a tamed
-// thread, fills *inherited (its pin, pre-pin mask and name, and whether
-// `attr` explicitly requests exactly that pin) and returns the pin;
-// otherwise returns -1.
-int InheritedPinToUndo(const pthread_attr_t *attr,
-                       InheritedState *inherited) noexcept;
+// Creator side, for every thread being created: fills *inherited. Its
+// creator_cpu is the caller's pin, or -1 when the caller is not a tamed
+// thread; otherwise also its pre-pin mask and name, and whether `attr`
+// explicitly requests exactly that pin.
+void CaptureInheritedState(const pthread_attr_t *attr,
+                           InheritedState *inherited) noexcept;
+
+// INFERFLUX_ROCR_TAME (read once). When false the interposer passes every
+// creation straight through.
+bool RocrTamerEnabled() noexcept;
 
 // Runs in a non-ROCr thread created by a tamed thread: restores the
 // creator's original name and, unless the attribute asked for the pin, the
