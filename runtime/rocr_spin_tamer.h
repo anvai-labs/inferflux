@@ -1,128 +1,89 @@
 #pragma once
 
-#include <cstdint>
-#include <functional>
-#include <string>
+#include <vector>
 
 namespace inferflux {
 
-// Confine ROCm/ROCr HSA-runtime busy-spin poller threads (AsyncEventsLoop).
+// ROCr thread tamer (WSL2/ROCm AsyncEventsLoop workaround).
 //
-// ROCm 7.x libhsa-runtime64 spawns two poller threads at hipInit() that
-// busy-spin at 100% CPU each for the process lifetime (upstream fix
-// rocm-systems#7898 unreleased; no env knob disables the loop). The tamer
-// co-pins them onto one core (bounding the cost from 2 cores to 1) and sets
-// nice 19. Not SCHED_IDLE: the same thread runs HSA async signal handlers,
-// and native Linux enforces SCHED_IDLE strictly enough to starve it; a
-// nice-19 thread still gets a share of every CFS period. (WSL2 enforces
-// neither for service-cgroup threads; the pin is the load-bearing part.)
-// Pinning the caller around hipInit() instead is not viable: ROCr widens its
-// threads' affinity to every CPU, and disabling that override
-// (HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0) under a pinned caller aborts.
+// ROCm 7.x libhsa-runtime64 starts AsyncEventsLoop poller threads at
+// hipInit() that busy-spin at 100% CPU each for the process lifetime on
+// WSL2/gfx1201 (upstream fix rocm-systems#7898 unreleased; no HSA_* knob
+// disables the loop). The tamer bounds that cost to one core.
 //
-// Identification is positive, not heuristic, because confinement is
-// irreversible:
-//  1. Prefilter (selects threads to probe): over a ~1.2 s window the thread
-//     never blocks (runnable for >= 80% of the window by schedstat, which is
-//     immune to host load; user time when schedstat is absent or inert),
-//     spends ~no time in the kernel, and makes zero voluntary context
-//     switches. Thread names are ignored: threads inherit their creator's.
-//  2. Proof (decides confinement): the thread is interrupted with a probe
-//     signal up to 3 times and confined only if at least 2 sampled
-//     instruction pointers resolve (dladdr) into the ROCr runtime library.
-//     Before each signal the thread must still be the same thread (start
-//     time), running/runnable, and neither block nor ignore the probe.
-//     Residual risk, minimized not eliminated: the state check and the
-//     signal are not atomic, and a probe that times out stays pending, so a
-//     non-ROCr spinner that enters a syscall in that window can see one
-//     EINTR (SA_RESTART covers most calls; epoll/poll/timed waits do not).
-// A thread not proven (other code, or no reply) backs off for 1, 2, 4, ...
-// up to 12 scans before it is probed again, so a busy third-party worker
-// (ggml/OpenMP/BLAS) receives at most 2 SA_RESTART probe signals per
-// back-off period and is never confined, while a real poller that was
-// unlucky once is still caught later. Confined threads are remembered by
-// (tid, start time); a TID reused before confinement is detected by
-// re-checking the start time. At most 8 live threads are confined at once
-// (slots free up when confined threads exit). All confined threads share
-// one pin core, chosen once from the server's affinity mask (captured before
-// main runs, so it is the operator's taskset/cgroup allotment; ROCr widens
-// its own threads to every CPU, so their masks say nothing about it). With
-// no usable allotment, or an allotment of a single CPU, nothing is pinned
-// (two 100% spinners must not be piled onto the server's only CPU). A
-// thread whose mask excludes the chosen core is left unconfined rather than
-// pinned elsewhere; a
-// thread counts as confined only once pinned (the pin is the bound; nice is
-// not enforced on WSL2). A proven poller that cannot be confined backs off
-// like an unproven thread instead of being re-probed every scan. If the
-// probe signal is owned by another handler (or set to SIG_IGN) or the
-// architecture is unsupported, nothing is confined.
+// Identification is exact and happens at thread creation: inferfluxd defines
+// pthread_create (server/rocr_pthread_interposer.cpp, linked only into the
+// server binary), and every thread whose start routine lies in
+// libhsa-runtime64 is started through a trampoline that, in the new thread,
+// pins it to one shared core, sets nice 19 and names it "rocr-hsa-N". No
+// signals, no /proc scans, no background thread. Every libhsa-created thread
+// is tamed (they all start through one ROCr-internal routine, so pollers
+// cannot be told apart from ROCr's other, mostly blocked, threads).
 //
-// Residual risks, documented rather than eliminated: (1) the main thread's
-// mask is read during static initialization; a shared-library constructor
-// that binds it first (libgomp with OMP_PROC_BIND/GOMP_CPU_AFFINITY) narrows
-// the captured allotment, which fails safe (no pin, or a pin inside it);
-// (2) a microsecond window between the final start-time re-check and the
-// affinity/nice/rename syscalls cannot be closed without pidfds for
-// threads; (3) a library consuming SIGRTMIN+5 via sigwaitinfo/signalfd
-// while leaving it at SIG_DFL would have it intercepted.
-// Follow-up direction: interposing pthread_create to record threads whose
-// start routine lies in libhsa-runtime64 would identify pollers at creation
-// with no signals or scans.
+// Why a pin applied in the new thread: ROCr passes an explicit all-CPU
+// affinity through pthread_attr, so a pinned creator's mask is not
+// inherited, and disabling ROCr's override (HSA_OVERRIDE_CPU_AFFINITY_DEBUG=0)
+// under a pinned creator aborts. libhsa never changes a thread's affinity
+// after creation (its only affinity import is pthread_attr_setaffinity_np).
+// Why nice 19 and not SCHED_IDLE: the same thread runs HSA async signal
+// handlers, and native Linux enforces SCHED_IDLE strictly enough to starve
+// it; nice 19 still gets a share of every CFS period. On WSL2 neither is
+// enforced for service-cgroup threads; the pin is the load-bearing bound.
 //
-// Known limit (why the tamer is opt-in): the proof shows a thread executes
-// ROCr code, not which ROCr role it plays. InferFlux's own threads are
-// excluded (runtime/thread_name.h), but another runtime-internal thread that
-// busy-waits inside libhsa-runtime64 for a whole window would be confined
-// too. Validated on WSL2/gfx1201 under real inference: only the two pollers
-// were ever confined.
+// Core choice: the server's affinity allotment is the main thread's mask,
+// captured during static initialization (the operator's taskset/cgroup).
+// Fewer than two allotted CPUs -> never pin (two spinners must not be piled
+// onto the server's only CPU). Otherwise a valid INFERFLUX_ROCR_TAME_CORE
+// inside the allotment, else the highest allotted CPU.
 //
-// Linux-only; every entry point is a no-op elsewhere.
+// Residuals: a cgroup cpuset later shrunk to exclude the core moves the
+// threads off it; a future ROCr starting threads via std::thread (start
+// routine in libstdc++) would not be recognized (fails safe: nothing tamed);
+// sanitizer builds compile the interposer out.
 //
 // Knobs (env-only, see docs/CONFIG_REFERENCE.md section 10):
-//   INFERFLUX_ROCR_TAME       enable (default: disabled; opt-in with 1)
-//   INFERFLUX_ROCR_TAME_CORE  pin target CPU index (default: highest CPU in
-//                             the server's affinity mask; values outside it
-//                             warn and fall back; pinning skipped when a
-//                             thread may run on only one CPU)
+//   INFERFLUX_ROCR_TAME       enable with 1 (default off)
+//   INFERFLUX_ROCR_TAME_CORE  pin target CPU (default: highest allotted CPU)
 
-// The PC probe uses SIGRTMIN + this offset (exposed for tests).
-constexpr int kRocrTamerProbeSignalOffset = 5;
+// Pure. CPU to pin ROCr runtime threads on, or -1 to never pin. Fewer than
+// two allotted CPUs -> -1. A `core_env` naming an allotted CPU wins;
+// otherwise the highest allotted CPU. Sets *core_env_rejected when
+// `core_env` is non-empty but unparseable or not allotted.
+int ChooseRocrTameCore(const std::vector<int> &allotted, const char *core_env,
+                       bool *core_env_rejected = nullptr);
 
-struct RocrSpinTamerOptions {
-  // Fast path: skip the scan unless the ROCr runtime is loaded. Tests
-  // disable it to exercise the scanner without a ROCm runtime.
-  bool require_hsa_runtime = true;
-  // A sampled instruction pointer counts as the owner's when it lies in a
-  // loaded object whose path contains this substring.
-  std::string code_owner = "libhsa-runtime64";
-  // Test seam: when set, decides PC ownership instead of `code_owner`.
-  std::function<bool(std::uintptr_t pc)> pc_owner;
-  // Test seam: when set, only threads it accepts are considered (and so
-  // probed), keeping tests from signalling unrelated threads in-process.
-  std::function<bool(int tid)> candidate_filter; // tid: Linux pid_t.
-};
+// Pure. True when the basename of `object_path` starts with
+// "libhsa-runtime64" (a directory of that name does not count).
+bool IsRocrRuntimeObjectPath(const char *object_path);
 
-// Test seam: forgets the process-wide pin core and captured server mask, so
-// a test can exercise core selection independently of earlier tests.
-void ResetRuntimeSpinTamerPinForTesting();
+#if defined(__linux__)
+// True when `addr` lies in a loaded object accepted by
+// IsRocrRuntimeObjectPath (dladdr).
+bool IsRocrRuntimeAddress(const void *addr) noexcept;
 
-// Synchronous scan: samples for ~1.2 s, confines proven ROCr spinners, and
-// returns the number confined (0 when disabled, unsupported, or none found).
-int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options = {});
+// Creator side, called by the interposer for every pthread_create: the core
+// to pin the new thread on, or -1 to create it untouched. No logging.
+int RocrTameCoreForNewThread(void *(*start_routine)(void *)) noexcept;
 
-// Starts the background tamer once (idempotent; never blocks or throws).
-// Call after startup has initialized backends. The worker scans
-// immediately, again after ~10 s and ~60 s, then every ~5 min for the
-// process lifetime, so pollers created lazily or by a model loaded at
-// runtime are usually caught within one period (a thread whose probe was
-// unproven or timed out backs off, so it can take up to ~1 h). Each scan
-// also restores the pin of any confined thread whose affinity was widened
-// again. Starts nothing unless
-// INFERFLUX_ROCR_TAME=1, or when libhsa-runtime64 is not loaded (it is
-// linked into ROCm builds, so CPU-only and CUDA-only builds get no thread). The
-// worker blocks on a condition variable between scans and is never destroyed:
-// an atexit hook stops and joins it before the logger and metrics registry are
-// torn down.
-void StartRuntimeSpinTamer() noexcept;
+// Runs in the new thread before its start routine: pin, nice 19, rename,
+// count. No cancellation points, no logging, no allocation.
+void TameCurrentRocrThread(int core) noexcept;
+#endif
+
+// Called by the interposer's static initializer with its own address, so
+// ReportRocrTamerStatus can check the symbol is actually bound.
+void NoteRocrPthreadInterposerInstalled(void *interposer_fn) noexcept;
+
+// Called once from main: logs enabled/core/allotment/interposer state and the
+// count so far; warns on a rejected INFERFLUX_ROCR_TAME_CORE, a single-CPU
+// allotment, or an inactive interposer. No-op when disabled.
+void ReportRocrTamerStatus();
+
+// Number of threads tamed so far (also counted in GlobalMetrics()).
+unsigned long long RocrTamedThreadCount() noexcept;
+
+// Test seam: re-read the env and re-capture the allotment from the calling
+// thread.
+void ResetRocrTamerForTesting();
 
 } // namespace inferflux

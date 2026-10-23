@@ -2788,9 +2788,10 @@ std::string MetricsRegistry::RenderPrometheus() const {
     }
   }
 
-  // --- Runtime hygiene (rocr spin tamer) ---
-  out << "# HELP inferflux_runtime_spin_threads_confined_total Runtime "
-         "busy-spin threads demoted and co-parked by the ROCr spin tamer\n";
+  // --- Runtime hygiene (ROCr thread tamer) ---
+  out << "# HELP inferflux_runtime_spin_threads_confined_total ROCr runtime "
+         "(libhsa-runtime64) threads pinned to the shared tame core at "
+         "creation\n";
   out << "# TYPE inferflux_runtime_spin_threads_confined_total counter\n";
   out << "inferflux_runtime_spin_threads_confined_total "
       << runtime_spin_threads_confined_.load() << "\n";

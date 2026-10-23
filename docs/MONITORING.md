@@ -34,7 +34,7 @@ flowchart LR
 | Distributed KV health | `inferflux_disagg_kv_tickets_total{stage=...}`, `inferflux_disagg_kv_timeout_streak`, `inferflux_disagg_kv_timeout_debt` |
 | Cache execution path | `inferflux_cache_execution_path_total{path=...}` | `phased`, `full_generate`, `full_generate_images` -- the bypass population is visible directly; `INFERFLUX_DISABLE_PHASED_LOGPROBS=1` moves logprobs traffic back to `full_generate` (ADR-0007 Stage 1) |
 | Cache reuse | `inferflux_prefix_hits_total`, `inferflux_prefix_partial_hits_total`, `inferflux_prefix_matched_tokens_total`, `inferflux_kv_prefix_reuse_total` |
-| ROCr spin-thread confinement | `inferflux_runtime_spin_threads_confined_total` — ROCr `AsyncEventsLoop` busy-spin pollers proven (signal-sampled instruction pointers) and confined to one core; cumulative — grows by `2` per ROCr runtime initialization on WSL2/gfx1201 (more after unload/reload cycles), stays `0` elsewhere. Confined threads appear as `rocr-spin-N` in `top -H`. Opt-in via `INFERFLUX_ROCR_TAME=1`; scans run at startup, +10 s, +60 s, then every 5 min (`docs/ROCM_INSTALLATION_GUIDE_WSL.md`) |
+| ROCr thread confinement | `inferflux_runtime_spin_threads_confined_total` — threads started by `libhsa-runtime64` that were pinned to the shared tame core at creation (opt-in `INFERFLUX_ROCR_TAME=1`); cumulative — grows by about 3 per ROCr runtime initialization on WSL2/gfx1201, stays `0` elsewhere. Tamed threads appear as `rocr-hsa-N` in `top -H`; the `rocr_tamer` startup log line reports the core (`docs/ROCM_INSTALLATION_GUIDE_WSL.md`) |
 
 ## Cache counter scopes
 
@@ -242,7 +242,7 @@ nsys profile -t cuda,nvtx -o /tmp/inferflux_profile \
 | VRAM pressure | native KV planning metrics + dequant policy | tighten budget or keep memory-first dequant policy |
 | Cache not helping | prefix/kv reuse counters | validate warmup patterns and prefix-affinity policy |
 | Selected operator never executes | dispatch divergence metric plus `parse_dispatch_trace.py` | check `dispatch_catalog.h`, the executor allowlist, and `/readyz` down-rank fields |
-| Idle ROCm server burns ~2 CPU cores | `top -H -p $(pidof inferfluxd)` for threads at ~100% CPU (ROCr pollers may carry an inherited `if-*` name); `inferflux_runtime_spin_threads_confined_total` | expect `rocr-spin-N` threads sharing one core, typically within minutes (a poller still busy at one scan is caught by the next; back-off after an unproven probe can delay it up to ~1 h); if the counter stays `0`, check `INFERFLUX_ROCR_TAME` and `rocr_tamer` debug logs |
+| Idle ROCm server burns ~2 CPU cores | `top -H -p $(pidof inferfluxd)` for threads at ~100% CPU; `inferflux_runtime_spin_threads_confined_total`; the `rocr_tamer` startup log line | with `INFERFLUX_ROCR_TAME=1`, expect `rocr-hsa-N` threads sharing one core from startup; if the counter stays `0`, check the env var and the startup line ("interposer is not active" means e.g. a sanitizer build; a single-CPU allotment pins nothing) |
 
 ## 9) Related Docs
 

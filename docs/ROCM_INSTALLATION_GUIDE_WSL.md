@@ -273,41 +273,47 @@ and no HSA environment knob disables the loop (`HSA_ENABLE_SLEEP`,
 nice are additionally not enforced for service-cgroup threads, so CPU
 affinity is the only effective mitigation.
 
-With `INFERFLUX_ROCR_TAME=1`, `inferfluxd` applies it from a background thread that scans
-at startup (after models load), again after ~10 s and ~60 s, and then every
-~5 min, so pollers created lazily or by a model loaded at runtime are caught
-within one period. Processes without `libhsa-runtime64` loaded (CPU-only
-and CUDA-only builds) start no tamer thread at all. Over a ~1.2 s window it shortlists threads
-that never block: runnable for the whole window (on-CPU plus run-queue time
-from `/proc/.../schedstat`, so the check holds on a busy host), ~no kernel
-time, and zero voluntary context switches. Thread names are ignored (Linux
-threads inherit their creator's name). Each shortlisted thread is then
-interrupted with a probe signal (up to 3 times; threads that block or
-ignore it are never signalled) and confined only if at least 2 sampled
-instruction pointers resolve into `libhsa-runtime64`. InferFlux's own
-threads register themselves and are never probed, even when an inference
-thread busy-waits inside `libhsa-runtime64` (as `hipStreamSynchronize` does
-on WSL2). A busy CPU threadpool or other non-ROCr thread is never confined; a thread that is not proven
-backs off for 1, 2, 4, ... up to 12 scans (~1 h) before it is probed again,
-so it receives at most 2 `SA_RESTART` probe signals per back-off period. At most 8 live
-threads are confined at once. InferFlux's own threads are named `if-*` for
-`top -H` readability. Confined
-threads are co-pinned onto a single core, bounding the cost from 2 cores to
-1, and set to nice 19 (not `SCHED_IDLE`, which on native Linux can starve
-the HSA signal-handler thread these pollers also run). GPU sync latency is unaffected
-(verified empirically under full CPU contention).
+With `INFERFLUX_ROCR_TAME=1`, `inferfluxd` confines these threads **at
+creation**. The server binary defines `pthread_create`, so every thread
+`libhsa-runtime64` starts goes through it; a thread whose start routine lies
+in `libhsa-runtime64` is started through a small trampoline that, in the new
+thread, pins it to one shared core, sets nice 19, and names it `rocr-hsa-N`.
+Identification is exact (the start routine's owning library), so no other
+thread — InferFlux's own or a third-party threadpool — is ever touched, and
+there are no signals, `/proc` scans, or background threads. ROCr starts its
+threads with an explicit all-CPU affinity, and the pin is applied after that,
+inside the new thread; libhsa never changes a thread's affinity afterwards.
+
+All `libhsa-runtime64` threads are pinned (about three per runtime
+initialization: the two pollers and a short-lived helper), because they share
+one ROCr-internal start routine. Nice 19 rather than `SCHED_IDLE`: on native
+Linux `SCHED_IDLE` can starve the HSA signal-handler work these threads also
+run. GPU sync latency is unaffected (verified empirically under full CPU
+contention).
+
+The core is chosen from the server's own affinity allotment (its
+`taskset`/cgroup mask, read at process start): a valid
+`INFERFLUX_ROCR_TAME_CORE` inside it, else its highest CPU. A server allotted
+a single CPU pins nothing (two spinners must not share its only CPU).
 
 Knobs (see `docs/CONFIG_REFERENCE.md` section 10):
 
-- `INFERFLUX_ROCR_TAME=1` enables the tamer. It is **off by default**: it
-  signals and confines threads InferFlux does not own, so it is opt-in for
+- `INFERFLUX_ROCR_TAME=1` enables the tamer. It is **off by default**, since
+  it changes the scheduling of threads InferFlux does not own; enable it on
   hosts that show the spin (e.g. WSL2 + gfx1201).
-- `INFERFLUX_ROCR_TAME_CORE=<n>` pins the spin threads to CPU `n` (default:
-  highest CPU in the server's affinity mask).
+- `INFERFLUX_ROCR_TAME_CORE=<n>` pins to CPU `n` (default: highest CPU in the
+  server's affinity mask).
 
-Verify: `top -H -p $(pidof inferfluxd)` — two `rocr-spin-N` threads should
-share a single core (~100% combined instead of ~200%), and
-`inferflux_runtime_spin_threads_confined_total` appears in `/metrics`.
+Verify: the startup log line from `rocr_tamer` reports the core and that the
+interposer is active; `top -H -p $(pidof inferfluxd)` shows the `rocr-hsa-N`
+pollers sharing a single core (~100% combined instead of ~200%); and
+`inferflux_runtime_spin_threads_confined_total` in `/metrics` counts the
+tamed threads.
+
+Limits: a cgroup cpuset later shrunk to exclude the chosen core moves the
+threads off it; a future ROCr that starts threads via `std::thread` would not
+be recognized (nothing is tamed, nothing breaks); sanitizer builds compile
+the interposer out (the startup log says so).
 
 ## Supported AMD GPUs
 

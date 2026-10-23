@@ -1749,12 +1749,11 @@ int main(int argc, char **argv) {
     inferflux::RunStartupAdvisor(advisor_ctx);
   }
 
-  // ROCr spin-thread tamer (WSL2/ROCm AsyncEventsLoop workaround). Started
-  // after model loads and the startup advisor, the last points that may
-  // initialize HIP during startup; its own schedule (now, +10 s, +60 s, then
-  // every 5 min) catches HIP initialized later, e.g. by a model loaded at
-  // runtime. Background thread; never blocks startup.
-  inferflux::StartRuntimeSpinTamer();
+  // ROCr thread tamer (WSL2/ROCm AsyncEventsLoop workaround): threads started
+  // by libhsa-runtime64 are confined at creation by inferfluxd's
+  // pthread_create (server/rocr_pthread_interposer.cpp). This only reports
+  // the configuration and how many threads were tamed so far.
+  inferflux::ReportRocrTamerStatus();
 
   int http_workers = 16; // Increased from 4 for better concurrent throughput
   if (const char *env_workers = std::getenv("INFERFLUX_HTTP_WORKERS")) {

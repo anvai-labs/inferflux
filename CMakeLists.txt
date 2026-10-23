@@ -570,7 +570,8 @@ target_link_libraries(inferflux_core PUBLIC OpenSSL::Crypto OpenSSL::SSL yaml-cp
 if(UNIX AND NOT APPLE)
   target_link_libraries(inferflux_core PUBLIC rt)
 endif()
-# dlopen/dladdr (runtime/rocr_spin_tamer.cpp) live in libdl on glibc < 2.34.
+# dlopen/dladdr/dlsym (runtime/rocr_spin_tamer.cpp,
+# server/rocr_pthread_interposer.cpp) live in libdl on glibc < 2.34.
 target_link_libraries(inferflux_core PUBLIC ${CMAKE_DL_LIBS})
 
 # §2.2 Multimodal support via libmtmd (ENABLE_MTMD=OFF by default)
@@ -632,6 +633,20 @@ elseif(APPLE)
 else()
   target_link_libraries(inferfluxd PRIVATE
     -Wl,--whole-archive inferflux_core -Wl,--no-whole-archive)
+endif()
+
+# ROCr thread tamer: inferfluxd defines pthread_create so threads started by
+# libhsa-runtime64 are recognized at creation (runtime/rocr_spin_tamer.h).
+# Never part of inferflux_core, which inferctl/benchmarks/tests also link.
+# The dynamic list exports the symbol so libhsa binds to it.
+set(INFERFLUX_ROCR_INTERPOSER_DYNLIST
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocr_pthread_interposer.dynlist")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_sources(inferfluxd PRIVATE server/rocr_pthread_interposer.cpp)
+  target_link_options(inferfluxd PRIVATE
+    "LINKER:--dynamic-list=${INFERFLUX_ROCR_INTERPOSER_DYNLIST}")
+  set_property(TARGET inferfluxd APPEND PROPERTY LINK_DEPENDS
+    "${INFERFLUX_ROCR_INTERPOSER_DYNLIST}")
 endif()
 
 add_executable(inferctl cli/main.cpp)
@@ -909,6 +924,45 @@ add_test(NAME ShmTransportTests COMMAND inferflux_tests "[shm_transport]")
 set_tests_properties(ShmTransportTests PROPERTIES LABELS shm_transport)
 add_test(NAME RocrSpinTamerTests COMMAND inferflux_tests "[rocr_spin_tamer]")
 set_tests_properties(RocrSpinTamerTests PROPERTIES LABELS rocr_spin_tamer)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  find_package(Threads REQUIRED)
+  # Stand-in for the ROCr runtime: a dlopen-only module whose basename starts
+  # with "libhsa-runtime64" (so threads it starts look like ROCr's), built in
+  # its own directory with a distinct name so it can never shadow the real
+  # libhsa-runtime64.so.1.
+  add_library(inferflux_fake_hsa_runtime MODULE
+    tests/support/fake_hsa_runtime.cpp)
+  set_target_properties(inferflux_fake_hsa_runtime PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "libhsa-runtime64-inferflux-test"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests/fake_hsa"
+    CXX_VISIBILITY_PRESET hidden)
+  target_link_libraries(inferflux_fake_hsa_runtime PRIVATE Threads::Threads)
+
+  # Exercises the real interposer in its own process (interposing in
+  # inferflux_tests would affect every other test).
+  add_executable(rocr_interposer_tests
+    tests/unit/test_rocr_interposer.cpp
+    server/rocr_pthread_interposer.cpp
+    external/catch2/catch_amalgamated.cpp)
+  target_include_directories(rocr_interposer_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/external ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+  target_compile_definitions(rocr_interposer_tests PRIVATE INFERFLUX_TESTING
+    INFERFLUX_FAKE_HSA_RUNTIME_PATH="$<TARGET_FILE:inferflux_fake_hsa_runtime>")
+  target_link_libraries(rocr_interposer_tests PRIVATE
+    inferflux_core Threads::Threads ${CMAKE_DL_LIBS})
+  target_link_options(rocr_interposer_tests PRIVATE
+    "LINKER:--dynamic-list=${INFERFLUX_ROCR_INTERPOSER_DYNLIST}")
+  set_property(TARGET rocr_interposer_tests APPEND PROPERTY LINK_DEPENDS
+    "${INFERFLUX_ROCR_INTERPOSER_DYNLIST}")
+  add_dependencies(rocr_interposer_tests inferflux_fake_hsa_runtime)
+  # Targeted builds (--target inferflux_tests, coverage) must also build what
+  # CTest runs (same pattern as the TLS probe below).
+  add_dependencies(inferflux_tests rocr_interposer_tests)
+  add_test(NAME RocrInterposerTests COMMAND rocr_interposer_tests)
+  set_tests_properties(RocrInterposerTests PROPERTIES
+    LABELS rocr_spin_tamer TIMEOUT 120)
+endif()
 # Isolated real-TLS fixture; no model or GPU runtime is needed.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)

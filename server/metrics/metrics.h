@@ -121,8 +121,8 @@ public:
   void SetRocmMemoryUsageMB(double memory_mb);
   void RecordRocmDeviceProperties(int device_id, const std::string &arch);
 
-  // Runtime hygiene (rocr spin tamer): number of busy-spin runtime threads
-  // demoted and co-parked onto one core.
+  // Runtime hygiene (ROCr thread tamer): libhsa-runtime64 threads pinned to
+  // the shared tame core at creation.
   void RecordRuntimeSpinThreadsConfined(int confined);
 
   // KV transfer latency (§2.5 item 12): elapsed time from
@@ -408,8 +408,8 @@ private:
   std::atomic<double> rocm_memory_mb_{0.0};
   std::string rocm_device_arch_{"unknown"};
 
-  // Runtime hygiene (rocr spin tamer): cumulative busy-spin threads
-  // confined. Plain atomic so MetricsRegistry::Reset() restores it.
+  // Runtime hygiene (ROCr thread tamer): cumulative ROCr runtime threads
+  // pinned at creation. Plain atomic so MetricsRegistry::Reset() restores it.
   std::atomic<uint64_t> runtime_spin_threads_confined_{0};
 
   // Latency histograms.
