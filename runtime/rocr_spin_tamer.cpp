@@ -49,6 +49,8 @@ thread_local int t_tamed_cpu = -1;
 // A tamed thread's mask before the pin: what its children would have
 // inherited without the tamer.
 thread_local cpu_set_t t_pre_pin_mask;
+// ...and its name before the rename, which its children inherit.
+thread_local char t_pre_name[16];
 
 void CaptureAllotment() {
   cpu_set_t mask;
@@ -168,9 +170,11 @@ int ChooseRocrTameCore(const std::vector<int> &allotted, const char *core_env,
   }
   char *end = nullptr;
   errno = 0;
-  const long requested = std::strtol(core_env, &end, 10);
-  const bool parsed = errno == 0 && end != core_env && *end == '\0' &&
-                      requested >= 0 && requested <= INT_MAX;
+  // Digits only: strtol alone would also accept leading spaces and a sign.
+  const bool digits = *core_env >= '0' && *core_env <= '9';
+  const long requested = digits ? std::strtol(core_env, &end, 10) : -1;
+  const bool parsed = digits && errno == 0 && *end == '\0' && requested >= 0 &&
+                      requested <= INT_MAX;
   if (parsed) {
     for (int cpu : allotted) {
       if (cpu == requested) {
@@ -226,7 +230,7 @@ int RocrTameCoreForNewThread(void *(*start_routine)(void *)) noexcept {
   }
 }
 
-void TameCurrentRocrThread(int core) noexcept {
+void TameCurrentRocrThread(int core, const InheritedState &inherited) noexcept {
   int old_cancel_state = 0;
   (void)pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old_cancel_state);
   const int saved_errno = errno;
@@ -235,6 +239,14 @@ void TameCurrentRocrThread(int core) noexcept {
   int target = -1;
   if (core >= 0 && core < CPU_SETSIZE &&
       sched_getaffinity(0, sizeof(own), &own) == 0) {
+    // Created by a tamed thread without its own affinity: its mask is the
+    // creator's pin; treat the creator's pre-pin mask as its own so that
+    // neither the target nor what its children get back is the pin.
+    if (inherited.creator_cpu >= 0 && !inherited.explicit_affinity &&
+        CPU_COUNT(&own) == 1 && CPU_ISSET(inherited.creator_cpu, &own) &&
+        CPU_COUNT(&inherited.mask) > 0) {
+      own = inherited.mask;
+    }
     if (CPU_ISSET(core, &own)) {
       target = core;
     } else {
@@ -264,6 +276,12 @@ void TameCurrentRocrThread(int core) noexcept {
       char name[16];
       std::snprintf(name, sizeof(name), "rocr-hsa-%d",
                     g_next_name.fetch_add(1) % 100000);
+      if (inherited.creator_cpu >= 0 && inherited.name[0] != '\0') {
+        std::memcpy(t_pre_name, inherited.name, sizeof(t_pre_name));
+      } else if (pthread_getname_np(pthread_self(), t_pre_name,
+                                    sizeof(t_pre_name)) != 0) {
+        t_pre_name[0] = '\0';
+      }
       SetCurrentThreadName(name);
       t_pre_pin_mask = own;
       t_tamed_cpu = target;
@@ -279,37 +297,41 @@ void TameCurrentRocrThread(int core) noexcept {
 }
 
 int InheritedPinToUndo(const pthread_attr_t *attr,
-                       cpu_set_t *restore_mask) noexcept {
+                       InheritedState *inherited) noexcept {
   const int creator_cpu = t_tamed_cpu;
   if (creator_cpu < 0) {
     return -1;
   }
-  *restore_mask = t_pre_pin_mask;
-  if (attr == nullptr) {
-    return creator_cpu;
-  }
-  // glibc reports "no cpuset in the attribute" as all CPUs, so a single-CPU
-  // answer equal to the creator's pin is an explicit request to keep.
-  cpu_set_t requested;
-  CPU_ZERO(&requested);
-  if (pthread_attr_getaffinity_np(attr, sizeof(requested), &requested) == 0 &&
-      CPU_COUNT(&requested) == 1 && CPU_ISSET(creator_cpu, &requested)) {
-    return -1;
+  inherited->mask = t_pre_pin_mask;
+  std::memcpy(inherited->name, t_pre_name, sizeof(inherited->name));
+  inherited->explicit_affinity = false;
+  if (attr != nullptr) {
+    // glibc reports "no cpuset in the attribute" as all CPUs, so a
+    // single-CPU answer equal to the creator's pin is an explicit request.
+    cpu_set_t requested;
+    CPU_ZERO(&requested);
+    inherited->explicit_affinity =
+        pthread_attr_getaffinity_np(attr, sizeof(requested), &requested) == 0 &&
+        CPU_COUNT(&requested) == 1 && CPU_ISSET(creator_cpu, &requested);
   }
   return creator_cpu;
 }
 
-void RestoreInheritedScheduling(int creator_cpu,
-                                const cpu_set_t &restore_mask) noexcept {
+void RestoreInheritedScheduling(const InheritedState &inherited) noexcept {
   const int saved_errno = errno;
+  const int creator_cpu = inherited.creator_cpu;
+  const cpu_set_t &restore_mask = inherited.mask;
+  // The creator's rocr-hsa-N name was inherited; give back the name it had.
+  if (creator_cpu >= 0 && inherited.name[0] != '\0') {
+    SetCurrentThreadName(inherited.name);
+  }
   cpu_set_t own;
   CPU_ZERO(&own);
-  // Still exactly the creator's pin, i.e. inherited (explicit requests for
-  // that CPU were filtered out by InheritedPinToUndo): give the thread the
+  // Still exactly the creator's pin and not asked for: give the thread the
   // mask it would have inherited without the tamer.
-  if (creator_cpu >= 0 && sched_getaffinity(0, sizeof(own), &own) == 0 &&
-      CPU_COUNT(&own) == 1 && CPU_ISSET(creator_cpu, &own) &&
-      CPU_COUNT(&restore_mask) > 0) {
+  if (creator_cpu >= 0 && !inherited.explicit_affinity &&
+      sched_getaffinity(0, sizeof(own), &own) == 0 && CPU_COUNT(&own) == 1 &&
+      CPU_ISSET(creator_cpu, &own) && CPU_COUNT(&restore_mask) > 0) {
     (void)sched_setaffinity(0, sizeof(restore_mask), &restore_mask);
   }
   errno = saved_errno;

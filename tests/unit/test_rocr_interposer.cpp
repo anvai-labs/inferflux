@@ -52,6 +52,7 @@ struct FakeRuntime {
   SpawnWithAttrFn spawn_with_attr = nullptr;
   SymbolFn symbol = nullptr;
   SpawnParentFn spawn_parent = nullptr;
+  void *handle = nullptr;
 };
 
 const FakeRuntime &Fake() {
@@ -61,6 +62,7 @@ const FakeRuntime &Fake() {
     // executable's pthread_create must still win.
     void *handle =
         dlopen(INFERFLUX_FAKE_HSA_RUNTIME_PATH, RTLD_NOW | RTLD_LOCAL);
+    f.handle = handle;
     if (handle != nullptr) {
       f.spawn = reinterpret_cast<SpawnFn>(dlsym(handle, "fake_hsa_spawn"));
       f.spawn_with_attr = reinterpret_cast<SpawnWithAttrFn>(
@@ -72,6 +74,16 @@ const FakeRuntime &Fake() {
     return f;
   }();
   return fake;
+}
+
+// Defined by server/rocr_pthread_interposer.cpp: 0 where the interposer is
+// compiled out (sanitizer builds).
+extern "C" const int inferflux_rocr_pthread_interposer_compiled;
+
+void RequireInterposer() {
+  if (inferflux_rocr_pthread_interposer_compiled == 0) {
+    SKIP("the pthread_create interposer is compiled out of this build");
+  }
 }
 
 std::vector<int> AllowedCpus() {
@@ -127,6 +139,7 @@ FakeHsaReport SpawnAndJoin(int mode = kReport) {
 
 TEST_CASE("interposer: libraries bind pthread_create to the executable",
           "[rocr_interposer]") {
+  RequireInterposer();
   REQUIRE(Fake().spawn != nullptr);
   REQUIRE(dlsym(RTLD_DEFAULT, "pthread_create") ==
           reinterpret_cast<void *>(&pthread_create));
@@ -135,6 +148,7 @@ TEST_CASE("interposer: libraries bind pthread_create to the executable",
 
 TEST_CASE("interposer: tamer off leaves runtime threads untouched",
           "[rocr_interposer]") {
+  RequireInterposer();
   for (const char *off : {static_cast<const char *>(nullptr), "0"}) {
     TamerEnv env(off, nullptr);
     const unsigned long long before = inferflux::RocrTamedThreadCount();
@@ -150,6 +164,7 @@ TEST_CASE("interposer: tamer off leaves runtime threads untouched",
 
 TEST_CASE("interposer: tames runtime threads at creation",
           "[rocr_interposer]") {
+  RequireInterposer();
   const std::vector<int> cpus = AllowedCpus();
   if (cpus.size() < 2) {
     SKIP("needs >= 2 allowed CPUs to observe a pin");
@@ -172,6 +187,7 @@ TEST_CASE("interposer: tames runtime threads at creation",
 
 TEST_CASE("interposer: INFERFLUX_ROCR_TAME_CORE override and fallback",
           "[rocr_interposer]") {
+  RequireInterposer();
   const std::vector<int> cpus = AllowedCpus();
   if (cpus.size() < 2) {
     SKIP("needs >= 2 allowed CPUs to observe a pin");
@@ -190,6 +206,7 @@ TEST_CASE("interposer: INFERFLUX_ROCR_TAME_CORE override and fallback",
 
 TEST_CASE("interposer: threads the executable starts are never tamed",
           "[rocr_interposer]") {
+  RequireInterposer();
   TamerEnv env("1", nullptr);
   const unsigned long long before = inferflux::RocrTamedThreadCount();
   int cpu_count = 0;
@@ -210,6 +227,7 @@ TEST_CASE("interposer: threads the executable starts are never tamed",
 
 TEST_CASE("interposer: a single-CPU allotment is never pinned",
           "[rocr_interposer]") {
+  RequireInterposer();
   const std::vector<int> cpus = AllowedCpus();
   if (cpus.size() < 2) {
     SKIP("needs >= 2 allowed CPUs to narrow the allotment");
@@ -244,6 +262,7 @@ TEST_CASE("interposer: a single-CPU allotment is never pinned",
 TEST_CASE("interposer: pthread_exit, cancellation and thread_local work "
           "through the trampoline",
           "[rocr_interposer]") {
+  RequireInterposer();
   TamerEnv env("1", nullptr);
   SECTION("pthread_exit") {
     const FakeHsaReport report = SpawnAndJoin(kPthreadExit);
@@ -285,6 +304,7 @@ TEST_CASE("interposer: pthread_exit, cancellation and thread_local work "
 
 TEST_CASE("interposer: creation failures pass through unchanged",
           "[rocr_interposer]") {
+  RequireInterposer();
   TamerEnv env("1", nullptr);
   pthread_attr_t attr;
   pthread_attr_init(&attr);
@@ -318,6 +338,7 @@ TEST_CASE("interposer: creation failures pass through unchanged",
 
 TEST_CASE("interposer: concurrent creations are each tamed exactly once",
           "[rocr_interposer]") {
+  RequireInterposer();
   if (AllowedCpus().size() < 2) {
     SKIP("needs >= 2 allowed CPUs to observe a pin");
   }
@@ -352,6 +373,7 @@ struct ChildReport {
   int cpu_count = 0;
   int only_cpu = -1;
   int nice = -100;
+  char name[16] = {};
 };
 
 void *FillChildReport(void *raw) {
@@ -368,12 +390,14 @@ void *FillChildReport(void *raw) {
     }
   }
   report->nice = OwnNice();
+  (void)pthread_getname_np(pthread_self(), report->name, sizeof(report->name));
   return nullptr;
 }
 } // namespace
 
 TEST_CASE("interposer: a tamed thread's children do not inherit the pin",
           "[rocr_interposer]") {
+  RequireInterposer();
   const std::vector<int> cpus = AllowedCpus();
   if (cpus.size() < 2) {
     SKIP("needs >= 2 allowed CPUs to observe a pin");
@@ -417,6 +441,7 @@ TEST_CASE("interposer: a tamed thread's children do not inherit the pin",
 
 TEST_CASE("interposer: a runtime-narrowed thread is pinned within its mask",
           "[rocr_interposer]") {
+  RequireInterposer();
   const std::vector<int> cpus = AllowedCpus();
   const long online = sysconf(_SC_NPROCESSORS_ONLN);
   if (cpus.size() < 3 || cpus.back() != online - 1) {
@@ -438,6 +463,7 @@ TEST_CASE("interposer: a runtime-narrowed thread is pinned within its mask",
 
 TEST_CASE("interposer: a NUMA-bound tamed thread's children keep its node",
           "[rocr_interposer]") {
+  RequireInterposer();
   const std::vector<int> cpus = AllowedCpus();
   const long online = sysconf(_SC_NPROCESSORS_ONLN);
   if (cpus.size() < 3 || static_cast<long>(cpus.size()) != online) {
@@ -454,4 +480,37 @@ TEST_CASE("interposer: a NUMA-bound tamed thread's children keep its node",
   // The child gets the node mask it would have inherited, not the whole
   // allotment (the highest CPU stays excluded).
   CHECK(child.cpu_count == static_cast<int>(cpus.size()) - 1);
+}
+
+TEST_CASE("interposer: the pin does not leak through nested ROCr threads",
+          "[rocr_interposer]") {
+  RequireInterposer();
+  const std::vector<int> cpus = AllowedCpus();
+  if (cpus.size() < 2) {
+    SKIP("needs >= 2 allowed CPUs to observe a pin");
+  }
+  TamerEnv env("1", nullptr);
+  using NestedEntry = void *(*)(void *);
+  struct Nested {
+    void *(*fn)(void *);
+    void *arg;
+  };
+  const auto nested_entry = reinterpret_cast<NestedEntry>(
+      dlsym(Fake().handle, "fake_hsa_nested_entry"));
+  REQUIRE(nested_entry != nullptr);
+  ChildReport grandchild;
+  Nested nested{&FillChildReport, &grandchild};
+  char own_name[16] = {};
+  REQUIRE(pthread_getname_np(pthread_self(), own_name, sizeof(own_name)) == 0);
+  const unsigned long long before = inferflux::RocrTamedThreadCount();
+  FakeHsaReport parent{};
+  pthread_t thread{};
+  // ROCr parent (tamed) -> ROCr child with no attribute (tamed against what
+  // it would have inherited) -> non-ROCr grandchild (fully restored).
+  REQUIRE(Fake().spawn_parent(&thread, &parent, nested_entry, &nested,
+                              /*child_attr_cpu=*/-1, 0) == 0);
+  REQUIRE(pthread_join(thread, nullptr) == 0);
+  CHECK(inferflux::RocrTamedThreadCount() == before + 2);
+  CHECK(grandchild.cpu_count == static_cast<int>(cpus.size()));
+  CHECK(std::string(grandchild.name) == own_name);
 }

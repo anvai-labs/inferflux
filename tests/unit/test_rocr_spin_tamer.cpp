@@ -39,7 +39,8 @@ TEST_CASE("rocr tamer core: a valid allotted override wins",
 
 TEST_CASE("rocr tamer core: invalid overrides fall back and are reported",
           "[rocr_spin_tamer]") {
-  for (const char *bad : {"4", "abc", "2x", "-1", "99999999999"}) {
+  for (const char *bad :
+       {"4", "abc", "2x", "-1", "99999999999", " 2", "+2", "2 "}) {
     bool rejected = false;
     CHECK(ChooseRocrTameCore({0, 5, 2}, bad, &rejected) == 5);
     CHECK(rejected);

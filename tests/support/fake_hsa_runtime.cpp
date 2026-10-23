@@ -208,6 +208,21 @@ fake_hsa_spawn_parent(pthread_t *out, FakeHsaReport *report,
   return rc;
 }
 
+// A start routine inside this object (so a thread running it is a ROCr
+// thread) that starts `arg->fn(arg->arg)` without an attribute and joins it.
+struct FakeHsaNested {
+  void *(*fn)(void *);
+  void *arg;
+};
+__attribute__((visibility("default"))) void *fake_hsa_nested_entry(void *raw) {
+  auto *nested = static_cast<FakeHsaNested *>(raw);
+  pthread_t grandchild{};
+  if (pthread_create(&grandchild, nullptr, nested->fn, nested->arg) == 0) {
+    pthread_join(grandchild, nullptr);
+  }
+  return nullptr;
+}
+
 // An address inside this object (for dladdr-based checks).
 __attribute__((visibility("default"))) void *fake_hsa_symbol() {
   return reinterpret_cast<void *>(&FakeHsaMain);

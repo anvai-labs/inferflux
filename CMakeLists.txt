@@ -641,7 +641,9 @@ endif()
 # The dynamic list exports the symbol so libhsa binds to it.
 set(INFERFLUX_ROCR_INTERPOSER_DYNLIST
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/rocr_pthread_interposer.dynlist")
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+# Only ROCm-enabled server builds carry the interposer: CUDA-only and CPU
+# deployments never route thread creation through it.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND ENABLE_ROCM)
   target_sources(inferfluxd PRIVATE server/rocr_pthread_interposer.cpp)
   target_link_options(inferfluxd PRIVATE
     "LINKER:--dynamic-list=${INFERFLUX_ROCR_INTERPOSER_DYNLIST}")
@@ -959,13 +961,10 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Targeted builds (--target inferflux_tests, coverage) must also build what
   # CTest runs (same pattern as the TLS probe below).
   add_dependencies(inferflux_tests rocr_interposer_tests)
-  # The interposer body compiles only for x86_64/aarch64 without sanitizers
-  # (see its #if); elsewhere the test binary would run against libc's
-  # pthread_create, so it is built but not registered.
-  string(TOUPPER "${CMAKE_BUILD_TYPE}" _rocr_build_type)
-  set(_rocr_cxx_flags "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${_rocr_build_type}}")
-  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|aarch64|arm64)$" AND
-     NOT _rocr_cxx_flags MATCHES "-fsanitize=")
+  # The interposer body compiles only for x86_64/aarch64 (see its #if); on
+  # other Linux targets the test binary is built but not registered. Under
+  # sanitizers it compiles out too, and the test skips itself at run time.
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|aarch64|arm64)$")
     add_test(NAME RocrInterposerTests COMMAND rocr_interposer_tests)
     set_tests_properties(RocrInterposerTests PROPERTIES
       LABELS rocr_spin_tamer TIMEOUT 120)

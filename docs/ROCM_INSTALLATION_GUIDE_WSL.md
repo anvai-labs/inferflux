@@ -317,8 +317,11 @@ pollers sharing a single core (~100% combined instead of ~200%); and
 tamed threads (`inferflux_runtime_spin_threads_unconfined_total` counts ROCr
 threads whose own CPU mask had no allotted CPU, which are left alone).
 
-Enable it on ROCm hosts only: on other hosts every thread creation pays one
-`dladdr` lookup for nothing.
+The interposer is linked only into ROCm-enabled (`ENABLE_ROCM=ON`) server
+builds; CUDA-only and CPU builds never route thread creation through it.
+Enable the tamer on ROCm hosts only: elsewhere every thread creation pays one
+`dladdr` lookup for nothing. Helper threads that a tamed thread starts get
+back its original name and CPU mask.
 
 Limits: a cgroup cpuset later shrunk to exclude the chosen core moves the
 threads off it; a future ROCr that starts threads via `std::thread`, or that

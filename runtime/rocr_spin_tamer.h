@@ -17,8 +17,8 @@ namespace inferflux {
 // disables the loop). The tamer bounds that cost to one core.
 //
 // Identification is exact and happens at thread creation: inferfluxd defines
-// pthread_create (server/rocr_pthread_interposer.cpp, linked only into the
-// server binary), and every thread whose start routine lies in
+// pthread_create (server/rocr_pthread_interposer.cpp, linked only into
+// ROCm-enabled server builds), and every thread whose start routine lies in
 // libhsa-runtime64 is started through a trampoline that, in the new thread,
 // pins it to one shared core and names it "rocr-hsa-N". No
 // signals, no /proc scans, no background thread. Every libhsa-created thread
@@ -87,22 +87,31 @@ bool IsRocrRuntimeAddress(const void *addr) noexcept;
 // to pin the new thread on, or -1 to create it untouched. No logging.
 int RocrTameCoreForNewThread(void *(*start_routine)(void *)) noexcept;
 
+// What a thread created by a tamed thread inherited from it, and what it
+// would have inherited without the tamer.
+struct InheritedState {
+  int creator_cpu = -1; // The creator's pin; -1: not from a tamed thread.
+  bool explicit_affinity = false; // The attribute asks for exactly that pin.
+  cpu_set_t mask{};               // The creator's mask before its pin.
+  char name[16] = {};             // The creator's name before its rename.
+};
+
 // Runs in the new thread before its start routine: pin, rename, count. No
-// cancellation points, no logging, no allocation.
-void TameCurrentRocrThread(int core) noexcept;
+// cancellation points, no logging, no allocation. `inherited` describes a
+// tamed creator (creator_cpu -1 if none).
+void TameCurrentRocrThread(int core, const InheritedState &inherited) noexcept;
 
-// Creator side, for a non-ROCr thread being created: the CPU whose inherited
-// pin its trampoline should undo, or -1. -1 when the caller is not a tamed
-// thread, or when `attr` explicitly requests exactly the caller's CPU.
-// Otherwise also stores the caller's pre-pin mask in *restore_mask.
+// Creator side, for every thread being created: when the caller is a tamed
+// thread, fills *inherited (its pin, pre-pin mask and name, and whether
+// `attr` explicitly requests exactly that pin) and returns the pin;
+// otherwise returns -1.
 int InheritedPinToUndo(const pthread_attr_t *attr,
-                       cpu_set_t *restore_mask) noexcept;
+                       InheritedState *inherited) noexcept;
 
-// Runs in a non-ROCr thread created by a tamed thread pinned to
-// `creator_cpu`: if its mask is still exactly that CPU, sets `restore_mask`
-// (the creator's mask before it was pinned).
-void RestoreInheritedScheduling(int creator_cpu,
-                                const cpu_set_t &restore_mask) noexcept;
+// Runs in a non-ROCr thread created by a tamed thread: restores the
+// creator's original name and, unless the attribute asked for the pin, the
+// creator's mask before it was pinned.
+void RestoreInheritedScheduling(const InheritedState &inherited) noexcept;
 #endif
 
 // Called by the interposer's static initializer with its own address, so
