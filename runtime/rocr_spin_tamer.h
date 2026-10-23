@@ -44,10 +44,13 @@ namespace inferflux {
 // (tid, start time); a TID reused before confinement is detected by
 // re-checking the start time. At most 8 live threads are confined at once
 // (slots free up when confined threads exit). All confined threads share
-// one pin core, chosen once from the server's affinity mask (captured when
-// the tamer starts; ROCr widens its own threads to every CPU, so their masks
-// say nothing about the operator's allotment); a thread whose mask excludes
-// that core is left unconfined rather than pinned elsewhere; a
+// one pin core, chosen once from the server's affinity mask (captured before
+// main runs, so it is the operator's taskset/cgroup allotment; ROCr widens
+// its own threads to every CPU, so their masks say nothing about it). With
+// no usable allotment, or an allotment of a single CPU, nothing is pinned
+// (two 100% spinners must not be piled onto the server's only CPU). A
+// thread whose mask excludes the chosen core is left unconfined rather than
+// pinned elsewhere; a
 // thread counts as confined only once pinned (the pin is the bound; nice is
 // not enforced on WSL2), or when its mask already allows a single CPU. If
 // the probe signal is owned by another handler or the architecture is
@@ -95,7 +98,10 @@ int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options = {});
 // Call after startup has initialized backends. The worker scans
 // immediately, again after ~10 s and ~60 s, then every ~5 min for the
 // process lifetime, so pollers created lazily or by a model loaded at
-// runtime are caught within one period. Starts nothing unless
+// runtime are usually caught within one period (a thread whose probe was
+// unproven or timed out backs off, so it can take up to ~1 h). Each scan
+// also restores the pin of any confined thread whose affinity was widened
+// again. Starts nothing unless
 // INFERFLUX_ROCR_TAME=1, or when libhsa-runtime64 is not loaded (it is
 // linked into ROCm builds, so CPU-only and CUDA-only builds get no thread). The
 // worker blocks on a condition variable between scans and is never destroyed:

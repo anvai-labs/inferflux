@@ -28,7 +28,6 @@
 #include <iterator>
 #include <map>
 #include <mutex>
-#include <set>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -209,7 +208,7 @@ struct Backoff {
 };
 
 std::mutex g_memory_mutex;
-std::set<ThreadKey> g_confined;
+std::map<ThreadKey, int> g_confined; // -> pinned core (-1: none)
 std::map<ThreadKey, Backoff> g_backoff;
 unsigned long long g_scan_seq = 0;
 
@@ -232,7 +231,9 @@ BeginScan(const std::unordered_map<pid_t, ThreadSample> &alive) {
   std::vector<ThreadKey> remembered;
   {
     std::lock_guard<std::mutex> lock(g_memory_mutex);
-    remembered.assign(g_confined.begin(), g_confined.end());
+    for (const auto &entry : g_confined) {
+      remembered.push_back(entry.first);
+    }
     for (const auto &entry : g_backoff) {
       remembered.push_back(entry.first);
     }
@@ -249,6 +250,41 @@ BeginScan(const std::unordered_map<pid_t, ThreadSample> &alive) {
     g_backoff.erase(key);
   }
   return ++g_scan_seq;
+}
+
+// Re-applies the pin of any confined thread whose affinity was widened
+// again (e.g. by the runtime after a re-initialization), so a thread
+// reported as confined stays bounded. Reads affinity outside the lock.
+void MaintainPins() {
+  std::vector<std::pair<pid_t, int>> pinned;
+  {
+    std::lock_guard<std::mutex> lock(g_memory_mutex);
+    for (const auto &entry : g_confined) {
+      if (entry.second >= 0) {
+        pinned.emplace_back(entry.first.first, entry.second);
+      }
+    }
+  }
+  for (const auto &[tid, core] : pinned) {
+    cpu_set_t now;
+    CPU_ZERO(&now);
+    if (sched_getaffinity(tid, sizeof(now), &now) != 0) {
+      continue; // Exited; pruned by the next scan.
+    }
+    if (CPU_COUNT(&now) == 1 && CPU_ISSET(core, &now)) {
+      continue;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(core, &set);
+    if (sched_setaffinity(tid, sizeof(set), &set) == 0) {
+      static std::atomic<bool> noted{false};
+      if (!noted.exchange(true)) {
+        log::Info(kComponent, "re-pinned a confined thread whose affinity "
+                              "was widened");
+      }
+    }
+  }
 }
 
 // True when the thread is already confined or still backing off.
@@ -283,7 +319,7 @@ Claim ClaimConfinement(const ThreadKey &key) {
   if (g_confined.size() >= kMaxConfinedAlive) {
     return Claim::kCapReached;
   }
-  g_confined.insert(key);
+  g_confined.emplace(key, -1);
   return Claim::kClaimed;
 }
 
@@ -291,6 +327,30 @@ void UnclaimConfinement(const ThreadKey &key) {
   std::lock_guard<std::mutex> lock(g_memory_mutex);
   g_confined.erase(key);
 }
+
+// Releases a claim unless committed, on every exit path (including an
+// exception while logging), so an unpinned thread never stays recorded as
+// confined.
+class ClaimGuard {
+public:
+  explicit ClaimGuard(const ThreadKey &key) : key_(key) {}
+  ~ClaimGuard() {
+    if (!committed_) {
+      UnclaimConfinement(key_);
+    }
+  }
+  void Commit(int pinned_core) {
+    std::lock_guard<std::mutex> lock(g_memory_mutex);
+    g_confined[key_] = pinned_core;
+    committed_ = true;
+  }
+  ClaimGuard(const ClaimGuard &) = delete;
+  ClaimGuard &operator=(const ClaimGuard &) = delete;
+
+private:
+  ThreadKey key_;
+  bool committed_ = false;
+};
 
 // --- Instruction-pointer probe ---------------------------------------------
 // The handler only stores the interrupted PC of the targeted thread; all
@@ -501,7 +561,15 @@ void CaptureServerMaskOnce() {
   }
 }
 
-enum class PinPlan { kPin, kSingleCpu, kNotPinnable, kError };
+// Captured during static initialization, before main runs: the main
+// thread's mask is then exactly the operator's taskset/cgroup allotment,
+// before any library (OpenMP binding, ggml affinity) can narrow it.
+[[maybe_unused]] const bool g_server_mask_captured_at_load = [] {
+  CaptureServerMaskOnce();
+  return true;
+}();
+
+enum class PinPlan { kPin, kSingleCpu, kNotPinnable, kNoAllotment, kError };
 
 // Resolves the pin target. Every confined thread is pinned to one shared
 // core, chosen once: a valid INFERFLUX_ROCR_TAME_CORE inside the server's
@@ -522,8 +590,14 @@ PinPlan ChooseTameCore(pid_t tid, int *tame_core) {
   }
   CaptureServerMaskOnce();
   std::lock_guard<std::mutex> lock(g_memory_mutex);
+  // No captured allotment, or an allotment of a single CPU: pinning would
+  // either guess a CPU the operator may have excluded, or pile two 100%
+  // spinners onto the server's only CPU. Leave the pollers alone instead.
+  if (!g_server_mask_set || CPU_COUNT(&g_server_mask) <= 1) {
+    return PinPlan::kNoAllotment;
+  }
   if (g_tame_core < 0) {
-    const cpu_set_t &server = g_server_mask_set ? g_server_mask : allowed;
+    const cpu_set_t &server = g_server_mask;
     // Valid CPU indices are [0, CPU_SETSIZE - 1]; an index of CPU_SETSIZE
     // would make CPU_ISSET/CPU_SET address past the end of cpu_set_t.
     const int requested =
@@ -586,13 +660,21 @@ bool ConfineThread(const ThreadKey &key, int *pinned_cpu) {
   case Claim::kClaimed:
     break;
   }
+  ClaimGuard claim(key);
   // The pin is what bounds the cost (nice is not enforced for service
   // threads on WSL2), so a thread only counts as confined once pinned, or
   // when its mask already allows a single CPU (nothing left to bound).
   int tame_core = -1;
   const PinPlan plan = ChooseTameCore(tid, &tame_core);
   if (plan == PinPlan::kError) {
-    UnclaimConfinement(key); // Thread exited (ESRCH) or mask unreadable.
+    return false; // Thread exited (ESRCH) or mask unreadable.
+  }
+  if (plan == PinPlan::kNoAllotment) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      log::Warn(kComponent, "server affinity mask unavailable or a single "
+                            "CPU; leaving ROCr pollers unconfined");
+    }
     return false;
   }
   if (plan == PinPlan::kNotPinnable) {
@@ -602,7 +684,6 @@ bool ConfineThread(const ThreadKey &key, int *pinned_cpu) {
                                 " cannot run on the shared pin core; leaving "
                                 "it unconfined to keep the one-core bound");
     }
-    UnclaimConfinement(key);
     return false;
   }
   if (plan == PinPlan::kPin) {
@@ -612,11 +693,11 @@ bool ConfineThread(const ThreadKey &key, int *pinned_cpu) {
     if (sched_setaffinity(tid, sizeof(set), &set) != 0) {
       log::Warn(kComponent, "affinity pin of tid " + std::to_string(tid) +
                                 " failed: " + std::strerror(errno));
-      UnclaimConfinement(key);
       return false;
     }
     *pinned_cpu = tame_core;
   }
+  claim.Commit(*pinned_cpu);
   // PRIO_PROCESS with a tid targets that thread's nice value on Linux.
   // Best-effort: the pin above already bounds the cost.
   (void)setpriority(PRIO_PROCESS, tid, 19);
@@ -673,6 +754,7 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
   }
   const auto second = SampleAllThreads();
   const unsigned long long scan = BeginScan(second);
+  MaintainPins();
   const long hz = sysconf(_SC_CLK_TCK);
   const long ticks_per_second = hz > 0 ? hz : 100; // No USER_HZ assumption.
 

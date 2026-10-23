@@ -460,4 +460,65 @@ TEST_CASE("rocr spin tamer pins every confined thread to the same core",
   REQUIRE(CPU_COUNT(&a) == 1);
   REQUIRE(CPU_EQUAL(&a, &b));
 }
+TEST_CASE("rocr spin tamer never pins onto a single-CPU allotment",
+          "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("needs >= 2 allowed CPUs to narrow the server mask");
+  }
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
+  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
+  // The spinner keeps the full mask (as ROCr's widened pollers do); the
+  // scanning thread - whose mask the tamer adopts as the server allotment
+  // after a reset - is narrowed to one CPU.
+  SpinnerGroup spinners(1);
+  cpu_set_t original;
+  CPU_ZERO(&original);
+  REQUIRE(sched_getaffinity(0, sizeof(original), &original) == 0);
+  cpu_set_t one;
+  CPU_ZERO(&one);
+  CPU_SET(LowestAllowedCpu(), &one);
+  REQUIRE(sched_setaffinity(0, sizeof(one), &one) == 0);
+  inferflux::ResetRuntimeSpinTamerPinForTesting();
+  int confined = 0;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    confined += inferflux::TameRuntimeSpinThreads(OwnedByTestLoop());
+  }
+  cpu_set_t spinner_mask;
+  CPU_ZERO(&spinner_mask);
+  const bool read = sched_getaffinity(spinners.tid(0), sizeof(spinner_mask),
+                                      &spinner_mask) == 0;
+  // Restore before asserting so a failure cannot leave the runner narrowed.
+  sched_setaffinity(0, sizeof(original), &original);
+  inferflux::ResetRuntimeSpinTamerPinForTesting();
+  REQUIRE(confined == 0);
+  REQUIRE(read);
+  REQUIRE(CPU_COUNT(&spinner_mask) == CPU_COUNT(&original));
+}
+
+TEST_CASE("rocr spin tamer restores a confined thread's widened pin",
+          "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("needs >= 2 allowed CPUs to observe a pin");
+  }
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
+  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
+  inferflux::ResetRuntimeSpinTamerPinForTesting();
+  SpinnerGroup spinners(1);
+  REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
+  cpu_set_t pinned;
+  CPU_ZERO(&pinned);
+  REQUIRE(sched_getaffinity(spinners.tid(0), sizeof(pinned), &pinned) == 0);
+  REQUIRE(CPU_COUNT(&pinned) == 1);
+  // Simulate the runtime widening the thread's affinity again.
+  cpu_set_t all;
+  CPU_ZERO(&all);
+  REQUIRE(sched_getaffinity(0, sizeof(all), &all) == 0);
+  REQUIRE(sched_setaffinity(spinners.tid(0), sizeof(all), &all) == 0);
+  // The next scan re-pins it (and does not count it again).
+  REQUIRE(inferflux::TameRuntimeSpinThreads(OwnedByTestLoop()) == 0);
+  cpu_set_t now;
+  CPU_ZERO(&now);
+  REQUIRE(sched_getaffinity(spinners.tid(0), sizeof(now), &now) == 0);
+  REQUIRE(CPU_EQUAL(&now, &pinned));
+}
 #endif // defined(__linux__)
