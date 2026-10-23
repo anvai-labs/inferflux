@@ -18,6 +18,8 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -61,6 +63,21 @@ RocrTamerTestSpinUntil(const bool *stop) {
   // section, so the sampled PCs would not land in the owned range.
   while (!__atomic_load_n(stop, __ATOMIC_RELAXED)) {
   }
+}
+
+// TIDs of live SpinnerGroup threads. Test scans consider only these, so
+// they never signal unrelated threads elsewhere in the test process.
+std::mutex &TestSpinnersMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+std::set<pid_t> &TestSpinners() {
+  static std::set<pid_t> tids;
+  return tids;
+}
+bool IsTestSpinner(int tid) {
+  std::lock_guard<std::mutex> lock(TestSpinnersMutex());
+  return TestSpinners().count(tid) != 0;
 }
 
 bool InTestSpinLoop(std::uintptr_t pc) {
@@ -155,8 +172,15 @@ public:
           sigaddset(&set, ProbeSignal());
           pthread_sigmask(SIG_BLOCK, &set, nullptr);
         }
-        tids_[i].store(inferflux::CurrentThreadId());
+        const pid_t tid = inferflux::CurrentThreadId();
+        {
+          std::lock_guard<std::mutex> lock(TestSpinnersMutex());
+          TestSpinners().insert(tid);
+        }
+        tids_[i].store(tid);
         RocrTamerTestSpinUntil(&stop_);
+        std::lock_guard<std::mutex> lock(TestSpinnersMutex());
+        TestSpinners().erase(tid);
       });
     }
     for (int i = 0; i < count; ++i) {
@@ -199,6 +223,7 @@ struct CountingOwner {
   RocrSpinTamerOptions Options() const {
     RocrSpinTamerOptions options;
     options.require_hsa_runtime = false;
+    options.candidate_filter = IsTestSpinner;
     auto counter = calls;
     const int limit = owned;
     options.pc_owner = [counter, limit](std::uintptr_t pc) {
@@ -214,6 +239,7 @@ struct CountingOwner {
 RocrSpinTamerOptions OwnedByTestLoop() {
   RocrSpinTamerOptions options;
   options.require_hsa_runtime = false;
+  options.candidate_filter = IsTestSpinner;
   options.pc_owner = InTestSpinLoop;
   return options;
 }
@@ -318,11 +344,25 @@ TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
 TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   std::atomic<bool> stop{false};
+  std::atomic<pid_t> sleeper_tid{0};
   std::thread sleeper([&] {
+    const pid_t tid = inferflux::CurrentThreadId();
+    {
+      // Make it a candidate, so only the never-blocks prefilter can reject
+      // it.
+      std::lock_guard<std::mutex> lock(TestSpinnersMutex());
+      TestSpinners().insert(tid);
+    }
+    sleeper_tid.store(tid);
     while (!stop.load(std::memory_order_relaxed)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+    std::lock_guard<std::mutex> lock(TestSpinnersMutex());
+    TestSpinners().erase(tid);
   });
+  while (sleeper_tid.load() == 0) {
+    std::this_thread::yield();
+  }
   // Join before asserting so a failure cannot leave a joinable thread.
   CountingOwner any_owner;
   any_owner.owned = 1000;
@@ -482,14 +522,11 @@ TEST_CASE("rocr spin tamer never pins onto a single-CPU allotment",
   CountingOwner owner;
   owner.owned = 1000;
   int confined = 0;
-  for (int attempt = 0; attempt < 4 && owner.calls->load() == 0; ++attempt) {
+  // Nothing could be confined, so scans must not probe at all.
+  for (int attempt = 0; attempt < 2; ++attempt) {
     confined += inferflux::TameRuntimeSpinThreads(owner.Options());
   }
-  // Proven but not confinable: the next scan backs off instead of probing
-  // it again.
-  const int calls_after_proof = owner.calls->load();
-  confined += inferflux::TameRuntimeSpinThreads(owner.Options());
-  const int calls_after_next_scan = owner.calls->load();
+  const int probes = owner.calls->load();
   cpu_set_t spinner_mask;
   CPU_ZERO(&spinner_mask);
   const bool read = sched_getaffinity(spinners.tid(0), sizeof(spinner_mask),
@@ -498,8 +535,7 @@ TEST_CASE("rocr spin tamer never pins onto a single-CPU allotment",
   sched_setaffinity(0, sizeof(original), &original);
   inferflux::ResetRuntimeSpinTamerPinForTesting();
   REQUIRE(confined == 0);
-  REQUIRE(calls_after_proof > 0);
-  REQUIRE(calls_after_next_scan == calls_after_proof);
+  REQUIRE(probes == 0);
   REQUIRE(read);
   REQUIRE(CPU_COUNT(&spinner_mask) == CPU_COUNT(&original));
 }

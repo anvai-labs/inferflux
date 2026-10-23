@@ -57,6 +57,18 @@ namespace inferflux {
 // probe signal is owned by another handler (or set to SIG_IGN) or the
 // architecture is unsupported, nothing is confined.
 //
+// Residual risks, documented rather than eliminated: (1) the main thread's
+// mask is read during static initialization; a shared-library constructor
+// that binds it first (libgomp with OMP_PROC_BIND/GOMP_CPU_AFFINITY) narrows
+// the captured allotment, which fails safe (no pin, or a pin inside it);
+// (2) a microsecond window between the final start-time re-check and the
+// affinity/nice/rename syscalls cannot be closed without pidfds for
+// threads; (3) a library consuming SIGRTMIN+5 via sigwaitinfo/signalfd
+// while leaving it at SIG_DFL would have it intercepted.
+// Follow-up direction: interposing pthread_create to record threads whose
+// start routine lies in libhsa-runtime64 would identify pollers at creation
+// with no signals or scans.
+//
 // Known limit (why the tamer is opt-in): the proof shows a thread executes
 // ROCr code, not which ROCr role it plays. InferFlux's own threads are
 // excluded (runtime/thread_name.h), but another runtime-internal thread that
@@ -85,6 +97,9 @@ struct RocrSpinTamerOptions {
   std::string code_owner = "libhsa-runtime64";
   // Test seam: when set, decides PC ownership instead of `code_owner`.
   std::function<bool(std::uintptr_t pc)> pc_owner;
+  // Test seam: when set, only threads it accepts are considered (and so
+  // probed), keeping tests from signalling unrelated threads in-process.
+  std::function<bool(int tid)> candidate_filter; // tid: Linux pid_t.
 };
 
 // Test seam: forgets the process-wide pin core and captured server mask, so

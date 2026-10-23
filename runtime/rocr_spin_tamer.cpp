@@ -279,8 +279,8 @@ void MaintainPins() {
     if (sched_getaffinity(tid, sizeof(now), &now) != 0) {
       continue; // Exited; pruned by the next scan.
     }
-    if (CPU_COUNT(&now) == 1 && CPU_ISSET(core, &now)) {
-      continue;
+    if (CPU_COUNT(&now) <= 1) {
+      continue; // Still bounded (possibly moved deliberately); leave it.
     }
     cpu_set_t set;
     CPU_ZERO(&set);
@@ -555,8 +555,9 @@ Verdict ProveOwner(pid_t pid, const ThreadKey &key,
   return Verdict::kNotProven;
 }
 
-// The server's affinity mask, captured once (at StartRuntimeSpinTamer, or
-// by the first scan's caller): the CPUs the operator allotted to inferfluxd.
+// The server's affinity mask, captured once during static initialization
+// (see g_server_mask_captured_at_load; in tests, by the first scan after
+// ResetRuntimeSpinTamerPinForTesting): the CPUs allotted to inferfluxd.
 // ROCr widens its own threads to every CPU, so their masks cannot be used to
 // find the allotment. g_memory_mutex.
 bool g_server_mask_set = false;
@@ -583,6 +584,22 @@ void CaptureServerMaskOnce() {
 }();
 
 enum class PinPlan { kPin, kNotPinnable, kNoAllotment, kError };
+
+// False when there is no usable server allotment (none captured, or a
+// single CPU): confinement could never succeed, so scans skip probing.
+bool PinningPossible() {
+  CaptureServerMaskOnce();
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  const bool possible = g_server_mask_set && CPU_COUNT(&g_server_mask) > 1;
+  if (!possible) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      log::Warn(kComponent, "server affinity mask unavailable or a single "
+                            "CPU; leaving ROCr pollers unconfined");
+    }
+  }
+  return possible;
+}
 
 // Resolves the pin target. Every confined thread is pinned to one shared
 // core, chosen once: a valid INFERFLUX_ROCR_TAME_CORE inside the server's
@@ -695,18 +712,16 @@ bool ConfineThread(const ThreadKey &key, int *pinned_cpu) {
     }
     return false;
   }
-  if (plan == PinPlan::kPin) {
-    cpu_set_t set;
-    CPU_ZERO(&set);
-    CPU_SET(tame_core, &set);
-    if (sched_setaffinity(tid, sizeof(set), &set) != 0) {
-      log::Warn(kComponent, "affinity pin of tid " + std::to_string(tid) +
-                                " failed: " + std::strerror(errno));
-      return false;
-    }
-    *pinned_cpu = tame_core;
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  CPU_SET(tame_core, &set);
+  if (sched_setaffinity(tid, sizeof(set), &set) != 0) {
+    log::Warn(kComponent, "affinity pin of tid " + std::to_string(tid) +
+                              " failed: " + std::strerror(errno));
+    return false;
   }
-  claim.Commit(*pinned_cpu);
+  *pinned_cpu = tame_core;
+  claim.Commit(tame_core);
   // PRIO_PROCESS with a tid targets that thread's nice value on Linux.
   // Best-effort: the pin above already bounds the cost.
   (void)setpriority(PRIO_PROCESS, tid, 19);
@@ -793,7 +808,8 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     // InferFlux's own threads may busy-wait inside libhsa-runtime64 (e.g. a
     // long hipStreamSynchronize on WSL2, where waits poll); executing ROCr
     // code does not make them ROCr's pollers. Never consider them.
-    if (IsFirstPartyThread(tid) || SkipThisScan(key, scan)) {
+    if ((options.candidate_filter && !options.candidate_filter(tid)) ||
+        IsFirstPartyThread(tid) || SkipThisScan(key, scan)) {
       continue;
     }
     const long utime_delta = after.utime_ticks - before.utime_ticks;
@@ -816,6 +832,12 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     }
   }
   if (candidates.empty()) {
+    return 0;
+  }
+
+  // Without a usable allotment nothing could be confined, so do not probe
+  // (no signals to threads for a result that cannot be acted on).
+  if (!PinningPossible()) {
     return 0;
   }
 
@@ -849,11 +871,8 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     GlobalMetrics().RecordRuntimeSpinThreadsConfined(confined);
     log::Info(kComponent,
               "confined " + std::to_string(confined) +
-                  " busy-spin runtime thread(s) (nice 19" +
-                  (last_pinned_cpu >= 0 ? std::string(", pinned to CPU ") +
-                                              std::to_string(last_pinned_cpu)
-                                        : std::string(", pin skipped")) +
-                  ")");
+                  " busy-spin runtime thread(s) (nice 19, pinned to CPU " +
+                  std::to_string(last_pinned_cpu) + ")");
   } else {
     log::Debug(kComponent, std::to_string(candidates.size()) +
                                " never-blocking thread(s) found; none proven "
@@ -976,8 +995,6 @@ void StartRuntimeSpinTamer() noexcept {
     if (!HsaRuntimeLoaded()) {
       return;
     }
-    CaptureServerMaskOnce(); // On the starting thread: the operator's
-                             // allotment, before libraries narrow it.
     TamerWorker::Instance().Start();
   } catch (const std::exception &ex) {
     try {
