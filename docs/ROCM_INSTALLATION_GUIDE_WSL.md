@@ -310,17 +310,29 @@ package, checksum-pinned). It installs nothing system-wide; the output
 directory holds the two libraries and `PATCHED_ROCR.json` (source commit,
 patch and library checksums).
 
-Deploy by copying the output into a directory on the server's
-`LD_LIBRARY_PATH` (for a release, its `runtime/bin`) and setting
-`HSA_ENABLE_DXG_DETECTION=1`, which makes upstream ROCr load `librocdxg`:
+The script requires the host ROCm to be exactly 7.2.0 (the backport's
+base), so the patched runtime always matches the installed HIP.
+
+Deploy by copying the output into a directory that is on the server's
+`LD_LIBRARY_PATH` and setting `HSA_ENABLE_DXG_DETECTION=1`, which makes
+upstream ROCr load `librocdxg`. Confirm the service actually sets
+`LD_LIBRARY_PATH` to that directory (e.g. a release's `runtime/bin` via
+`Environment=LD_LIBRARY_PATH=...` in the unit); otherwise the patch is never
+loaded. Keep any copies already there:
 
 ```bash
-cp -a ~/rocr-patched/lib* <release>/runtime/bin/
+D=<release>/runtime/bin
+mkdir -p "$D/pre-patched-rocr" && cp -a "$D"/libhsa-runtime64.so* "$D"/librocdxg.so* "$D/pre-patched-rocr/" 2>/dev/null
+cp -a ~/rocr-patched/lib* ~/rocr-patched/PATCHED_ROCR.json "$D/"
 # systemd unit: Environment=HSA_ENABLE_DXG_DETECTION=1
 ```
 
 `libamdhip64` finds `libhsa-runtime64.so.1` through `LD_LIBRARY_PATH` ahead
-of `/opt/rocm/lib`, so only that process uses the patched runtime.
+of `/opt/rocm/lib`, so only that process uses the patched runtime. The
+backoff means a completion handled by ROCr's async-event threads (HIP host
+callbacks, async signal handlers) can be observed up to 2 ms late after a
+long idle wait, and within microseconds while busy; synchronous waits
+(`hipStreamSynchronize`) do not go through these threads.
 
 Verify: `grep -E 'libhsa|librocdxg' /proc/$(pidof inferfluxd)/maps` shows
 both from the release directory, and idle CPU drops to about 1%
@@ -331,8 +343,8 @@ the stock runtime; c=8 and c=1 throughput and per-request latency unchanged
 
 `INFERFLUX_ROCR_TAME=1` can stay on alongside it: the threads it pins now
 sleep, and it bounds the cost if the patched library is ever missing.
-Rollback: remove the copied libraries and the `HSA_ENABLE_DXG_DETECTION`
-line, then restart. Retire the patch once a ROCm release includes #7898
+Rollback: remove the copied libraries (restoring anything saved in
+`pre-patched-rocr/`) and the `HSA_ENABLE_DXG_DETECTION` line, then restart. Retire the patch once a ROCm release includes #7898
 (check the release notes for rocm-systems#7898 / librocdxg#60).
 
 ## Supported AMD GPUs

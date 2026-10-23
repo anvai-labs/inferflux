@@ -462,6 +462,7 @@ Scope contract:
 | `INFERFLUX_DISABLE_STARTUP_ADVISOR` | suppress startup recommendations |
 | `INFERFLUX_ROCR_TAME` | confine ROCr HSA runtime busy-spin threads (demote to nice 19 + `SCHED_IDLE`, co-pin to one core; `true` default). WSL2/ROCm AsyncEventsLoop workaround — see `ROCM_INSTALLATION_GUIDE_WSL.md` |
 | `INFERFLUX_ROCR_TAME_CORE` | CPU index the spin threads are pinned to (default: highest CPU in the server's affinity mask; pinning is skipped when only one CPU is allowed) |
+| `HSA_ENABLE_DXG_DETECTION` | ROCr's own knob (not read by InferFlux): `1` makes an upstream ROCr runtime load `librocdxg` on WSL2. Required with the patched ROCr runtime from `scripts/rocm/build_patched_rocr.sh`; see `ROCM_INSTALLATION_GUIDE_WSL.md` |
 | `INFERFLUX_HTTP_WORKERS` | HTTP server thread pool size (default: 16) |
 | `INFERFLUX_HTTP_SEND_TIMEOUT_SEC` | socket send deadline in seconds (default 30); stalled SSE clients are cut off instead of blocking a decode worker |
 | `INFERFLUX_HTTP_RECV_TIMEOUT_SEC` | socket receive deadline in seconds (default 120); bounds idle keep-alive connections |

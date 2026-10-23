@@ -5,6 +5,12 @@ polling-fallback spin on WSL and mixed batches", merged 2026-08-18 as
 The runtime.cpp hunks are the upstream change re-fitted to 7.2.0's context
 (the upstream diff does not apply directly); core/util/poll_backoff.h is
 upstream's file verbatim. Upstream's rocrtst unit test is not included.
+
+The comments are kept as upstream wrote them. One does not hold for 7.2.0:
+the 200 us mixed-batch ceiling is described as matching "the interrupt
+path's 200us active-poll window", which 7.2.0's AsyncEventsLoop does not
+have. That ceiling only applies when interrupts are available (not on
+WSL2/dxg, where every signal polls and the 2 ms ceiling applies).
 ROCr is MIT-licensed (Copyright Advanced Micro Devices, Inc.).
 
 Applied by scripts/rocm/build_patched_rocr.sh with `git apply`.

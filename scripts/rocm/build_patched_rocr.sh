@@ -33,16 +33,17 @@ declare -A ROCDXG_SHA256=(
   [v1.2.2]="28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541"
 )
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 die() { echo "build_patched_rocr: $*" >&2; exit 1; }
+need_value() { [[ $# -ge 2 && -n "$2" ]] || { echo "$1 needs a value" >&2; usage 2; }; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --out) OUT="$2"; shift 2 ;;
-    --work) WORK="$2"; shift 2 ;;
-    --rocm-tag) ROCM_TAG="$2"; shift 2 ;;
-    --rocdxg) ROCDXG_TAG="$2"; shift 2 ;;
-    --rocm) ROCM_ROOT="$2"; shift 2 ;;
+    --out) need_value "$@"; OUT="$2"; shift 2 ;;
+    --work) need_value "$@"; WORK="$2"; shift 2 ;;
+    --rocm-tag) need_value "$@"; ROCM_TAG="$2"; shift 2 ;;
+    --rocdxg) need_value "$@"; ROCDXG_TAG="$2"; shift 2 ;;
+    --rocm) need_value "$@"; ROCM_ROOT="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
     *) echo "unknown argument: $1" >&2; usage 2 ;;
   esac
@@ -53,9 +54,18 @@ done
   die "the patch is a backport onto rocm-7.2.0; rebase it before using $ROCM_TAG"
 [[ -n "${ROCDXG_SHA256[$ROCDXG_TAG]:-}" ]] ||
   die "no pinned sha256 for librocdxg $ROCDXG_TAG; add one to ROCDXG_SHA256"
-for tool in git gh cmake dpkg-deb sha256sum; do
+for tool in git curl cmake dpkg-deb readelf sha256sum; do
   command -v "$tool" >/dev/null || die "missing required tool: $tool"
 done
+# The backport and its ABI assumptions are for ROCm 7.2.0 exactly: refuse to
+# drop a 7.2.0 runtime under a different host HIP.
+HOST_ROCM="$(cat "${ROCM_ROOT}/.info/version" 2>/dev/null || true)"
+[[ "$HOST_ROCM" == "7.2.0" ]] ||
+  die "host ROCm at ${ROCM_ROOT} is '${HOST_ROCM:-unknown}', not 7.2.0"
+# Absolute path: the build runs in a clean environment (see below), where a
+# cmake from ~/.local/bin or a venv would not be on PATH.
+CMAKE="$(command -v cmake)"
+CMAKE="$(cd "$(dirname "$CMAKE")" && pwd)/$(basename "$CMAKE")"
 for tool in clang llvm-objcopy; do
   [[ -x "${ROCM_ROOT}/llvm/bin/${tool}" ]] ||
     die "missing ${ROCM_ROOT}/llvm/bin/${tool} (ROCm LLVM)"
@@ -70,6 +80,13 @@ BUILD="${WORK}/build"
 echo "build_patched_rocr: work dir ${WORK}"
 
 # 1. Source: rocr-runtime only, at the exact tag, with the backport applied.
+# A partial or foreign checkout (e.g. an interrupted earlier run) is
+# discarded rather than trusted.
+if [[ -d "${SRC}/.git" ]] &&
+   { [[ ! -f "${SRC}/projects/rocr-runtime/CMakeLists.txt" ]] ||
+     [[ "$(git -C "$SRC" describe --tags --exact-match 2>/dev/null)" != "$ROCM_TAG" ]]; }; then
+  rm -rf "$SRC"
+fi
 if [[ ! -d "${SRC}/.git" ]]; then
   git -c advice.detachedHead=false clone --quiet --depth 1 --branch "$ROCM_TAG" --filter=blob:none \
     --sparse https://github.com/ROCm/rocm-systems.git "$SRC"
@@ -98,13 +115,14 @@ endif()
 EOF
 # A clean environment keeps conda/venv compilers, sysroots and LDFLAGS out.
 clean_env=(env -i "HOME=${HOME}" "PATH=/usr/local/bin:/usr/bin:/bin")
-"${clean_env[@]}" cmake -S "${SRC}/projects/rocr-runtime" -B "$BUILD" \
+rm -rf "$BUILD" # Never stage a library left over from an earlier build.
+"${clean_env[@]}" "$CMAKE" -S "${SRC}/projects/rocr-runtime" -B "$BUILD" \
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
   -DCMAKE_PREFIX_PATH="$ROCM_ROOT" \
   -DClang_DIR="${SHIM}/clang" -DLLVM_DIR="${SHIM}/llvm" \
   -DBUILD_ROCR_TESTS=OFF >"${WORK}/configure.log" 2>&1 ||
   die "configure failed; see ${WORK}/configure.log"
-"${clean_env[@]}" cmake --build "$BUILD" -j"$(nproc)" >"${WORK}/build.log" 2>&1 ||
+"${clean_env[@]}" "$CMAKE" --build "$BUILD" -j"$(nproc)" >"${WORK}/build.log" 2>&1 ||
   die "build failed; see ${WORK}/build.log"
 LIBHSA="$(find "${BUILD}/rocr/lib" -name 'libhsa-runtime64.so.1.*' -type f | head -1)"
 [[ -n "$LIBHSA" ]] || die "libhsa-runtime64 not produced"
@@ -114,8 +132,12 @@ DEB_DIR="${WORK}/rocdxg"
 DEB="${DEB_DIR}/rocdxg-roct_${ROCDXG_TAG#v}_amd64.deb"
 mkdir -p "$DEB_DIR"
 if [[ ! -f "$DEB" ]]; then
-  gh release download "$ROCDXG_TAG" -R ROCm/librocdxg \
-    -p "$(basename "$DEB")" -D "$DEB_DIR" --clobber
+  # Public release asset: no GitHub login needed; the checksum below is the
+  # trust anchor.
+  curl -fsSL -o "${DEB}.part" \
+    "https://github.com/ROCm/librocdxg/releases/download/${ROCDXG_TAG}/$(basename "$DEB")" ||
+    die "could not download $(basename "$DEB")"
+  mv "${DEB}.part" "$DEB"
 fi
 echo "${ROCDXG_SHA256[$ROCDXG_TAG]}  ${DEB}" | sha256sum --check --quiet ||
   die "librocdxg package checksum mismatch"
@@ -125,17 +147,20 @@ LIBDXG="$(find "${DEB_DIR}/x" -name 'librocdxg.so.*.*' -type f | head -1)"
 [[ -n "$LIBDXG" ]] || die "librocdxg not found in $(basename "$DEB")"
 
 # 4. Stage with the sonames the loader looks up.
-rm -f "${OUT}"/libhsa-runtime64.so* "${OUT}"/librocdxg.so*
+rm -f "${OUT}"/libhsa-runtime64.so* "${OUT}"/librocdxg.so* "${OUT}/PATCHED_ROCR.json"
 cp "$LIBHSA" "${OUT}/"
 ln -s "$(basename "$LIBHSA")" "${OUT}/libhsa-runtime64.so.1"
 cp "$LIBDXG" "${OUT}/"
-ln -s "$(basename "$LIBDXG")" "${OUT}/librocdxg.so.1"
+DXG_SONAME="$(readelf -d "$LIBDXG" | sed -n 's/.*(SONAME).*\[\(.*\)\].*/\1/p')"
+[[ -n "$DXG_SONAME" ]] || die "librocdxg has no SONAME"
+ln -s "$(basename "$LIBDXG")" "${OUT}/${DXG_SONAME}"
 ln -s "$(basename "$LIBDXG")" "${OUT}/librocdxg.so" # ROCr dlopens this name.
 
 sha() { sha256sum "$1" | cut -d' ' -f1; }
 cat > "${OUT}/PATCHED_ROCR.json" <<EOF
 {
   "rocm_systems_tag": "${ROCM_TAG}",
+  "host_rocm": "${HOST_ROCM}",
   "rocm_systems_commit": "$(git -C "$SRC" rev-parse HEAD)",
   "upstream_fix": "ROCm/rocm-systems#7898 (46558b7af4dc79b8b8014619c1afdb82db079a9f)",
   "patch_sha256": "$(sha "$PATCH")",
