@@ -11,6 +11,7 @@
 #include "runtime/kv_cache/paged_kv_cache.h"
 #include "runtime/prefix_cache/prefix_cache.h"
 #include "runtime/prefix_cache/radix_prefix_cache.h"
+#include "runtime/rocr_spin_tamer.h"
 #include "runtime/speculative/speculative_decoder.h"
 #include "runtime/string_utils.h"
 #include "scheduler/model_registry.h"
@@ -1747,6 +1748,12 @@ int main(int argc, char **argv) {
     advisor_ctx.config.speculative_enabled = speculative_enabled;
     inferflux::RunStartupAdvisor(advisor_ctx);
   }
+
+  // ROCr thread tamer (WSL2/ROCm AsyncEventsLoop workaround): threads started
+  // by libhsa-runtime64 are confined at creation by inferfluxd's
+  // pthread_create (server/rocr_pthread_interposer.cpp). This only reports
+  // the configuration and how many threads were tamed so far.
+  inferflux::ReportRocrTamerStatus();
 
   int http_workers = 16; // Increased from 4 for better concurrent throughput
   if (const char *env_workers = std::getenv("INFERFLUX_HTTP_WORKERS")) {

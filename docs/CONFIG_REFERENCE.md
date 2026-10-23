@@ -460,6 +460,8 @@ Scope contract:
 | `INFERFLUX_BACKEND_ALLOW_LLAMA_FALLBACK` | `runtime.backend_exposure.allow_llama_cpp_fallback` |
 | `INFERFLUX_BACKEND_STRICT_INFERFLUX_REQUEST` | `runtime.backend_exposure.strict_inferflux_request` |
 | `INFERFLUX_DISABLE_STARTUP_ADVISOR` | suppress startup recommendations |
+| `INFERFLUX_ROCR_TAME` | confine ROCr HSA runtime threads (WSL2/ROCm AsyncEventsLoop busy-spin workaround; `false` default — opt in with `1`). `inferfluxd` defines `pthread_create`, and every thread started by `libhsa-runtime64` is pinned at creation to one shared core and named `rocr-hsa-N` (priority is left unchanged; non-ROCr threads they start keep the mask they would have inherited). No signals, scans, or background thread; nothing is pinned when the server is allotted a single CPU; Linux ROCm-enabled `inferfluxd` builds only; enable on ROCm hosts only. See `ROCM_INSTALLATION_GUIDE_WSL.md` |
+| `INFERFLUX_ROCR_TAME_CORE` | CPU index ROCr runtime threads are pinned to (default: highest CPU in the server's affinity mask, e.g. the `taskset` allotment; an unparseable, out-of-range, or out-of-mask value falls back to that default with a startup warning) |
 | `INFERFLUX_HTTP_WORKERS` | HTTP server thread pool size (default: 16) |
 | `INFERFLUX_HTTP_SEND_TIMEOUT_SEC` | socket send deadline in seconds (default 30); stalled SSE clients are cut off instead of blocking a decode worker |
 | `INFERFLUX_HTTP_RECV_TIMEOUT_SEC` | socket receive deadline in seconds (default 120); bounds idle keep-alive connections |

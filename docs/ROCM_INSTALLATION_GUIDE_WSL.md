@@ -262,6 +262,88 @@ swap=8GB
 
 Then restart WSL: `wsl --shutdown` from PowerShell.
 
+### ROCr runtime spin threads (2 CPUs burned at idle)
+
+ROCm 7.x `libhsa-runtime64` starts two unnamed poller threads at `hipInit()`
+(the AsyncEventsLoop) that busy-spin at 100% CPU each for the life of the
+process. The upstream fix (rocm-systems#7898) is not in a released ROCm yet,
+and no HSA environment knob disables the loop (`HSA_ENABLE_SLEEP`,
+`HSA_ENABLE_INTERRUPT`, `HSA_ENABLE_SCRATCH_ASYNC_RECLAIM`, and
+`HSA_ENABLE_SDMA` were all tested without effect). On WSL2, `SCHED_IDLE` and
+nice are additionally not enforced for service-cgroup threads, so CPU
+affinity is the only effective mitigation.
+
+With `INFERFLUX_ROCR_TAME=1`, `inferfluxd` confines these threads **at
+creation**. The server binary defines `pthread_create`, so every thread
+`libhsa-runtime64` starts goes through it; a thread whose start routine lies
+in `libhsa-runtime64` is started through a small trampoline that, in the new
+thread, pins it to one shared core and names it `rocr-hsa-N`.
+Identification is exact (the start routine's owning library), so no other
+thread — InferFlux's own or a third-party threadpool — is ever touched, and
+there are no signals, `/proc` scans, or background threads. ROCr starts its
+threads with an explicit all-CPU affinity, and the pin is applied after that,
+inside the new thread; libhsa never changes a thread's affinity afterwards.
+
+All `libhsa-runtime64` threads are pinned (about three per runtime
+initialization: the two pollers and a short-lived helper), because they share
+one ROCr-internal start routine. If ROCr itself narrows a thread's mask (for
+example to the GPU's NUMA node) and the chosen core is outside it, the thread
+is pinned to the highest allotted CPU inside its own mask instead. The tamer
+only pins: it does not lower priority, because threads inherit their
+creator's nice value and an unprivileged thread cannot raise it back, and
+`SCHED_IDLE` can starve the HSA signal-handler work these threads run on
+native Linux. A thread that a tamed thread starts (and that is not itself a
+ROCr thread) gets the CPU mask it would have inherited without the tamer
+(the tamed thread's mask before its pin) whenever it is still on exactly
+that pin, so the pin never leaks (barring an allocation failure during
+that thread's creation, when it is created untouched). GPU sync latency is
+unaffected; measured tail latency improves (1-token requests, p99 ~7.7 ms
+on vs 11-13 ms off), because the spinners no longer land on request-path
+cores.
+
+The core is chosen from the server's own affinity allotment (its
+`taskset`/cgroup mask, read at process start): a valid
+`INFERFLUX_ROCR_TAME_CORE` inside it, else its highest CPU. A server allotted
+a single CPU pins nothing (two spinners must not share its only CPU).
+
+Knobs (see `docs/CONFIG_REFERENCE.md` section 10):
+
+- `INFERFLUX_ROCR_TAME=1` enables the tamer. It is **off by default**, since
+  it changes the scheduling of threads InferFlux does not own; enable it on
+  hosts that show the spin (e.g. WSL2 + gfx1201).
+- `INFERFLUX_ROCR_TAME_CORE=<n>` pins to CPU `n` (default: highest CPU in the
+  server's affinity mask).
+
+Verify: the startup log line from `rocr_tamer` reports the core and that the
+interposer is active; `top -H -p $(pidof inferfluxd)` shows the `rocr-hsa-N`
+pollers sharing a single core (~100% combined instead of ~200%); and
+`inferflux_runtime_spin_threads_confined_total` in `/metrics` counts the
+tamed threads (`inferflux_runtime_spin_threads_unconfined_total` counts ROCr
+threads that could not be pinned: no allotted CPU in their own mask, or
+the kernel refused the pin; they are left alone).
+
+The interposer is linked only into server builds where CMake actually found
+ROCm (`ENABLE_ROCM=ON` and the toolkit present; the configure log says
+"ROCm/HIP found"); CUDA-only and CPU builds never route thread creation through it.
+With the tamer off it passes every creation straight through. When on, each
+creation is classified with glibc's lock-free `_dl_find_object` (glibc
+2.35+; older glibc falls back to `dladdr`, which takes the loader lock).
+Helper threads that a tamed thread starts get
+back its original name and CPU mask.
+
+Limits: a cgroup cpuset later shrunk to exclude the chosen core moves the
+threads off it; a future ROCr that starts threads via `std::thread`, or that
+is loaded with `RTLD_DEEPBIND`, would not be recognized (nothing is tamed,
+nothing breaks); the allotment is read after shared-library constructors,
+so `OMP_PROC_BIND` narrowing the main thread first can shrink it (fails
+safe); a process forked from a ROCr thread starts on its pin; thread
+creation from a tamed thread allocates a small block, which an allocator
+that starts threads under its own lock could deadlock on; sanitizer builds compile the interposer out
+(the startup log says so). Linux threads inherit their creator's name, so
+with the tamer off, spinning ROCr threads started from a first-party thread
+show that thread's `if-*` name in `top -H`; the counters are process-wide
+and not reset by `MetricsRegistry::Reset()`.
+
 ## Supported AMD GPUs
 
 The InferFlux ROCm backend supports FlashAttention-2 on these architectures:
