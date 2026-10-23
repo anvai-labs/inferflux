@@ -63,7 +63,6 @@ constexpr unsigned long long kMaxBackoffScans = 12;
 // Counts threads confined and still alive, so a runtime that is torn down
 // and re-initialized (new pollers) never exhausts it.
 constexpr std::size_t kMaxConfinedAlive = 8;
-constexpr int kProbeSignalOffset = kRocrTamerProbeSignalOffset;
 // Opt-in (INFERFLUX_ROCR_TAME=1): the mechanism signals and confines
 // threads it does not own, so it stays off unless an operator enables it.
 constexpr bool kTameEnabledByDefault = false;
@@ -229,12 +228,25 @@ BeginScan(const std::unordered_map<pid_t, ThreadSample> &alive) {
     ThreadSample now;
     return !ReadThreadStat(key.first, &now) || now.starttime != key.second;
   };
-  std::lock_guard<std::mutex> lock(g_memory_mutex);
-  for (auto it = g_confined.begin(); it != g_confined.end();) {
-    it = is_dead(*it) ? g_confined.erase(it) : std::next(it);
+  // Decide liveness outside the lock (it may read /proc), then erase.
+  std::vector<ThreadKey> remembered;
+  {
+    std::lock_guard<std::mutex> lock(g_memory_mutex);
+    remembered.assign(g_confined.begin(), g_confined.end());
+    for (const auto &entry : g_backoff) {
+      remembered.push_back(entry.first);
+    }
   }
-  for (auto it = g_backoff.begin(); it != g_backoff.end();) {
-    it = is_dead(it->first) ? g_backoff.erase(it) : std::next(it);
+  std::vector<ThreadKey> dead;
+  for (const ThreadKey &key : remembered) {
+    if (is_dead(key)) {
+      dead.push_back(key);
+    }
+  }
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  for (const ThreadKey &key : dead) {
+    g_confined.erase(key);
+    g_backoff.erase(key);
   }
   return ++g_scan_seq;
 }
@@ -328,7 +340,7 @@ int ProbeSignal() {
 #if !defined(__x86_64__) && !defined(__aarch64__)
   return 0;
 #else
-  const int sig = SIGRTMIN + kProbeSignalOffset;
+  const int sig = SIGRTMIN + kRocrTamerProbeSignalOffset;
   if (sig > SIGRTMAX) {
     return 0;
   }
@@ -350,7 +362,7 @@ int ProbeSignal() {
   static std::atomic<bool> warned{false};
   if (!warned.exchange(true)) {
     log::Warn(kComponent, "probe signal SIGRTMIN+" +
-                              std::to_string(kProbeSignalOffset) +
+                              std::to_string(kRocrTamerProbeSignalOffset) +
                               " is owned by another handler; spin tamer "
                               "paused until it is released");
   }
@@ -470,20 +482,23 @@ Verdict ProveOwner(pid_t pid, const ThreadKey &key,
   return Verdict::kNotProven;
 }
 
-int g_tame_core = -1; // Shared pin target once chosen; g_memory_mutex.
+int g_tame_core = -1; // First pin target chosen; g_memory_mutex.
 
-// Resolves the pin target. All confined threads share one core (the first
-// one chosen) so the cost stays bounded to a single core; the target comes
-// from the confined thread's own affinity mask (ROCr widens its threads to
-// every CPU the process may use; the main thread's mask can be narrower).
-// Returns false when pinning must be skipped (single-CPU mask). An invalid
-// INFERFLUX_ROCR_TAME_CORE (unparseable, out of range, or outside the mask)
-// warns once and falls back to the highest allowed CPU.
-bool ChooseTameCore(pid_t tid, int *tame_core) {
+enum class PinPlan { kPin, kSingleCpu, kError };
+
+// Resolves the pin target from the confined thread's own affinity mask (ROCr
+// widens its threads to every CPU the process may use; the main thread's
+// mask can be narrower). Precedence: a valid INFERFLUX_ROCR_TAME_CORE, then
+// the core chosen for earlier confinements (so all confined threads share
+// one core), then the thread's highest allowed CPU. The shared core is set
+// once and never overwritten. kSingleCpu: the thread can only run on one CPU,
+// so there is nothing to bound. An invalid INFERFLUX_ROCR_TAME_CORE
+// (unparseable, out of range, or outside the mask) warns once.
+PinPlan ChooseTameCore(pid_t tid, int *tame_core) {
   cpu_set_t allowed;
   CPU_ZERO(&allowed);
   if (sched_getaffinity(tid, sizeof(allowed), &allowed) != 0) {
-    return false;
+    return PinPlan::kError;
   }
   int highest = -1;
   int count = 0;
@@ -494,36 +509,34 @@ bool ChooseTameCore(pid_t tid, int *tame_core) {
     }
   }
   if (count <= 1) {
-    return false; // Nothing to gain from pinning.
-  }
-  {
-    std::lock_guard<std::mutex> lock(g_memory_mutex);
-    if (g_tame_core >= 0 && CPU_ISSET(g_tame_core, &allowed)) {
-      *tame_core = g_tame_core;
-      return true;
-    }
+    return PinPlan::kSingleCpu;
   }
   // Valid CPU indices are [0, CPU_SETSIZE - 1]; an index of CPU_SETSIZE
   // would make CPU_ISSET/CPU_SET address past the end of cpu_set_t.
   const int requested =
       ParseIntEnv("INFERFLUX_ROCR_TAME_CORE", -1, 0, CPU_SETSIZE - 1);
-  if (requested >= 0 && CPU_ISSET(requested, &allowed)) {
-    *tame_core = requested;
-    std::lock_guard<std::mutex> lock(g_memory_mutex);
-    g_tame_core = requested;
-    return true;
-  }
   const char *raw = std::getenv("INFERFLUX_ROCR_TAME_CORE");
-  static std::atomic<bool> warned_invalid{false};
-  if (raw != nullptr && *raw != '\0' && !warned_invalid.exchange(true)) {
-    log::Warn(kComponent, std::string("INFERFLUX_ROCR_TAME_CORE=") + raw +
-                              " is not a CPU in the allowed mask; using CPU " +
-                              std::to_string(highest));
+  const bool requested_ok = requested >= 0 && CPU_ISSET(requested, &allowed);
+  if (!requested_ok && raw != nullptr && *raw != '\0') {
+    static std::atomic<bool> warned_invalid{false};
+    if (!warned_invalid.exchange(true)) {
+      log::Warn(kComponent, std::string("INFERFLUX_ROCR_TAME_CORE=") + raw +
+                                " is not a CPU in the allowed mask; ignoring "
+                                "it");
+    }
   }
-  *tame_core = highest;
   std::lock_guard<std::mutex> lock(g_memory_mutex);
-  g_tame_core = highest;
-  return true;
+  if (requested_ok) {
+    *tame_core = requested;
+  } else if (g_tame_core >= 0 && CPU_ISSET(g_tame_core, &allowed)) {
+    *tame_core = g_tame_core;
+  } else {
+    *tame_core = highest;
+  }
+  if (g_tame_core < 0) {
+    g_tame_core = *tame_core;
+  }
+  return PinPlan::kPin;
 }
 
 std::atomic<int> g_next_spin_name{0}; // Unique rocr-spin-N across scans.
@@ -560,28 +573,30 @@ bool ConfineThread(const ThreadKey &key, int *pinned_cpu) {
   case Claim::kClaimed:
     break;
   }
+  // The pin is what bounds the cost (nice is not enforced for service
+  // threads on WSL2), so a thread only counts as confined once pinned, or
+  // when its mask already allows a single CPU (nothing left to bound).
   int tame_core = -1;
-  bool applied = false;
-  if (ChooseTameCore(tid, &tame_core)) {
+  const PinPlan plan = ChooseTameCore(tid, &tame_core);
+  if (plan == PinPlan::kError) {
+    UnclaimConfinement(key); // Thread exited (ESRCH) or mask unreadable.
+    return false;
+  }
+  if (plan == PinPlan::kPin) {
     cpu_set_t set;
     CPU_ZERO(&set);
     CPU_SET(tame_core, &set);
-    if (sched_setaffinity(tid, sizeof(set), &set) == 0) {
-      applied = true;
-      *pinned_cpu = tame_core;
-    } else {
+    if (sched_setaffinity(tid, sizeof(set), &set) != 0) {
       log::Warn(kComponent, "affinity pin of tid " + std::to_string(tid) +
                                 " failed: " + std::strerror(errno));
+      UnclaimConfinement(key);
+      return false;
     }
+    *pinned_cpu = tame_core;
   }
   // PRIO_PROCESS with a tid targets that thread's nice value on Linux.
-  if (setpriority(PRIO_PROCESS, tid, 19) == 0) {
-    applied = true;
-  }
-  if (!applied) {
-    UnclaimConfinement(key); // ESRCH (thread exited) or EPERM.
-    return false;
-  }
+  // Best-effort: the pin above already bounds the cost.
+  (void)setpriority(PRIO_PROCESS, tid, 19);
   // Best-effort rename for observability: same-tgid comm writes need no
   // capabilities, and "rocr-spin-N" fits the 15-char TASK_COMM_LEN limit.
   // No trailing newline: the kernel stores the written bytes verbatim.

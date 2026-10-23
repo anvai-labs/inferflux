@@ -82,6 +82,20 @@ int HighestAllowedCpu() {
   return highest;
 }
 
+int LowestAllowedCpu() {
+  cpu_set_t set;
+  CPU_ZERO(&set);
+  if (sched_getaffinity(0, sizeof(set), &set) != 0) {
+    return -1;
+  }
+  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
+    if (CPU_ISSET(cpu, &set)) {
+      return cpu;
+    }
+  }
+  return -1;
+}
+
 int CountAllowedCpus() {
   cpu_set_t set;
   CPU_ZERO(&set);
@@ -203,9 +217,10 @@ RocrSpinTamerOptions OwnedByTestLoop() {
 
 // Retries absorb a loaded few-core CI runner where the spinner misses the
 // window threshold; the total must still be exactly `expected`.
-int ScanUntil(int expected, const RocrSpinTamerOptions &options) {
+int ScanUntil(int expected, const RocrSpinTamerOptions &options,
+              int max_attempts = 4) {
   int total = 0;
-  for (int attempt = 0; attempt < 4 && total < expected; ++attempt) {
+  for (int attempt = 0; attempt < max_attempts && total < expected; ++attempt) {
     total += inferflux::TameRuntimeSpinThreads(options);
   }
   return total;
@@ -397,7 +412,27 @@ TEST_CASE("rocr spin tamer backs off a rejected thread, then re-probes it",
   REQUIRE(accepting.calls->load() == 0);
 
   // Back-off is not a permanent blacklist: a later scan re-probes and, now
-  // that the evidence says owner code, confines it.
-  REQUIRE(ScanUntil(1, accepting.Options()) == 1);
+  // that the evidence says owner code, confines it. On a loaded runner
+  // timed-out probes can add strikes (skip 1, 2, 4, 8 scans), so allow
+  // enough attempts to outlast them; the usual case needs only 1-2.
+  REQUIRE(ScanUntil(1, accepting.Options(), 16) == 1);
+}
+TEST_CASE("rocr spin tamer honours INFERFLUX_ROCR_TAME_CORE",
+          "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("needs >= 2 allowed CPUs to observe a pin choice");
+  }
+  // Pick a CPU that differs from the default (highest allowed) target.
+  const int requested = LowestAllowedCpu();
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
+  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE",
+                                     std::to_string(requested));
+  SpinnerGroup spinners(1);
+  REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
+  cpu_set_t now;
+  CPU_ZERO(&now);
+  REQUIRE(sched_getaffinity(spinners.tid(0), sizeof(now), &now) == 0);
+  REQUIRE(CPU_COUNT(&now) == 1);
+  REQUIRE(CPU_ISSET(requested, &now));
 }
 #endif // defined(__linux__)

@@ -43,9 +43,19 @@ namespace inferflux {
 // unlucky once is still caught later. Confined threads are remembered by
 // (tid, start time); a TID reused before confinement is detected by
 // re-checking the start time. At most 8 live threads are confined at once
-// (slots free up when confined threads exit). The pin target comes from the
-// confined thread's own affinity mask. If the probe signal is owned by
-// another handler or the architecture is unsupported, nothing is confined.
+// (slots free up when confined threads exit). All confined threads share
+// one pin core, chosen from the first confined thread's own affinity mask; a
+// thread counts as confined only once pinned (the pin is the bound; nice is
+// not enforced on WSL2), or when its mask already allows a single CPU. If
+// the probe signal is owned by another handler or the architecture is
+// unsupported, nothing is confined.
+//
+// Known limit (why the tamer is opt-in): the proof shows a thread executes
+// ROCr code, not which ROCr role it plays. InferFlux's own threads are
+// excluded (runtime/thread_name.h), but another runtime-internal thread that
+// busy-waits inside libhsa-runtime64 for a whole window would be confined
+// too. Validated on WSL2/gfx1201 under real inference: only the two pollers
+// were ever confined.
 //
 // Linux-only; every entry point is a no-op elsewhere.
 //
