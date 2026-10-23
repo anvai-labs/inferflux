@@ -181,11 +181,16 @@ fi
 LDD_OUT="$("${clean_env[@]}" ldd "$LIBHSA")"
 MISSING="$(grep 'not found' <<<"$LDD_OUT" || true)"
 [[ -z "$MISSING" ]] || die "unresolved dependencies: ${MISSING}"
-# The ROCm-provided dependency must come from the install built against.
+# The ROCm-provided dependency must come from a 7.2.0 install checked above:
+# --rocm or /opt/rocm (what the clean loader configuration resolves).
 PROFREG="$(sed -n 's/.*librocprofiler-register[^ ]* => \([^ ]*\).*/\1/p' <<<"$LDD_OUT")"
 # (Optional in ROCr's CMake: only checked when it is linked.)
-if [[ -n "$PROFREG" && "$(realpath "$PROFREG")" != "$(realpath "$ROCM_ROOT")"/* ]]; then
-  die "librocprofiler-register resolves to ${PROFREG}, outside ${ROCM_ROOT}"
+if [[ -n "$PROFREG" ]]; then
+  PROFREG_REAL="$(realpath "$PROFREG")"
+  if [[ "$PROFREG_REAL" != "$(realpath "$ROCM_ROOT")"/* &&
+        "$PROFREG_REAL" != "$(realpath /opt/rocm)"/* ]]; then
+    die "librocprofiler-register resolves to ${PROFREG}, outside ${ROCM_ROOT} and /opt/rocm"
+  fi
 fi
 CXX_USED="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "${BUILD}/CMakeCache.txt")"
 CXX_VERSION="unknown"

@@ -389,6 +389,9 @@ D=<release>/runtime/bin
 (  # Subshell: `exit` stops the step without closing your terminal. Each
    # command checks itself (set -e is ignored in a `( ... ) ||` subshell).
   B="$D/pre-patched-rocr"
+  if [ ! -e "$B" ] && [ -e "$D/PATCHED_ROCR.json" ]; then
+    echo "$D already holds a patched runtime but no backup"; exit 1
+  fi
   if [ ! -e "$B" ]; then  # Taken once; a redeploy never overwrites it.
     T="$(mktemp -d "$D/.pre-patched-rocr.XXXXXX")" || exit 1
     for f in "$D"/libhsa-runtime64.so* "$D"/librocdxg.so*; do
@@ -397,8 +400,13 @@ D=<release>/runtime/bin
     done
     mv "$T" "$B" || exit 1  # Only a complete backup gets the final name.
   fi
-  cp -a ~/rocr-patched/lib* ~/rocr-patched/PATCHED_ROCR.json "$D/" || exit 1
-) || echo "deploy step failed (if the backup failed, nothing was replaced)"
+  # --remove-destination: replace a symlink in $D, never write through it.
+  cp -a --remove-destination ~/rocr-patched/lib* \
+    ~/rocr-patched/PATCHED_ROCR.json "$D/" || exit 2
+) || case $? in
+  2) echo "copy failed partway: roll back (below) before restarting" ;;
+  *) echo "deploy step failed before any library was replaced" ;;
+esac
 # systemd unit: Environment=HSA_ENABLE_DXG_DETECTION=1
 ```
 
