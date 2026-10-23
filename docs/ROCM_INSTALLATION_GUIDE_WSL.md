@@ -368,8 +368,9 @@ holds the two libraries and `PATCHED_ROCR.json` (source commit, compiler,
 patch and library checksums).
 
 The script requires the host ROCm to be exactly 7.2.0 (the backport's base)
-and refuses to stage a library that carries a RUNPATH or has unresolved
-dependencies. Unlike AMD's WSL build, the upstream runtime links `libdrm`,
+and refuses to stage a `libhsa-runtime64` that carries a RUNPATH, a
+`librocdxg` whose RUNPATH has an empty or relative element (AMD's carries
+the absolute `/opt/rocm/lib`), or either with unresolved dependencies. Unlike AMD's WSL build, the upstream runtime links `libdrm`,
 `libdrm_amdgpu`, `libnuma` and `librocprofiler-register`; on a ROCm 7.2 WSL
 install these resolve through the loader configuration (`/opt/amdgpu/lib`,
 `/opt/rocm/lib`, the system `libnuma1`). Deploy on the host it was built on,
@@ -391,8 +392,8 @@ D=<release>/runtime/bin
   if [ ! -e "$B" ]; then  # Taken once; a redeploy never overwrites it.
     T="$(mktemp -d "$D/.pre-patched-rocr.XXXXXX")" || exit 1
     for f in "$D"/libhsa-runtime64.so* "$D"/librocdxg.so*; do
-      [ -e "$f" ] || continue
-      cp -a "$f" "$T/" || exit 1
+      [ -e "$f" ] || [ -L "$f" ] || continue  # Dangling symlinks too.
+      cp -a "$f" "$T/" || { rm -rf "$T"; exit 1; }
     done
     mv "$T" "$B" || exit 1  # Only a complete backup gets the final name.
   fi
@@ -414,8 +415,10 @@ timer slack). Synchronous waits (`hipStreamSynchronize`), which InferFlux's
 decode path uses, do not go through these threads; the throughput and
 latency measurements below include this effect.
 
-Verify: `grep -E 'libhsa|librocdxg' /proc/$(pidof inferfluxd)/maps` shows
-both from the release directory, and idle CPU drops to about 1%
+Verify: `grep -E 'libhsa|librocdxg|libamdhip64|libdrm|librocprofiler' /proc/$(pidof inferfluxd)/maps`
+shows `libhsa-runtime64` and `librocdxg` from the release directory and the
+rest from the 7.2.0 install the script checked (`/opt/rocm-7.2.0`,
+`/opt/amdgpu`), not from copies bundled elsewhere, and idle CPU drops to about 1%
 (`top -H` shows no thread above a few percent). Measured on an R9700
 (gfx1201) with qwen2.5-0.5b: idle 200% → 1.1%; greedy outputs identical to
 the stock runtime; c=8 and c=1 throughput and per-request latency unchanged
@@ -423,8 +426,10 @@ the stock runtime; c=8 and c=1 throughput and per-request latency unchanged
 
 The backup is taken once per `runtime/bin` and is that directory's rollback
 target (a new release has its own `runtime/bin`, so it starts without one);
-after upgrading ROCm, delete `pre-patched-rocr/` there before deploying
-again, since it would restore 7.2.0-era libraries.
+before upgrading ROCm, roll the patch back (below): the patched 7.2.0
+runtime in `runtime/bin` would otherwise keep loading ahead of the new
+`/opt/rocm/lib` under the newer HIP. Then delete `pre-patched-rocr/` (it
+holds 7.2.0-era libraries) and rebuild once a matching backport exists.
 
 Every process that loads the patched runtime needs
 `HSA_ENABLE_DXG_DETECTION=1`: without it upstream ROCr does not load

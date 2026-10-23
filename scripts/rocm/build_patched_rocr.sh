@@ -34,7 +34,11 @@ declare -A ROCDXG_SHA256=(
   [v1.2.2]="28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541"
 )
 
-usage() { sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { # Help on stdout for --help, on stderr for usage errors.
+  if [[ "${1:-0}" -eq 0 ]]; then sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+  else sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2; fi
+  exit "${1:-0}"
+}
 die() { echo "build_patched_rocr: $*" >&2; exit 1; }
 need_value() {
   # Values may start with '-' (a path); only another option is refused.
@@ -199,6 +203,20 @@ rm -rf "${DEB_DIR}/x"
 dpkg-deb -x "$DEB" "${DEB_DIR}/x"
 LIBDXG="$(find "${DEB_DIR}/x" -name 'librocdxg.so.*.*' -type f 2>/dev/null | head -1 || true)"
 [[ -n "$LIBDXG" ]] || die "librocdxg not found in $(basename "$DEB")"
+# ROCr dlopens it as shipped. AMD's build carries RUNPATH /opt/rocm/lib; an
+# absolute system path is fine, but an empty or relative element (which
+# would search the service's working directory) is refused.
+DXG_RUNPATH="$(readelf -d "$LIBDXG" | sed -n 's/.*(\(RUNPATH\|RPATH\)).*\[\(.*\)\].*/\2/p')"
+if [[ -n "$DXG_RUNPATH" ]]; then
+  IFS=':' read -r -a dxg_entries <<<"${DXG_RUNPATH}:"
+  [[ "$DXG_RUNPATH" != *: && "$DXG_RUNPATH" != :* && "$DXG_RUNPATH" != *::* ]] ||
+    die "librocdxg RUNPATH '${DXG_RUNPATH}' has an empty element"
+  for entry in "${dxg_entries[@]}"; do
+    [[ "$entry" == /* ]] || die "librocdxg RUNPATH '${DXG_RUNPATH}' has a relative element"
+  done
+fi
+DXG_MISSING="$(grep 'not found' <<<"$("${clean_env[@]}" ldd "$LIBDXG")" || true)"
+[[ -z "$DXG_MISSING" ]] || die "librocdxg has unresolved dependencies: ${DXG_MISSING}"
 
 # 4. Stage with the sonames the loader looks up.
 rm -f "${OUT}"/libhsa-runtime64.so* "${OUT}"/librocdxg.so* "${OUT}/PATCHED_ROCR.json"
@@ -218,7 +236,7 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 json_str() { # Escape for a JSON string (backslash, quote, control chars).
   local s="${1//\\/\\\\}"
   s="${s//\"/\\\"}"
-  printf '%s' "${s//[$'\t\r\n']/ }"
+  printf '%s' "$s" | tr '\000-\037\177' ' '
 }
 cat > "${OUT}/PATCHED_ROCR.json" <<EOF
 {
