@@ -43,7 +43,7 @@ using SpawnWithAttrFn = int (*)(pthread_t *, const pthread_attr_t *,
                                 FakeHsaReport *);
 using SymbolFn = void *(*)();
 using SpawnParentFn = int (*)(pthread_t *, FakeHsaReport *, void *(*)(void *),
-                              void *, int);
+                              void *, int, int);
 
 enum Mode { kReport = 0, kPthreadExit = 1, kCancellable = 2, kThreadLocal = 3 };
 
@@ -384,7 +384,7 @@ TEST_CASE("interposer: a tamed thread's children do not inherit the pin",
     FakeHsaReport parent{};
     pthread_t thread{};
     REQUIRE(Fake().spawn_parent(&thread, &parent, &FillChildReport, &child,
-                                /*child_attr_cpu=*/-1) == 0);
+                                /*child_attr_cpu=*/-1, /*parent_numa=*/0) == 0);
     REQUIRE(pthread_join(thread, nullptr) == 0);
     CHECK(parent.cpu_count == 1); // The ROCr parent itself is tamed.
     CHECK(IsTamedName(parent.name));
@@ -396,7 +396,7 @@ TEST_CASE("interposer: a tamed thread's children do not inherit the pin",
     FakeHsaReport parent{};
     pthread_t thread{};
     REQUIRE(Fake().spawn_parent(&thread, &parent, &FillChildReport, &child,
-                                /*child_attr_cpu=*/cpus.back()) == 0);
+                                /*child_attr_cpu=*/cpus.back(), 0) == 0);
     REQUIRE(pthread_join(thread, nullptr) == 0);
     CHECK(parent.only_cpu == cpus.back()); // Parent is pinned there too.
     CHECK(child.cpu_count == 1);
@@ -407,7 +407,7 @@ TEST_CASE("interposer: a tamed thread's children do not inherit the pin",
     FakeHsaReport parent{};
     pthread_t thread{};
     REQUIRE(Fake().spawn_parent(&thread, &parent, &FillChildReport, &child,
-                                /*child_attr_cpu=*/cpus.front()) == 0);
+                                /*child_attr_cpu=*/cpus.front(), 0) == 0);
     REQUIRE(pthread_join(thread, nullptr) == 0);
     CHECK(child.cpu_count == 1);
     CHECK(child.only_cpu == cpus.front());
@@ -434,4 +434,24 @@ TEST_CASE("interposer: a runtime-narrowed thread is pinned within its mask",
   CHECK(report.only_cpu == cpus[cpus.size() - 2]); // Highest in its mask.
   CHECK(IsTamedName(report.name));
   CHECK(inferflux::RocrTamedThreadCount() == before + 1);
+}
+
+TEST_CASE("interposer: a NUMA-bound tamed thread's children keep its node",
+          "[rocr_interposer]") {
+  const std::vector<int> cpus = AllowedCpus();
+  const long online = sysconf(_SC_NPROCESSORS_ONLN);
+  if (cpus.size() < 3 || static_cast<long>(cpus.size()) != online) {
+    SKIP("needs >= 3 CPUs and an unrestricted allotment");
+  }
+  TamerEnv env("1", nullptr);
+  ChildReport child;
+  FakeHsaReport parent{};
+  pthread_t thread{};
+  REQUIRE(Fake().spawn_parent(&thread, &parent, &FillChildReport, &child,
+                              /*child_attr_cpu=*/-1, /*parent_numa=*/1) == 0);
+  REQUIRE(pthread_join(thread, nullptr) == 0);
+  CHECK(parent.cpu_count == 1); // Pinned inside its node.
+  // The child gets the node mask it would have inherited, not the whole
+  // allotment (the highest CPU stays excluded).
+  CHECK(child.cpu_count == static_cast<int>(cpus.size()) - 1);
 }

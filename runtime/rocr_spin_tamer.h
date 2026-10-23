@@ -4,6 +4,7 @@
 
 #if defined(__linux__)
 #include <pthread.h>
+#include <sched.h>
 #endif
 
 namespace inferflux {
@@ -46,8 +47,9 @@ namespace inferflux {
 // CPU in its mask that is also allotted, so each such mask still costs one
 // core; with no overlap it is left alone and counted as skipped. Threads that
 // a tamed thread creates (and that are not ROCr threads themselves) get the
-// allotment mask back unless their attribute sets an affinity explicitly,
-// so the pin never leaks to them.
+// mask they would have inherited without the tamer (the creator's mask
+// before its pin) unless their attribute sets an affinity explicitly, so
+// the pin never leaks to them.
 //
 // Residuals: the allotment is read in this binary's static initialization,
 // after shared-library constructors (libgomp with OMP_PROC_BIND can narrow
@@ -56,9 +58,9 @@ namespace inferflux {
 // until the first ROCr thread is identified, each creation costs one dladdr
 // (it takes the dynamic loader's lock), after which a cached address range
 // is used; a future ROCr starting threads via std::thread (start routine in
-// libstdc++), or loaded with RTLD_DEEPBIND, would not be recognized (fails
-// safe: nothing tamed; the report warns); the cached range assumes libhsa is
-// never unloaded (InferFlux never unloads its backends); sanitizer
+// libstdc++), or loaded with RTLD_DEEPBIND, or a second copy of libhsa,
+// would not be recognized (fails safe: nothing tamed); the cached range assumes
+// libhsa is never unloaded (InferFlux never unloads its backends); sanitizer
 // builds and non-x86_64/aarch64 targets compile the interposer out.
 //
 // Knobs (env-only, see docs/CONFIG_REFERENCE.md section 10):
@@ -89,21 +91,18 @@ int RocrTameCoreForNewThread(void *(*start_routine)(void *)) noexcept;
 // cancellation points, no logging, no allocation.
 void TameCurrentRocrThread(int core) noexcept;
 
-// True in a thread that TameCurrentRocrThread pinned.
-bool CurrentThreadIsTamedRocrThread() noexcept;
-
-// CPU a tamed thread is pinned to (-1 if the calling thread is not tamed).
-int CurrentTamedRocrThreadCpu() noexcept;
-
 // Creator side, for a non-ROCr thread being created: the CPU whose inherited
 // pin its trampoline should undo, or -1. -1 when the caller is not a tamed
 // thread, or when `attr` explicitly requests exactly the caller's CPU.
-int InheritedPinToUndo(const pthread_attr_t *attr) noexcept;
+// Otherwise also stores the caller's pre-pin mask in *restore_mask.
+int InheritedPinToUndo(const pthread_attr_t *attr,
+                       cpu_set_t *restore_mask) noexcept;
 
 // Runs in a non-ROCr thread created by a tamed thread pinned to
-// `creator_cpu`: if its mask is still exactly that CPU, restores the
-// allotment mask.
-void RestoreInheritedScheduling(int creator_cpu) noexcept;
+// `creator_cpu`: if its mask is still exactly that CPU, sets `restore_mask`
+// (the creator's mask before it was pinned).
+void RestoreInheritedScheduling(int creator_cpu,
+                                const cpu_set_t &restore_mask) noexcept;
 #endif
 
 // Called by the interposer's static initializer with its own address, so

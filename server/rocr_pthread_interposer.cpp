@@ -23,6 +23,7 @@
 
 #include <dlfcn.h>
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -59,9 +60,10 @@ PthreadCreateFn RealPthreadCreate() noexcept {
 struct TameBox {
   void *(*start_routine)(void *);
   void *arg;
-  int core;        // >= 0: tame this ROCr thread onto `core`.
-  int creator_cpu; // >= 0: non-ROCr child of a tamed thread; undo the
-                   // single-CPU pin it inherited.
+  int core;               // >= 0: tame this ROCr thread onto `core`.
+  int creator_cpu;        // >= 0: non-ROCr child of a tamed thread; undo the
+                          // single-CPU pin it inherited...
+  cpu_set_t restore_mask; // ...by restoring the creator's pre-pin mask.
 };
 
 // Deliberately NOT noexcept, with no try/catch and no RAII objects:
@@ -75,7 +77,7 @@ void *RocrTameTrampoline(void *raw_box) {
   if (box.core >= 0) {
     inferflux::TameCurrentRocrThread(box.core);
   } else {
-    inferflux::RestoreInheritedScheduling(box.creator_cpu);
+    inferflux::RestoreInheritedScheduling(box.creator_cpu, box.restore_mask);
   }
   return box.start_routine(box.arg);
 }
@@ -104,10 +106,13 @@ pthread_create(pthread_t *__restrict thread,
   const int core = inferflux::RocrTameCoreForNewThread(start_routine);
   // A tamed thread's children inherit its single-CPU mask; any that are not
   // ROCr threads themselves get it undone in the trampoline.
-  const int creator_cpu = core < 0 ? inferflux::InheritedPinToUndo(attr) : -1;
+  cpu_set_t restore_mask;
+  CPU_ZERO(&restore_mask);
+  const int creator_cpu =
+      core < 0 ? inferflux::InheritedPinToUndo(attr, &restore_mask) : -1;
   if (core >= 0 || creator_cpu >= 0) {
     if (auto *box = static_cast<TameBox *>(std::malloc(sizeof(TameBox)))) {
-      *box = TameBox{start_routine, arg, core, creator_cpu};
+      *box = TameBox{start_routine, arg, core, creator_cpu, restore_mask};
       errno = saved_errno;
       const int rc = real(thread, attr, &RocrTameTrampoline, box);
       if (rc != 0) {

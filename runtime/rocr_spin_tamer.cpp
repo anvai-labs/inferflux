@@ -1,6 +1,7 @@
 #include "runtime/rocr_spin_tamer.h"
 
 #include "runtime/string_utils.h"
+#include "runtime/thread_name.h"
 #include "server/logging/logger.h"
 
 #include <atomic>
@@ -45,6 +46,9 @@ std::atomic<int> g_next_name{0};
 std::atomic<std::uintptr_t> g_runtime_lo{0};
 std::atomic<std::uintptr_t> g_runtime_hi{0};
 thread_local int t_tamed_cpu = -1;
+// A tamed thread's mask before the pin: what its children would have
+// inherited without the tamer.
+thread_local cpu_set_t t_pre_pin_mask;
 
 void CaptureAllotment() {
   cpu_set_t mask;
@@ -260,7 +264,8 @@ void TameCurrentRocrThread(int core) noexcept {
       char name[16];
       std::snprintf(name, sizeof(name), "rocr-hsa-%d",
                     g_next_name.fetch_add(1) % 100000);
-      (void)pthread_setname_np(pthread_self(), name);
+      SetCurrentThreadName(name);
+      t_pre_pin_mask = own;
       t_tamed_cpu = target;
       g_tamed.fetch_add(1, std::memory_order_relaxed);
     } else {
@@ -273,13 +278,14 @@ void TameCurrentRocrThread(int core) noexcept {
   (void)pthread_setcancelstate(old_cancel_state, nullptr);
 }
 
-bool CurrentThreadIsTamedRocrThread() noexcept { return t_tamed_cpu >= 0; }
-
-int CurrentTamedRocrThreadCpu() noexcept { return t_tamed_cpu; }
-
-int InheritedPinToUndo(const pthread_attr_t *attr) noexcept {
+int InheritedPinToUndo(const pthread_attr_t *attr,
+                       cpu_set_t *restore_mask) noexcept {
   const int creator_cpu = t_tamed_cpu;
-  if (creator_cpu < 0 || attr == nullptr) {
+  if (creator_cpu < 0) {
+    return -1;
+  }
+  *restore_mask = t_pre_pin_mask;
+  if (attr == nullptr) {
     return creator_cpu;
   }
   // glibc reports "no cpuset in the attribute" as all CPUs, so a single-CPU
@@ -293,19 +299,18 @@ int InheritedPinToUndo(const pthread_attr_t *attr) noexcept {
   return creator_cpu;
 }
 
-void RestoreInheritedScheduling(int creator_cpu) noexcept {
+void RestoreInheritedScheduling(int creator_cpu,
+                                const cpu_set_t &restore_mask) noexcept {
   const int saved_errno = errno;
   cpu_set_t own;
   CPU_ZERO(&own);
-  // glibc reports "no cpuset" as all CPUs, so the creator cannot tell an
-  // explicit attribute affinity from none; the child can: an inherited mask
-  // is exactly the creator's single pinned CPU.
+  // Still exactly the creator's pin, i.e. inherited (explicit requests for
+  // that CPU were filtered out by InheritedPinToUndo): give the thread the
+  // mask it would have inherited without the tamer.
   if (creator_cpu >= 0 && sched_getaffinity(0, sizeof(own), &own) == 0 &&
-      CPU_COUNT(&own) == 1 && CPU_ISSET(creator_cpu, &own)) {
-    cpu_set_t allotted;
-    if (AllotmentMask(&allotted)) {
-      (void)sched_setaffinity(0, sizeof(allotted), &allotted);
-    }
+      CPU_COUNT(&own) == 1 && CPU_ISSET(creator_cpu, &own) &&
+      CPU_COUNT(&restore_mask) > 0) {
+    (void)sched_setaffinity(0, sizeof(restore_mask), &restore_mask);
   }
   errno = saved_errno;
 }
@@ -367,13 +372,6 @@ void ReportRocrTamerStatus() {
           " allotted) at creation; tamed so far: " +
           std::to_string(RocrTamedThreadCount()) +
           (HsaRuntimeLoaded() ? "" : " (libhsa-runtime64 not loaded yet)"));
-  if (RocrTamedThreadCount() == 0 && RocrSkippedThreadCount() == 0 &&
-      HsaRuntimeLoaded()) {
-    log::Warn(kComponent,
-              "libhsa-runtime64 is loaded but no ROCr thread has been tamed; "
-              "if `top -H` shows unnamed threads at 100% CPU, the runtime is "
-              "bypassing this binary's pthread_create (e.g. RTLD_DEEPBIND)");
-  }
   if (RocrSkippedThreadCount() > 0) {
     log::Warn(kComponent, std::to_string(RocrSkippedThreadCount()) +
                               " ROCr runtime thread(s) could not be pinned "

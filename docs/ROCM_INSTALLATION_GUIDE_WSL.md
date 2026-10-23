@@ -293,7 +293,8 @@ only pins: it does not lower priority, because threads inherit their
 creator's nice value and an unprivileged thread cannot raise it back, and
 `SCHED_IDLE` can starve the HSA signal-handler work these threads run on
 native Linux. A thread that a tamed thread starts (and that is not itself a
-ROCr thread) gets the full allotment back unless it asked for an explicit
+ROCr thread) gets the CPU mask it would have inherited without the tamer
+(the tamed thread's mask before its pin) unless it asked for an explicit
 affinity, so the pin never leaks. GPU sync latency is unaffected.
 
 The core is chosen from the server's own affinity allotment (its
@@ -322,12 +323,15 @@ Enable it on ROCm hosts only: on other hosts every thread creation pays one
 Limits: a cgroup cpuset later shrunk to exclude the chosen core moves the
 threads off it; a future ROCr that starts threads via `std::thread`, or that
 is loaded with `RTLD_DEEPBIND`, would not be recognized (nothing is tamed,
-nothing breaks; the startup log warns when ROCr is loaded but nothing was
-tamed); the allotment is read after shared-library constructors, so
+nothing breaks), and neither would threads of a second, separately loaded
+copy of `libhsa-runtime64`; the allotment is read after shared-library constructors, so
 `OMP_PROC_BIND` narrowing the main thread first can shrink it (fails safe);
 the cached ROCr address range assumes libhsa is never unloaded (InferFlux
 never unloads its backends); sanitizer builds compile the interposer out
-(the startup log says so).
+(the startup log says so). Linux threads inherit their creator's name, so
+with the tamer off, spinning ROCr threads started from a first-party thread
+show that thread's `if-*` name in `top -H`; the counters are process-wide
+and not reset by `MetricsRegistry::Reset()`.
 
 ## Supported AMD GPUs
 
