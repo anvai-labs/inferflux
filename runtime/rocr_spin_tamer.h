@@ -44,7 +44,10 @@ namespace inferflux {
 // (tid, start time); a TID reused before confinement is detected by
 // re-checking the start time. At most 8 live threads are confined at once
 // (slots free up when confined threads exit). All confined threads share
-// one pin core, chosen from the first confined thread's own affinity mask; a
+// one pin core, chosen once from the server's affinity mask (captured when
+// the tamer starts; ROCr widens its own threads to every CPU, so their masks
+// say nothing about the operator's allotment); a thread whose mask excludes
+// that core is left unconfined rather than pinned elsewhere; a
 // thread counts as confined only once pinned (the pin is the bound; nice is
 // not enforced on WSL2), or when its mask already allows a single CPU. If
 // the probe signal is owned by another handler or the architecture is
@@ -62,9 +65,9 @@ namespace inferflux {
 // Knobs (env-only, see docs/CONFIG_REFERENCE.md section 10):
 //   INFERFLUX_ROCR_TAME       enable (default: disabled; opt-in with 1)
 //   INFERFLUX_ROCR_TAME_CORE  pin target CPU index (default: highest CPU in
-//                             the process affinity mask; invalid values warn
-//                             and fall back; pinning skipped when <= 1 CPU
-//                             is allowed)
+//                             the server's affinity mask; values outside it
+//                             warn and fall back; pinning skipped when a
+//                             thread may run on only one CPU)
 
 // The PC probe uses SIGRTMIN + this offset (exposed for tests).
 constexpr int kRocrTamerProbeSignalOffset = 5;
@@ -79,6 +82,10 @@ struct RocrSpinTamerOptions {
   // Test seam: when set, decides PC ownership instead of `code_owner`.
   std::function<bool(std::uintptr_t pc)> pc_owner;
 };
+
+// Test seam: forgets the process-wide pin core and captured server mask, so
+// a test can exercise core selection independently of earlier tests.
+void ResetRuntimeSpinTamerPinForTesting();
 
 // Synchronous scan: samples for ~1.2 s, confines proven ROCr spinners, and
 // returns the number confined (0 when disabled, unsupported, or none found).

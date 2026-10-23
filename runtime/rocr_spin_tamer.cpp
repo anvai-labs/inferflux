@@ -482,60 +482,73 @@ Verdict ProveOwner(pid_t pid, const ThreadKey &key,
   return Verdict::kNotProven;
 }
 
-int g_tame_core = -1; // First pin target chosen; g_memory_mutex.
+// The server's affinity mask, captured once (at StartRuntimeSpinTamer, or
+// by the first scan's caller): the CPUs the operator allotted to inferfluxd.
+// ROCr widens its own threads to every CPU, so their masks cannot be used to
+// find the allotment. g_memory_mutex.
+bool g_server_mask_set = false;
+cpu_set_t g_server_mask;
+int g_tame_core = -1; // The one shared pin core, chosen once; g_memory_mutex.
 
-enum class PinPlan { kPin, kSingleCpu, kError };
+void CaptureServerMaskOnce() {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  const bool ok = sched_getaffinity(0, sizeof(mask), &mask) == 0;
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  if (!g_server_mask_set && ok) {
+    g_server_mask = mask;
+    g_server_mask_set = true;
+  }
+}
 
-// Resolves the pin target from the confined thread's own affinity mask (ROCr
-// widens its threads to every CPU the process may use; the main thread's
-// mask can be narrower). Precedence: a valid INFERFLUX_ROCR_TAME_CORE, then
-// the core chosen for earlier confinements (so all confined threads share
-// one core), then the thread's highest allowed CPU. The shared core is set
-// once and never overwritten. kSingleCpu: the thread can only run on one CPU,
-// so there is nothing to bound. An invalid INFERFLUX_ROCR_TAME_CORE
-// (unparseable, out of range, or outside the mask) warns once.
+enum class PinPlan { kPin, kSingleCpu, kNotPinnable, kError };
+
+// Resolves the pin target. Every confined thread is pinned to one shared
+// core, chosen once: a valid INFERFLUX_ROCR_TAME_CORE inside the server's
+// allotment, else the highest CPU of that allotment. A thread whose own mask
+// excludes the shared core is not confined (kNotPinnable) rather than pinned
+// elsewhere, so the cost stays bounded to that single core. kSingleCpu: the
+// thread can only run on one CPU, so there is nothing to bound. An invalid
+// INFERFLUX_ROCR_TAME_CORE (unparseable, out of range, or outside the
+// allotment) warns once.
 PinPlan ChooseTameCore(pid_t tid, int *tame_core) {
   cpu_set_t allowed;
   CPU_ZERO(&allowed);
   if (sched_getaffinity(tid, sizeof(allowed), &allowed) != 0) {
     return PinPlan::kError;
   }
-  int highest = -1;
-  int count = 0;
-  for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu) {
-    if (CPU_ISSET(cpu, &allowed)) {
-      highest = cpu;
-      ++count;
-    }
-  }
-  if (count <= 1) {
+  if (CPU_COUNT(&allowed) <= 1) {
     return PinPlan::kSingleCpu;
   }
-  // Valid CPU indices are [0, CPU_SETSIZE - 1]; an index of CPU_SETSIZE
-  // would make CPU_ISSET/CPU_SET address past the end of cpu_set_t.
-  const int requested =
-      ParseIntEnv("INFERFLUX_ROCR_TAME_CORE", -1, 0, CPU_SETSIZE - 1);
-  const char *raw = std::getenv("INFERFLUX_ROCR_TAME_CORE");
-  const bool requested_ok = requested >= 0 && CPU_ISSET(requested, &allowed);
-  if (!requested_ok && raw != nullptr && *raw != '\0') {
-    static std::atomic<bool> warned_invalid{false};
-    if (!warned_invalid.exchange(true)) {
-      log::Warn(kComponent, std::string("INFERFLUX_ROCR_TAME_CORE=") + raw +
-                                " is not a CPU in the allowed mask; ignoring "
-                                "it");
+  CaptureServerMaskOnce();
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  if (g_tame_core < 0) {
+    const cpu_set_t &server = g_server_mask_set ? g_server_mask : allowed;
+    // Valid CPU indices are [0, CPU_SETSIZE - 1]; an index of CPU_SETSIZE
+    // would make CPU_ISSET/CPU_SET address past the end of cpu_set_t.
+    const int requested =
+        ParseIntEnv("INFERFLUX_ROCR_TAME_CORE", -1, 0, CPU_SETSIZE - 1);
+    if (requested >= 0 && CPU_ISSET(requested, &server)) {
+      g_tame_core = requested;
+    } else {
+      const char *raw = std::getenv("INFERFLUX_ROCR_TAME_CORE");
+      if (raw != nullptr && *raw != '\0') {
+        log::Warn(kComponent, std::string("INFERFLUX_ROCR_TAME_CORE=") + raw +
+                                  " is not a CPU in the server's affinity "
+                                  "mask; ignoring it");
+      }
+      for (int cpu = CPU_SETSIZE - 1; cpu >= 0; --cpu) {
+        if (CPU_ISSET(cpu, &server)) {
+          g_tame_core = cpu;
+          break;
+        }
+      }
     }
   }
-  std::lock_guard<std::mutex> lock(g_memory_mutex);
-  if (requested_ok) {
-    *tame_core = requested;
-  } else if (g_tame_core >= 0 && CPU_ISSET(g_tame_core, &allowed)) {
-    *tame_core = g_tame_core;
-  } else {
-    *tame_core = highest;
+  if (g_tame_core < 0 || !CPU_ISSET(g_tame_core, &allowed)) {
+    return PinPlan::kNotPinnable;
   }
-  if (g_tame_core < 0) {
-    g_tame_core = *tame_core;
-  }
+  *tame_core = g_tame_core;
   return PinPlan::kPin;
 }
 
@@ -580,6 +593,16 @@ bool ConfineThread(const ThreadKey &key, int *pinned_cpu) {
   const PinPlan plan = ChooseTameCore(tid, &tame_core);
   if (plan == PinPlan::kError) {
     UnclaimConfinement(key); // Thread exited (ESRCH) or mask unreadable.
+    return false;
+  }
+  if (plan == PinPlan::kNotPinnable) {
+    static std::atomic<bool> warned{false};
+    if (!warned.exchange(true)) {
+      log::Warn(kComponent, "tid " + std::to_string(tid) +
+                                " cannot run on the shared pin core; leaving "
+                                "it unconfined to keep the one-core bound");
+    }
+    UnclaimConfinement(key);
     return false;
   }
   if (plan == PinPlan::kPin) {
@@ -723,6 +746,9 @@ int TameRuntimeSpinThreadsImpl(const RocrSpinTamerOptions &options,
     }
   }
 
+  if (Cancelled(cancelled)) {
+    return confined; // Process is exiting: don't touch metrics or statics.
+  }
   if (confined > 0) {
     GlobalMetrics().RecordRuntimeSpinThreadsConfined(confined);
     log::Info(kComponent,
@@ -823,6 +849,14 @@ private:
 
 } // namespace
 
+void ResetRuntimeSpinTamerPinForTesting() {
+#if defined(__linux__)
+  std::lock_guard<std::mutex> lock(g_memory_mutex);
+  g_tame_core = -1;
+  g_server_mask_set = false;
+#endif
+}
+
 int TameRuntimeSpinThreads(const RocrSpinTamerOptions &options) {
 #if defined(__linux__)
   return TameRuntimeSpinThreadsImpl(options, nullptr);
@@ -843,6 +877,8 @@ void StartRuntimeSpinTamer() noexcept {
     if (!HsaRuntimeLoaded()) {
       return;
     }
+    CaptureServerMaskOnce(); // On the starting thread: the operator's
+                             // allotment, before libraries narrow it.
     TamerWorker::Instance().Start();
   } catch (const std::exception &ex) {
     try {

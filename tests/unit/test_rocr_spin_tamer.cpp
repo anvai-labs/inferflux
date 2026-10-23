@@ -236,6 +236,7 @@ TEST_CASE("rocr spin tamer confines a spinner proven to run owner code",
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
 
+  inferflux::ResetRuntimeSpinTamerPinForTesting();
   SpinnerGroup spinners(1);
   const int ncpu = CountAllowedCpus();
   const int expected_core = HighestAllowedCpu();
@@ -430,6 +431,7 @@ TEST_CASE("rocr spin tamer honours INFERFLUX_ROCR_TAME_CORE",
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE",
                                      std::to_string(requested));
+  inferflux::ResetRuntimeSpinTamerPinForTesting();
   SpinnerGroup spinners(1);
   REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
   cpu_set_t now;
@@ -437,5 +439,25 @@ TEST_CASE("rocr spin tamer honours INFERFLUX_ROCR_TAME_CORE",
   REQUIRE(sched_getaffinity(spinners.tid(0), sizeof(now), &now) == 0);
   REQUIRE(CPU_COUNT(&now) == 1);
   REQUIRE(CPU_ISSET(requested, &now));
+}
+TEST_CASE("rocr spin tamer pins every confined thread to the same core",
+          "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("needs >= 2 allowed CPUs to observe a pin choice");
+  }
+  inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
+  inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
+  inferflux::ResetRuntimeSpinTamerPinForTesting();
+  SpinnerGroup first(1);
+  REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
+  SpinnerGroup second(1);
+  REQUIRE(ScanUntil(1, OwnedByTestLoop()) == 1);
+  cpu_set_t a, b;
+  CPU_ZERO(&a);
+  CPU_ZERO(&b);
+  REQUIRE(sched_getaffinity(first.tid(0), sizeof(a), &a) == 0);
+  REQUIRE(sched_getaffinity(second.tid(0), sizeof(b), &b) == 0);
+  REQUIRE(CPU_COUNT(&a) == 1);
+  REQUIRE(CPU_EQUAL(&a, &b));
 }
 #endif // defined(__linux__)
