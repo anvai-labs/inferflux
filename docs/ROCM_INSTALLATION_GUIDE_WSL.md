@@ -359,25 +359,39 @@ scripts/rocm/build_patched_rocr.sh --out ~/rocr-patched   # ~1 min
 
 The script clones `ROCm/rocm-systems` at `rocm-7.2.0` (`projects/rocr-runtime`
 only), applies `scripts/rocm/patches/rocr-7.2.0-async-events-poll-backoff.patch`,
-builds `libhsa-runtime64` with ROCm's LLVM in a clean environment, and adds
-AMD's prebuilt WSL thunk `librocdxg` (from the `ROCm/librocdxg` release
-package, checksum-pinned). It installs nothing system-wide; the output
-directory holds the two libraries and `PATCHED_ROCR.json` (source commit,
+builds `libhsa-runtime64` in a clean environment (host code with the
+system C++ compiler, which `PATCHED_ROCR.json` records; ROCm's LLVM only
+for the GPU blit and trap-handler code objects), and adds AMD's prebuilt WSL
+thunk `librocdxg` (from the `ROCm/librocdxg` release package,
+checksum-pinned). It installs nothing system-wide; the output directory
+holds the two libraries and `PATCHED_ROCR.json` (source commit, compiler,
 patch and library checksums).
 
-The script requires the host ROCm to be exactly 7.2.0 (the backport's
-base), so the patched runtime always matches the installed HIP.
+The script requires the host ROCm to be exactly 7.2.0 (the backport's base)
+and refuses to stage a library that carries a RUNPATH or has unresolved
+dependencies. Unlike AMD's WSL build, the upstream runtime links `libdrm`,
+`libdrm_amdgpu`, `libnuma` and `librocprofiler-register`; on a ROCm 7.2 WSL
+install these resolve through the loader configuration (`/opt/amdgpu/lib`,
+`/opt/rocm/lib`, the system `libnuma1`). Deploy on the host it was built on,
+or one with the same ROCm and `amdgpu` packages.
 
-Deploy by copying the output into a directory that is on the server's
+Deploy by copying the output into a directory on the server's
 `LD_LIBRARY_PATH` and setting `HSA_ENABLE_DXG_DETECTION=1`, which makes
-upstream ROCr load `librocdxg`. Confirm the service actually sets
-`LD_LIBRARY_PATH` to that directory (e.g. a release's `runtime/bin` via
-`Environment=LD_LIBRARY_PATH=...` in the unit); otherwise the patch is never
-loaded. Keep any copies already there:
+upstream ROCr load `librocdxg`. That directory must come **before**
+`/opt/rocm/lib` in `LD_LIBRARY_PATH` (the setup step above prepends
+`/opt/rocm/lib` for interactive shells; a service should set its own, e.g.
+`Environment=LD_LIBRARY_PATH=<release>/runtime/bin` in the unit), or the
+stock runtime shadows the patched one. Back up anything already there, once:
 
 ```bash
 D=<release>/runtime/bin
-mkdir -p "$D/pre-patched-rocr" && cp -a "$D"/libhsa-runtime64.so* "$D"/librocdxg.so* "$D/pre-patched-rocr/" 2>/dev/null
+B="$D/pre-patched-rocr"
+if [ ! -e "$B" ]; then   # Never overwrite the original backup on a redeploy.
+  mkdir "$B"
+  for f in "$D"/libhsa-runtime64.so* "$D"/librocdxg.so*; do
+    [ -e "$f" ] && { cp -a "$f" "$B/" || { echo "backup failed: $f"; exit 1; }; }
+  done
+fi
 cp -a ~/rocr-patched/lib* ~/rocr-patched/PATCHED_ROCR.json "$D/"
 # systemd unit: Environment=HSA_ENABLE_DXG_DETECTION=1
 ```
@@ -399,8 +413,9 @@ the stock runtime; c=8 and c=1 throughput and per-request latency unchanged
 `INFERFLUX_ROCR_TAME=1` can stay on alongside it: the threads it pins now
 sleep, and it bounds the cost if the patched library is ever missing.
 Rollback: remove the copied libraries (restoring anything saved in
-`pre-patched-rocr/`) and the `HSA_ENABLE_DXG_DETECTION` line, then restart. Retire the patch once a ROCm release includes #7898
-(check the release notes for rocm-systems#7898 / librocdxg#60).
+`pre-patched-rocr/`) and the `HSA_ENABLE_DXG_DETECTION` line, then restart.
+Retire the patch once a ROCm release includes #7898 (check the release notes
+for rocm-systems#7898 / librocdxg#60).
 
 ## Supported AMD GPUs
 

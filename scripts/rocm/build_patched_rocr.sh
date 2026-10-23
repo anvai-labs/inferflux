@@ -10,7 +10,7 @@
 #
 # Usage:
 #   scripts/rocm/build_patched_rocr.sh --out DIR [--work DIR]
-#       [--rocm-tag rocm-7.2.0] [--rocdxg v1.2.2] [--rocm /opt/rocm]
+#       [--rocdxg v1.2.2] [--rocm /opt/rocm]
 #
 # Nothing is installed system-wide. DIR receives libhsa-runtime64.so*,
 # librocdxg.so* and PATCHED_ROCR.json. Deploy by copying them into the
@@ -24,7 +24,7 @@ PATCH="${SCRIPT_DIR}/patches/rocr-7.2.0-async-events-poll-backoff.patch"
 
 OUT=""
 WORK=""
-ROCM_TAG="rocm-7.2.0"
+ROCM_TAG="rocm-7.2.0" # The patch is a backport onto exactly this tag.
 ROCDXG_TAG="v1.2.2"
 ROCM_ROOT="/opt/rocm"
 
@@ -41,7 +41,6 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --out) need_value "$@"; OUT="$2"; shift 2 ;;
     --work) need_value "$@"; WORK="$2"; shift 2 ;;
-    --rocm-tag) need_value "$@"; ROCM_TAG="$2"; shift 2 ;;
     --rocdxg) need_value "$@"; ROCDXG_TAG="$2"; shift 2 ;;
     --rocm) need_value "$@"; ROCM_ROOT="$2"; shift 2 ;;
     -h|--help) usage 0 ;;
@@ -50,8 +49,6 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$OUT" ]] || usage 2
-[[ "$ROCM_TAG" == "rocm-7.2.0" ]] ||
-  die "the patch is a backport onto rocm-7.2.0; rebase it before using $ROCM_TAG"
 [[ -n "${ROCDXG_SHA256[$ROCDXG_TAG]:-}" ]] ||
   die "no pinned sha256 for librocdxg $ROCDXG_TAG; add one to ROCDXG_SHA256"
 for tool in git curl cmake dpkg-deb readelf sha256sum; do
@@ -71,7 +68,10 @@ for tool in clang llvm-objcopy; do
     die "missing ${ROCM_ROOT}/llvm/bin/${tool} (ROCm LLVM)"
 done
 
-WORK="${WORK:-$(mktemp -d -t patched-rocr.XXXXXX)}"
+if [[ -z "$WORK" ]]; then
+  WORK="$(mktemp -d -t patched-rocr.XXXXXX)"
+  trap 'rm -rf "$WORK"' EXIT # Auto-created: never leave it behind.
+fi
 mkdir -p "$WORK" "$OUT"
 WORK="$(cd "$WORK" && pwd)"
 OUT="$(cd "$OUT" && pwd)"
@@ -120,12 +120,24 @@ rm -rf "$BUILD" # Never stage a library left over from an earlier build.
   -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON \
   -DCMAKE_PREFIX_PATH="$ROCM_ROOT" \
   -DClang_DIR="${SHIM}/clang" -DLLVM_DIR="${SHIM}/llvm" \
+  -DCMAKE_SKIP_RPATH=ON \
   -DBUILD_ROCR_TESTS=OFF >"${WORK}/configure.log" 2>&1 ||
   die "configure failed; see ${WORK}/configure.log"
 "${clean_env[@]}" "$CMAKE" --build "$BUILD" -j"$(nproc)" >"${WORK}/build.log" 2>&1 ||
   die "build failed; see ${WORK}/build.log"
 LIBHSA="$(find "${BUILD}/rocr/lib" -name 'libhsa-runtime64.so.1.*' -type f | head -1)"
 [[ -n "$LIBHSA" ]] || die "libhsa-runtime64 not produced"
+# Like the stock runtime: no RUNPATH/RPATH (an empty element would make the
+# loader search the service's working directory), and every dependency
+# (libelf, libdrm, libdrm_amdgpu, libnuma, librocprofiler-register) must
+# resolve through the system loader configuration.
+if readelf -d "$LIBHSA" | grep -qE '\((RUNPATH|RPATH)\)'; then
+  die "built libhsa-runtime64 carries a RUNPATH/RPATH"
+fi
+MISSING="$(ldd "$LIBHSA" | grep 'not found' || true)"
+[[ -z "$MISSING" ]] || die "unresolved dependencies: ${MISSING}"
+CXX_USED="$(sed -n 's/^CMAKE_CXX_COMPILER:[A-Z]*=//p' "${BUILD}/CMakeCache.txt")"
+CXX_VERSION="$("$CXX_USED" --version | head -1)"
 
 # 3. Prebuilt WSL thunk: download, verify, extract (never installed).
 DEB_DIR="${WORK}/rocdxg"
@@ -139,8 +151,10 @@ if [[ ! -f "$DEB" ]]; then
     die "could not download $(basename "$DEB")"
   mv "${DEB}.part" "$DEB"
 fi
-echo "${ROCDXG_SHA256[$ROCDXG_TAG]}  ${DEB}" | sha256sum --check --quiet ||
+if ! echo "${ROCDXG_SHA256[$ROCDXG_TAG]}  ${DEB}" | sha256sum --check --quiet; then
+  rm -f "$DEB" # Never keep a bad cached download: the next run refetches.
   die "librocdxg package checksum mismatch"
+fi
 rm -rf "${DEB_DIR}/x"
 dpkg-deb -x "$DEB" "${DEB_DIR}/x"
 LIBDXG="$(find "${DEB_DIR}/x" -name 'librocdxg.so.*.*' -type f | head -1)"
@@ -161,6 +175,7 @@ cat > "${OUT}/PATCHED_ROCR.json" <<EOF
 {
   "rocm_systems_tag": "${ROCM_TAG}",
   "host_rocm": "${HOST_ROCM}",
+  "host_compiler": "${CXX_VERSION}",
   "rocm_systems_commit": "$(git -C "$SRC" rev-parse HEAD)",
   "upstream_fix": "ROCm/rocm-systems#7898 (46558b7af4dc79b8b8014619c1afdb82db079a9f)",
   "patch_sha256": "$(sha "$PATCH")",

@@ -6,11 +6,11 @@ The runtime.cpp hunks are the upstream change re-fitted to 7.2.0's context
 (the upstream diff does not apply directly); core/util/poll_backoff.h is
 upstream's file verbatim. Upstream's rocrtst unit test is not included.
 
-The comments are kept as upstream wrote them. One does not hold for 7.2.0:
-the 200 us mixed-batch ceiling is described as matching "the interrupt
-path's 200us active-poll window", which 7.2.0's AsyncEventsLoop does not
-have. That ceiling only applies when interrupts are available (not on
-WSL2/dxg, where every signal polls and the 2 ms ceiling applies).
+Two upstream comments are reworded: they justify the 200 us mixed-batch
+ceiling by an interrupt-path poll window that 7.2.0's AsyncEventsLoop does
+not have. The value is unchanged, and it only applies when interrupts are
+available (not on WSL2/dxg, where every signal polls and the 2 ms ceiling
+applies).
 ROCr is MIT-licensed (Copyright Advanced Micro Devices, Inc.).
 
 Applied by scripts/rocm/build_patched_rocr.sh with `git apply`.
@@ -43,8 +43,8 @@ index 4450f4b..b6981bc 100644
 +      // still be forced by a single EopEvent-less signal in the batch (an IPC
 +      // signal or an internal DefaultSignal such as gang-copy signals); the
 +      // nap then delays unrelated interrupt-backed handlers on this shared
-+      // thread, so it is capped at the interrupt path's 200us active-poll
-+      // window instead.
++      // thread, so it is capped at 200us (upstream's interrupt-path window;
++      // 7.2.0 has no such window, the value is kept as upstream chose it).
 +      const int poll_nap_ceiling_us =
 +          g_use_interrupt_wait ? kPollNapCeilingMixedUs : kPollNapCeilingUs;
 +      int poll_nap_us = kPollNapFloorUs;
@@ -113,8 +113,8 @@ index 0000000..3311dce
 +// or an internal DefaultSignal, e.g. gang copies). One such signal drags every
 +// interrupt-backed signal on the shared async-events thread into this polling
 +// scan, so the nap here bounds the added callback latency of unrelated
-+// interrupt-backed handlers. Kept at the interrupt path's 200us active-poll
-+// window (see AsyncEventsLoop) so that bound stays at the noise floor.
++// interrupt-backed handlers. Upstream ties it to a 200us interrupt-path poll
++// window; rocm-7.2.0 has none, so here it is simply upstream's chosen bound.
 +inline constexpr int kPollNapCeilingMixedUs = 200;
 +
 +// Given the current nap duration, return the next one: double it, capped at
