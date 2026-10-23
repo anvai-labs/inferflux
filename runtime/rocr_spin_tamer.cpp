@@ -142,11 +142,14 @@ bool Enabled() noexcept {
   return enabled == 1;
 }
 
-// True when `own` is exactly the pin inherited from a tamed creator (not an
-// affinity the new thread's attribute asked for).
+// True when `own` is exactly a tamed creator's pin. That is treated as
+// inherited even if the new thread's attribute named that CPU: an explicit
+// request cannot be told apart from an attribute cloned from the pinned
+// creator (pthread_getattr_np), and widening a real request is harmless
+// while leaving a leaked pin confines the thread next to the spinners.
 bool OnlyInheritedPin(const InheritedState &inherited, const cpu_set_t &own) {
-  return inherited.creator_cpu >= 0 && !inherited.explicit_affinity &&
-         CPU_COUNT(&own) == 1 && CPU_ISSET(inherited.creator_cpu, &own) &&
+  return inherited.creator_cpu >= 0 && CPU_COUNT(&own) == 1 &&
+         CPU_ISSET(inherited.creator_cpu, &own) &&
          CPU_COUNT(&inherited.mask) > 0;
 }
 
@@ -298,7 +301,9 @@ void TameCurrentRocrThread(int core, const InheritedState &inherited) noexcept {
       char name[16];
       std::snprintf(name, sizeof(name), "rocr-hsa-%d",
                     g_next_name.fetch_add(1) % 100000);
-      if (inherited.creator_cpu >= 0 && inherited.name[0] != '\0') {
+      if (inherited.creator_cpu >= 0) {
+        // Created by a tamed thread: its current name is the creator's
+        // rocr-hsa-N, so take the creator's original name (possibly empty).
         std::memcpy(t_pre_name, inherited.name, sizeof(t_pre_name));
       } else if (pthread_getname_np(pthread_self(), t_pre_name,
                                     sizeof(t_pre_name)) != 0) {
@@ -323,8 +328,7 @@ void TameCurrentRocrThread(int core, const InheritedState &inherited) noexcept {
   (void)pthread_setcancelstate(old_cancel_state, nullptr);
 }
 
-void CaptureInheritedState(const pthread_attr_t *attr,
-                           InheritedState *inherited) noexcept {
+void CaptureInheritedState(InheritedState *inherited) noexcept {
   const int creator_cpu = t_tamed_cpu;
   inherited->creator_cpu = creator_cpu;
   if (creator_cpu < 0) {
@@ -332,16 +336,6 @@ void CaptureInheritedState(const pthread_attr_t *attr,
   }
   inherited->mask = t_pre_pin_mask;
   std::memcpy(inherited->name, t_pre_name, sizeof(inherited->name));
-  inherited->explicit_affinity = false;
-  if (attr != nullptr) {
-    // glibc reports "no cpuset in the attribute" as all CPUs, so a
-    // single-CPU answer equal to the creator's pin is an explicit request.
-    cpu_set_t requested;
-    CPU_ZERO(&requested);
-    inherited->explicit_affinity =
-        pthread_attr_getaffinity_np(attr, sizeof(requested), &requested) == 0 &&
-        CPU_COUNT(&requested) == 1 && CPU_ISSET(creator_cpu, &requested);
-  }
 }
 
 void RestoreInheritedScheduling(const InheritedState &inherited) noexcept {

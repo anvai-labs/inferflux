@@ -113,7 +113,7 @@ pthread_create(pthread_t *__restrict thread,
   // non-ROCr child gets them undone in the trampoline, a ROCr child is
   // tamed against what it would have inherited without the tamer.
   inferflux::InheritedState inherited;
-  inferflux::CaptureInheritedState(attr, &inherited);
+  inferflux::CaptureInheritedState(&inherited);
   if (core >= 0 || inherited.creator_cpu >= 0) {
     if (auto *box = static_cast<TameBox *>(std::malloc(sizeof(TameBox)))) {
       *box = TameBox{start_routine, arg, core, inherited};

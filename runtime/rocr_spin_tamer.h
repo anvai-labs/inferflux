@@ -48,8 +48,9 @@ namespace inferflux {
 // core; with no overlap it is left alone and counted as skipped. Threads that
 // a tamed thread creates (and that are not ROCr threads themselves) get the
 // mask they would have inherited without the tamer (the creator's mask
-// before its pin) unless their attribute sets an affinity explicitly, so
-// the pin never leaks to them.
+// before its pin) whenever they are still on exactly the creator's pin, so
+// the pin never leaks to them (an attribute naming only that CPU counts as
+// inherited: it cannot be told apart from one cloned from the creator).
 //
 // Residuals: the allotment is read in this binary's static initialization,
 // after shared-library constructors (libgomp with OMP_PROC_BIND can narrow
@@ -59,7 +60,10 @@ namespace inferflux {
 // static initialization, each classification's dladdr takes the dynamic
 // loader's lock; a future ROCr starting threads via
 // std::thread (start routine in libstdc++), or loaded with RTLD_DEEPBIND,
-// would not be recognized (fails safe: nothing tamed); sanitizer builds and
+// would not be recognized (fails safe: nothing tamed); a process forked
+// from a tamed thread starts on its pin; creating a thread from a tamed
+// thread allocates a small box (malloc), so an allocator that starts threads
+// while holding its own lock could deadlock there; sanitizer builds and
 // non-x86_64/aarch64 targets compile the interposer out.
 //
 // Knobs (env-only, see docs/CONFIG_REFERENCE.md section 10):
@@ -90,9 +94,8 @@ int RocrTameCoreForNewThread(void *(*start_routine)(void *)) noexcept;
 // would have inherited without the tamer.
 struct InheritedState {
   int creator_cpu = -1; // The creator's pin; -1: not from a tamed thread.
-  bool explicit_affinity = false; // The attribute asks for exactly that pin.
-  cpu_set_t mask{};               // The creator's mask before its pin.
-  char name[16] = {};             // The creator's name before its rename.
+  cpu_set_t mask{};     // The creator's mask before its pin.
+  char name[16] = {};   // The creator's name before its rename.
 };
 
 // Runs in the new thread before its start routine: pin, rename, count. No
@@ -102,18 +105,16 @@ void TameCurrentRocrThread(int core, const InheritedState &inherited) noexcept;
 
 // Creator side, for every thread being created: fills *inherited. Its
 // creator_cpu is the caller's pin, or -1 when the caller is not a tamed
-// thread; otherwise also its pre-pin mask and name, and whether `attr`
-// explicitly requests exactly that pin.
-void CaptureInheritedState(const pthread_attr_t *attr,
-                           InheritedState *inherited) noexcept;
+// thread; otherwise also the caller's pre-pin mask and name.
+void CaptureInheritedState(InheritedState *inherited) noexcept;
 
 // INFERFLUX_ROCR_TAME (read once). When false the interposer passes every
 // creation straight through.
 bool RocrTamerEnabled() noexcept;
 
 // Runs in a non-ROCr thread created by a tamed thread: restores the
-// creator's original name and, unless the attribute asked for the pin, the
-// creator's mask before it was pinned.
+// creator's original name and, if it is still on exactly the creator's pin,
+// the creator's mask before it was pinned.
 void RestoreInheritedScheduling(const InheritedState &inherited) noexcept;
 #endif
 

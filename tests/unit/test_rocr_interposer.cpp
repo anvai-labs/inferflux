@@ -415,16 +415,17 @@ TEST_CASE("interposer: a tamed thread's children do not inherit the pin",
     CHECK(child.cpu_count == static_cast<int>(cpus.size()));
     CHECK(child.nice == OwnNice());
   }
-  SECTION("an explicit attribute affinity on the tame core is kept") {
+  SECTION("an attribute naming only the tame core is still restored") {
+    // Indistinguishable from an attribute cloned from the pinned creator
+    // (pthread_getattr_np), so the pin must not survive it.
     ChildReport child;
     FakeHsaReport parent{};
     pthread_t thread{};
     REQUIRE(Fake().spawn_parent(&thread, &parent, &FillChildReport, &child,
                                 /*child_attr_cpu=*/cpus.back(), 0) == 0);
     REQUIRE(pthread_join(thread, nullptr) == 0);
-    CHECK(parent.only_cpu == cpus.back()); // Parent is pinned there too.
-    CHECK(child.cpu_count == 1);
-    CHECK(child.only_cpu == cpus.back());
+    CHECK(parent.only_cpu == cpus.back()); // Parent is pinned there.
+    CHECK(child.cpu_count == static_cast<int>(cpus.size()));
   }
   SECTION("an explicit attribute affinity is kept") {
     ChildReport child;
