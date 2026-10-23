@@ -388,6 +388,8 @@ stock runtime shadows the patched one. Back up anything already there, once:
 D=<release>/runtime/bin
 (  # Subshell: `exit` stops the step without closing your terminal. Each
    # command checks itself (set -e is ignored in a `( ... ) ||` subshell).
+  # The build writes PATCHED_ROCR.json last: without it the output is partial.
+  [ -f ~/rocr-patched/PATCHED_ROCR.json ] || { echo "incomplete build"; exit 1; }
   B="$D/pre-patched-rocr"
   if [ ! -e "$B" ] && [ -e "$D/PATCHED_ROCR.json" ]; then
     echo "$D already holds a patched runtime but no backup"; exit 1

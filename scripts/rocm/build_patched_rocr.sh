@@ -164,8 +164,12 @@ rm -rf "$BUILD" # Never stage a library left over from an earlier build.
   die "configure failed; see ${WORK}/configure.log"
 "${clean_env[@]}" "$CMAKE" --build "$BUILD" -j"$(nproc)" >"${WORK}/build.log" 2>&1 ||
   die "build failed; see ${WORK}/build.log"
-LIBHSA="$(find "$BUILD" -name 'libhsa-runtime64.so.1.*' -type f 2>/dev/null | head -1 || true)"
-[[ -n "$LIBHSA" ]] || die "libhsa-runtime64 not produced"
+LIBHSA_FOUND="$(find "$BUILD" -name 'libhsa-runtime64.so.1.*' -type f 2>/dev/null || true)"
+[[ -n "$LIBHSA_FOUND" ]] || die "libhsa-runtime64 not produced"
+# Exactly one, so what is staged and checksummed never depends on find order.
+[[ "$LIBHSA_FOUND" != *$'\n'* ]] ||
+  die "more than one libhsa-runtime64 produced: ${LIBHSA_FOUND//$'\n'/, }"
+LIBHSA="$LIBHSA_FOUND"
 # Like the stock runtime: no RUNPATH/RPATH (an empty element would make the
 # loader search the service's working directory), and every dependency
 # (libelf, libdrm, libdrm_amdgpu, libnuma, librocprofiler-register) must
@@ -206,7 +210,7 @@ mkdir -p "$DEB_DIR"
 if [[ ! -f "$DEB" ]]; then
   # Public release asset: no GitHub login needed; the checksum below is the
   # trust anchor.
-  curl -fsSL -o "${DEB}.part" \
+  curl -fsSL --connect-timeout 30 --max-time 600 --retry 3 -o "${DEB}.part" \
     "https://github.com/ROCm/librocdxg/releases/download/${ROCDXG_TAG}/$(basename "$DEB")" ||
     die "could not download $(basename "$DEB")"
   mv "${DEB}.part" "$DEB"
@@ -235,8 +239,10 @@ fi
 DXG_MISSING="$(grep 'not found' <<<"$("${clean_env[@]}" ldd "$LIBDXG")" || true)"
 [[ -z "$DXG_MISSING" ]] || die "librocdxg has unresolved dependencies: ${DXG_MISSING}"
 
-# 4. Stage with the sonames the loader looks up: assembled completely in
-# ${WORK}/stage first, so a failure never leaves OUT half-replaced.
+# 4. Stage with the sonames the loader looks up, assembled completely in
+# ${WORK}/stage first. PATCHED_ROCR.json is the completion marker: it is
+# removed from OUT before the libraries are replaced and renamed into place
+# last, so an OUT without it is incomplete and must not be deployed.
 STAGE="${WORK}/stage"
 rm -rf "$STAGE" && mkdir -p "$STAGE"
 cp "$LIBHSA" "${STAGE}/"
@@ -271,10 +277,13 @@ cat > "${STAGE}/PATCHED_ROCR.json" <<EOF
   "required_env": {"HSA_ENABLE_DXG_DETECTION": "1"}
 }
 EOF
-# Swap the complete set into OUT.
-rm -f "${OUT}"/libhsa-runtime64.so* "${OUT}"/librocdxg.so* "${OUT}/PATCHED_ROCR.json"
+# Swap the complete set into OUT, manifest last.
+rm -f "${OUT}/PATCHED_ROCR.json" "${OUT}/.PATCHED_ROCR.json.tmp"
+rm -f "${OUT}"/libhsa-runtime64.so* "${OUT}"/librocdxg.so*
 touch "${OUT}/${OUT_MARK}"
-cp -a "${STAGE}"/. "${OUT}/"
+cp -a "${STAGE}"/lib* "${OUT}/"
+cp "${STAGE}/PATCHED_ROCR.json" "${OUT}/.PATCHED_ROCR.json.tmp"
+mv "${OUT}/.PATCHED_ROCR.json.tmp" "${OUT}/PATCHED_ROCR.json"
 rm -rf "$STAGE"
 echo "build_patched_rocr: staged into ${OUT}"
 ls -l "$OUT"
