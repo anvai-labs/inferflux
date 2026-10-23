@@ -1,7 +1,7 @@
 // Defines pthread_create for the executable it is linked into, so the ROCr
 // thread tamer can recognize threads started by libhsa-runtime64 at creation
-// (see runtime/rocr_spin_tamer.h). Linked ONLY into ROCm-enabled
-// (ENABLE_ROCM) inferfluxd builds and rocr_interposer_tests -- never into
+// (see runtime/rocr_spin_tamer.h). Linked ONLY into inferfluxd builds where
+// CMake found ROCm (GGML_HIP), and into rocr_interposer_tests -- never into
 // inferflux_core, which inferctl, the benchmarks and the other tests also link.
 // The symbol is exported with cmake/rocr_pthread_interposer.dynlist so
 // libraries (libhsa-runtime64, loaded as a dependency or dlopen'd RTLD_LOCAL
@@ -32,6 +32,7 @@
 #include <cerrno>
 #include <cstdlib>
 
+namespace inferflux {
 namespace {
 
 using PthreadCreateFn = int (*)(pthread_t *, const pthread_attr_t *,
@@ -64,7 +65,7 @@ struct TameBox {
   void *arg;
   int core; // >= 0: tame this ROCr thread onto `core`.
   // inherited.creator_cpu >= 0: created by a tamed thread; what to undo.
-  inferflux::InheritedState inherited;
+  InheritedState inherited;
 };
 
 // Deliberately NOT noexcept, with no try/catch and no RAII objects:
@@ -76,9 +77,9 @@ void *RocrTameTrampoline(void *raw_box) {
   const TameBox box = *static_cast<TameBox *>(raw_box);
   std::free(raw_box);
   if (box.core >= 0) {
-    inferflux::TameCurrentRocrThread(box.core, box.inherited);
+    TameCurrentRocrThread(box.core, box.inherited);
   } else {
-    inferflux::RestoreInheritedScheduling(box.inherited);
+    RestoreInheritedScheduling(box.inherited);
   }
   return box.start_routine(box.arg);
 }
@@ -88,12 +89,12 @@ void *RocrTameTrampoline(void *raw_box) {
 // runs (library constructors) resolve lazily.
 [[maybe_unused]] const bool g_interposer_ready = [] {
   (void)RealPthreadCreate();
-  inferflux::NoteRocrPthreadInterposerInstalled(
-      reinterpret_cast<void *>(&pthread_create));
+  NoteRocrPthreadInterposerInstalled(reinterpret_cast<void *>(&pthread_create));
   return true;
 }();
 
 } // namespace
+} // namespace inferflux
 
 // glibc declares pthread_create noexcept in C++; the definition must match.
 extern "C" __attribute__((visibility("default"), used)) int
@@ -103,7 +104,7 @@ pthread_create(pthread_t *__restrict thread,
   // Saved first: the lazy dlsym, getenv, lookups and malloc must not leak
   // errno to the caller.
   const int saved_errno = errno;
-  const PthreadCreateFn real = RealPthreadCreate();
+  const inferflux::PthreadCreateFn real = inferflux::RealPthreadCreate();
   if (!inferflux::RocrTamerEnabled()) {
     errno = saved_errno;
     return real(thread, attr, start_routine, arg); // Opt-in; off by default.
@@ -115,10 +116,11 @@ pthread_create(pthread_t *__restrict thread,
   inferflux::InheritedState inherited;
   inferflux::CaptureInheritedState(&inherited);
   if (core >= 0 || inherited.creator_cpu >= 0) {
-    if (auto *box = static_cast<TameBox *>(std::malloc(sizeof(TameBox)))) {
-      *box = TameBox{start_routine, arg, core, inherited};
+    if (auto *box = static_cast<inferflux::TameBox *>(
+            std::malloc(sizeof(inferflux::TameBox)))) {
+      *box = inferflux::TameBox{start_routine, arg, core, inherited};
       errno = saved_errno;
-      const int rc = real(thread, attr, &RocrTameTrampoline, box);
+      const int rc = real(thread, attr, &inferflux::RocrTameTrampoline, box);
       if (rc != 0) {
         const int create_errno = errno;
         std::free(box); // The child never ran, so the box is still ours.
