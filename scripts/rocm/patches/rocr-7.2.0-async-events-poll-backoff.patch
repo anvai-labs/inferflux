@@ -1,0 +1,134 @@
+Backport of ROCm/rocm-systems#7898 ("fix(rocr): throttle AsyncEventsLoop
+polling-fallback spin on WSL and mixed batches", merged 2026-08-18 as
+46558b7af4dc79b8b8014619c1afdb82db079a9f) onto the rocm-7.2.0 tag.
+
+The runtime.cpp hunks are the upstream change re-fitted to 7.2.0's context
+(the upstream diff does not apply directly); core/util/poll_backoff.h is
+upstream's file except for the reworded comments below. Upstream's rocrtst
+unit test is not included.
+
+Two upstream comments are reworded: they justify the 200 us mixed-batch
+ceiling by an interrupt-path poll window that 7.2.0's AsyncEventsLoop does
+not have. The value is unchanged, and it only applies when interrupts are
+available (not on WSL2/dxg, where every signal polls and the 2 ms ceiling
+applies).
+ROCr is MIT-licensed (Copyright Advanced Micro Devices, Inc.).
+
+Applied by scripts/rocm/build_patched_rocr.sh with `git apply`.
+
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
+index 4450f4b..b6981bc 100644
+--- a/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/runtime/runtime.cpp
+@@ -84,6 +84,7 @@
+ #include "core/inc/signal.h"
+ #include "core/util/memory.h"
+ #include "core/util/os.h"
++#include "core/util/poll_backoff.h"
+ #include "inc/hsa_ven_amd_aqlprofile.h"
+ 
+ #ifndef HSA_VERSION_MAJOR
+@@ -1842,6 +1843,23 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
+       bool finish = false;
+       bool polling = false;
+       bool init_age = true;
++      // Nap duration for the no-interrupt polling mode below (see
++      // core/util/poll_backoff.h). poll_nap_us is re-initialized here, i.e.
++      // once per outer-loop iteration (one per new wait batch), so the backoff
++      // only compounds within a single idle wait and every new wait starts
++      // again at the floor -- the escalated value cannot carry across waits.
++      // The ceiling depends on why we would be polling: with interrupts
++      // unavailable globally (WSL/dxg, DTIF, KFD 1.0, HSA_ENABLE_INTERRUPT=0)
++      // every signal is polling-only and a long nap costs only the napping
++      // wait's own observation latency. With interrupts available, polling can
++      // still be forced by a single EopEvent-less signal in the batch (an IPC
++      // signal or an internal DefaultSignal such as gang-copy signals); the
++      // nap then delays unrelated interrupt-backed handlers on this shared
++      // thread, so it is capped at 200us (upstream's interrupt-path window;
++      // 7.2.0 has no such window, the value is kept as upstream chose it).
++      const int poll_nap_ceiling_us =
++          g_use_interrupt_wait ? kPollNapCeilingMixedUs : kPollNapCeilingUs;
++      int poll_nap_us = kPollNapFloorUs;
+ 
+       // Mark all signals with a waiting tag
+       // @note: Waiting tag must be marked before the signal state check on CPU to
+@@ -1894,6 +1912,17 @@ void Runtime::AsyncEventsLoop(void* _eventsInfo) {
+         if (interrupt_wait) {
+           WaitForInterrupt();
+           init_age = false;
++        } else if (polling && !finish) {
++          // No interrupt-backed event is available for at least one pending
++          // signal (PrepareInterrupt forced polling) -- on the WSL/dxg thunk
++          // that is every signal, since it implements no KFD events at all.
++          // Without a sleep this loop monopolizes a CPU core re-scanning the
++          // signal values for the whole lifetime of the async-events thread
++          // (https://github.com/ROCm/librocdxg/issues/60). Nap between scans,
++          // doubling from 20us up to poll_nap_ceiling_us. Backport of
++          // ROCm/rocm-systems#7898 (46558b7) onto rocm-7.2.0.
++          os::uSleep(poll_nap_us);
++          poll_nap_us = NextPollNapUs(poll_nap_us, poll_nap_ceiling_us);
+         }
+       }
+     }
+diff --git a/projects/rocr-runtime/runtime/hsa-runtime/core/util/poll_backoff.h b/projects/rocr-runtime/runtime/hsa-runtime/core/util/poll_backoff.h
+new file mode 100644
+index 0000000..3311dce
+--- /dev/null
++++ b/projects/rocr-runtime/runtime/hsa-runtime/core/util/poll_backoff.h
+@@ -0,0 +1,56 @@
++////////////////////////////////////////////////////////////////////////////////
++//
++//
++// Copyright © Advanced Micro Devices, Inc., or its affiliates.
++// SPDX-License-Identifier: MIT
++//
++// Escalating backoff for userspace polling fallbacks.
++//
++// Some wait paths cannot sleep in the kernel (e.g. AsyncEventsLoop when the
++// thunk exposes no interrupt-backed signal events, as on the WSL/dxg thunk).
++// Those paths re-scan signal values in userspace and would otherwise burn a
++// full CPU core. To keep idle cost near zero without penalizing a wait that
++// completes quickly, the nap between scans starts at a small floor and doubles
++// up to a ceiling; callers reset to the floor at each new wait batch, so the
++// escalation only compounds within a single idle wait batch.
++
++#ifndef HSA_RUNTIME_CORE_UTIL_POLL_BACKOFF_H_
++#define HSA_RUNTIME_CORE_UTIL_POLL_BACKOFF_H_
++
++#include <algorithm>
++
++namespace rocr {
++namespace core {
++
++// Floor (microseconds) for the polling-fallback nap.
++inline constexpr int kPollNapFloorUs = 20;
++
++// Ceiling (microseconds) when the runtime has no interrupt-backed signal
++// events at all (g_use_interrupt_wait == false, e.g. the WSL/dxg thunk).
++// Every signal is polling-only, so the only cost of a long nap is observation
++// latency of the napping wait itself.
++inline constexpr int kPollNapCeilingUs = 2000;
++
++// Ceiling (microseconds) when interrupts are available globally but the wait
++// batch was forced into polling by a signal with no EopEvent (an IPC signal
++// or an internal DefaultSignal, e.g. gang copies). One such signal drags every
++// interrupt-backed signal on the shared async-events thread into this polling
++// scan, so the nap here bounds the added callback latency of unrelated
++// interrupt-backed handlers. Upstream ties it to a 200us interrupt-path poll
++// window; rocm-7.2.0 has none, so here it is simply upstream's chosen bound.
++inline constexpr int kPollNapCeilingMixedUs = 200;
++
++// Given the current nap duration, return the next one: double it, capped at
++// ceiling_us. Saturating at the ceiling is a fixed point, so repeated calls
++// converge to and stay at ceiling_us. The multiply is only evaluated when
++// current_us <= ceiling_us/2, so current_us*2 <= ceiling_us and can never
++// overflow even for a ceiling_us up to INT_MAX.
++constexpr int NextPollNapUs(int current_us, int ceiling_us = kPollNapCeilingUs) {
++  return (current_us > ceiling_us / 2) ? ceiling_us
++                                       : std::min(current_us * 2, ceiling_us);
++}
++
++}  // namespace core
++}  // namespace rocr
++
++#endif  // HSA_RUNTIME_CORE_UTIL_POLL_BACKOFF_H_
