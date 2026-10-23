@@ -420,7 +420,10 @@ int ProbeSignal() {
       current.sa_sigaction == ProbeHandler) {
     return sig;
   }
-  if ((current.sa_flags & SA_SIGINFO) == 0 && current.sa_handler == SIG_DFL) {
+  const bool is_default = (current.sa_flags & SA_SIGINFO) != 0
+                              ? current.sa_sigaction == nullptr
+                              : current.sa_handler == SIG_DFL;
+  if (is_default) {
     struct sigaction action {};
     action.sa_sigaction = ProbeHandler;
     action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -493,6 +496,12 @@ enum class SampleResult { kPc, kNoReply, kSlotUnsafe };
 SampleResult SamplePc(pid_t pid, const ThreadKey &key, int sig,
                       const std::atomic<bool> *cancelled, std::uintptr_t *pc) {
   *pc = 0;
+  // A handler left in flight by an earlier, aborted probe must finish before
+  // the slot is re-armed, or it could store its PC as this sample.
+  if (!WaitFor([] { return g_probe_inflight.load() == 0; },
+               kHandlerDrainTimeoutMs, cancelled)) {
+    return SampleResult::kSlotUnsafe;
+  }
   if (!SafeToProbe(key, sig)) {
     return SampleResult::kNoReply;
   }
@@ -588,7 +597,6 @@ enum class PinPlan { kPin, kNotPinnable, kNoAllotment, kError };
 // False when there is no usable server allotment (none captured, or a
 // single CPU): confinement could never succeed, so scans skip probing.
 bool PinningPossible() {
-  CaptureServerMaskOnce();
   std::lock_guard<std::mutex> lock(g_memory_mutex);
   const bool possible = g_server_mask_set && CPU_COUNT(&g_server_mask) > 1;
   if (!possible) {
@@ -614,7 +622,6 @@ PinPlan ChooseTameCore(pid_t tid, int *tame_core) {
   if (sched_getaffinity(tid, sizeof(allowed), &allowed) != 0) {
     return PinPlan::kError;
   }
-  CaptureServerMaskOnce();
   std::lock_guard<std::mutex> lock(g_memory_mutex);
   // No captured allotment, or an allotment of a single CPU: pinning would
   // either guess a CPU the operator may have excluded, or pile two 100%
@@ -696,12 +703,7 @@ bool ConfineThread(const ThreadKey &key, int *pinned_cpu) {
     return false; // Thread exited (ESRCH) or mask unreadable.
   }
   if (plan == PinPlan::kNoAllotment) {
-    static std::atomic<bool> warned{false};
-    if (!warned.exchange(true)) {
-      log::Warn(kComponent, "server affinity mask unavailable or a single "
-                            "CPU; leaving ROCr pollers unconfined");
-    }
-    return false;
+    return false; // PinningPossible() already warned.
   }
   if (plan == PinPlan::kNotPinnable) {
     static std::atomic<bool> warned{false};
@@ -969,9 +971,12 @@ private:
 
 void ResetRuntimeSpinTamerPinForTesting() {
 #if defined(__linux__)
-  std::lock_guard<std::mutex> lock(g_memory_mutex);
-  g_tame_core = -1;
-  g_server_mask_set = false;
+  {
+    std::lock_guard<std::mutex> lock(g_memory_mutex);
+    g_tame_core = -1;
+    g_server_mask_set = false;
+  }
+  CaptureServerMaskOnce(); // The calling test thread's mask.
 #endif
 }
 

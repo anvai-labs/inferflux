@@ -259,6 +259,9 @@ int ScanUntil(int expected, const RocrSpinTamerOptions &options,
 
 TEST_CASE("rocr spin tamer confines a spinner proven to run owner code",
           "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("confinement pins to one core; needs >= 2 allowed CPUs");
+  }
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
 
@@ -290,6 +293,9 @@ TEST_CASE("rocr spin tamer confines a spinner proven to run owner code",
 
 TEST_CASE("rocr spin tamer refuses spinners running other code",
           "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("probing only runs when pinning is possible; needs >= 2 CPUs");
+  }
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   // Spinners pass the never-blocks prefilter and are probed (the predicate
   // is consulted), but none is proven to run owner code — the case of a busy
@@ -307,6 +313,9 @@ TEST_CASE("rocr spin tamer refuses spinners running other code",
 
 TEST_CASE("rocr spin tamer needs a majority of samples in the owner",
           "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("confinement pins to one core; needs >= 2 allowed CPUs");
+  }
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
   {
@@ -375,6 +384,9 @@ TEST_CASE("rocr spin tamer ignores sleeping threads", "[rocr_spin_tamer]") {
 
 TEST_CASE("rocr spin tamer does not re-confine an already confined thread",
           "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("confinement pins to one core; needs >= 2 allowed CPUs");
+  }
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
   SpinnerGroup spinners(1);
@@ -386,6 +398,9 @@ TEST_CASE("rocr spin tamer does not re-confine an already confined thread",
 
 TEST_CASE("rocr spin tamer confines a poller that inherited a thread name",
           "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("confinement pins to one core; needs >= 2 allowed CPUs");
+  }
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
   // Linux threads inherit their creator's name: ROCr pollers spawned while a
@@ -437,6 +452,9 @@ TEST_CASE("rocr spin tamer never signals a thread that blocks the probe",
 
 TEST_CASE("rocr spin tamer backs off a rejected thread, then re-probes it",
           "[rocr_spin_tamer]") {
+  if (CountAllowedCpus() < 2) {
+    SKIP("confinement pins to one core; needs >= 2 allowed CPUs");
+  }
   inferflux::test::ScopedEnvVar enable("INFERFLUX_ROCR_TAME", "1");
   inferflux::test::ScopedEnvVar core("INFERFLUX_ROCR_TAME_CORE", nullptr);
   SpinnerGroup spinners(1);
