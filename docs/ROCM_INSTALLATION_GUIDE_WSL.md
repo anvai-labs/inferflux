@@ -289,6 +289,52 @@ Verify: `top -H -p $(pidof inferfluxd)` — two `rocr-spin-N` threads should
 share a single core (~100% combined instead of ~200%), and
 `inferflux_runtime_spin_threads_confined_total` appears in `/metrics`.
 
+### Patched ROCr runtime (near-zero idle CPU)
+
+Confining the spin threads to one core still leaves about one core busy,
+because they never sleep. The real fix is upstream
+([rocm-systems#7898](https://github.com/ROCm/rocm-systems/pull/7898)), which
+makes the polling loop nap with a 20 µs → 2 ms backoff. Until a released ROCm
+contains it, build ROCr 7.2.0 with the fix backported and point
+`inferfluxd` at it:
+
+```bash
+scripts/rocm/build_patched_rocr.sh --out ~/rocr-patched   # ~1 min
+```
+
+The script clones `ROCm/rocm-systems` at `rocm-7.2.0` (`projects/rocr-runtime`
+only), applies `scripts/rocm/patches/rocr-7.2.0-async-events-poll-backoff.patch`,
+builds `libhsa-runtime64` with ROCm's LLVM in a clean environment, and adds
+AMD's prebuilt WSL thunk `librocdxg` (from the `ROCm/librocdxg` release
+package, checksum-pinned). It installs nothing system-wide; the output
+directory holds the two libraries and `PATCHED_ROCR.json` (source commit,
+patch and library checksums).
+
+Deploy by copying the output into a directory on the server's
+`LD_LIBRARY_PATH` (for a release, its `runtime/bin`) and setting
+`HSA_ENABLE_DXG_DETECTION=1`, which makes upstream ROCr load `librocdxg`:
+
+```bash
+cp -a ~/rocr-patched/lib* <release>/runtime/bin/
+# systemd unit: Environment=HSA_ENABLE_DXG_DETECTION=1
+```
+
+`libamdhip64` finds `libhsa-runtime64.so.1` through `LD_LIBRARY_PATH` ahead
+of `/opt/rocm/lib`, so only that process uses the patched runtime.
+
+Verify: `grep -E 'libhsa|librocdxg' /proc/$(pidof inferfluxd)/maps` shows
+both from the release directory, and idle CPU drops to about 1%
+(`top -H` shows no thread above a few percent). Measured on an R9700
+(gfx1201) with qwen2.5-0.5b: idle 200% → 1.1%; greedy outputs identical to
+the stock runtime; c=8 and c=1 throughput and per-request latency unchanged
+(1-token request p50 7.1 ms on both).
+
+`INFERFLUX_ROCR_TAME=1` can stay on alongside it: the threads it pins now
+sleep, and it bounds the cost if the patched library is ever missing.
+Rollback: remove the copied libraries and the `HSA_ENABLE_DXG_DETECTION`
+line, then restart. Retire the patch once a ROCm release includes #7898
+(check the release notes for rocm-systems#7898 / librocdxg#60).
+
 ## Supported AMD GPUs
 
 The InferFlux ROCm backend supports FlashAttention-2 on these architectures:

@@ -39,6 +39,13 @@ Supported entry points:
   - `test_gguf_native_smoke.py`
   - `compare_decode_traces.py`
 
+Host packaging (not part of the build):
+
+- `rocm/build_patched_rocr.sh` builds the ROCr runtime with the WSL2
+  AsyncEventsLoop spin fix backported (see
+  `docs/ROCM_INSTALLATION_GUIDE_WSL.md`, "Patched ROCr runtime"); its patch
+  lives in `rocm/patches/`.
+
 Archive policy:
 
 - One-off probes, temporary experiments, and superseded wrappers live under `scripts/archive/`.
