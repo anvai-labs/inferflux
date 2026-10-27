@@ -3,17 +3,17 @@
   "dependencies": [
     {
       "name": "llama.cpp",
-      "version": "0.2.0 (bb4caa7)",
+      "version": "0.7.0 (620d222)",
       "source_url": "https://github.com/ggml-org/llama.cpp",
-      "source_ref": "bb4caa7540188872173c44d161602d9271386413",
-      "source_digest": "git:bb4caa7540188872173c44d161602d9271386413",
+      "source_ref": "620d2225cc436ab0b001e3200e590e3b286ef9ab",
+      "source_digest": "git:620d2225cc436ab0b001e3200e590e3b286ef9ab",
       "integration": "git-submodule",
       "artifacts": [
         {
           "path": "external/llama.cpp"
         }
       ],
-      "purl": "pkg:github/ggml-org/llama.cpp@bb4caa7540188872173c44d161602d9271386413",
+      "purl": "pkg:github/ggml-org/llama.cpp@620d2225cc436ab0b001e3200e590e3b286ef9ab",
       "license": "MIT",
       "owner": "Runtime",
       "supported_toolchains": [
@@ -22,7 +22,7 @@
         "ROCm 7.2 gfx1201",
         "Metal/MPS"
       ],
-      "upgrade_target": "v0.2.1 or newer; track upstream release notes for sampler/grammar API changes",
+      "upgrade_target": "v0.8.0 or newer; track upstream release notes for sampler/grammar and common/json API changes",
       "rollback": "Restore the external/llama.cpp gitlink to source_ref and rebuild all provider lanes."
     },
     {
@@ -57,18 +57,18 @@
     },
     {
       "name": "nlohmann-json",
-      "version": "3.11.3",
+      "version": "3.12.0",
       "source_url": "https://github.com/nlohmann/json",
-      "source_ref": "v3.11.3 (9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03)",
-      "source_digest": "git:9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03",
+      "source_ref": "v3.12.0 (55f93686c01528224f448c19128836e7df245f72), amalgamated via llama.cpp v0.7.0's vendor step (not the upstream single-header release artifact)",
+      "source_digest": "git:55f93686c01528224f448c19128836e7df245f72",
       "integration": "vendored-single-header",
       "artifacts": [
         {
           "path": "external/nlohmann/json.hpp",
-          "sha256": "9bea4c8066ef4a1c206b2be5a36302f8926f7fdc6087af5d20b417d0cf103ea6"
+          "sha256": "08f19bbcc66ff3082f5caf58867b1232987dba98d82e2b29d870722fce42776b"
         }
       ],
-      "purl": "pkg:github/nlohmann/json@v3.11.3",
+      "purl": "pkg:github/nlohmann/json@v3.12.0",
       "license": "MIT",
       "owner": "Runtime",
       "supported_toolchains": [
@@ -78,7 +78,7 @@
         "MSVC",
         "AppleClang"
       ],
-      "upgrade_target": "v3.12.0",
+      "upgrade_target": "v3.13.0 or newer once llama.cpp vendors it; resync together with the llama.cpp submodule bump",
       "rollback": "Restore external/nlohmann/json.hpp and its manifest hash."
     },
     {
