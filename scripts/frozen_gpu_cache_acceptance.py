@@ -270,7 +270,13 @@ def diagnostic_evidence(events, calls):
                     "policy_bypass",
                     "prefill_accepted",
                     "completed",
+                    # capacity_eviction stays whitelisted so historical
+                    # frozen bundles recorded before the donor/bystander
+                    # split still project; the current scheduler emits the
+                    # two split stages below.
                     "capacity_eviction",
+                    "capacity_eviction_donor",
+                    "capacity_eviction_bystander",
                     "copy_failed",
                     "partial_prefill_failed",
                     "prefill_deferred",
