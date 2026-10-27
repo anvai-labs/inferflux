@@ -316,13 +316,13 @@ void RadixPrefixCache::EvictOne() {
   size_--;
 }
 
-bool RadixPrefixCache::EvictOneSequence() {
+bool RadixPrefixCache::EvictOneSequence(int *retired_sequence_id) {
   std::unique_lock<std::shared_mutex> lock(mutex_);
-  return EvictOneSequenceLocked();
+  return EvictOneSequenceLocked(retired_sequence_id);
 }
 
 // Must hold mutex_ exclusively.
-bool RadixPrefixCache::EvictOneSequenceLocked() {
+bool RadixPrefixCache::EvictOneSequenceLocked(int *retired_sequence_id) {
   std::vector<std::pair<uint64_t, RadixNode *>> seq_nodes;
   CollectNodes(
       root_.get(), [](const RadixNode *n) { return n->sequence_id >= 0; },
@@ -336,6 +336,9 @@ bool RadixPrefixCache::EvictOneSequenceLocked() {
       [](const auto &a, const auto &b) { return a.first < b.first; });
 
   RadixNode *victim = victim_it->second;
+  if (retired_sequence_id) {
+    *retired_sequence_id = victim->sequence_id;
+  }
   auto locked_be = victim->backend.lock();
   if (locked_be) {
     locked_be->FreeSequence(victim->sequence_id);

@@ -2364,6 +2364,7 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
         uint64_t seq_generation =
             reused_session_state ? cached_seq_generation : 0;
         int evicted_sequences = 0;
+        std::vector<int> retired_donor_sequences;
         int seq_id =
             reused_session_state
                 ? cached_seq_id
@@ -2372,16 +2373,25 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                       pending->resolved_backend
                           ? pending->resolved_backend->SequenceCapacity()
                           : 0,
-                      &evicted_sequences);
+                      &evicted_sequences, &retired_donor_sequences);
         if (evicted_sequences > 0) {
+          // Admission pressure retires LRU radix donors to free slots.
+          // Lookup refreshes last_used on the nodes it walks, so the victim
+          // is normally an unrelated bystander: the matched donor, its
+          // backend sequence, and its block references (held by the trie
+          // node) all survive, and the candidate stays valid. Only the rare
+          // case where the matched donor itself was retired invalidates the
+          // candidate — its slot was reused, and a copy from that
+          // now-empty slot is not reuse.
+          const bool donor_retired =
+              std::find(retired_donor_sequences.begin(),
+                        retired_donor_sequences.end(),
+                        cached_seq_id) != retired_donor_sequences.end();
           LogCacheDecision(inf, pending->resolved_backend.get(),
-                           "capacity_eviction", matched_tokens, 0,
-                           cached_seq_id, evicted_sequences);
-          if (prefix_hit && !reused_session_state) {
-            // Admission can retire the donor selected by Lookup and reuse its
-            // slot. A successful copy from that now-empty slot is not reuse.
-            // Conservatively discard the candidate after any slot eviction;
-            // its unacquired block IDs may already have been freed as well.
+                           donor_retired ? "capacity_eviction_donor"
+                                         : "capacity_eviction_bystander",
+                           matched_tokens, 0, cached_seq_id, evicted_sequences);
+          if (prefix_hit && !reused_session_state && donor_retired) {
             prefix_hit = false;
             cached_blocks.clear();
             cached_seq_id = -1;
@@ -3124,7 +3134,8 @@ void Scheduler::ApplyFairness(BatchSelection *selection) {
 }
 
 int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out,
-                            int sequence_capacity, int *evicted_sequences) {
+                            int sequence_capacity, int *evicted_sequences,
+                            std::vector<int> *retired_sequence_ids) {
   if (evicted_sequences) {
     *evicted_sequences = 0;
   }
@@ -3139,10 +3150,16 @@ int Scheduler::AllocSeqSlot(int64_t request_id, uint64_t *generation_out,
     // releases the slot) and retry, so admission cannot starve on warm
     // prefixes now that AcquireLease no longer silently evicts occupied
     // slots (issue #161). EvictOneSequence returns false once the trie has
-    // no more sequences to give up.
-    while (!lease && prefix_cache_->EvictOneSequence()) {
+    // no more sequences to give up. The retired id is reported so the
+    // admission path can keep a prefix candidate whose donor was NOT the
+    // victim.
+    int retired_donor = -1;
+    while (!lease && prefix_cache_->EvictOneSequence(&retired_donor)) {
       if (evicted_sequences) {
         ++*evicted_sequences;
+      }
+      if (retired_sequence_ids) {
+        retired_sequence_ids->push_back(retired_donor);
       }
       lease = slot_manager_->AcquireLease(request_id, sequence_capacity);
     }

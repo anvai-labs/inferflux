@@ -281,7 +281,10 @@ class AccountingTests(unittest.TestCase):
             r"LogCacheDecision\((?:inf|req),.*?\);", source, re.DOTALL
         )
         stages = sorted(set(re.findall(r'"([a-z_]+)"', " ".join(calls_in_source))))
-        self.assertTrue({"capacity_eviction", "copy_failed"}.issubset(stages))
+        self.assertTrue(
+            {"capacity_eviction_donor", "capacity_eviction_bystander",
+             "copy_failed"}.issubset(stages)
+        )
         source = (ROOT / "runtime/backends/llama/llama_cpp_backend.cpp").read_text()
         backend = re.search(
             r'LlamaCppBackend::Name\(\) const\s*\{\s*return "([^"]+)";\s*\}', source

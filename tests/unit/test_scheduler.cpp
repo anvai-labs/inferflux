@@ -3143,6 +3143,85 @@ TEST_CASE("Scheduler rejects a prefix donor evicted during slot admission",
   }
 }
 
+TEST_CASE(
+    "Scheduler keeps prefix reuse when admission evicts an unrelated donor",
+    "[scheduler][cache_ownership]") {
+  class TwoSequenceDistinctBackend : public PositionCheckingBackend {
+  public:
+    int copy_calls = 0;
+    int SequenceCapacity() const override { return 2; }
+    std::vector<int> TokenizeForCache(const std::string &text) const override {
+      // Distinct token identity per prompt so two donations occupy separate
+      // trie nodes instead of aliasing one donor.
+      const int seed = text.empty() ? 7 : static_cast<int>(text[0]);
+      return std::vector<int>(40, seed);
+    }
+    bool CopySequencePrefix(int source, int target, int tokens) override {
+      ++copy_calls;
+      return PositionCheckingBackend::CopySequencePrefix(source, target,
+                                                         tokens);
+    }
+  };
+  for (const bool deferred : {false, true}) {
+    CAPTURE(deferred);
+    SimpleTokenizer tokenizer;
+    auto cache = std::make_shared<PagedKVCache>(
+        32, 1024, PagedKVCache::EvictionPolicy::kLRU);
+    auto router = std::make_shared<SingleModelRouter>();
+    auto backend = std::make_shared<TwoSequenceDistinctBackend>();
+    backend->defer_prefill = deferred;
+    ModelInfo info;
+    info.id = "two-slot";
+    info.backend = "cpu";
+    REQUIRE(router->RegisterModel(info, backend));
+    Scheduler *owner = nullptr;
+    auto prefix = std::make_shared<RadixPrefixCache>(
+        cache,
+        [&](int sequence, std::shared_ptr<BackendInterface>) {
+          owner->FreeSeqSlot(sequence);
+        },
+        RadixPrefixCacheLimits{64, 8});
+    Scheduler scheduler(tokenizer, std::make_shared<CPUDeviceContext>(), cache,
+                        router, nullptr, prefix);
+    owner = &scheduler;
+
+    const std::string prompt_a(40, 'a');
+    const std::string prompt_b(40, 'b');
+    for (const std::string *seed : {&prompt_a, &prompt_b}) {
+      InferenceRequest request;
+      request.prompt = *seed;
+      request.prompt_tokens = backend->TokenizeForCache(request.prompt);
+      request.max_tokens = 2;
+      const auto result = scheduler.Generate(std::move(request)).get();
+      REQUIRE_FALSE(result.no_backend);
+      REQUIRE(result.completion_tokens > 0);
+      REQUIRE(result.cached_prompt_tokens == 0); // cold seeds
+    }
+    // Both slots now park radix donors; neither seed had a copy candidate.
+    REQUIRE(prefix->LiveSequences() == 2);
+    REQUIRE(backend->copy_calls == 0);
+    REQUIRE(cache->NumFreeBlocks() == 24); // two 4-block donations
+
+    // Repeat prompt A: Lookup refreshes A's donor timestamp, so admission
+    // pressure retires the bystander B. The candidate survives and the
+    // accepted reuse must proceed instead of being conservatively dropped.
+    InferenceRequest repeat;
+    repeat.prompt = prompt_a;
+    repeat.prompt_tokens = backend->TokenizeForCache(prompt_a);
+    repeat.max_tokens = 2;
+    const auto result = scheduler.Generate(std::move(repeat)).get();
+    REQUIRE_FALSE(result.no_backend);
+    REQUIRE(result.completion_tokens > 0);
+    REQUIRE(backend->copy_calls == 1);
+    REQUIRE(result.cached_prompt_tokens == 39); // exact hit replays one token
+    REQUIRE(backend->position_violations == 0);
+    // The bystander was retired; the matched donor line survived. B's four
+    // blocks returned to the pool; A's donation keeps its four.
+    REQUIRE(prefix->LiveSequences() == 1);
+    REQUIRE(cache->NumFreeBlocks() == 28);
+  }
+}
+
 TEST_CASE("Scheduler discards failed deferred prefill instead of retaining it",
           "[scheduler][cache_ownership]") {
   for (const bool session : {false, true}) {
