@@ -365,6 +365,23 @@ LaunchMMAGQAPrefill(const T *Q, const T *K, const T *V, T *O, int batch_size,
   return cudaGetLastError();
 }
 
+// Dispatch a GQA ratio-parameterized launcher (8/4/2 grouped kernels).
+// Returns cudaErrorNotSupported for other ratios so each caller runs its
+// own non-GQA fallback — the same dispatch the per-site if-chains did.
+template <typename T, template <typename, int> class LaunchFn, typename... Args>
+static cudaError_t DispatchGqaRatio(int gqa_ratio, Args &&...args) {
+  switch (gqa_ratio) {
+  case 8:
+    return LaunchFn<T, 8>(std::forward<Args>(args)...);
+  case 4:
+    return LaunchFn<T, 4>(std::forward<Args>(args)...);
+  case 2:
+    return LaunchFn<T, 2>(std::forward<Args>(args)...);
+  default:
+    return cudaErrorNotSupported;
+  }
+}
+
 // Launch GQA-grouped prefill kernel for a specific GQA ratio.
 // Selects MMA kernel when query_len >= 16 and head_dim fits MMA tiles.
 template <typename T, int GQARatio>
@@ -411,20 +428,11 @@ cudaError_t FlashAttention2Typed(const T *Q, const T *K, const T *V, T *O,
                             ? (num_heads / num_kv_heads)
                             : 1;
 
-  if (gqa_ratio == 8) {
-    return LaunchGQAPrefill<T, 8>(Q, K, V, O, batch_size, query_len, kv_len,
-                                  num_heads, num_kv_heads, head_dim, scale,
-                                  causal, stream);
-  }
-  if (gqa_ratio == 4) {
-    return LaunchGQAPrefill<T, 4>(Q, K, V, O, batch_size, query_len, kv_len,
-                                  num_heads, num_kv_heads, head_dim, scale,
-                                  causal, stream);
-  }
-  if (gqa_ratio == 2) {
-    return LaunchGQAPrefill<T, 2>(Q, K, V, O, batch_size, query_len, kv_len,
-                                  num_heads, num_kv_heads, head_dim, scale,
-                                  causal, stream);
+  const cudaError_t gqa_err = DispatchGqaRatio<T, LaunchGQAPrefill>(
+      gqa_ratio, Q, K, V, O, batch_size, query_len, kv_len, num_heads,
+      num_kv_heads, head_dim, scale, causal, stream);
+  if (gqa_err != cudaErrorNotSupported) {
+    return gqa_err;
   }
 
   // Fallback: non-GQA or unsupported ratio
@@ -2096,23 +2104,10 @@ cudaError_t FlashDecodeMultiSeqStrided(
                             ? (num_heads / num_kv_heads)
                             : 1;
 
-  if (gqa_ratio == 8) {
-    return LaunchGQADecode<T, 8>(
-        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
-        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
-        stream, split_workspace, split_workspace_bytes, max_kv_hint);
-  }
-  if (gqa_ratio == 4) {
-    return LaunchGQADecode<T, 4>(
-        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
-        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
-        stream, split_workspace, split_workspace_bytes, max_kv_hint);
-  }
-  if (gqa_ratio == 2) {
-    return LaunchGQADecode<T, 2>(
-        Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads,
-        num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale,
-        stream, split_workspace, split_workspace_bytes, max_kv_hint);
+  const cudaError_t gqa_err =
+      DispatchGqaRatio<T, LaunchGQADecode>(gqa_ratio, Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale, stream, split_workspace, split_workspace_bytes, max_kv_hint));
+  if (gqa_err != cudaErrorNotSupported) {
+    return gqa_err;
   }
 
   // Fallback: non-GQA or unsupported ratio — use per-head kernel
@@ -2520,23 +2515,10 @@ cudaError_t FlashDecodeMultiSeqStridedSplit(
     qsplit = 1;
   }
 
-  if (gqa_ratio == 8) {
-    return LaunchSplitGQADecode<T, 8>(
-        Q, kv_buffer, O, partials, d_seq_ids, d_kv_lens, layer, batch_size,
-        num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride,
-        scale, qsplit, chunk, ksplits, stream);
-  }
-  if (gqa_ratio == 4) {
-    return LaunchSplitGQADecode<T, 4>(
-        Q, kv_buffer, O, partials, d_seq_ids, d_kv_lens, layer, batch_size,
-        num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride,
-        scale, qsplit, chunk, ksplits, stream);
-  }
-  if (gqa_ratio == 2) {
-    return LaunchSplitGQADecode<T, 2>(
-        Q, kv_buffer, O, partials, d_seq_ids, d_kv_lens, layer, batch_size,
-        num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride,
-        scale, qsplit, chunk, ksplits, stream);
+  const cudaError_t gqa_err =
+      DispatchGqaRatio<T, LaunchSplitGQADecode>(gqa_ratio, Q, kv_buffer, O, partials, d_seq_ids, d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale, qsplit, chunk, ksplits, stream));
+  if (gqa_err != cudaErrorNotSupported) {
+    return gqa_err;
   }
   // Unsupported ratio — fall back to the monolithic dispatcher.
   return FlashDecodeMultiSeqStrided<T>(Q, kv_buffer, O, d_seq_ids, d_kv_lens,

@@ -98,6 +98,9 @@ public:
                   const WeightMap &weights, IKvCacheGpu *kv_cache,
                   CublasGemm *gemm, cudaStream_t stream) override;
 
+  // Checked RMS-norm steps shared by Forward()'s stage plumbing.
+  bool EnsureInputNormChecked(int layer);
+  bool EnsurePostAttnNormChecked();
   bool Forward(const std::vector<int> &token_ids, int n_past, int sequence_id,
                float *d_logits) override;
 

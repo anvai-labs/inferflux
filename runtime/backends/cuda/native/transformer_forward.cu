@@ -1643,6 +1643,33 @@ static EmbedGatherPlan ResolveEmbedGather(const WeightMap *weights) {
 }
 
 template <typename T>
+// Checked RMS-norm steps shared by the attention/FFN stage plumbing in
+// Forward(): byte-identical to the per-site ensure-norm lambdas, including
+// their distinct error labels.
+template <typename T>
+bool LlamaForwardTyped<T>::EnsureInputNormChecked(int layer) {
+  cudaError_t err =
+      cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, seq_len,
+                              hidden_size_, rms_norm_eps_, stream_);
+  if (err != cudaSuccess) {
+    log::Error("llama_forward",
+               "RmsNorm failed at layer " + std::to_string(layer));
+    return false;
+  }
+  return true;
+}
+
+template <typename T> bool LlamaForwardTyped<T>::EnsurePostAttnNormChecked() {
+  cudaError_t err =
+      cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm, d_norm_out_, seq_len,
+                              hidden_size_, rms_norm_eps_, stream_);
+  if (err != cudaSuccess) {
+    log::Error("llama_forward", "Post-attn RmsNorm failed");
+    return false;
+  }
+  return true;
+}
+
 bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                    int n_past, int sequence_id,
                                    float *d_logits) {
@@ -1857,18 +1884,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
-                        [&]() {
-                          err = cuda_kernel::RmsNorm<T>(
-                              d_residual_, input_norm, d_norm_out_, seq_len,
-                              hidden_size_, rms_norm_eps_, stream_);
-                          if (err != cudaSuccess) {
-                            log::Error("llama_forward",
-                                       "RmsNorm failed at layer " +
-                                           std::to_string(layer));
-                            return false;
-                          }
-                          return true;
-                        },
+                        [&]() { return EnsureInputNormChecked<T>(layer); },
                         [&]() {
                           if constexpr (std::is_same_v<T, half>) {
                             static const bool qkv_fused_ok = [] {
@@ -1933,18 +1949,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
-                        [&]() {
-                          err = cuda_kernel::RmsNorm<T>(
-                              d_residual_, input_norm, d_norm_out_, seq_len,
-                              hidden_size_, rms_norm_eps_, stream_);
-                          if (err != cudaSuccess) {
-                            log::Error("llama_forward",
-                                       "RmsNorm failed at layer " +
-                                           std::to_string(layer));
-                            return false;
-                          }
-                          return true;
-                        },
+                        [&]() { return EnsureInputNormChecked<T>(layer); },
                         [&]() {
                           if (qkv_fused) {
                             return true;
@@ -1969,18 +1974,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
-                        [&]() {
-                          err = cuda_kernel::RmsNorm<T>(
-                              d_residual_, input_norm, d_norm_out_, seq_len,
-                              hidden_size_, rms_norm_eps_, stream_);
-                          if (err != cudaSuccess) {
-                            log::Error("llama_forward",
-                                       "RmsNorm failed at layer " +
-                                           std::to_string(layer));
-                            return false;
-                          }
-                          return true;
-                        },
+                        [&]() { return EnsureInputNormChecked<T>(layer); },
                         [&]() {
                           if (qkv_fused) {
                             return true;
@@ -2364,17 +2358,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &ffn_norm_computed,
-                        [&]() {
-                          err = cuda_kernel::RmsNorm<T>(
-                              d_residual_, post_attn_norm, d_norm_out_, seq_len,
-                              hidden_size_, rms_norm_eps_, stream_);
-                          if (err != cudaSuccess) {
-                            log::Error("llama_forward",
-                                       "Post-attn RmsNorm failed");
-                            return false;
-                          }
-                          return true;
-                        },
+                        [&]() { return EnsurePostAttnNormChecked<T>(); },
                         [&]() {
                           return TryQuantizedProjection(
                               pctx, gate_raw, d_norm_out_, d_ffn_gate_, seq_len,
@@ -2396,17 +2380,7 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &ffn_norm_computed,
-                        [&]() {
-                          err = cuda_kernel::RmsNorm<T>(
-                              d_residual_, post_attn_norm, d_norm_out_, seq_len,
-                              hidden_size_, rms_norm_eps_, stream_);
-                          if (err != cudaSuccess) {
-                            log::Error("llama_forward",
-                                       "Post-attn RmsNorm failed");
-                            return false;
-                          }
-                          return true;
-                        },
+                        [&]() { return EnsurePostAttnNormChecked<T>(); },
                         [&]() {
                           return TryQuantizedProjection(
                               pctx, up_raw, d_norm_out_, d_ffn_up_, seq_len,
