@@ -48,6 +48,97 @@ constexpr int calc_mmvq_threads(int ncols) {
 // Q4_K × Q8_1 MMVQ kernel
 // ============================================================================
 
+// ── Shared MMVQ kernel epilogues and dispatch ladder (round 7) ─────────────
+// Cross-warp reduction of the per-column accumulators and the tid-0 store,
+// factored from the byte-identical tails of the narrow-family kernels. The
+// shared array is declared inside the helper: each kernel instantiation
+// calls it exactly once, so the allocation is identical to the previous
+// per-kernel declaration.
+template <int ncols>
+__device__ __forceinline__ void
+MmvqReduceStoreHalf(const float (&acc)[ncols], int lane, int warp_id, int tid,
+                    int col_base, int M, int N, int out_idx,
+                    half *__restrict__ output) {
+  __shared__ float warp_sums[kMmvqWarps * ncols];
+  if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row >= M)
+        break;
+      float sum = 0.0f;
+      for (int w = 0; w < kMmvqWarps; ++w)
+        sum += warp_sums[c * kMmvqWarps + w];
+      output[row * N + out_idx] = __float2half(sum);
+    }
+  }
+}
+
+// Accumulating epilogue: OutputT float uses atomicAdd or a direct store per
+// UseAtomic; half accumulates into the existing half value.
+template <int ncols, typename OutputT, bool UseAtomic>
+__device__ __forceinline__ void
+MmvqReduceStoreAccum(const float (&acc)[ncols], int lane, int warp_id, int tid,
+                     int col_base, int M, int N, int out_idx,
+                     OutputT *__restrict__ output) {
+  __shared__ float warp_sums[kMmvqWarps * ncols];
+  if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row >= M)
+        break;
+      float sum = 0.0f;
+      for (int w = 0; w < kMmvqWarps; ++w)
+        sum += warp_sums[c * kMmvqWarps + w];
+      if constexpr (std::is_same_v<OutputT, float>) {
+        // Atomic FP32 accumulate: prevents race condition when multiple blocks
+        // write to same output location (e.g., grouped projections or residual
+        // accumulation across layers)
+        if constexpr (UseAtomic) {
+          atomicAdd(&output[row * N + out_idx], sum);
+        } else {
+          // Direct write: faster when safe (no race conditions)
+          output[row * N + out_idx] = sum;
+        }
+      } else {
+        output[row * N + out_idx] =
+            __float2half(sum + __half2float(output[row * N + out_idx]));
+      }
+    }
+  }
+}
+
+// M-bucket dispatch ladder shared by the host launchers: the packed column
+// width follows the row count (1/2/4/8); wider M is not MMVQ's regime.
+template <typename LaunchT, typename K1, typename K2, typename K4, typename K8>
+bool DispatchMmvqByM(int M, LaunchT &&launch, K1 kernel1, K2 kernel2,
+                     K4 kernel4, K8 kernel8) {
+  if (M <= 1)
+    return launch(1, kernel1);
+  if (M <= 2)
+    return launch(2, kernel2);
+  if (M <= 4)
+    return launch(4, kernel4);
+  if (M <= 8)
+    return launch(8, kernel8);
+  return false; // M > 8 → MMQ or cuBLAS
+}
+
 template <int ncols>
 __global__ void inferflux_mmvq_q4k(const block_q4_k *__restrict__ weight,
                                    const block_q8_1 *__restrict__ act_q8_1,
@@ -138,26 +229,8 @@ __global__ void inferflux_mmvq_q4k(const block_q4_k *__restrict__ weight,
   }
 
   // Cross-warp reduction via shared memory
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum);
-    }
-  }
+  MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                             output);
 }
 
 // Q4_K × Q8_1 MMVQ with bias epilogue: output = dot(W, x) + bias[out_idx]
@@ -498,39 +571,8 @@ inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
   }
 
   // Cross-warp reduction via shared memory
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      if constexpr (std::is_same_v<OutputT, float>) {
-        // Atomic FP32 accumulate: prevents race condition when multiple blocks
-        // write to same output location (e.g., grouped projections or residual
-        // accumulation across layers)
-        if constexpr (UseAtomic) {
-          atomicAdd(&output[row * N + out_idx], sum);
-        } else {
-          // Direct write: faster when safe (no race conditions)
-          output[row * N + out_idx] = sum;
-        }
-      } else {
-        output[row * N + out_idx] =
-            __float2half(sum + __half2float(output[row * N + out_idx]));
-      }
-    }
-  }
+  MmvqReduceStoreAccum<ncols, OutputT, UseAtomic>(
+      acc, lane, warp_id, tid, col_base, M, N, out_idx, output);
 }
 
 // ============================================================================
@@ -616,26 +658,8 @@ __global__ void inferflux_mmvq_q6k(const block_q6_k *__restrict__ weight,
   }
 
   // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum);
-    }
-  }
+  MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                             output);
 }
 
 // Q6_K × Q8_1 MMVQ vectorized kernel: uses __ldg + wider loads for ql/qh.
@@ -726,26 +750,8 @@ __global__ void inferflux_mmvq_q6k_vec(const block_q6_k *__restrict__ weight,
     }
   }
 
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum);
-    }
-  }
+  MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                             output);
 }
 
 // Q6_K × Q8_1 MMVQ accumulate variant (adds to existing output)
@@ -828,37 +834,8 @@ inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
   }
 
   // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      if constexpr (std::is_same_v<OutputT, float>) {
-        // Atomic FP32 accumulate: prevents race condition
-        if constexpr (UseAtomic) {
-          atomicAdd(&output[row * N + out_idx], sum);
-        } else {
-          // Direct write: faster when safe (no race conditions)
-          output[row * N + out_idx] = sum;
-        }
-      } else {
-        output[row * N + out_idx] =
-            __float2half(sum + __half2float(output[row * N + out_idx]));
-      }
-    }
-  }
+  MmvqReduceStoreAccum<ncols, OutputT, UseAtomic>(
+      acc, lane, warp_id, tid, col_base, M, N, out_idx, output);
 }
 
 // Q6_K x Q8_1 MMVQ accumulate variant with vectorized weight loads.
@@ -1032,26 +1009,8 @@ __global__ void inferflux_mmvq_q8_0(const block_q8_0 *__restrict__ weight,
   }
 
   // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum);
-    }
-  }
+  MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                             output);
 }
 
 // Q8_0 × Q8_1 MMVQ accumulate variant (adds to existing output)
@@ -1114,37 +1073,8 @@ inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
   }
 
   // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      if constexpr (std::is_same_v<OutputT, float>) {
-        // Atomic FP32 accumulate: prevents race condition
-        if constexpr (UseAtomic) {
-          atomicAdd(&output[row * N + out_idx], sum);
-        } else {
-          // Direct write: faster when safe (no race conditions)
-          output[row * N + out_idx] = sum;
-        }
-      } else {
-        output[row * N + out_idx] =
-            __float2half(sum + __half2float(output[row * N + out_idx]));
-      }
-    }
-  }
+  MmvqReduceStoreAccum<ncols, OutputT, UseAtomic>(
+      acc, lane, warp_id, tid, col_base, M, N, out_idx, output);
 }
 
 // ============================================================================
@@ -1208,26 +1138,8 @@ __global__ void inferflux_mmvq_q8k(const block_q8_k *__restrict__ weight,
   }
 
   // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum);
-    }
-  }
+  MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                             output);
 }
 
 // Q8_K × Q8_1 MMVQ accumulate variant (adds to existing output)
@@ -1288,37 +1200,8 @@ inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
   }
 
   // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      if constexpr (std::is_same_v<OutputT, float>) {
-        // Atomic FP32 accumulate: prevents race condition
-        if constexpr (UseAtomic) {
-          atomicAdd(&output[row * N + out_idx], sum);
-        } else {
-          // Direct write: faster when safe (no race conditions)
-          output[row * N + out_idx] = sum;
-        }
-      } else {
-        output[row * N + out_idx] =
-            __float2half(sum + __half2float(output[row * N + out_idx]));
-      }
-    }
-  }
+  MmvqReduceStoreAccum<ncols, OutputT, UseAtomic>(
+      acc, lane, warp_id, tid, col_base, M, N, out_idx, output);
 }
 
 // ============================================================================
@@ -1631,15 +1514,7 @@ bool DispatchMmvq(const void *data, const void *act_q8_1, half *output, int M,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false; // M > 8 → MMQ or cuBLAS
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 // Bias-enabled dispatch: same as DispatchMmvq but passes bias to kernels.
@@ -1666,15 +1541,7 @@ bool DispatchMmvqBias(const void *data, const void *act_q8_1, half *output,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false;
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 template <
@@ -1696,15 +1563,7 @@ bool DispatchMmvqAccum(const void *data, const void *act_q8_1, half *output,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false;
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 // FP32 output variant of DispatchMmvqAccum for FP32 residual stream.
@@ -1728,15 +1587,7 @@ bool DispatchMmvqAccumF32(const void *data, const void *act_q8_1, float *output,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false;
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 template <typename BlockT, int nprojs,
@@ -1771,15 +1622,7 @@ bool DispatchMmvqGroup(const std::array<const void *, nprojs> &weights,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false;
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 // Convenience dispatch for pair (2 projections)
