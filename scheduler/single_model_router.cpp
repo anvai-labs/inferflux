@@ -650,6 +650,15 @@ void SingleModelRouter::SetMinimumSequenceCapacity(int capacity) {
   minimum_sequence_capacity_ = std::max(minimum_sequence_capacity_, capacity);
 }
 
+long SingleModelRouter::ModelReferenceCount(const std::string &id) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = models_.find(id);
+  if (it == models_.end()) {
+    return 0;
+  }
+  return it->second.backend ? it->second.backend.use_count() : 1;
+}
+
 bool SingleModelRouter::UnloadModel(const std::string &id) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = models_.find(id);

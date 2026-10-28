@@ -143,11 +143,17 @@ TEST_CASE("SingleModelRouter admin identity operations reject unknown ids",
 
   REQUIRE_FALSE(router.SetDefaultModel("missing-model"));
   REQUIRE_FALSE(router.UnloadModel("missing-model"));
+  // Advisory reference snapshot distinguishes unknown ids from live ones
+  // (issue #283): 0 for unknown, at least the router's own reference for a
+  // registered model.
+  REQUIRE(router.ModelReferenceCount("missing-model") == 0);
+  REQUIRE(router.ModelReferenceCount("model-a") >= 1);
 
   REQUIRE(router.SetDefaultModel("model-b"));
   REQUIRE(router.DefaultModelId() == "model-b");
   REQUIRE(router.UnloadModel("model-b"));
   REQUIRE(router.ResolveExact("model-b") == nullptr);
+  REQUIRE(router.ModelReferenceCount("model-b") == 0);
   REQUIRE(router.DefaultModelId() == "model-a");
 }
 

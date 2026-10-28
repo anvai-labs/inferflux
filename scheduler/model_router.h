@@ -102,6 +102,14 @@ public:
   virtual void SetMinimumSequenceCapacity(int) {}
   virtual std::string LastLoadError() const { return ""; }
   virtual bool UnloadModel(const std::string &id) = 0;
+  // Live shared_ptr reference count for a registered model's backend: 0 when
+  // the id is unknown, -1 when the implementation cannot report it.
+  // Advisory snapshot (other threads may hold or release references); used
+  // to distinguish a busy unload from a missing model (issue #283).
+  virtual long ModelReferenceCount(const std::string &id) const {
+    (void)id;
+    return -1;
+  }
   virtual bool SetDefaultModel(const std::string &model_id) = 0;
 };
 

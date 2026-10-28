@@ -2391,6 +2391,11 @@ void Scheduler::ProcessBatch(BatchSelection selection) {
                            donor_retired ? "capacity_eviction_donor"
                                          : "capacity_eviction_bystander",
                            matched_tokens, 0, cached_seq_id, evicted_sequences);
+          if (donor_retired) {
+            metrics_->RecordCacheEvictionDonorRetired();
+          } else {
+            metrics_->RecordCacheEvictionBystanderRetired();
+          }
           if (prefix_hit && !reused_session_state && donor_retired) {
             prefix_hit = false;
             cached_blocks.clear();

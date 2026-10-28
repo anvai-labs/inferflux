@@ -48,6 +48,7 @@ public:
   std::string LoadModel(const ModelLoadSpec &spec) override;
   void SetMinimumSequenceCapacity(int capacity) override;
   bool UnloadModel(const std::string &id) override;
+  long ModelReferenceCount(const std::string &id) const override;
   ModelInfo *Resolve(const std::string &requested_model) override;
   ModelInfo *ResolveExact(const std::string &model_id) override;
   std::shared_ptr<BackendInterface>

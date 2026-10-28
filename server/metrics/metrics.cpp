@@ -296,6 +296,14 @@ void MetricsRegistry::RecordPrefixLookup(bool hit) {
   }
 }
 
+void MetricsRegistry::RecordCacheEvictionDonorRetired() {
+  capacity_eviction_donor_total_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void MetricsRegistry::RecordCacheEvictionBystanderRetired() {
+  capacity_eviction_bystander_total_.fetch_add(1, std::memory_order_relaxed);
+}
+
 void MetricsRegistry::RecordCacheExecutionPath(const std::string &path) {
   std::lock_guard<std::mutex> lock(cache_execution_path_mutex_);
   cache_execution_path_counts_[path] += 1;
@@ -1514,6 +1522,20 @@ std::string MetricsRegistry::RenderPrometheus() const {
   out << "# TYPE inferflux_prefix_misses_total counter\n";
   out << "inferflux_prefix_misses_total{backend=\"" << backend << "\"} "
       << prefix_misses_.load() << "\n";
+
+  out << "# HELP inferflux_capacity_eviction_donor_total Slot-pressure "
+         "admissions that retired the matched prefix donor (candidate "
+         "discarded)\n";
+  out << "# TYPE inferflux_capacity_eviction_donor_total counter\n";
+  out << "inferflux_capacity_eviction_donor_total{backend=\"" << backend
+      << "\"} " << capacity_eviction_donor_total_.load() << "\n";
+
+  out << "# HELP inferflux_capacity_eviction_bystander_total "
+         "Slot-pressure admissions that retired only an unrelated donor "
+         "(candidate kept)\n";
+  out << "# TYPE inferflux_capacity_eviction_bystander_total counter\n";
+  out << "inferflux_capacity_eviction_bystander_total{backend=\"" << backend
+      << "\"} " << capacity_eviction_bystander_total_.load() << "\n";
 
   out << "# HELP inferflux_prefix_matched_tokens_total Tokens matched by "
          "lookup hits (exact or partial-extent)\n";

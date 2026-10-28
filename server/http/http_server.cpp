@@ -2621,8 +2621,27 @@ void HttpServer::HandleClient(ClientSession &session) {
                                      "Bad Request"));
       return;
     }
+    // Distinguish a genuinely unknown id from a model whose backend is still
+    // referenced (pending requests, retained state): the router only reports
+    // failure, the advisory reference snapshot says which (issue #283).
+    const long live_references = router->ModelReferenceCount(id);
     if (!router->UnloadModel(id)) {
-      SendAll(session, BuildModelNotFoundResponse());
+      if (live_references > 1) {
+        SendAll(
+            session,
+            BuildResponse(
+                json({{"error",
+                       {{"message", "model is held by " +
+                                        std::to_string(live_references) +
+                                        " live references (pending requests or "
+                                        "retained state); release them first"},
+                        {"type", "inferflux_error"},
+                        {"code", "model_in_use"}}}})
+                    .dump(),
+                409, "Conflict"));
+      } else {
+        SendAll(session, BuildModelNotFoundResponse());
+      }
       return;
     }
     SendAll(session, BuildResponse(json({{"status", "ok"}}).dump()));
