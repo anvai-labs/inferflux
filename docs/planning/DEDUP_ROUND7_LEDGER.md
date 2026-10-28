@@ -90,6 +90,24 @@ Round-7 findings feeding later phases:
    declaration-level duplication is not worth the header-API churn (added
    at round 7 triage).
 
+## Round close (2026-10-28)
+
+Final rows for the two half-sized batches (batch sizing halved per the
+review-balance adjustment after the #291 fix-commit noise):
+
+| PR | Phase | Files | Class | jscpd delta | Rig delta | SASS | Review |
+|---|---|---|---|---|---|---|---|
+| #292 | t150 norm-quant phases | quant_common.cuh, fused_dequant_gemv.cuh, fused_gemv_accum_norm_quant.cuh | A device + B-lite | norm-quant clone family eliminated (−139 net lines) | gate_up 7/8 rows within ±1.5% (one untouched mma row +2.4% = floor) | n/a (host-verified parity 21/70) | adversarial (PR body) |
+| (this PR) | t50 host tail: admin prologue | http_server.{cpp,h} | A | 4× admin prologue → RequireAdminRouter member; server/http t50 14→12 pairs | n/a (hooks + StubIntegration cover the endpoints) | n/a | standard |
+
+`.jscpd.json` ratchets 150 → 50 with this PR; the t50 baseline it records
+is 629 clones / 7,230 dup lines (the t150 story: 75 → ~53 clones after all
+merged rounds; see the per-PR rows above). Deliberately not deduped in this
+round, recorded for a future one: `inferflux_cuda_executor.cpp` and
+`cuda_kernels.cu` host-side clones (CUDA-gated, bench-validated lane),
+`main.cpp` guard triplets, the tokenizer sibling wrappers, and every entry
+in the do-not-dedup registry.
+
 ## Benchmark recording template (per Class-B PR)
 
 ```
