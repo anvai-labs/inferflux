@@ -368,15 +368,17 @@ LaunchMMAGQAPrefill(const T *Q, const T *K, const T *V, T *O, int batch_size,
 // Dispatch a GQA ratio-parameterized launcher (8/4/2 grouped kernels).
 // Returns cudaErrorNotSupported for other ratios so each caller runs its
 // own non-GQA fallback — the same dispatch the per-site if-chains did.
-template <typename T, template <typename, int> class LaunchFn, typename... Args>
-static cudaError_t DispatchGqaRatio(int gqa_ratio, Args &&...args) {
+template <typename T, template <typename FnT, typename... Args>
+                      static cudaError_t DispatchGqaRatio(
+                          int gqa_ratio, FnT launch2, FnT launch4, FnT launch8,
+                          Args &&...args) {
   switch (gqa_ratio) {
-  case 8:
-    return LaunchFn<T, 8>(std::forward<Args>(args)...);
-  case 4:
-    return LaunchFn<T, 4>(std::forward<Args>(args)...);
   case 2:
-    return LaunchFn<T, 2>(std::forward<Args>(args)...);
+    return launch2(std::forward<Args>(args)...);
+  case 4:
+    return launch4(std::forward<Args>(args)...);
+  case 8:
+    return launch8(std::forward<Args>(args)...);
   default:
     return cudaErrorNotSupported;
   }
@@ -428,10 +430,11 @@ cudaError_t FlashAttention2Typed(const T *Q, const T *K, const T *V, T *O,
                             ? (num_heads / num_kv_heads)
                             : 1;
 
-  const cudaError_t gqa_err = DispatchGqaRatio<T, LaunchGQAPrefill>(
-      gqa_ratio, Q, K, V, O, batch_size, query_len, kv_len, num_heads,
-      num_kv_heads, head_dim, scale, causal, stream);
-  if (gqa_err != cudaErrorNotSupported) {
+  const cudaError_t gqa_err = DispatchGqaRatio(
+      gqa_ratio, LaunchGQAPrefill<T, 2>, LaunchGQAPrefill<T, 4>,
+      LaunchGQAPrefill<T, 8>, Q, K, V, O, batch_size, query_len, kv_len,
+      num_heads, num_kv_heads, head_dim, scale, causal,
+      stream) if (gqa_err != cudaErrorNotSupported) {
     return gqa_err;
   }
 
@@ -2104,11 +2107,12 @@ cudaError_t FlashDecodeMultiSeqStrided(
                             ? (num_heads / num_kv_heads)
                             : 1;
 
-  const cudaError_t gqa_err = DispatchGqaRatio<T, LaunchGQADecode>(
-      gqa_ratio, Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size,
-      num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride,
-      scale, stream, split_workspace, split_workspace_bytes, max_kv_hint);
-  if (gqa_err != cudaErrorNotSupported) {
+  const cudaError_t gqa_err = DispatchGqaRatio(
+      gqa_ratio, LaunchGQADecode<T, 2>, LaunchGQADecode<T, 4>,
+      LaunchGQADecode<T, 8>, Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
+      batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride,
+      kv_stride, scale, stream, split_workspace, split_workspace_bytes,
+      max_kv_hint) if (gqa_err != cudaErrorNotSupported) {
     return gqa_err;
   }
 
@@ -2518,7 +2522,7 @@ cudaError_t FlashDecodeMultiSeqStridedSplit(
   }
 
   const cudaError_t gqa_err =
-      DispatchGqaRatio<T, LaunchSplitGQADecode>(gqa_ratio, Q, kv_buffer, O, partials, d_seq_ids, d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale, qsplit, chunk, ksplits, stream));
+      DispatchGqaRatio(gqa_ratio, LaunchSplitGQADecode<T, 2>, LaunchSplitGQADecode<T, 4>, LaunchSplitGQADecode<T, 8>, Q, kv_buffer, O, partials, d_seq_ids, d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale, qsplit, chunk, ksplits, stream))
   if (gqa_err != cudaErrorNotSupported) {
     return gqa_err;
   }
