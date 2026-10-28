@@ -397,126 +397,149 @@ bool ExperimentalQ8_1GroupedRowPairW4Enabled() {
       .enable_experimental_q81_grouped_rowpair_w4;
 }
 
+// Bounded lookup shared by every dispatch-entry table: qtype indexes the
+// GGUF tensor-type enum; out-of-range (or future) types fall to a null
+// entry exactly as each table's inline guard did.
+template <typename EntryT>
+const EntryT &BoundedDispatchLookup(const EntryT (&table)[kMaxTensorType],
+                                    GGUF::TensorType qtype) {
+  static const EntryT empty = {nullptr, nullptr};
+  const auto idx = static_cast<uint32_t>(qtype);
+  if (idx >= kMaxTensorType) {
+    return empty;
+  }
+  return table[idx];
+}
+
+// Per-quant kernel catalog for the packed dp4a GEMV dispatch tables: one
+// specialization per supported quant carries the label and the single /
+// pair / triple kernel choices that the three tables previously repeated.
+template <typename BlockT> struct GemvDp4aCatalog;
+
+template <> struct GemvDp4aCatalog<block_q8_0> {
+  static constexpr const char *name = "Q8_0";
+  static constexpr auto single = fused_dequant_gemv_q8_0_dp4a_packed;
+  static constexpr auto pair = fused_dequant_gemv_q8_0_dp4a_packed_group<2>;
+  static constexpr auto triple = fused_dequant_gemv_q8_0_dp4a_packed_group<3>;
+};
+
+template <> struct GemvDp4aCatalog<block_q4_k> {
+  static constexpr const char *name = "Q4_K";
+  static constexpr auto single = fused_dequant_gemv_q4k_dp4a_packed;
+  static constexpr auto pair = fused_dequant_gemv_q4k_dp4a_packed_group<2>;
+  static constexpr auto triple = fused_dequant_gemv_q4k_dp4a_packed_group<3>;
+};
+
+template <> struct GemvDp4aCatalog<block_q6_k> {
+  static constexpr const char *name = "Q6_K";
+  static constexpr auto single = fused_dequant_gemv_q6k_dp4a_packed;
+  static constexpr auto pair = fused_dequant_gemv_q6k_dp4a_packed_group<2>;
+  static constexpr auto triple = fused_dequant_gemv_q6k_dp4a_packed_group<3>;
+};
+
+template <> struct GemvDp4aCatalog<block_q8_k> {
+  static constexpr const char *name = "Q8_K";
+  static constexpr auto single = fused_dequant_gemv_q8k_dp4a_packed;
+  static constexpr auto pair = fused_dequant_gemv_q8k_dp4a_packed_group<2>;
+  static constexpr auto triple = fused_dequant_gemv_q8k_dp4a_packed_group<3>;
+};
+
+// dp4a gating stays at table-build time, exactly as the per-row ternaries
+// did before.
+template <typename BlockT>
+PackedDispatchEntry MakePackedSingleEntry(bool dp4a) {
+  return {dp4a ? DispatchPackedDp4a<BlockT, GemvDp4aCatalog<BlockT>::single>
+               : nullptr,
+          GemvDp4aCatalog<BlockT>::name};
+}
+
+template <typename BlockT>
+PackedDispatchPairEntry MakePackedPairEntry(bool dp4a) {
+  return {dp4a ? DispatchPackedDp4aPair<BlockT, GemvDp4aCatalog<BlockT>::pair>
+               : nullptr,
+          GemvDp4aCatalog<BlockT>::name};
+}
+
+template <typename BlockT>
+PackedDispatchTripleEntry MakePackedTripleEntry(bool dp4a) {
+  return {
+      dp4a ? DispatchPackedDp4aTriple<BlockT, GemvDp4aCatalog<BlockT>::triple>
+           : nullptr,
+      GemvDp4aCatalog<BlockT>::name};
+}
+
 const PackedDispatchEntry &GetPackedDispatchEntry(GGUF::TensorType qtype) {
   static const bool dp4a = GetGpuProfile().has_dp4a;
   static const PackedDispatchEntry table[kMaxTensorType] = {
-      {nullptr, nullptr}, // 0: F32
-      {nullptr, nullptr}, // 1: F16
-      {nullptr, nullptr}, // 2: Q4_0
-      {nullptr, nullptr}, // 3: Q4_1
-      {nullptr, nullptr}, // 4: (unused)
-      {nullptr, nullptr}, // 5: (unused)
-      {nullptr, nullptr}, // 6: Q5_0
-      {nullptr, nullptr}, // 7: Q5_1
-      {dp4a
-           ? DispatchPackedDp4a<block_q8_0, fused_dequant_gemv_q8_0_dp4a_packed>
-           : nullptr,
-       "Q8_0"},           // 8
-      {nullptr, nullptr}, // 9: Q8_1
-      {nullptr, nullptr}, // 10: Q2_K
-      {nullptr, nullptr}, // 11: Q3_K
-      {dp4a ? DispatchPackedDp4a<block_q4_k, fused_dequant_gemv_q4k_dp4a_packed>
-            : nullptr,
-       "Q4_K"},           // 12
-      {nullptr, nullptr}, // 13: Q5_K
-      {dp4a ? DispatchPackedDp4a<block_q6_k, fused_dequant_gemv_q6k_dp4a_packed>
-            : nullptr,
-       "Q6_K"}, // 14
-      {dp4a ? DispatchPackedDp4a<block_q8_k, fused_dequant_gemv_q8k_dp4a_packed>
-            : nullptr,
-       "Q8_K"}, // 15
+      {nullptr, nullptr},                      // 0: F32
+      {nullptr, nullptr},                      // 1: F16
+      {nullptr, nullptr},                      // 2: Q4_0
+      {nullptr, nullptr},                      // 3: Q4_1
+      {nullptr, nullptr},                      // 4: (unused)
+      {nullptr, nullptr},                      // 5: (unused)
+      {nullptr, nullptr},                      // 6: Q5_0
+      {nullptr, nullptr},                      // 7: Q5_1
+      MakePackedSingleEntry<block_q8_0>(dp4a), // 8
+      {nullptr, nullptr},                      // 9: Q8_1
+      {nullptr, nullptr},                      // 10: Q2_K
+      {nullptr, nullptr},                      // 11: Q3_K
+      MakePackedSingleEntry<block_q4_k>(dp4a), // 12
+      {nullptr, nullptr},                      // 13: Q5_K
+      MakePackedSingleEntry<block_q6_k>(dp4a), // 14
+      MakePackedSingleEntry<block_q8_k>(dp4a), // 15
   };
 
-  static const PackedDispatchEntry empty = {nullptr, nullptr};
-  auto idx = static_cast<uint32_t>(qtype);
-  if (idx >= kMaxTensorType)
-    return empty;
-  return table[idx];
+  return BoundedDispatchLookup(table, qtype);
 }
 
 const PackedDispatchPairEntry &
 GetPackedDispatchPairEntry(GGUF::TensorType qtype) {
   static const bool dp4a = GetGpuProfile().has_dp4a;
   static const PackedDispatchPairEntry table[kMaxTensorType] = {
-      {nullptr, nullptr}, // 0: F32
-      {nullptr, nullptr}, // 1: F16
-      {nullptr, nullptr}, // 2: Q4_0
-      {nullptr, nullptr}, // 3: Q4_1
-      {nullptr, nullptr}, // 4: (unused)
-      {nullptr, nullptr}, // 5: (unused)
-      {nullptr, nullptr}, // 6: Q5_0
-      {nullptr, nullptr}, // 7: Q5_1
-      {dp4a ? DispatchPackedDp4aPair<
-                  block_q8_0, fused_dequant_gemv_q8_0_dp4a_packed_group<2>>
-            : nullptr,
-       "Q8_0"},           // 8
-      {nullptr, nullptr}, // 9: Q8_1
-      {nullptr, nullptr}, // 10: Q2_K
-      {nullptr, nullptr}, // 11: Q3_K
-      {dp4a
-           ? DispatchPackedDp4aPair<block_q4_k,
-                                    fused_dequant_gemv_q4k_dp4a_packed_group<2>>
-           : nullptr,
-       "Q4_K"},           // 12
-      {nullptr, nullptr}, // 13: Q5_K
-      {dp4a
-           ? DispatchPackedDp4aPair<block_q6_k,
-                                    fused_dequant_gemv_q6k_dp4a_packed_group<2>>
-           : nullptr,
-       "Q6_K"}, // 14
-      {dp4a
-           ? DispatchPackedDp4aPair<block_q8_k,
-                                    fused_dequant_gemv_q8k_dp4a_packed_group<2>>
-           : nullptr,
-       "Q8_K"}, // 15
+      {nullptr, nullptr},                    // 0: F32
+      {nullptr, nullptr},                    // 1: F16
+      {nullptr, nullptr},                    // 2: Q4_0
+      {nullptr, nullptr},                    // 3: Q4_1
+      {nullptr, nullptr},                    // 4: (unused)
+      {nullptr, nullptr},                    // 5: (unused)
+      {nullptr, nullptr},                    // 6: Q5_0
+      {nullptr, nullptr},                    // 7: Q5_1
+      MakePackedPairEntry<block_q8_0>(dp4a), // 8
+      {nullptr, nullptr},                    // 9: Q8_1
+      {nullptr, nullptr},                    // 10: Q2_K
+      {nullptr, nullptr},                    // 11: Q3_K
+      MakePackedPairEntry<block_q4_k>(dp4a), // 12
+      {nullptr, nullptr},                    // 13: Q5_K
+      MakePackedPairEntry<block_q6_k>(dp4a), // 14
+      MakePackedPairEntry<block_q8_k>(dp4a), // 15
   };
 
-  static const PackedDispatchPairEntry empty = {nullptr, nullptr};
-  auto idx = static_cast<uint32_t>(qtype);
-  if (idx >= kMaxTensorType)
-    return empty;
-  return table[idx];
+  return BoundedDispatchLookup(table, qtype);
 }
 
 const PackedDispatchTripleEntry &
 GetPackedDispatchTripleEntry(GGUF::TensorType qtype) {
   static const bool dp4a = GetGpuProfile().has_dp4a;
   static const PackedDispatchTripleEntry table[kMaxTensorType] = {
-      {nullptr, nullptr}, // 0: F32
-      {nullptr, nullptr}, // 1: F16
-      {nullptr, nullptr}, // 2: Q4_0
-      {nullptr, nullptr}, // 3: Q4_1
-      {nullptr, nullptr}, // 4: (unused)
-      {nullptr, nullptr}, // 5: (unused)
-      {nullptr, nullptr}, // 6: Q5_0
-      {nullptr, nullptr}, // 7: Q5_1
-      {dp4a ? DispatchPackedDp4aTriple<
-                  block_q8_0, fused_dequant_gemv_q8_0_dp4a_packed_group<3>>
-            : nullptr,
-       "Q8_0"},           // 8
-      {nullptr, nullptr}, // 9: Q8_1
-      {nullptr, nullptr}, // 10: Q2_K
-      {nullptr, nullptr}, // 11: Q3_K
-      {dp4a ? DispatchPackedDp4aTriple<
-                  block_q4_k, fused_dequant_gemv_q4k_dp4a_packed_group<3>>
-            : nullptr,
-       "Q4_K"},           // 12
-      {nullptr, nullptr}, // 13: Q5_K
-      {dp4a ? DispatchPackedDp4aTriple<
-                  block_q6_k, fused_dequant_gemv_q6k_dp4a_packed_group<3>>
-            : nullptr,
-       "Q6_K"}, // 14
-      {dp4a ? DispatchPackedDp4aTriple<
-                  block_q8_k, fused_dequant_gemv_q8k_dp4a_packed_group<3>>
-            : nullptr,
-       "Q8_K"}, // 15
+      {nullptr, nullptr},                      // 0: F32
+      {nullptr, nullptr},                      // 1: F16
+      {nullptr, nullptr},                      // 2: Q4_0
+      {nullptr, nullptr},                      // 3: Q4_1
+      {nullptr, nullptr},                      // 4: (unused)
+      {nullptr, nullptr},                      // 5: (unused)
+      {nullptr, nullptr},                      // 6: Q5_0
+      {nullptr, nullptr},                      // 7: Q5_1
+      MakePackedTripleEntry<block_q8_0>(dp4a), // 8
+      {nullptr, nullptr},                      // 9: Q8_1
+      {nullptr, nullptr},                      // 10: Q2_K
+      {nullptr, nullptr},                      // 11: Q3_K
+      MakePackedTripleEntry<block_q4_k>(dp4a), // 12
+      {nullptr, nullptr},                      // 13: Q5_K
+      MakePackedTripleEntry<block_q6_k>(dp4a), // 14
+      MakePackedTripleEntry<block_q8_k>(dp4a), // 15
   };
 
-  static const PackedDispatchTripleEntry empty = {nullptr, nullptr};
-  auto idx = static_cast<uint32_t>(qtype);
-  if (idx >= kMaxTensorType)
-    return empty;
-  return table[idx];
+  return BoundedDispatchLookup(table, qtype);
 }
 
 template <size_t Count>
@@ -597,13 +620,64 @@ __global__ void transform_downproj_mmq_layout(const BlockT *__restrict__ src,
   }
 }
 
+// Shared skeleton of the two down-proj MMQ tile kernels: stage the row's
+// q8_1 activation into dynamic shared memory (all threads participate —
+// callers rely on the __syncthreads), then the per-warp reduction and
+// half store. Byte-identical operation order to the previous inline code.
+__device__ __forceinline__ block_q8_1 *
+StageActQ8_1Shared(unsigned char *shared_raw,
+                   const block_q8_1 *__restrict__ act_q8_1, int row, int K,
+                   int linear_tid, int threads) {
+  auto *shared_act = reinterpret_cast<block_q8_1 *>(shared_raw);
+  const int num_q8_blocks = K / QK8_1;
+  for (int idx = linear_tid; idx < num_q8_blocks; idx += threads) {
+    shared_act[idx] = act_q8_1[row * num_q8_blocks + idx];
+  }
+  __syncthreads();
+  return shared_act;
+}
+
+__device__ __forceinline__ void WarpReduceStoreHalf(half *__restrict__ output,
+                                                    float acc, int lane,
+                                                    int row, int out_idx,
+                                                    int N) {
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
+  }
+  if (lane == 0) {
+    output[row * N + out_idx] = __float2half(acc);
+  }
+}
+
+// Shared host prologue of the two down-proj tile launches: identical
+// validation, geometry, and dynamic-shared sizing; only the kernel and
+// its block type differ.
+template <typename BlockT, void (*KernelT)(const BlockT *, const block_q8_1 *,
+                                           half *, int, int, int)>
+bool LaunchDownProjMmqTile(const void *weight, const void *act_q8_1,
+                           half *output, int M, int N, int K, int tile_cols,
+                           cudaStream_t stream) {
+  if (!weight || !act_q8_1 || !output || M <= 0 || N <= 0 || K <= 0 ||
+      tile_cols <= 0 || K % QK_K != 0 || K % QK8_1 != 0) {
+    return false;
+  }
+
+  const auto *w = static_cast<const BlockT *>(weight);
+  const auto *a = static_cast<const block_q8_1 *>(act_q8_1);
+  const dim3 block(32, tile_cols);
+  const dim3 grid((N + tile_cols - 1) / tile_cols, M);
+  const size_t shared_bytes =
+      static_cast<size_t>(K / QK8_1) * sizeof(block_q8_1);
+  KernelT<<<grid, block, shared_bytes, stream>>>(w, a, output, N, K, tile_cols);
+  return true;
+}
+
 __global__ void
 fused_downproj_mmq_q4k_q8_1_tile(const block_q4_k *__restrict__ tiled_weight,
                                  const block_q8_1 *__restrict__ act_q8_1,
                                  half *__restrict__ output, int N, int K,
                                  int tile_cols) {
   extern __shared__ unsigned char shared[];
-  auto *shared_act = reinterpret_cast<block_q8_1 *>(shared);
 
   const int lane = threadIdx.x;
   const int out_local = threadIdx.y;
@@ -611,13 +685,9 @@ fused_downproj_mmq_q4k_q8_1_tile(const block_q4_k *__restrict__ tiled_weight,
   const int row = blockIdx.y;
 
   const int num_super_blocks = K / QK_K;
-  const int num_q8_blocks = K / QK8_1;
-  const int linear_tid = out_local * 32 + lane;
-  for (int idx = linear_tid; idx < num_q8_blocks;
-       idx += blockDim.x * blockDim.y) {
-    shared_act[idx] = act_q8_1[row * num_q8_blocks + idx];
-  }
-  __syncthreads();
+  block_q8_1 *shared_act =
+      StageActQ8_1Shared(shared, act_q8_1, row, K, out_local * 32 + lane,
+                         static_cast<int>(blockDim.x * blockDim.y));
 
   if (out_idx >= N) {
     return;
@@ -668,31 +738,14 @@ fused_downproj_mmq_q4k_q8_1_tile(const block_q4_k *__restrict__ tiled_weight,
     }
   }
 
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
-  }
-  if (lane == 0) {
-    output[row * N + out_idx] = __float2half(acc);
-  }
+  WarpReduceStoreHalf(output, acc, lane, row, out_idx, N);
 }
 
 bool DispatchDownProjMmqQ4K(const void *weight, const void *act_q8_1,
                             half *output, int M, int N, int K, int tile_cols,
                             cudaStream_t stream) {
-  if (!weight || !act_q8_1 || !output || M <= 0 || N <= 0 || K <= 0 ||
-      tile_cols <= 0 || K % QK_K != 0 || K % QK8_1 != 0) {
-    return false;
-  }
-
-  const auto *w = static_cast<const block_q4_k *>(weight);
-  const auto *a = static_cast<const block_q8_1 *>(act_q8_1);
-  const dim3 block(32, tile_cols);
-  const dim3 grid((N + tile_cols - 1) / tile_cols, M);
-  const size_t shared_bytes =
-      static_cast<size_t>(K / QK8_1) * sizeof(block_q8_1);
-  fused_downproj_mmq_q4k_q8_1_tile<<<grid, block, shared_bytes, stream>>>(
-      w, a, output, N, K, tile_cols);
-  return true;
+  return LaunchDownProjMmqTile<block_q4_k, fused_downproj_mmq_q4k_q8_1_tile>(
+      weight, act_q8_1, output, M, N, K, tile_cols, stream);
 }
 
 __global__ void
@@ -701,7 +754,6 @@ fused_downproj_mmq_q6k_q8_1_tile(const block_q6_k *__restrict__ tiled_weight,
                                  half *__restrict__ output, int N, int K,
                                  int tile_cols) {
   extern __shared__ unsigned char shared[];
-  auto *shared_act = reinterpret_cast<block_q8_1 *>(shared);
 
   const int lane = threadIdx.x;
   const int out_local = threadIdx.y;
@@ -709,13 +761,9 @@ fused_downproj_mmq_q6k_q8_1_tile(const block_q6_k *__restrict__ tiled_weight,
   const int row = blockIdx.y;
 
   const int num_super_blocks = K / QK_K;
-  const int num_q8_blocks = K / QK8_1;
-  const int linear_tid = out_local * 32 + lane;
-  for (int idx = linear_tid; idx < num_q8_blocks;
-       idx += blockDim.x * blockDim.y) {
-    shared_act[idx] = act_q8_1[row * num_q8_blocks + idx];
-  }
-  __syncthreads();
+  block_q8_1 *shared_act =
+      StageActQ8_1Shared(shared, act_q8_1, row, K, out_local * 32 + lane,
+                         static_cast<int>(blockDim.x * blockDim.y));
 
   if (out_idx >= N) {
     return;
@@ -766,31 +814,14 @@ fused_downproj_mmq_q6k_q8_1_tile(const block_q6_k *__restrict__ tiled_weight,
                     static_cast<float>(dot_hi));
   }
 
-  for (int offset = 16; offset > 0; offset >>= 1) {
-    acc += __shfl_down_sync(0xFFFFFFFF, acc, offset);
-  }
-  if (lane == 0) {
-    output[row * N + out_idx] = __float2half(acc);
-  }
+  WarpReduceStoreHalf(output, acc, lane, row, out_idx, N);
 }
 
 bool DispatchDownProjMmqQ6K(const void *weight, const void *act_q8_1,
                             half *output, int M, int N, int K, int tile_cols,
                             cudaStream_t stream) {
-  if (!weight || !act_q8_1 || !output || M <= 0 || N <= 0 || K <= 0 ||
-      tile_cols <= 0 || K % QK_K != 0 || K % QK8_1 != 0) {
-    return false;
-  }
-
-  const auto *w = static_cast<const block_q6_k *>(weight);
-  const auto *a = static_cast<const block_q8_1 *>(act_q8_1);
-  const dim3 block(32, tile_cols);
-  const dim3 grid((N + tile_cols - 1) / tile_cols, M);
-  const size_t shared_bytes =
-      static_cast<size_t>(K / QK8_1) * sizeof(block_q8_1);
-  fused_downproj_mmq_q6k_q8_1_tile<<<grid, block, shared_bytes, stream>>>(
-      w, a, output, N, K, tile_cols);
-  return true;
+  return LaunchDownProjMmqTile<block_q6_k, fused_downproj_mmq_q6k_q8_1_tile>(
+      weight, act_q8_1, output, M, N, K, tile_cols, stream);
 }
 
 struct DownProjMmqDispatchEntry {
@@ -819,12 +850,7 @@ GetDownProjMmqDispatchEntry(GGUF::TensorType qtype) {
       {nullptr, nullptr},               // 15: Q8_K
   };
 
-  static const DownProjMmqDispatchEntry empty = {nullptr, nullptr};
-  auto idx = static_cast<uint32_t>(qtype);
-  if (idx >= kMaxTensorType) {
-    return empty;
-  }
-  return table[idx];
+  return BoundedDispatchLookup(table, qtype);
 }
 
 } // namespace

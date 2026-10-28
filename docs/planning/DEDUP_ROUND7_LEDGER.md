@@ -49,7 +49,20 @@ gate is ≤2% on the matching headline metrics, median of 3.
 | PR | Phase | Files | Class | jscpd delta | Rig delta | SASS | Review |
 |---|---|---|---|---|---|---|---|
 | #284 | pre-round (bug fixes) | router/http/metrics | — | n/a | n/a | n/a | standard |
-| (PR-1) | infrastructure | .jscpd.json, this ledger | — | config only | baselines recorded | — | — |
+| #285 | infrastructure | .jscpd.json, this ledger | — | config only | baselines recorded | — | — |
+| #286 | t150 host stragglers | cublas/llama/native backends | A | 75→72 clones, 2,246→2,182 L | n/a (host-only) | n/a | standard |
+| #287 | gate hardening | ci.yml, hooks, instructions | — | n/a | n/a | n/a | standard |
+| (PR-3) | t150 dispatch tables + tile skeleton | fused_quant_gemm.cu | A + B-lite | 72→71, 2,182→2,156 L | q4k rig dp4a-mmq medians −1.05%/−1.30% | differs ~50%/34% (nvcc rescheduled through inlined helpers; parity green) | adversarial (this table + PR body) |
+
+Round-7 findings feeding later phases:
+- SASS identity is NOT guaranteed by `__forceinline__` factoring alone — nvcc
+  reschedules around the helper boundary (see PR-3). The Phase-4/5 mmvq gates
+  must treat "byte-identical SASS" as the exception, with rig parity +
+  correctness parity as the hard bars.
+- The two down-proj tile decode cores (q4_k scale/min unpack vs q6_k ql/qh
+  reconstruction) are structurally different — a traits merge rides the
+  Phase-5 evidence gate rather than this phase, per the tuning-generation
+  registry rule.
 
 ## Do-NOT-dedup registry (deliberate duplication, preserved)
 
