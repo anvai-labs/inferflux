@@ -48,96 +48,17 @@ constexpr int calc_mmvq_threads(int ncols) {
 // Q4_K × Q8_1 MMVQ kernel
 // ============================================================================
 
+// ── Shared MMVQ kernel epilogues and dispatch ladder (round 7) ─────────────
+// Cross-warp reduction of the per-column accumulators and the tid-0 store,
+// factored from the byte-identical tails of the narrow-family kernels. The
+// shared array is declared inside the helper: each kernel instantiation
+// calls it exactly once, so the allocation is identical to the previous
+// per-kernel declaration.
 template <int ncols>
-__global__ void inferflux_mmvq_q4k(const block_q4_k *__restrict__ weight,
-                                   const block_q8_1 *__restrict__ act_q8_1,
-                                   half *__restrict__ output, int N, int K,
-                                   int M) {
-  const int tid = threadIdx.x;
-  const int warp_id = tid >> 5;
-  const int lane = tid & 31;
-  const int out_idx = blockIdx.x;
-  const int col_base = blockIdx.y * ncols;
-  if (out_idx >= N)
-    return;
-
-  const int num_super_blocks = K / QK_K;
-  const block_q4_k *wrow = weight + out_idx * num_super_blocks;
-  const int num_q8_per_row = K / QK8_1;
-
-  const int pair = lane >> 3;
-  const int offs = (lane & 7) * 4;
-  const int group_leader = lane & ~7;
-
-  float acc[ncols] = {};
-
-  // Outer loop: weight blocks along K dimension (weights read ONCE)
-  for (int blk = warp_id; blk < num_super_blocks; blk += kMmvqWarps) {
-    // Load weight data ONCE from global memory (use __ldg for read-only cache)
-    const block_q4_k &b = wrow[blk];
-    const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
-    const float dmin =
-        __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
-
-    unsigned char sc_lo, m_lo, sc_hi, m_hi;
-    if ((lane & 7) == 0) {
-      get_scale_min_k4(pair * 2, b.scales, &sc_lo, &m_lo);
-      get_scale_min_k4(pair * 2 + 1, b.scales, &sc_hi, &m_hi);
-    }
-    sc_lo = __shfl_sync(0xFFFFFFFF, sc_lo, group_leader);
-    m_lo = __shfl_sync(0xFFFFFFFF, m_lo, group_leader);
-    sc_hi = __shfl_sync(0xFFFFFFFF, sc_hi, group_leader);
-    m_hi = __shfl_sync(0xFFFFFFFF, m_hi, group_leader);
-
-    const float d_sc_lo = d * static_cast<float>(sc_lo);
-    const float dm_m_lo = dmin * static_cast<float>(m_lo);
-    const float d_sc_hi = d * static_cast<float>(sc_hi);
-    const float dm_m_hi = dmin * static_cast<float>(m_hi);
-
-    int qs4 = __ldg(reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
-    int q_lo4 = qs4 & 0x0F0F0F0F;
-    int q_hi4 = (qs4 >> 4) & 0x0F0F0F0F;
-
-    // Inner loop: batch columns (activation reads, reusing weight data)
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-
-      const block_q8_1 *a_row = act_q8_1 + row * num_q8_per_row;
-      const block_q8_1 &a_lo = a_row[blk * 8 + pair * 2];
-      const block_q8_1 &a_hi = a_row[blk * 8 + pair * 2 + 1];
-
-      const int x_lo4 = *reinterpret_cast<const int *>(&a_lo.qs[offs]);
-      const int x_hi4 = *reinterpret_cast<const int *>(&a_hi.qs[offs]);
-
-      float d8_lo = __half2float(__low2half(a_lo.ds));
-      float d8_hi = __half2float(__low2half(a_hi.ds));
-
-      int dot_lo = Dp4aS8(q_lo4, x_lo4, 0);
-      int dot_hi = Dp4aS8(q_hi4, x_hi4, 0);
-
-      acc[c] += d_sc_lo * d8_lo * static_cast<float>(dot_lo) +
-                d_sc_hi * d8_hi * static_cast<float>(dot_hi);
-
-      if ((lane & 7) == 0) {
-        float s_lo = __half2float(__high2half(a_lo.ds));
-        float s_hi = __half2float(__high2half(a_hi.ds));
-        acc[c] -= dm_m_lo * s_lo + dm_m_hi * s_hi;
-      }
-    }
-  }
-
-  // Intra-warp reduction for each column
-#pragma unroll
-  for (int c = 0; c < ncols; ++c) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
-    }
-  }
-
-  // Cross-warp reduction via shared memory
+__device__ __forceinline__ void
+MmvqReduceStoreHalf(const float (&acc)[ncols], int lane, int warp_id, int tid,
+                    int col_base, int M, int N, int out_idx,
+                    half *__restrict__ output) {
   __shared__ float warp_sums[kMmvqWarps * ncols];
   if (lane == 0) {
 #pragma unroll
@@ -160,95 +81,13 @@ __global__ void inferflux_mmvq_q4k(const block_q4_k *__restrict__ weight,
   }
 }
 
-// Q4_K × Q8_1 MMVQ with bias epilogue: output = dot(W, x) + bias[out_idx]
-// Identical to inferflux_mmvq_q4k but adds bias in writeback, eliminating
-// a separate BiasAdd kernel launch. Bias may be nullptr (no-op).
+// Bias epilogue: plain half store plus a per-output-column bias
+// (nullptr = no-op).
 template <int ncols>
-__global__ void inferflux_mmvq_q4k_bias(const block_q4_k *__restrict__ weight,
-                                        const block_q8_1 *__restrict__ act_q8_1,
-                                        half *__restrict__ output,
-                                        const half *__restrict__ bias, int N,
-                                        int K, int M) {
-  const int tid = threadIdx.x;
-  const int warp_id = tid >> 5;
-  const int lane = tid & 31;
-  const int out_idx = blockIdx.x;
-  const int col_base = blockIdx.y * ncols;
-  if (out_idx >= N)
-    return;
-
-  const int num_super_blocks = K / QK_K;
-  const block_q4_k *wrow = weight + out_idx * num_super_blocks;
-  const int num_q8_per_row = K / QK8_1;
-
-  const int pair = lane >> 3;
-  const int offs = (lane & 7) * 4;
-  const int group_leader = lane & ~7;
-
-  float acc[ncols] = {};
-
-  for (int blk = warp_id; blk < num_super_blocks; blk += kMmvqWarps) {
-    const block_q4_k &b = wrow[blk];
-    const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
-    const float dmin =
-        __half2float(__ldg(reinterpret_cast<const half *>(&b.dmin)));
-
-    unsigned char sc_lo, m_lo, sc_hi, m_hi;
-    if ((lane & 7) == 0) {
-      get_scale_min_k4(pair * 2, b.scales, &sc_lo, &m_lo);
-      get_scale_min_k4(pair * 2 + 1, b.scales, &sc_hi, &m_hi);
-    }
-    sc_lo = __shfl_sync(0xFFFFFFFF, sc_lo, group_leader);
-    m_lo = __shfl_sync(0xFFFFFFFF, m_lo, group_leader);
-    sc_hi = __shfl_sync(0xFFFFFFFF, sc_hi, group_leader);
-    m_hi = __shfl_sync(0xFFFFFFFF, m_hi, group_leader);
-
-    const float d_sc_lo = d * static_cast<float>(sc_lo);
-    const float dm_m_lo = dmin * static_cast<float>(m_lo);
-    const float d_sc_hi = d * static_cast<float>(sc_hi);
-    const float dm_m_hi = dmin * static_cast<float>(m_hi);
-
-    int qs4 = __ldg(reinterpret_cast<const int *>(&b.qs[pair * 32 + offs]));
-    int q_lo4 = qs4 & 0x0F0F0F0F;
-    int q_hi4 = (qs4 >> 4) & 0x0F0F0F0F;
-
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-
-      const block_q8_1 *a_row = act_q8_1 + row * num_q8_per_row;
-      const block_q8_1 &a_lo = a_row[blk * 8 + pair * 2];
-      const block_q8_1 &a_hi = a_row[blk * 8 + pair * 2 + 1];
-
-      const int x_lo4 = *reinterpret_cast<const int *>(&a_lo.qs[offs]);
-      const int x_hi4 = *reinterpret_cast<const int *>(&a_hi.qs[offs]);
-
-      float d8_lo = __half2float(__low2half(a_lo.ds));
-      float d8_hi = __half2float(__low2half(a_hi.ds));
-
-      int dot_lo = Dp4aS8(q_lo4, x_lo4, 0);
-      int dot_hi = Dp4aS8(q_hi4, x_hi4, 0);
-
-      acc[c] += d_sc_lo * d8_lo * static_cast<float>(dot_lo) +
-                d_sc_hi * d8_hi * static_cast<float>(dot_hi);
-
-      if ((lane & 7) == 0) {
-        float s_lo = __half2float(__high2half(a_lo.ds));
-        float s_hi = __half2float(__high2half(a_hi.ds));
-        acc[c] -= dm_m_lo * s_lo + dm_m_hi * s_hi;
-      }
-    }
-  }
-
-#pragma unroll
-  for (int c = 0; c < ncols; ++c) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
-    }
-  }
-
+__device__ __forceinline__ void
+MmvqReduceStoreBias(const float (&acc)[ncols], int lane, int warp_id, int tid,
+                    int col_base, int M, int N, int out_idx,
+                    half *__restrict__ output, const half *__restrict__ bias) {
   __shared__ float warp_sums[kMmvqWarps * ncols];
   if (lane == 0) {
 #pragma unroll
@@ -273,6 +112,68 @@ __global__ void inferflux_mmvq_q4k_bias(const block_q4_k *__restrict__ weight,
     }
   }
 }
+
+// Accumulating epilogue: OutputT float uses atomicAdd or a direct store per
+// UseAtomic; half accumulates into the existing half value.
+template <int ncols, typename OutputT, bool UseAtomic>
+__device__ __forceinline__ void
+MmvqReduceStoreAccum(const float (&acc)[ncols], int lane, int warp_id, int tid,
+                     int col_base, int M, int N, int out_idx,
+                     OutputT *__restrict__ output) {
+  __shared__ float warp_sums[kMmvqWarps * ncols];
+  if (lane == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
+    }
+  }
+  __syncthreads();
+  if (tid == 0) {
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row >= M)
+        break;
+      float sum = 0.0f;
+      for (int w = 0; w < kMmvqWarps; ++w)
+        sum += warp_sums[c * kMmvqWarps + w];
+      if constexpr (std::is_same_v<OutputT, float>) {
+        // Atomic FP32 accumulate: prevents race condition when multiple blocks
+        // write to same output location (e.g., grouped projections or residual
+        // accumulation across layers)
+        if constexpr (UseAtomic) {
+          atomicAdd(&output[row * N + out_idx], sum);
+        } else {
+          // Direct write: faster when safe (no race conditions)
+          output[row * N + out_idx] = sum;
+        }
+      } else {
+        output[row * N + out_idx] =
+            __float2half(sum + __half2float(output[row * N + out_idx]));
+      }
+    }
+  }
+}
+
+// M-bucket dispatch ladder shared by the host launchers: the packed column
+// width follows the row count (1/2/4/8); wider M is not MMVQ's regime.
+template <typename LaunchT, typename K1, typename K2, typename K4, typename K8>
+bool DispatchMmvqByM(int M, LaunchT &&launch, K1 kernel1, K2 kernel2,
+                     K4 kernel4, K8 kernel8) {
+  if (M <= 1)
+    return launch(1, kernel1);
+  if (M <= 2)
+    return launch(2, kernel2);
+  if (M <= 4)
+    return launch(4, kernel4);
+  if (M <= 8)
+    return launch(8, kernel8);
+  return false; // M > 8 → MMQ or cuBLAS
+}
+
+// Q4_K × Q8_1 MMVQ with bias epilogue: output = dot(W, x) + bias[out_idx]
+// Identical to inferflux_mmvq_q4k but adds bias in writeback, eliminating
+// a separate BiasAdd kernel launch. Bias may be nullptr (no-op).
 
 // Q4_K × Q8_1 MMVQ accumulate variant (adds to existing output)
 // OutputT = half (default): read-modify-write via __half2float/__float2half
@@ -408,11 +309,13 @@ inferflux_mmvq_q4k_accum_wide(const block_q4_k *__restrict__ weight,
   }
 }
 
-template <int ncols, typename OutputT = half, bool UseAtomic = true>
-__global__ void
-inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
-                         const block_q8_1 *__restrict__ act_q8_1,
-                         OutputT *__restrict__ output, int N, int K, int M) {
+template <int ncols, typename OutputT = half, bool UseAtomic = true,
+          bool kAccum = true, bool kBias = false>
+__device__ __forceinline__ void
+MmvqQ4KBody(const block_q4_k *__restrict__ weight,
+            const block_q8_1 *__restrict__ act_q8_1,
+            OutputT *__restrict__ output, const half *__restrict__ bias, int N,
+            int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -498,145 +401,49 @@ inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
   }
 
   // Cross-warp reduction via shared memory
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
+  if constexpr (kAccum) {
+    MmvqReduceStoreAccum<ncols, OutputT, UseAtomic>(
+        acc, lane, warp_id, tid, col_base, M, N, out_idx, output);
+  } else if constexpr (kBias) {
+    MmvqReduceStoreBias<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                               output, bias);
+  } else {
+    MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                               output);
   }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      if constexpr (std::is_same_v<OutputT, float>) {
-        // Atomic FP32 accumulate: prevents race condition when multiple blocks
-        // write to same output location (e.g., grouped projections or residual
-        // accumulation across layers)
-        if constexpr (UseAtomic) {
-          atomicAdd(&output[row * N + out_idx], sum);
-        } else {
-          // Direct write: faster when safe (no race conditions)
-          output[row * N + out_idx] = sum;
-        }
-      } else {
-        output[row * N + out_idx] =
-            __float2half(sum + __half2float(output[row * N + out_idx]));
-      }
-    }
-  }
+}
+
+template <int ncols>
+__global__ void inferflux_mmvq_q4k(const block_q4_k *__restrict__ weight,
+                                   const block_q8_1 *__restrict__ act_q8_1,
+                                   half *__restrict__ output, int N, int K,
+                                   int M) {
+  MmvqQ4KBody<ncols, half, true, false, false>(weight, act_q8_1, output,
+                                               nullptr, N, K, M);
+}
+
+template <int ncols>
+__global__ void inferflux_mmvq_q4k_bias(const block_q4_k *__restrict__ weight,
+                                        const block_q8_1 *__restrict__ act_q8_1,
+                                        half *__restrict__ output,
+                                        const half *__restrict__ bias, int N,
+                                        int K, int M) {
+  MmvqQ4KBody<ncols, half, true, false, true>(weight, act_q8_1, output, bias, N,
+                                              K, M);
+}
+
+template <int ncols, typename OutputT = half, bool UseAtomic = true>
+__global__ void
+inferflux_mmvq_q4k_accum(const block_q4_k *__restrict__ weight,
+                         const block_q8_1 *__restrict__ act_q8_1,
+                         OutputT *__restrict__ output, int N, int K, int M) {
+  MmvqQ4KBody<ncols, OutputT, UseAtomic, true, false>(weight, act_q8_1, output,
+                                                      nullptr, N, K, M);
 }
 
 // ============================================================================
 // Q6_K × Q8_1 MMVQ kernel
 // ============================================================================
-
-template <int ncols>
-__global__ void inferflux_mmvq_q6k(const block_q6_k *__restrict__ weight,
-                                   const block_q8_1 *__restrict__ act_q8_1,
-                                   half *__restrict__ output, int N, int K,
-                                   int M) {
-  const int tid = threadIdx.x;
-  const int warp_id = tid >> 5;
-  const int lane = tid & 31;
-  const int out_idx = blockIdx.x;
-  const int col_base = blockIdx.y * ncols;
-  if (out_idx >= N)
-    return;
-
-  const int num_super_blocks = K / QK_K;
-  const block_q6_k *wrow = weight + out_idx * num_super_blocks;
-  const int num_q8_per_row = K / QK8_1;
-
-  const int sub_pair = lane >> 3;
-  const int e_base = (lane & 7) << 2;
-  const int g = sub_pair >> 1;
-  const int sub_base = sub_pair & 1;
-  const int qh_shift_lo = sub_base * 2;
-  const int qh_shift_hi = qh_shift_lo + 4;
-  const int sc_lo = g * 8 + sub_base * 2 + e_base / 16;
-  const int sc_hi = g * 8 + (sub_base + 2) * 2 + e_base / 16;
-
-  float acc[ncols] = {};
-
-  for (int blk = warp_id; blk < num_super_blocks; blk += kMmvqWarps) {
-    const block_q6_k &b = wrow[blk];
-    const float d = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
-
-    const int ql4 =
-        LoadPackedInt32Unaligned(&b.ql[g * 64 + sub_base * 32 + e_base]);
-    const int qh4 = LoadPackedInt32Unaligned(&b.qh[g * 32 + e_base]);
-
-    int vl_lo = ql4 & 0x0F0F0F0F;
-    int vh_lo = ((qh4 >> qh_shift_lo) << 4) & 0x30303030;
-    int vi_lo = Vsubss4(vl_lo | vh_lo, 0x20202020);
-
-    int vl_hi = (ql4 >> 4) & 0x0F0F0F0F;
-    int vh_hi = ((qh4 >> qh_shift_hi) << 4) & 0x30303030;
-    int vi_hi = Vsubss4(vl_hi | vh_hi, 0x20202020);
-
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-
-      const block_q8_1 *a_row = act_q8_1 + row * num_q8_per_row;
-      const block_q8_1 &a_lo = a_row[blk * 8 + g * 4 + sub_base];
-      const block_q8_1 &a_hi = a_row[blk * 8 + g * 4 + sub_base + 2];
-
-      const int x_lo = LoadPackedInt32Unaligned(&a_lo.qs[e_base]);
-      const int x_hi = LoadPackedInt32Unaligned(&a_hi.qs[e_base]);
-
-      float d8_lo = __half2float(__low2half(a_lo.ds));
-      float d8_hi = __half2float(__low2half(a_hi.ds));
-
-      int dot_lo = Dp4aS8(vi_lo, x_lo, 0);
-      int dot_hi = Dp4aS8(vi_hi, x_hi, 0);
-
-      acc[c] += d * (static_cast<float>(b.scales[sc_lo]) * d8_lo *
-                         static_cast<float>(dot_lo) +
-                     static_cast<float>(b.scales[sc_hi]) * d8_hi *
-                         static_cast<float>(dot_hi));
-    }
-  }
-
-  // Intra-warp reduction
-#pragma unroll
-  for (int c = 0; c < ncols; ++c) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
-    }
-  }
-
-  // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum);
-    }
-  }
-}
 
 // Q6_K × Q8_1 MMVQ vectorized kernel: uses __ldg + wider loads for ql/qh.
 // Improves bandwidth utilization from ~62% to ~78% by reducing load
@@ -726,34 +533,17 @@ __global__ void inferflux_mmvq_q6k_vec(const block_q6_k *__restrict__ weight,
     }
   }
 
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum);
-    }
-  }
+  MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                             output);
 }
 
 // Q6_K × Q8_1 MMVQ accumulate variant (adds to existing output)
-template <int ncols, typename OutputT = half, bool UseAtomic = true>
-__global__ void
-inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
-                         const block_q8_1 *__restrict__ act_q8_1,
-                         OutputT *__restrict__ output, int N, int K, int M) {
+template <int ncols, typename OutputT = half, bool UseAtomic = true,
+          bool kAccum = true>
+__device__ __forceinline__ void
+MmvqQ6KBody(const block_q6_k *__restrict__ weight,
+            const block_q8_1 *__restrict__ act_q8_1,
+            OutputT *__restrict__ output, int N, int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -828,37 +618,30 @@ inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
   }
 
   // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
+  if constexpr (kAccum) {
+    MmvqReduceStoreAccum<ncols, OutputT, UseAtomic>(
+        acc, lane, warp_id, tid, col_base, M, N, out_idx, output);
+  } else {
+    MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                               output);
   }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      if constexpr (std::is_same_v<OutputT, float>) {
-        // Atomic FP32 accumulate: prevents race condition
-        if constexpr (UseAtomic) {
-          atomicAdd(&output[row * N + out_idx], sum);
-        } else {
-          // Direct write: faster when safe (no race conditions)
-          output[row * N + out_idx] = sum;
-        }
-      } else {
-        output[row * N + out_idx] =
-            __float2half(sum + __half2float(output[row * N + out_idx]));
-      }
-    }
-  }
+}
+
+template <int ncols>
+__global__ void inferflux_mmvq_q6k(const block_q6_k *__restrict__ weight,
+                                   const block_q8_1 *__restrict__ act_q8_1,
+                                   half *__restrict__ output, int N, int K,
+                                   int M) {
+  MmvqQ6KBody<ncols, half, true, false>(weight, act_q8_1, output, N, K, M);
+}
+
+template <int ncols, typename OutputT = half, bool UseAtomic = true>
+__global__ void
+inferflux_mmvq_q6k_accum(const block_q6_k *__restrict__ weight,
+                         const block_q8_1 *__restrict__ act_q8_1,
+                         OutputT *__restrict__ output, int N, int K, int M) {
+  MmvqQ6KBody<ncols, OutputT, UseAtomic, true>(weight, act_q8_1, output, N, K,
+                                               M);
 }
 
 // Q6_K x Q8_1 MMVQ accumulate variant with vectorized weight loads.
@@ -973,352 +756,180 @@ inferflux_mmvq_q6k_accum_vec(const block_q6_k *__restrict__ weight,
 // Q8_0 × Q8_1 MMVQ kernel
 // ============================================================================
 
+// Q8_0 × Q8_1 MMVQ accumulate variant (adds to existing output)
+template <int ncols, typename OutputT = half, bool UseAtomic = true,
+          bool kAccum = true>
+__device__ __forceinline__ void
+MmvqQ8_0Body(const block_q8_0 *__restrict__ weight,
+             const block_q8_1 *__restrict__ act_q8_1,
+             OutputT *__restrict__ output, int N, int K, int M) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x;
+  const int col_base = blockIdx.y * ncols;
+  if (out_idx >= N)
+    return;
+
+  // Q8_0 and Q8_1 both have 32-element blocks: 1:1 mapping
+  const int num_blocks = K / QK8_0;
+  const block_q8_0 *wrow = weight + out_idx * num_blocks;
+
+  float acc[ncols] = {};
+
+  // Each warp handles strided blocks. Weight data read once per block.
+  for (int blk = warp_id * 32 + lane; blk < num_blocks;
+       blk += kMmvqWarps * 32) {
+    const block_q8_0 &b = wrow[blk];
+    const float d_w = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
+
+    // Pre-load weight quants
+    int w4[QK8_0 / 4];
+    for (int j = 0; j < QK8_0; j += 4) {
+      w4[j / 4] = LoadPackedInt32Unaligned(&b.qs[j]);
+    }
+
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row >= M)
+        break;
+
+      const block_q8_1 *a_row = act_q8_1 + row * num_blocks;
+      const block_q8_1 &a = a_row[blk];
+      const float d_a = __half2float(__low2half(a.ds));
+
+      int int_acc = 0;
+      for (int j = 0; j < QK8_0; j += 4) {
+        const int x4 = *reinterpret_cast<const int *>(&a.qs[j]);
+        int_acc = Dp4aS8(w4[j / 4], x4, int_acc);
+      }
+      acc[c] += d_w * d_a * static_cast<float>(int_acc);
+    }
+  }
+
+  // Intra-warp reduction
+#pragma unroll
+  for (int c = 0; c < ncols; ++c) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
+    }
+  }
+
+  // Cross-warp reduction
+  if constexpr (kAccum) {
+    MmvqReduceStoreAccum<ncols, OutputT, UseAtomic>(
+        acc, lane, warp_id, tid, col_base, M, N, out_idx, output);
+  } else {
+    MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                               output);
+  }
+}
+
 template <int ncols>
 __global__ void inferflux_mmvq_q8_0(const block_q8_0 *__restrict__ weight,
                                     const block_q8_1 *__restrict__ act_q8_1,
                                     half *__restrict__ output, int N, int K,
                                     int M) {
-  const int tid = threadIdx.x;
-  const int warp_id = tid >> 5;
-  const int lane = tid & 31;
-  const int out_idx = blockIdx.x;
-  const int col_base = blockIdx.y * ncols;
-  if (out_idx >= N)
-    return;
-
-  // Q8_0 and Q8_1 both have 32-element blocks: 1:1 mapping
-  const int num_blocks = K / QK8_0;
-  const block_q8_0 *wrow = weight + out_idx * num_blocks;
-
-  float acc[ncols] = {};
-
-  // Each warp handles strided blocks. Weight data read once per block.
-  for (int blk = warp_id * 32 + lane; blk < num_blocks;
-       blk += kMmvqWarps * 32) {
-    const block_q8_0 &b = wrow[blk];
-    const float d_w = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
-
-    // Pre-load weight quants
-    int w4[QK8_0 / 4];
-    for (int j = 0; j < QK8_0; j += 4) {
-      w4[j / 4] = LoadPackedInt32Unaligned(&b.qs[j]);
-    }
-
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-
-      const block_q8_1 *a_row = act_q8_1 + row * num_blocks;
-      const block_q8_1 &a = a_row[blk];
-      const float d_a = __half2float(__low2half(a.ds));
-
-      int int_acc = 0;
-      for (int j = 0; j < QK8_0; j += 4) {
-        const int x4 = *reinterpret_cast<const int *>(&a.qs[j]);
-        int_acc = Dp4aS8(w4[j / 4], x4, int_acc);
-      }
-      acc[c] += d_w * d_a * static_cast<float>(int_acc);
-    }
-  }
-
-  // Intra-warp reduction
-#pragma unroll
-  for (int c = 0; c < ncols; ++c) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
-    }
-  }
-
-  // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum);
-    }
-  }
+  MmvqQ8_0Body<ncols, half, true, false>(weight, act_q8_1, output, N, K, M);
 }
 
-// Q8_0 × Q8_1 MMVQ accumulate variant (adds to existing output)
 template <int ncols, typename OutputT = half, bool UseAtomic = true>
 __global__ void
 inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
                           const block_q8_1 *__restrict__ act_q8_1,
                           OutputT *__restrict__ output, int N, int K, int M) {
-  const int tid = threadIdx.x;
-  const int warp_id = tid >> 5;
-  const int lane = tid & 31;
-  const int out_idx = blockIdx.x;
-  const int col_base = blockIdx.y * ncols;
-  if (out_idx >= N)
-    return;
-
-  // Q8_0 and Q8_1 both have 32-element blocks: 1:1 mapping
-  const int num_blocks = K / QK8_0;
-  const block_q8_0 *wrow = weight + out_idx * num_blocks;
-
-  float acc[ncols] = {};
-
-  // Each warp handles strided blocks. Weight data read once per block.
-  for (int blk = warp_id * 32 + lane; blk < num_blocks;
-       blk += kMmvqWarps * 32) {
-    const block_q8_0 &b = wrow[blk];
-    const float d_w = __half2float(__ldg(reinterpret_cast<const half *>(&b.d)));
-
-    // Pre-load weight quants
-    int w4[QK8_0 / 4];
-    for (int j = 0; j < QK8_0; j += 4) {
-      w4[j / 4] = LoadPackedInt32Unaligned(&b.qs[j]);
-    }
-
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-
-      const block_q8_1 *a_row = act_q8_1 + row * num_blocks;
-      const block_q8_1 &a = a_row[blk];
-      const float d_a = __half2float(__low2half(a.ds));
-
-      int int_acc = 0;
-      for (int j = 0; j < QK8_0; j += 4) {
-        const int x4 = *reinterpret_cast<const int *>(&a.qs[j]);
-        int_acc = Dp4aS8(w4[j / 4], x4, int_acc);
-      }
-      acc[c] += d_w * d_a * static_cast<float>(int_acc);
-    }
-  }
-
-  // Intra-warp reduction
-#pragma unroll
-  for (int c = 0; c < ncols; ++c) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
-    }
-  }
-
-  // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      if constexpr (std::is_same_v<OutputT, float>) {
-        // Atomic FP32 accumulate: prevents race condition
-        if constexpr (UseAtomic) {
-          atomicAdd(&output[row * N + out_idx], sum);
-        } else {
-          // Direct write: faster when safe (no race conditions)
-          output[row * N + out_idx] = sum;
-        }
-      } else {
-        output[row * N + out_idx] =
-            __float2half(sum + __half2float(output[row * N + out_idx]));
-      }
-    }
-  }
+  MmvqQ8_0Body<ncols, OutputT, UseAtomic, true>(weight, act_q8_1, output, N, K,
+                                                M);
 }
 
 // ============================================================================
 // Q8_K × Q8_1 MMVQ kernel
 // ============================================================================
 
+// Q8_K × Q8_1 MMVQ accumulate variant (adds to existing output)
+template <int ncols, typename OutputT = half, bool UseAtomic = true,
+          bool kAccum = true>
+__device__ __forceinline__ void
+MmvqQ8KBody(const block_q8_k *__restrict__ weight,
+            const block_q8_1 *__restrict__ act_q8_1,
+            OutputT *__restrict__ output, int N, int K, int M) {
+  const int tid = threadIdx.x;
+  const int warp_id = tid >> 5;
+  const int lane = tid & 31;
+  const int out_idx = blockIdx.x;
+  const int col_base = blockIdx.y * ncols;
+  if (out_idx >= N)
+    return;
+
+  // Q8_K super-block = 256 elements = 8 Q8_1 blocks
+  const int num_super_blocks = K / QK_K;
+  const block_q8_k *wrow = weight + out_idx * num_super_blocks;
+  const int num_q8_per_row = K / QK8_1;
+
+  float acc[ncols] = {};
+
+  for (int blk = warp_id * 32 + lane; blk < num_super_blocks;
+       blk += kMmvqWarps * 32) {
+    const block_q8_k &b = wrow[blk];
+    const float d_w = __ldg(&b.d);
+
+#pragma unroll
+    for (int c = 0; c < ncols; ++c) {
+      const int row = col_base + c;
+      if (row >= M)
+        break;
+
+      const block_q8_1 *a_row = act_q8_1 + row * num_q8_per_row;
+
+      for (int sub = 0; sub < 8; ++sub) {
+        const block_q8_1 &a = a_row[blk * 8 + sub];
+        const float d_a = __half2float(__low2half(a.ds));
+
+        int int_acc = 0;
+        for (int j = 0; j < QK8_1; j += 4) {
+          int w4 = __ldg(reinterpret_cast<const int *>(&b.qs[sub * QK8_1 + j]));
+          const int x4 = *reinterpret_cast<const int *>(&a.qs[j]);
+          int_acc = Dp4aS8(w4, x4, int_acc);
+        }
+        acc[c] += d_w * d_a * static_cast<float>(int_acc);
+      }
+    }
+  }
+
+  // Intra-warp reduction
+#pragma unroll
+  for (int c = 0; c < ncols; ++c) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
+    }
+  }
+
+  // Cross-warp reduction
+  if constexpr (kAccum) {
+    MmvqReduceStoreAccum<ncols, OutputT, UseAtomic>(
+        acc, lane, warp_id, tid, col_base, M, N, out_idx, output);
+  } else {
+    MmvqReduceStoreHalf<ncols>(acc, lane, warp_id, tid, col_base, M, N, out_idx,
+                               output);
+  }
+}
+
 template <int ncols>
 __global__ void inferflux_mmvq_q8k(const block_q8_k *__restrict__ weight,
                                    const block_q8_1 *__restrict__ act_q8_1,
                                    half *__restrict__ output, int N, int K,
                                    int M) {
-  const int tid = threadIdx.x;
-  const int warp_id = tid >> 5;
-  const int lane = tid & 31;
-  const int out_idx = blockIdx.x;
-  const int col_base = blockIdx.y * ncols;
-  if (out_idx >= N)
-    return;
-
-  // Q8_K super-block = 256 elements = 8 Q8_1 blocks
-  const int num_super_blocks = K / QK_K;
-  const block_q8_k *wrow = weight + out_idx * num_super_blocks;
-  const int num_q8_per_row = K / QK8_1;
-
-  float acc[ncols] = {};
-
-  for (int blk = warp_id * 32 + lane; blk < num_super_blocks;
-       blk += kMmvqWarps * 32) {
-    const block_q8_k &b = wrow[blk];
-    const float d_w = __ldg(&b.d);
-
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-
-      const block_q8_1 *a_row = act_q8_1 + row * num_q8_per_row;
-
-      for (int sub = 0; sub < 8; ++sub) {
-        const block_q8_1 &a = a_row[blk * 8 + sub];
-        const float d_a = __half2float(__low2half(a.ds));
-
-        int int_acc = 0;
-        for (int j = 0; j < QK8_1; j += 4) {
-          int w4 = __ldg(reinterpret_cast<const int *>(&b.qs[sub * QK8_1 + j]));
-          const int x4 = *reinterpret_cast<const int *>(&a.qs[j]);
-          int_acc = Dp4aS8(w4, x4, int_acc);
-        }
-        acc[c] += d_w * d_a * static_cast<float>(int_acc);
-      }
-    }
-  }
-
-  // Intra-warp reduction
-#pragma unroll
-  for (int c = 0; c < ncols; ++c) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
-    }
-  }
-
-  // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      output[row * N + out_idx] = __float2half(sum);
-    }
-  }
+  MmvqQ8KBody<ncols, half, true, false>(weight, act_q8_1, output, N, K, M);
 }
 
-// Q8_K × Q8_1 MMVQ accumulate variant (adds to existing output)
 template <int ncols, typename OutputT = half, bool UseAtomic = true>
 __global__ void
 inferflux_mmvq_q8k_accum(const block_q8_k *__restrict__ weight,
                          const block_q8_1 *__restrict__ act_q8_1,
                          OutputT *__restrict__ output, int N, int K, int M) {
-  const int tid = threadIdx.x;
-  const int warp_id = tid >> 5;
-  const int lane = tid & 31;
-  const int out_idx = blockIdx.x;
-  const int col_base = blockIdx.y * ncols;
-  if (out_idx >= N)
-    return;
-
-  // Q8_K super-block = 256 elements = 8 Q8_1 blocks
-  const int num_super_blocks = K / QK_K;
-  const block_q8_k *wrow = weight + out_idx * num_super_blocks;
-  const int num_q8_per_row = K / QK8_1;
-
-  float acc[ncols] = {};
-
-  for (int blk = warp_id * 32 + lane; blk < num_super_blocks;
-       blk += kMmvqWarps * 32) {
-    const block_q8_k &b = wrow[blk];
-    const float d_w = __ldg(&b.d);
-
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-
-      const block_q8_1 *a_row = act_q8_1 + row * num_q8_per_row;
-
-      for (int sub = 0; sub < 8; ++sub) {
-        const block_q8_1 &a = a_row[blk * 8 + sub];
-        const float d_a = __half2float(__low2half(a.ds));
-
-        int int_acc = 0;
-        for (int j = 0; j < QK8_1; j += 4) {
-          int w4 = __ldg(reinterpret_cast<const int *>(&b.qs[sub * QK8_1 + j]));
-          const int x4 = *reinterpret_cast<const int *>(&a.qs[j]);
-          int_acc = Dp4aS8(w4, x4, int_acc);
-        }
-        acc[c] += d_w * d_a * static_cast<float>(int_acc);
-      }
-    }
-  }
-
-  // Intra-warp reduction
-#pragma unroll
-  for (int c = 0; c < ncols; ++c) {
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      acc[c] += __shfl_down_sync(0xFFFFFFFF, acc[c], offset);
-    }
-  }
-
-  // Cross-warp reduction
-  __shared__ float warp_sums[kMmvqWarps * ncols];
-  if (lane == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      warp_sums[c * kMmvqWarps + warp_id] = acc[c];
-    }
-  }
-  __syncthreads();
-  if (tid == 0) {
-#pragma unroll
-    for (int c = 0; c < ncols; ++c) {
-      const int row = col_base + c;
-      if (row >= M)
-        break;
-      float sum = 0.0f;
-      for (int w = 0; w < kMmvqWarps; ++w)
-        sum += warp_sums[c * kMmvqWarps + w];
-      if constexpr (std::is_same_v<OutputT, float>) {
-        // Atomic FP32 accumulate: prevents race condition
-        if constexpr (UseAtomic) {
-          atomicAdd(&output[row * N + out_idx], sum);
-        } else {
-          // Direct write: faster when safe (no race conditions)
-          output[row * N + out_idx] = sum;
-        }
-      } else {
-        output[row * N + out_idx] =
-            __float2half(sum + __half2float(output[row * N + out_idx]));
-      }
-    }
-  }
+  MmvqQ8KBody<ncols, OutputT, UseAtomic, true>(weight, act_q8_1, output, N, K,
+                                               M);
 }
 
 // ============================================================================
@@ -1631,15 +1242,7 @@ bool DispatchMmvq(const void *data, const void *act_q8_1, half *output, int M,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false; // M > 8 → MMQ or cuBLAS
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 // Bias-enabled dispatch: same as DispatchMmvq but passes bias to kernels.
@@ -1666,15 +1269,7 @@ bool DispatchMmvqBias(const void *data, const void *act_q8_1, half *output,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false;
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 template <
@@ -1696,15 +1291,7 @@ bool DispatchMmvqAccum(const void *data, const void *act_q8_1, half *output,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false;
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 // FP32 output variant of DispatchMmvqAccum for FP32 residual stream.
@@ -1728,15 +1315,7 @@ bool DispatchMmvqAccumF32(const void *data, const void *act_q8_1, float *output,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false;
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 template <typename BlockT, int nprojs,
@@ -1771,15 +1350,7 @@ bool DispatchMmvqGroup(const std::array<const void *, nprojs> &weights,
     return true;
   };
 
-  if (M <= 1)
-    return launch(1, Kernel1);
-  if (M <= 2)
-    return launch(2, Kernel2);
-  if (M <= 4)
-    return launch(4, Kernel4);
-  if (M <= 8)
-    return launch(8, Kernel8);
-  return false;
+  return DispatchMmvqByM(M, launch, Kernel1, Kernel2, Kernel4, Kernel8);
 }
 
 // Convenience dispatch for pair (2 projections)

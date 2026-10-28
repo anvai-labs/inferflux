@@ -1,0 +1,17 @@
+{
+  "minTokens": 50,
+  "formats": ["cpp", "c", "cpp-header", "c-header"],
+  "formats-exts": {
+    "cpp": ["cu", "cuh"]
+  },
+  "ignore": [
+    "**/external/**",
+    "**/build*/**",
+    "**/third_party/**",
+    "**/webui/**",
+    "**/.git/**"
+  ],
+  "path": ["runtime", "scheduler", "server", "io", "net", "policy", "model", "cli"],
+  "reporters": ["consoleFull", "json"],
+  "output": "./build/jscpd"
+}

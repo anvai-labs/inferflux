@@ -25,6 +25,25 @@ TEST_CASE("Cache reuse counters share execution events across model labels",
               "model=\"quote\\\"line\\nslash\\\\\"") != std::string::npos);
 }
 
+TEST_CASE("Capacity eviction decision counters render",
+          "[metrics][cache_usage]") {
+  inferflux::MetricsRegistry registry;
+  const auto out = registry.RenderPrometheus();
+  // Zero-valued counters are present before any admission pressure.
+  REQUIRE(out.find("inferflux_capacity_eviction_donor_total{backend=\"cpu\"}"
+                   " 0\n") != std::string::npos);
+  REQUIRE(out.find("inferflux_capacity_eviction_bystander_total{backend="
+                   "\"cpu\"} 0\n") != std::string::npos);
+  registry.RecordCacheEvictionDonorRetired();
+  registry.RecordCacheEvictionDonorRetired();
+  registry.RecordCacheEvictionBystanderRetired();
+  const auto updated = registry.RenderPrometheus();
+  REQUIRE(updated.find("inferflux_capacity_eviction_donor_total{backend="
+                       "\"cpu\"} 2\n") != std::string::npos);
+  REQUIRE(updated.find("inferflux_capacity_eviction_bystander_total{backend="
+                       "\"cpu\"} 1\n") != std::string::npos);
+}
+
 TEST_CASE("MetricsRegistry default backend is cpu", "[metrics]") {
   inferflux::MetricsRegistry registry;
   auto output = registry.RenderPrometheus();

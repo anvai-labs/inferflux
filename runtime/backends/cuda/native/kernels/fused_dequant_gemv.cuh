@@ -18,7 +18,6 @@ constexpr int kGemvThreadsPerBlock = kGemvWarpsPerBlock * 32;
 // Dp4aS8, Vsubss4, LoadPackedInt32*, PackedProjectionGroupParams, and
 // get_scale_min_k4 are now defined in quant_common.cuh (included above).
 
-
 // Vectorized half→float load with sum-of-squares accumulation (for RmsNorm).
 __device__ __forceinline__ float
 LoadHalfToSmemSumSq(const half *__restrict__ src, float *__restrict__ dst,
@@ -34,7 +33,6 @@ LoadHalfToSmemSumSq(const half *__restrict__ src, float *__restrict__ dst,
   }
   return local_sum_sq;
 }
-
 
 // Float→smem load with sum-of-squares (for FP32 residual stream).
 __device__ __forceinline__ float
@@ -61,7 +59,6 @@ ApplyNormInPlace(float *__restrict__ sx, const half *__restrict__ norm_weight,
     sx[2 * i + 1] = sx[2 * i + 1] * rms * nf.y;
   }
 }
-
 
 //==============================================================================
 // Q6_K dp4a GEMV (SM 6.1+)
@@ -229,7 +226,6 @@ __global__ void fused_dequant_gemv_q6k_dp4a_packed_group(
     }
   }
 }
-
 
 __global__ void
 fused_dequant_gemv_q4k_dp4a_packed(const block_q4_k *__restrict__ weight,
@@ -612,8 +608,7 @@ __global__ void quantize_row_q8_1_kernel(const half *__restrict__ input,
     const bool has_blk1 = blk1 < num_blocks;
 
     float val0 = __half2float(x_row[blk0 * QK8_1 + lane]);
-    float val1 =
-        has_blk1 ? __half2float(x_row[blk1 * QK8_1 + lane]) : 0.0f;
+    float val1 = has_blk1 ? __half2float(x_row[blk1 * QK8_1 + lane]) : 0.0f;
 
     float amax0 = fabsf(val0);
     float amax1 = fabsf(val1);
@@ -750,15 +745,8 @@ __global__ void fused_rmsnorm_quantize_q8_1_kernel(
     warp_sums[warp_id] = local_sum_sq;
   __syncthreads();
 
-  float rms;
-  if (tid == 0) {
-    float total = 0.0f;
-    for (int w = 0; w < kGemvWarpsPerBlock; ++w)
-      total += warp_sums[w];
-    warp_sums[0] = rsqrtf(total / static_cast<float>(K) + eps);
-  }
-  __syncthreads();
-  rms = warp_sums[0];
+  const float rms =
+      ComputeRmsFromWarpSums<kGemvWarpsPerBlock>(warp_sums, tid, K, eps);
 
   // Phase 2: Apply norm weights in-place (vectorized half2 norm loads)
   ApplyNormInPlace(sx, norm_weight, rms, K, tid);
@@ -768,51 +756,8 @@ __global__ void fused_rmsnorm_quantize_q8_1_kernel(
   const int num_blocks = K / QK8_1;
   block_q8_1 *out_row = output + row * num_blocks;
 
-  for (int blk0 = warp_id * 2; blk0 < num_blocks;
-       blk0 += kGemvWarpsPerBlock * 2) {
-    const int blk1 = blk0 + 1;
-    const bool has_blk1 = blk1 < num_blocks;
-
-    float val0 = sx[blk0 * QK8_1 + lane];
-    float val1 = has_blk1 ? sx[blk1 * QK8_1 + lane] : 0.0f;
-
-    float amax0 = fabsf(val0);
-    float amax1 = fabsf(val1);
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      amax0 = fmaxf(amax0, __shfl_xor_sync(0xFFFFFFFF, amax0, offset));
-      amax1 = fmaxf(amax1, __shfl_xor_sync(0xFFFFFFFF, amax1, offset));
-    }
-
-    float d0 = amax0 / 127.0f;
-    float inv_d0 = (amax0 > 0.0f) ? 127.0f / amax0 : 0.0f;
-    int q0 = __float2int_rn(val0 * inv_d0);
-    q0 = max(-128, min(127, q0));
-    int sum0 = q0;
-
-    float d1 = amax1 / 127.0f;
-    float inv_d1 = (amax1 > 0.0f) ? 127.0f / amax1 : 0.0f;
-    int q1 = has_blk1 ? __float2int_rn(val1 * inv_d1) : 0;
-    q1 = max(-128, min(127, q1));
-    int sum1 = q1;
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, offset);
-      sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, offset);
-    }
-
-    out_row[blk0].qs[lane] = static_cast<int8_t>(q0);
-    if (lane == 0) {
-      out_row[blk0].ds = __halves2half2(
-          __float2half(d0), __float2half(d0 * static_cast<float>(sum0)));
-    }
-    if (has_blk1) {
-      out_row[blk1].qs[lane] = static_cast<int8_t>(q1);
-      if (lane == 0) {
-        out_row[blk1].ds = __halves2half2(
-            __float2half(d1), __float2half(d1 * static_cast<float>(sum1)));
-      }
-    }
-  }
+  QuantQ8_1DualBlocks<kGemvWarpsPerBlock>(sx, out_row, num_blocks, warp_id,
+                                          lane);
 }
 
 // FP32 residual variant: reads float* residual instead of half*.
@@ -838,15 +783,8 @@ __global__ void fused_rmsnorm_quantize_q8_1_kernel_f32(
     warp_sums[warp_id] = local_sum_sq;
   __syncthreads();
 
-  float rms;
-  if (tid == 0) {
-    float total = 0.0f;
-    for (int w = 0; w < kGemvWarpsPerBlock; ++w)
-      total += warp_sums[w];
-    warp_sums[0] = rsqrtf(total / static_cast<float>(K) + eps);
-  }
-  __syncthreads();
-  rms = warp_sums[0];
+  const float rms =
+      ComputeRmsFromWarpSums<kGemvWarpsPerBlock>(warp_sums, tid, K, eps);
 
   // Phase 2: Apply norm weights in-place
   ApplyNormInPlace(sx, norm_weight, rms, K, tid);
@@ -856,51 +794,8 @@ __global__ void fused_rmsnorm_quantize_q8_1_kernel_f32(
   const int num_blocks = K / QK8_1;
   block_q8_1 *out_row = output + row * num_blocks;
 
-  for (int blk0 = warp_id * 2; blk0 < num_blocks;
-       blk0 += kGemvWarpsPerBlock * 2) {
-    const int blk1 = blk0 + 1;
-    const bool has_blk1 = blk1 < num_blocks;
-
-    float val0 = sx[blk0 * QK8_1 + lane];
-    float val1 = has_blk1 ? sx[blk1 * QK8_1 + lane] : 0.0f;
-
-    float amax0 = fabsf(val0);
-    float amax1 = fabsf(val1);
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      amax0 = fmaxf(amax0, __shfl_xor_sync(0xFFFFFFFF, amax0, offset));
-      amax1 = fmaxf(amax1, __shfl_xor_sync(0xFFFFFFFF, amax1, offset));
-    }
-
-    float d0 = amax0 / 127.0f;
-    float inv_d0 = (amax0 > 0.0f) ? 127.0f / amax0 : 0.0f;
-    int q0 = __float2int_rn(val0 * inv_d0);
-    q0 = max(-128, min(127, q0));
-    int sum0 = q0;
-
-    float d1 = amax1 / 127.0f;
-    float inv_d1 = (amax1 > 0.0f) ? 127.0f / amax1 : 0.0f;
-    int q1 = has_blk1 ? __float2int_rn(val1 * inv_d1) : 0;
-    q1 = max(-128, min(127, q1));
-    int sum1 = q1;
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, offset);
-      sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, offset);
-    }
-
-    out_row[blk0].qs[lane] = static_cast<int8_t>(q0);
-    if (lane == 0) {
-      out_row[blk0].ds = __halves2half2(
-          __float2half(d0), __float2half(d0 * static_cast<float>(sum0)));
-    }
-    if (has_blk1) {
-      out_row[blk1].qs[lane] = static_cast<int8_t>(q1);
-      if (lane == 0) {
-        out_row[blk1].ds = __halves2half2(
-            __float2half(d1), __float2half(d1 * static_cast<float>(sum1)));
-      }
-    }
-  }
+  QuantQ8_1DualBlocks<kGemvWarpsPerBlock>(sx, out_row, num_blocks, warp_id,
+                                          lane);
 }
 
 //==============================================================================
@@ -1197,8 +1092,6 @@ __global__ void fused_dequant_gemv_q6k_q8_1_group(
   }
 }
 
-
-
 template <int Outputs>
 __global__ void fused_dequant_gemv_q8_0_q8_1_group(
     PackedProjectionGroupParams<block_q8_0, Outputs> params,
@@ -1260,7 +1153,6 @@ __global__ void fused_dequant_gemv_q8_0_q8_1_group(
     }
   }
 }
-
 
 template <int Outputs>
 __global__ void fused_dequant_gemv_q8k_q8_1_group(

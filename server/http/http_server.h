@@ -183,6 +183,11 @@ private:
   };
 
   bool ResolveSubject(const std::string &header_blob, AuthContext *ctx) const;
+  // Admin-handler prologue shared by the /v1/admin routes: scope check
+  // plus router resolution with a 503 reply. Returns nullptr after replying.
+  ModelRouter *RequireAdminRouter(const AuthContext &auth_ctx,
+                                  ClientSession &session);
+
   bool RequireScope(const AuthContext &ctx, const std::string &scope,
                     ClientSession &session, const std::string &error_message);
 
