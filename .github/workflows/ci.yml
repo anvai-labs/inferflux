@@ -998,9 +998,14 @@ jobs:
           fetch-depth: 0
 
       - name: Install clang-format
+        # Pinned so the gate never silently jumps when the runner image
+        # changes. Formatting output intentionally differs across
+        # clang-format majors; local development must match this major
+        # (see the pre-commit hook's version check and CLAUDE.md).
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends clang-format
+          python3 -m pip install --disable-pip-version-check --quiet \
+            clang-format==18.1.8
+          clang-format --version
 
       - name: Check formatting
         run: |

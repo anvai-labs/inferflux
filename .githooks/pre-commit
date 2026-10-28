@@ -31,6 +31,16 @@ if [ "${SKIP_FORMAT:-0}" != "1" ]; then
 
   if [ -n "$STAGED_CPP" ]; then
     if command -v clang-format &>/dev/null; then
+      # The CI gate pins clang-format 18 (ci.yml, clang-format check job).
+      # Formatting output intentionally differs across majors; a mismatched
+      # local version passes here and fails CI.
+      FORMAT_MAJOR="$(clang-format --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | cut -d. -f1)"
+      if [ "$FORMAT_MAJOR" != "18" ]; then
+        echo "[pre-commit] clang-format major $FORMAT_MAJOR found; the CI gate pins 18."
+        echo "[pre-commit] Install 18 (brew install llvm@18, or pip install clang-format==18.1.8)"
+        echo "[pre-commit] and ensure it is first on PATH, or set SKIP_FORMAT=1 to defer to CI."
+        exit 1
+      fi
       FORMAT_ISSUES=""
       while IFS= read -r file; do
         [ -f "$file" ] || continue
