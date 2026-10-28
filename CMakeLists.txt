@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(InferFlux VERSION 0.5.3 LANGUAGES CXX)
+project(InferFlux VERSION 0.6.0 LANGUAGES CXX)
 
 include(GNUInstallDirs)
 
@@ -194,6 +194,14 @@ add_library(inferflux_core STATIC
   runtime/multimodal/image_preprocessor.cpp
   runtime/multimodal/image_preprocessor.h
   external/llama.cpp/common/json-schema-to-grammar.cpp
+  # llama.cpp 0.7: schema-to-grammar now builds on common_json (methods in
+  # common/json.cpp), common_chat_schema (common/json-schema.cpp), the shared
+  # common_trie (common/trie.cpp) and the unicode codepoint helpers
+  # (common/unicode.cpp).
+  external/llama.cpp/common/json.cpp
+  external/llama.cpp/common/json-schema.cpp
+  external/llama.cpp/common/trie.cpp
+  external/llama.cpp/common/unicode.cpp
   io/async_file_writer.cpp
   io/async_file_writer.h
   net/http_client.cpp

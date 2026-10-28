@@ -101,13 +101,17 @@ public:
   // Evict the sequence-holding node with the smallest last_used timestamp (§
   // Item 1). Clears backend KV via the eviction callback and releases the
   // slot — used as the admission pressure valve when all slots are warm.
-  // Takes the cache lock. Returns true when a sequence was evicted.
-  bool EvictOneSequence();
+  // Takes the cache lock. Returns true when a sequence was evicted; when
+  // retired_sequence_id is non-null it receives the retired sequence so
+  // callers can distinguish losing their own donor from a bystander
+  // eviction (Lookup refreshes last_used, so a just-matched donor is only
+  // retired when no other donor exists).
+  bool EvictOneSequence(int *retired_sequence_id = nullptr);
 
 private:
   // Locking variant: callers must hold mutex_ exclusively (Insert uses this
   // under its unique_lock).
-  bool EvictOneSequenceLocked();
+  bool EvictOneSequenceLocked(int *retired_sequence_id = nullptr);
 
   // DFS: collect nodes matching a criteria.
   void CollectNodes(RadixNode *node,

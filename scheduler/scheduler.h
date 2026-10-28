@@ -134,9 +134,12 @@ public:
   // completion. AllocSeqSlot() is called from worker/decode loops.
   // FreeSeqSlot() may also be called from DecodeWorkerLoop or RadixPrefixCache
   // eviction — callers must hold queue_mutex_ when calling from a
-  // non-worker-loop context.
+  // non-worker-loop context. retired_sequence_ids, when non-null, collects
+  // the radix donor sequences retired to satisfy this allocation so callers
+  // can tell a bystander eviction from the loss of their matched donor.
   int AllocSeqSlot(int64_t request_id = -1, uint64_t *generation_out = nullptr,
-                   int sequence_capacity = 0, int *evicted_sequences = nullptr);
+                   int sequence_capacity = 0, int *evicted_sequences = nullptr,
+                   std::vector<int> *retired_sequence_ids = nullptr);
   void FreeSeqSlot(int slot, uint64_t generation = 0,
                    std::shared_ptr<LlamaCppBackend> backend = nullptr);
 

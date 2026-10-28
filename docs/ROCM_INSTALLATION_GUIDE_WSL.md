@@ -344,6 +344,120 @@ with the tamer off, spinning ROCr threads started from a first-party thread
 show that thread's `if-*` name in `top -H`; the counters are process-wide
 and not reset by `MetricsRegistry::Reset()`.
 
+### Patched ROCr runtime (near-zero idle CPU)
+
+Confining the spin threads to one core still leaves about one core busy,
+because they never sleep. The real fix is upstream
+([rocm-systems#7898](https://github.com/ROCm/rocm-systems/pull/7898)), which
+makes the polling loop nap with a 20 µs → 2 ms backoff. Until a released ROCm
+contains it, build ROCr 7.2.0 with the fix backported and point
+`inferfluxd` at it:
+
+```bash
+scripts/rocm/build_patched_rocr.sh --out ~/rocr-patched   # ~1 min
+```
+
+The script clones `ROCm/rocm-systems` at `rocm-7.2.0` (`projects/rocr-runtime`
+only), applies `scripts/rocm/patches/rocr-7.2.0-async-events-poll-backoff.patch`,
+builds `libhsa-runtime64` in a clean environment (host code with the
+system C++ compiler, which `PATCHED_ROCR.json` records; ROCm's LLVM only
+for the GPU blit and trap-handler code objects), and adds AMD's prebuilt WSL
+thunk `librocdxg` (from the `ROCm/librocdxg` release package,
+checksum-pinned). It installs nothing system-wide; the output directory
+holds the two libraries and `PATCHED_ROCR.json` (source commit, compiler,
+patch and library checksums).
+
+The script requires the host ROCm to be exactly 7.2.0 (the backport's base)
+and refuses to stage a `libhsa-runtime64` that carries a RUNPATH, a
+`librocdxg` whose RUNPATH has an empty or relative element (AMD's carries
+the absolute `/opt/rocm/lib`), or either with unresolved dependencies. Unlike AMD's WSL build, the upstream runtime links `libdrm`,
+`libdrm_amdgpu`, `libnuma` and `librocprofiler-register`; on a ROCm 7.2 WSL
+install these resolve through the loader configuration (`/opt/amdgpu/lib`,
+`/opt/rocm/lib`, the system `libnuma1`). Deploy on the host it was built on,
+or one with the same ROCm and `amdgpu` packages.
+
+Deploy by copying the output into a directory on the server's
+`LD_LIBRARY_PATH` and setting `HSA_ENABLE_DXG_DETECTION=1`, which makes
+upstream ROCr load `librocdxg`. That directory must come **before**
+`/opt/rocm/lib` in `LD_LIBRARY_PATH` (the setup step above prepends
+`/opt/rocm/lib` for interactive shells; a service should set its own, e.g.
+`Environment=LD_LIBRARY_PATH=<release>/runtime/bin` in the unit), or the
+stock runtime shadows the patched one. Back up anything already there, once:
+
+```bash
+D=<release>/runtime/bin
+(  # Subshell: `exit` stops the step without closing your terminal. Each
+   # command checks itself (set -e is ignored in a `( ... ) ||` subshell).
+  # The build writes PATCHED_ROCR.json last: without it the output is partial.
+  [ -f ~/rocr-patched/PATCHED_ROCR.json ] || { echo "incomplete build"; exit 1; }
+  B="$D/pre-patched-rocr"
+  if [ ! -e "$B" ] && [ -e "$D/PATCHED_ROCR.json" ]; then
+    echo "$D already holds a patched runtime but no backup"; exit 1
+  fi
+  if [ ! -e "$B" ]; then  # Taken once; a redeploy never overwrites it.
+    T="$(mktemp -d "$D/.pre-patched-rocr.XXXXXX")" || exit 1
+    for f in "$D"/libhsa-runtime64.so* "$D"/librocdxg.so*; do
+      [ -e "$f" ] || [ -L "$f" ] || continue  # Dangling symlinks too.
+      cp -a "$f" "$T/" || { rm -rf "$T"; exit 1; }
+    done
+    mv "$T" "$B" || exit 1  # Only a complete backup gets the final name.
+  fi
+  # --remove-destination: replace a symlink in $D, never write through it.
+  cp -a --remove-destination ~/rocr-patched/lib* \
+    ~/rocr-patched/PATCHED_ROCR.json "$D/" || exit 2
+) || case $? in
+  2) echo "copy failed partway: roll back (below) before restarting" ;;
+  *) echo "deploy step failed before any library was replaced" ;;
+esac
+# systemd unit: Environment=HSA_ENABLE_DXG_DETECTION=1
+```
+
+`libamdhip64` finds `libhsa-runtime64.so.1` through `LD_LIBRARY_PATH` ahead
+of `/opt/rocm/lib`, so only that process uses the patched runtime. The
+backoff means events handled by ROCr's async-event threads (HIP host
+callbacks, async signal handlers, and the registration of a new handler,
+which is signalled through the same polled loop) are observed up to about
+2 ms plus timer slack late whenever the wait they belong to has lasted
+longer than about 2.5 ms (the nap doubles from 20 µs per scan and only
+resets when a wait batch ends), whether the server is idle or busy. Short
+waits see the floor (20 µs requested, ~70-100 µs in practice with Linux
+timer slack). Synchronous waits (`hipStreamSynchronize`), which InferFlux's
+decode path uses, do not go through these threads; the throughput and
+latency measurements below include this effect.
+
+Verify: `grep -E 'libhsa|librocdxg|libamdhip64|libdrm|librocprofiler' /proc/$(pidof inferfluxd)/maps`
+shows `libhsa-runtime64` and `librocdxg` from the release directory and the
+rest from the 7.2.0 install the script checked (`/opt/rocm-7.2.0`,
+`/opt/amdgpu`), not from copies bundled elsewhere, and idle CPU drops to about 1%
+(`top -H` shows no thread above a few percent). Measured on an R9700
+(gfx1201) with qwen2.5-0.5b: idle 200% → 1.1%; greedy outputs identical to
+the stock runtime; c=8 and c=1 throughput and per-request latency unchanged
+(1-token request p50 7.1 ms on both).
+
+The backup is taken once per `runtime/bin` and is that directory's rollback
+target (a new release has its own `runtime/bin`, so it starts without one);
+before upgrading ROCm, roll the patch back (below): the patched 7.2.0
+runtime in `runtime/bin` would otherwise keep loading ahead of the new
+`/opt/rocm/lib` under the newer HIP. Then delete `pre-patched-rocr/` (it
+holds 7.2.0-era libraries) and rebuild once a matching backport exists.
+
+Every process that loads the patched runtime needs
+`HSA_ENABLE_DXG_DETECTION=1`: without it upstream ROCr does not load
+`librocdxg`, finds no KFD device on WSL2, and the ROCm backend is
+unavailable (the server falls back or fails to start the ROCm model). This
+applies to manual `inferfluxd` runs and tests that put the same directory on
+`LD_LIBRARY_PATH`, not only the service.
+
+`INFERFLUX_ROCR_TAME=1` can stay on alongside it: the `libhsa-runtime64`
+threads it pins now sleep, and it bounds the cost if the patched library is
+ever missing. (Threads that the separate `librocdxg` might start are not
+recognized by the tamer; none are busy at idle in the measurements above.)
+Rollback: remove the copied libraries and `PATCHED_ROCR.json` (restoring
+anything saved in `pre-patched-rocr/`) and the `HSA_ENABLE_DXG_DETECTION`
+line, then restart.
+Retire the patch once a ROCm release includes #7898 (check the release notes
+for rocm-systems#7898 / librocdxg#60).
+
 ## Supported AMD GPUs
 
 The InferFlux ROCm backend supports FlashAttention-2 on these architectures:

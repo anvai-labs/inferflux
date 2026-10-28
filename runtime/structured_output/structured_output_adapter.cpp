@@ -32,7 +32,7 @@ bool ParseSchema(const std::string &schema, nlohmann::ordered_json *out,
   }
 }
 
-bool ConvertSchemaToGrammar(const nlohmann::ordered_json &schema,
+bool ConvertSchemaToGrammar(const std::string &schema_text,
                             StructuredConstraint *out, std::string *error) {
   if (!out) {
     if (error) {
@@ -41,6 +41,10 @@ bool ConvertSchemaToGrammar(const nlohmann::ordered_json &schema,
     return false;
   }
   try {
+    // llama.cpp 0.7 exposes json_schema_to_grammar over common_json (its
+    // nlohmann-independent value type) — parse the already-validated schema
+    // text directly into that type instead of converting the ordered_json.
+    const common_json schema = common_json::parse(schema_text);
     std::string grammar = json_schema_to_grammar(schema, /*force_gbnf=*/true);
     if (grammar.empty()) {
       if (error) {
@@ -70,7 +74,7 @@ bool BuildJsonObjectConstraint(const std::string &schema_text,
         nlohmann::ordered_json::parse(kDefaultObjectSchema);
     out->has_schema = true;
     out->schema = parsed.dump();
-    return ConvertSchemaToGrammar(parsed, out, error);
+    return ConvertSchemaToGrammar(kDefaultObjectSchema, out, error);
   }
   nlohmann::ordered_json parsed;
   if (!ParseSchema(schema_text, &parsed, error)) {
@@ -78,7 +82,7 @@ bool BuildJsonObjectConstraint(const std::string &schema_text,
   }
   out->has_schema = true;
   out->schema = parsed.dump();
-  return ConvertSchemaToGrammar(parsed, out, error);
+  return ConvertSchemaToGrammar(schema_text, out, error);
 }
 
 } // namespace
@@ -118,7 +122,7 @@ bool StructuredOutputAdapter::BuildConstraint(const std::string &type,
     out->require_json_object = true;
     out->has_schema = true;
     out->schema = parsed.dump();
-    return ConvertSchemaToGrammar(parsed, out, error);
+    return ConvertSchemaToGrammar(schema, out, error);
   }
 
   if (type == "grammar") {
