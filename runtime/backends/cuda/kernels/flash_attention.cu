@@ -2521,8 +2521,12 @@ cudaError_t FlashDecodeMultiSeqStridedSplit(
     qsplit = 1;
   }
 
-  const cudaError_t gqa_err =
-      DispatchGqaRatio(gqa_ratio, LaunchSplitGQADecode<T, 2>, LaunchSplitGQADecode<T, 4>, LaunchSplitGQADecode<T, 8>, Q, kv_buffer, O, partials, d_seq_ids, d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale, qsplit, chunk, ksplits, stream));
+  const cudaError_t gqa_err = DispatchGqaRatio(
+      gqa_ratio, LaunchSplitGQADecode<T, 2>, LaunchSplitGQADecode<T, 4>,
+      LaunchSplitGQADecode<T, 8>, Q, kv_buffer, O, partials, d_seq_ids,
+      d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim,
+      slot_stride, layer_stride, kv_stride, scale, qsplit, chunk, ksplits,
+      stream);
   if (gqa_err != cudaErrorNotSupported) {
     return gqa_err;
   }
