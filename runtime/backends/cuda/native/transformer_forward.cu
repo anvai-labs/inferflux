@@ -1889,8 +1889,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
                         [&]() {
-                          return EnsureInputNormChecked<T>(layer, input_norm,
-                                                           seq_len);
+                          return EnsureInputNormChecked(layer, input_norm,
+                                                        seq_len);
                         },
                         [&]() {
                           if constexpr (std::is_same_v<T, half>) {
@@ -1957,8 +1957,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
                         [&]() {
-                          return EnsureInputNormChecked<T>(layer, input_norm,
-                                                           seq_len);
+                          return EnsureInputNormChecked(layer, input_norm,
+                                                        seq_len);
                         },
                         [&]() {
                           if (qkv_fused) {
@@ -1985,8 +1985,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
                         [&]() {
-                          return EnsureInputNormChecked<T>(layer, input_norm,
-                                                           seq_len);
+                          return EnsureInputNormChecked(layer, input_norm,
+                                                        seq_len);
                         },
                         [&]() {
                           if (qkv_fused) {
@@ -2372,8 +2372,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &ffn_norm_computed,
                         [&]() {
-                          return EnsurePostAttnNormChecked<T>(post_attn_norm,
-                                                              seq_len);
+                          return EnsurePostAttnNormChecked(post_attn_norm,
+                                                           seq_len);
                         },
                         [&]() {
                           return TryQuantizedProjection(
@@ -2397,8 +2397,8 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &ffn_norm_computed,
                         [&]() {
-                          return EnsurePostAttnNormChecked<T>(post_attn_norm,
-                                                              seq_len);
+                          return EnsurePostAttnNormChecked(post_attn_norm,
+                                                           seq_len);
                         },
                         [&]() {
                           return TryQuantizedProjection(
