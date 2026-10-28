@@ -1845,6 +1845,22 @@ bool HttpServer::RequireScope(const AuthContext &ctx, const std::string &scope,
   return false;
 }
 
+// Admin-handler prologue shared by the /v1/admin routes: enforces the
+// admin scope and resolves the scheduler's model router, replying 503 on
+// unavailability. Returns nullptr after replying.
+ModelRouter *HttpServer::RequireAdminRouter(const AuthContext &auth_ctx,
+                                            ClientSession &session) {
+  if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
+    return nullptr;
+  }
+  auto *router = scheduler_ ? scheduler_->Router() : nullptr;
+  if (!router) {
+    SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503,
+                                   "Service Unavailable"));
+  }
+  return router;
+}
+
 // Synthetic no-backend tool call: the stub answers tool-driving requests with
 // a deterministic call so clients can exercise their tool loops model-free.
 static ToolCallResult MakeStubToolCall(const std::string &function_name,
@@ -2487,13 +2503,8 @@ void HttpServer::HandleClient(ClientSession &session) {
   }
 
   if (method == "GET" && path == "/v1/admin/models") {
-    if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
-      return;
-    }
-    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
+    auto *router = RequireAdminRouter(auth_ctx, session);
     if (!router) {
-      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503,
-                                     "Service Unavailable"));
       return;
     }
     auto models = router->ListModels();
@@ -2514,13 +2525,8 @@ void HttpServer::HandleClient(ClientSession &session) {
   }
 
   if (method == "POST" && path == "/v1/admin/models") {
-    if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
-      return;
-    }
-    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
+    auto *router = RequireAdminRouter(auth_ctx, session);
     if (!router) {
-      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503,
-                                     "Service Unavailable"));
       return;
     }
     ModelLoadSpec spec;
@@ -2606,13 +2612,8 @@ void HttpServer::HandleClient(ClientSession &session) {
   }
 
   if (method == "DELETE" && path == "/v1/admin/models") {
-    if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
-      return;
-    }
-    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
+    auto *router = RequireAdminRouter(auth_ctx, session);
     if (!router) {
-      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503,
-                                     "Service Unavailable"));
       return;
     }
     std::string id = ParseJsonStringField(body, "id");
@@ -2653,13 +2654,8 @@ void HttpServer::HandleClient(ClientSession &session) {
   }
 
   if (method == "PUT" && path == "/v1/admin/models/default") {
-    if (!RequireScope(auth_ctx, "admin", session, "admin scope required")) {
-      return;
-    }
-    auto *router = scheduler_ ? scheduler_->Router() : nullptr;
+    auto *router = RequireAdminRouter(auth_ctx, session);
     if (!router) {
-      SendAll(session, BuildResponse(BuildErrorBody("router_unavailable"), 503,
-                                     "Service Unavailable"));
       return;
     }
     std::string id = ParseJsonStringField(body, "id");

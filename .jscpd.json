@@ -1,5 +1,5 @@
 {
-  "minTokens": 150,
+  "minTokens": 50,
   "formats": ["cpp", "c", "cpp-header", "c-header"],
   "formats-exts": {
     "cpp": ["cu", "cuh"]
