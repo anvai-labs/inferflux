@@ -1877,9 +1877,9 @@ TokenLogprob LlamaCppBackend::CollectLogprob(int token_id,
                         [this](int32_t id) { return TokenToString(id); });
 }
 
-void LlamaCppBackend::FinalizeUnifiedToken(const UnifiedBatchInput &inp, int token,
-                                      const float *logits,
-                                      UnifiedBatchOutput *out) {
+void LlamaCppBackend::FinalizeUnifiedToken(const UnifiedBatchInput &inp,
+                                           int token, const float *logits,
+                                           UnifiedBatchOutput *out) {
   out->ok = true;
   if (IsTerminalGeneratedToken(token)) {
     out->token = -1;
