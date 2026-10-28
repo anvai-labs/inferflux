@@ -30,7 +30,12 @@ cmake -S . -B build -DENABLE_CUDA=OFF -DENABLE_ROCM=OFF -DENABLE_MPS=OFF -DENABL
 # Smoke-test the API once INFERFLUX_MODEL_PATH points at a GGUF
 ./build/inferctl chat --message "user:Hello" --api-key dev-key-123 --stream
 
-# Format before committing (CI + pre-commit hook check these directories)
+# Format before committing (CI + pre-commit hook check these directories).
+# clang-format MAJOR 18 is pinned (CI installs clang-format==18.1.8; the
+# hook rejects other majors). Formatting output intentionally differs
+# across majors — a newer local version will pass locally and fail CI.
+#   brew install llvm@18 && PATH=/opt/homebrew/opt/llvm@18/bin:$PATH
+#   pip install clang-format==18.1.8        # alternative
 find server runtime scheduler model cli net io policy \
   \( -name '*.cpp' -o -name '*.h' \) ! -path '*/external/*' \
   | xargs clang-format -i

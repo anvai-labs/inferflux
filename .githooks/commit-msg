@@ -20,8 +20,12 @@ if echo "$MSG" | grep -qiE "$AI_ATTRIBUTION_PATTERN"; then
 fi
 
 # ── 3. Block standalone AI agent name references ─────────────────────────────
-# Exempt lines that are clearly URLs (contain ://)
-NON_URL_LINES=$(echo "$MSG" | grep -viE '://') || NON_URL_LINES=""
+# Exempt lines that are clearly URLs (contain ://), and exempt the repo's
+# own instruction filenames (CLAUDE.md / AGENTS.md / GEMINI.md) — those
+# legitimately appear in commit messages that document instruction-file
+# changes and are not agent references.
+NON_URL_LINES=$(echo "$MSG" | grep -viE '://' \
+                | sed -E 's/(CLAUDE|AGENTS|GEMINI)\.md/REPO_INSTRUCTIONS_FILE/g') || NON_URL_LINES=""
 if [ -n "$NON_URL_LINES" ]; then
   AI_NAME_PATTERN='\b(claude|codex|copilot|chatgpt|openai|anthropic|cursor)\b'
   if echo "$NON_URL_LINES" | grep -qiE "$AI_NAME_PATTERN"; then
