@@ -1593,22 +1593,7 @@ LlamaCppBackend::ExecuteUnifiedBatch(
         if (logits) {
           const int tok = static_cast<int>(std::distance(
               logits, std::max_element(logits, logits + n_vocab_)));
-          results[i].ok = true;
-          if (IsTerminalGeneratedToken(tok)) {
-            results[i].token = -1;
-          } else {
-            results[i].token = tok;
-            results[i].piece = TokenToString(tok);
-            if (inp.logprob_top_n >= 0) {
-              results[i].step_logprob = CollectLogprobFromRow(
-                  logits, tok, results[i].piece, inp.logprob_top_n);
-              results[i].has_step_logprob = true;
-            }
-            LogTokenTrace("unified_batch", inp.request_id, inp.sequence_id,
-                          inp.client_request_id, inp.sequence_generation,
-                          inp.n_past + static_cast<int>(inp.tokens.size()), tok,
-                          results[i].piece);
-          }
+          FinalizeUnifiedToken(inp, tok, logits, &results[i]);
         } else {
           results[i].ok = false;
         }
@@ -1633,22 +1618,7 @@ LlamaCppBackend::ExecuteUnifiedBatch(
             llama_sampler_sample(active_sampler_, context_, logit_indices[i]);
         llama_sampler_accept(active_sampler_, tok);
 
-        results[i].ok = true;
-        if (IsTerminalGeneratedToken(tok)) {
-          results[i].token = -1;
-        } else {
-          results[i].token = tok;
-          results[i].piece = TokenToString(tok);
-          if (inp.logprob_top_n >= 0) {
-            results[i].step_logprob = CollectLogprobFromRow(
-                logits, tok, results[i].piece, inp.logprob_top_n);
-            results[i].has_step_logprob = true;
-          }
-          LogTokenTrace("unified_batch", inp.request_id, inp.sequence_id,
-                        inp.client_request_id, inp.sequence_generation,
-                        inp.n_past + static_cast<int>(inp.tokens.size()), tok,
-                        results[i].piece);
-        }
+        FinalizeUnifiedToken(inp, tok, logits, &results[i]);
       } else {
         // Fallback to greedy if SetupSampler failed.
         const float *logits = llama_get_logits_ith(context_, logit_indices[i]);
@@ -1907,6 +1877,26 @@ TokenLogprob LlamaCppBackend::CollectLogprob(int token_id,
                         [this](int32_t id) { return TokenToString(id); });
 }
 
+void LlamaCppBackend::FinalizeUnifiedToken(const UnifiedBatchInput &inp, int token,
+                                      const float *logits,
+                                      UnifiedBatchOutput *out) {
+  out->ok = true;
+  if (IsTerminalGeneratedToken(token)) {
+    out->token = -1;
+  } else {
+    out->token = token;
+    out->piece = TokenToString(token);
+    if (inp.logprob_top_n >= 0) {
+      out->step_logprob =
+          CollectLogprobFromRow(logits, token, out->piece, inp.logprob_top_n);
+      out->has_step_logprob = true;
+    }
+    LogTokenTrace("unified_batch", inp.request_id, inp.sequence_id,
+                  inp.client_request_id, inp.sequence_generation,
+                  inp.n_past + static_cast<int>(inp.tokens.size()), token,
+                  out->piece);
+  }
+}
 // Row-parameterized variant for the unified batch sampling block, where the
 // per-sequence row comes from llama_get_logits_ith (ADR-0007 Stage 1). Same
 // math derivation as CollectLogprob.

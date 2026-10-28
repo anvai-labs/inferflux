@@ -225,6 +225,11 @@ private:
   TokenLogprob CollectLogprobFromRow(const float *row, int token_id,
                                      const std::string &token_str,
                                      int top_n) const;
+  // Shared per-token finalize for the unified-batch sampling paths: marks
+  // the step ok, resolves terminal tokens, collects optional top-n
+  // logprobs, and emits the unified_batch token trace.
+  void FinalizeUnifiedToken(const UnifiedBatchInput &inp, int token,
+                            const float *logits, UnifiedBatchOutput *out);
   TokenLogprob CollectLogprob(int token_id, const std::string &token_str,
                               int top_n) const;
 

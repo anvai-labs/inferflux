@@ -155,6 +155,42 @@ inline void LtAlgoToBytes(const cublasLtMatmulAlgo_t &algo,
                           unsigned char *bytes) {
   std::memcpy(bytes, &algo, sizeof(algo));
 }
+
+// Row-major x·Wᵀ descriptor set: A = x [M, K] with op N, B = W [N, K] with
+// op T, D = C [M, N]. Descriptors are cheap host objects, rebuilt per call;
+// only the chosen algo is cached per shape. Returns true when the matmul
+// descriptor and all three layouts were created successfully.
+inline bool CreateLtDescAndLayouts(cublasLtMatmulDesc_t *op,
+                                   cublasLtMatrixLayout_t *ad,
+                                   cublasLtMatrixLayout_t *bd,
+                                   cublasLtMatrixLayout_t *dd, int M, int N,
+                                   int K, cudaDataType_t dtype) {
+  const cublasLtOrder_t kRowOrder = CUBLASLT_ORDER_ROW;
+  cublasStatus_t st =
+      cublasLtMatmulDescCreate(op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+  if (st == CUBLAS_STATUS_SUCCESS) {
+    cublasOperation_t ta = CUBLAS_OP_N, tb = CUBLAS_OP_T;
+    cublasLtMatmulDescSetAttribute(*op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
+                                   sizeof(ta));
+    cublasLtMatmulDescSetAttribute(*op, CUBLASLT_MATMUL_DESC_TRANSB, &tb,
+                                   sizeof(tb));
+    st = cublasLtMatrixLayoutCreate(ad, dtype, M, K, K);
+    if (st == CUBLAS_STATUS_SUCCESS)
+      st = cublasLtMatrixLayoutSetAttribute(ad, CUBLASLT_MATRIX_LAYOUT_ORDER,
+                                            &kRowOrder, sizeof(kRowOrder));
+    if (st == CUBLAS_STATUS_SUCCESS)
+      st = cublasLtMatrixLayoutCreate(bd, dtype, N, K, K);
+    if (st == CUBLAS_STATUS_SUCCESS)
+      st = cublasLtMatrixLayoutSetAttribute(bd, CUBLASLT_MATRIX_LAYOUT_ORDER,
+                                            &kRowOrder, sizeof(kRowOrder));
+    if (st == CUBLAS_STATUS_SUCCESS)
+      st = cublasLtMatrixLayoutCreate(dd, dtype, M, N, N);
+    if (st == CUBLAS_STATUS_SUCCESS)
+      st = cublasLtMatrixLayoutSetAttribute(dd, CUBLASLT_MATRIX_LAYOUT_ORDER,
+                                            &kRowOrder, sizeof(kRowOrder));
+  }
+  return st == CUBLAS_STATUS_SUCCESS;
+}
 } // namespace
 
 template <typename T>
@@ -180,7 +216,6 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
     }
   }
 
-  static const cublasLtOrder_t kRowOrder = CUBLASLT_ORDER_ROW;
   cublasLtMatmulDesc_t op = nullptr;
   cublasLtMatrixLayout_t ad = nullptr, bd = nullptr, dd = nullptr;
   bool layouts_ok = false;
@@ -188,30 +223,7 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
     // A = x [M, K] row-major with op N; B = W [N, K] row-major with op T;
     // D = C [M, N] row-major. Descriptors are cheap host objects, rebuilt
     // per call; only the chosen algo is cached per shape.
-    cublasStatus_t st =
-        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    if (st == CUBLAS_STATUS_SUCCESS) {
-      cublasOperation_t ta = CUBLAS_OP_N, tb = CUBLAS_OP_T;
-      cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
-                                     sizeof(ta));
-      cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb,
-                                     sizeof(tb));
-      st = cublasLtMatrixLayoutCreate(&ad, dtype, M, K, K);
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutSetAttribute(ad, CUBLASLT_MATRIX_LAYOUT_ORDER,
-                                              &kRowOrder, sizeof(kRowOrder));
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutCreate(&bd, dtype, N, K, K);
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutSetAttribute(bd, CUBLASLT_MATRIX_LAYOUT_ORDER,
-                                              &kRowOrder, sizeof(kRowOrder));
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutCreate(&dd, dtype, M, N, N);
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutSetAttribute(dd, CUBLASLT_MATRIX_LAYOUT_ORDER,
-                                              &kRowOrder, sizeof(kRowOrder));
-      layouts_ok = (st == CUBLAS_STATUS_SUCCESS);
-    }
+    layouts_ok = CreateLtDescAndLayouts(&op, &ad, &bd, &dd, M, N, K, dtype);
     if (layouts_ok) {
       cublasLtMatmulPreference_t pref = nullptr;
       if (cublasLtMatmulPreferenceCreate(&pref) == CUBLAS_STATUS_SUCCESS) {
@@ -244,30 +256,7 @@ bool CublasGemm::GemmTypedLt(int M, int N, int K, const T *A, const T *B,
     }
   } else {
     // Cache hit: still need descriptors for the call.
-    cublasStatus_t st =
-        cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
-    if (st == CUBLAS_STATUS_SUCCESS) {
-      cublasOperation_t ta = CUBLAS_OP_N, tb = CUBLAS_OP_T;
-      cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta,
-                                     sizeof(ta));
-      cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb,
-                                     sizeof(tb));
-      st = cublasLtMatrixLayoutCreate(&ad, dtype, M, K, K);
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutSetAttribute(ad, CUBLASLT_MATRIX_LAYOUT_ORDER,
-                                              &kRowOrder, sizeof(kRowOrder));
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutCreate(&bd, dtype, N, K, K);
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutSetAttribute(bd, CUBLASLT_MATRIX_LAYOUT_ORDER,
-                                              &kRowOrder, sizeof(kRowOrder));
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutCreate(&dd, dtype, M, N, N);
-      if (st == CUBLAS_STATUS_SUCCESS)
-        st = cublasLtMatrixLayoutSetAttribute(dd, CUBLASLT_MATRIX_LAYOUT_ORDER,
-                                              &kRowOrder, sizeof(kRowOrder));
-      layouts_ok = (st == CUBLAS_STATUS_SUCCESS);
-    }
+    layouts_ok = CreateLtDescAndLayouts(&op, &ad, &bd, &dd, M, N, K, dtype);
   }
 
   bool ok = false;

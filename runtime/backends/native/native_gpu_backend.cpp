@@ -403,6 +403,24 @@ bool NativeGpuBackend::HydrateSequence(int dest_sequence_id,
 
 // --- Decode / Generate token loops ---
 
+std::optional<UnifiedBatchOutput>
+NativeGpuBackend::RunUnifiedTokenStep(int sequence_id, int n_past,
+                                      int current_token,
+                                      const SamplingParams &sampling) const {
+  UnifiedBatchInput step_input;
+  step_input.sequence_id = sequence_id;
+  step_input.n_past = n_past;
+  step_input.tokens = {current_token};
+  step_input.request_logits = true;
+  step_input.sampling = sampling;
+
+  auto step = runtime_->ExecuteUnifiedBatch({step_input});
+  if (step.empty() || !step.front().ok || step.front().token < 0) {
+    return std::nullopt;
+  }
+  return std::move(step.front());
+}
+
 std::string NativeGpuBackend::Decode(
     int n_past, int sequence_id, int max_tokens,
     const std::function<bool(const std::string &, const TokenLogprob *)>
@@ -524,25 +542,19 @@ std::string NativeGpuBackend::Decode(
       GlobalMetrics().RecordInferfluxCudaBurstDecodeFallback("decode");
     }
 
-    UnifiedBatchInput step_input;
-    step_input.sequence_id = sequence_id;
-    step_input.n_past = n_past;
-    step_input.tokens = {current_token};
-    step_input.request_logits = true;
-    step_input.sampling = sampling;
-
-    auto step = runtime_->ExecuteUnifiedBatch({step_input});
-    if (step.empty() || !step.front().ok || step.front().token < 0) {
+    const auto step =
+        RunUnifiedTokenStep(sequence_id, n_past, current_token, sampling);
+    if (!step) {
       break;
     }
 
     ++n_past;
-    current_token = step.front().token;
+    current_token = step->token;
     if (tokenizer->IsTerminalGeneratedToken(current_token)) {
       break;
     }
-    std::string piece = NormalizeNativeOutputPiece(tokenizer, current_token,
-                                                   step.front().piece);
+    std::string piece =
+        NormalizeNativeOutputPiece(tokenizer, current_token, step->piece);
     if (!IsVisibleNativePiece(piece)) {
       if (++non_emitting_steps >= max_non_emitting_steps) {
         log::Warn(LogTag(),
@@ -772,25 +784,19 @@ std::string NativeGpuBackend::Generate(
     }
 
     // Standard per-token path (with logprobs, streaming, or stochastic)
-    UnifiedBatchInput step_input;
-    step_input.sequence_id = sequence_id;
-    step_input.n_past = n_past;
-    step_input.tokens = {current_token};
-    step_input.request_logits = true;
-    step_input.sampling = sampling;
-
-    auto step = runtime_->ExecuteUnifiedBatch({step_input});
-    if (step.empty() || !step.front().ok || step.front().token < 0) {
+    const auto step =
+        RunUnifiedTokenStep(sequence_id, n_past, current_token, sampling);
+    if (!step) {
       break;
     }
 
     ++n_past;
-    current_token = step.front().token;
+    current_token = step->token;
     if (tokenizer->IsTerminalGeneratedToken(current_token)) {
       break;
     }
-    std::string piece = NormalizeNativeOutputPiece(tokenizer, current_token,
-                                                   step.front().piece);
+    std::string piece =
+        NormalizeNativeOutputPiece(tokenizer, current_token, step->piece);
     if (!IsVisibleNativePiece(piece)) {
       if (++non_emitting_steps >= max_non_emitting_steps) {
         log::Warn(LogTag(),
