@@ -134,3 +134,49 @@ may be restored to a nonzero value if the phased fairness cadence is wanted
 (the fix makes that safe); until then it must stay 0 on any binary without #241.
 The actual Victor agent/member run, its usage joins and deliverable verdicts —
 and the six-Qwen/one-ZAI C5 verdict — remain Mac-owned. **#184 stays open.**
+
+## Closing addendum (2026-10-28): the bystander-eviction fix is accepted
+
+The October 2026 investigation into zero-observed reuse on this server
+ended in a fix, a release, and a measurement window; this addendum closes
+the chain with the verdict and the evidence.
+
+**Root cause.** Slot-pressure admission retires LRU radix donors
+(`Scheduler::AllocSeqSlot`); `ProcessBatch` then discarded the request's
+own prefix candidate after ANY eviction, although `Lookup` refreshes
+`last_used` on the nodes it walks — the victim is almost always an
+unrelated bystander whose eviction leaves the matched donor, its backend
+sequence, and its block references fully intact. Fixed by PR #276
+(`EvictOneSequence` reports the retired id; the candidate is discarded
+only when the matched donor itself was retired; diagnostic stages split
+`capacity_eviction_donor`/`capacity_eviction_bystander`). Shipped in
+v0.6.0 (promoted, dual-GPU gates green at `9a09cfa`, aiserver1 deployed
+from the exact tagged SHA 2026-10-27).
+
+**Evidence.**
+- Probe signature before the fix: three identical 433-token requests
+  reported `cached_tokens` 0, 0, 432 (the first repeat always fell into
+  the discard; walls 0.21–0.22 s). After: 432, 432, 432 with 0.10 s
+  walls; gpt-oss-20b: 0, 491, 491.
+- Production window (43.6 h post-deploy): organic traffic on this
+  homelab server is near-zero (15 requests total), so the ratio cannot
+  be read from organic traffic — recorded as a finding, not a gap.
+- Bounded multi-turn replay (the victor pattern: each turn re-sends the
+  full conversation; 3 conversations × 4 turns, growing 658→943-token
+  prefixes): **9 of 9 lookup hits accepted as reuse (100%), 6,777
+  tokens skipped**; every multi-turn turn reused the entire prior
+  prefix. Logs: aiserver1 `/tmp/replay_window.py` output in the closing
+  PR body.
+
+**ADR-0008 trigger verdict.** The recorded implementation trigger
+("accepted-reuse ratio < 50% of lookup hits on repeat-heavy traffic")
+**does not fire** — the measured ratio is 100%. The serialized KV tier
+stays data-gated and unimplemented; revisit only if a future workload
+shows sustained loss the fix cannot explain.
+
+**Companion hardening shipped with the window:** eviction-decision
+counters `inferflux_capacity_eviction_donor/bystander_total` (#284) make
+the discard split observable without the env-gated decision log, and the
+honest `model_in_use` unload error (#284, issue #283) removed the
+misleading 404 that originally obscured runtime model swap during the
+bake-off.
