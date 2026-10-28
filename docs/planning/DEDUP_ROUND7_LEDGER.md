@@ -53,6 +53,7 @@ gate is ≤2% on the matching headline metrics, median of 3.
 | #286 | t150 host stragglers | cublas/llama/native backends | A | 75→72 clones, 2,246→2,182 L | n/a (host-only) | n/a | standard |
 | #287 | gate hardening | ci.yml, hooks, instructions | — | n/a | n/a | n/a | standard |
 | (PR-3) | t150 dispatch tables + tile skeleton | fused_quant_gemm.cu | A + B-lite | 72→71, 2,182→2,156 L | q4k rig dp4a-mmq medians −1.05%/−1.30% | differs ~50%/34% (nvcc rescheduled through inlined helpers; parity green) | adversarial (this table + PR body) |
+| #289 | t150 mmvq epilogues + ladder | kernels/mmvq.cuh | A (device) | 71→63, 2,156→1,899 L | SASS byte-identical (3 instantiations); rig deltas within the session's contention floor (untouched mma rows drifted +3.5%) | identical (0/516, 0/644, 0/708 lines) | adversarial (PR body) |
 
 Round-7 findings feeding later phases:
 - SASS identity is NOT guaranteed by `__forceinline__` factoring alone — nvcc
