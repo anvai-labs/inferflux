@@ -1647,7 +1647,9 @@ template <typename T>
 // Forward(): byte-identical to the per-site ensure-norm lambdas, including
 // their distinct error labels.
 template <typename T>
-bool LlamaForwardTyped<T>::EnsureInputNormChecked(int layer) {
+bool LlamaForwardTyped<T>::EnsureInputNormChecked(int layer,
+                                                  const T *input_norm,
+                                                  int seq_len) {
   cudaError_t err =
       cuda_kernel::RmsNorm<T>(d_residual_, input_norm, d_norm_out_, seq_len,
                               hidden_size_, rms_norm_eps_, stream_);
@@ -1659,7 +1661,9 @@ bool LlamaForwardTyped<T>::EnsureInputNormChecked(int layer) {
   return true;
 }
 
-template <typename T> bool LlamaForwardTyped<T>::EnsurePostAttnNormChecked() {
+template <typename T>
+bool LlamaForwardTyped<T>::EnsurePostAttnNormChecked(const T *post_attn_norm,
+                                                     int seq_len) {
   cudaError_t err =
       cuda_kernel::RmsNorm<T>(d_residual_, post_attn_norm, d_norm_out_, seq_len,
                               hidden_size_, rms_norm_eps_, stream_);
@@ -1884,7 +1888,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
-                        [&]() { return EnsureInputNormChecked<T>(layer); },
+                        [&]() {
+                          return EnsureInputNormChecked<T>(layer, input_norm,
+                                                           seq_len);
+                        },
                         [&]() {
                           if constexpr (std::is_same_v<T, half>) {
                             static const bool qkv_fused_ok = [] {
@@ -1949,7 +1956,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
-                        [&]() { return EnsureInputNormChecked<T>(layer); },
+                        [&]() {
+                          return EnsureInputNormChecked<T>(layer, input_norm,
+                                                           seq_len);
+                        },
                         [&]() {
                           if (qkv_fused) {
                             return true;
@@ -1974,7 +1984,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &norm_computed,
-                        [&]() { return EnsureInputNormChecked<T>(layer); },
+                        [&]() {
+                          return EnsureInputNormChecked<T>(layer, input_norm,
+                                                           seq_len);
+                        },
                         [&]() {
                           if (qkv_fused) {
                             return true;
@@ -2358,7 +2371,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &ffn_norm_computed,
-                        [&]() { return EnsurePostAttnNormChecked<T>(); },
+                        [&]() {
+                          return EnsurePostAttnNormChecked<T>(post_attn_norm,
+                                                              seq_len);
+                        },
                         [&]() {
                           return TryQuantizedProjection(
                               pctx, gate_raw, d_norm_out_, d_ffn_gate_, seq_len,
@@ -2380,7 +2396,10 @@ bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
 
                 if (!ExecuteNativeNormalizedProjectionStage(
                         &ffn_norm_computed,
-                        [&]() { return EnsurePostAttnNormChecked<T>(); },
+                        [&]() {
+                          return EnsurePostAttnNormChecked<T>(post_attn_norm,
+                                                              seq_len);
+                        },
                         [&]() {
                           return TryQuantizedProjection(
                               pctx, up_raw, d_norm_out_, d_ffn_up_, seq_len,
