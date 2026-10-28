@@ -82,13 +82,12 @@ MmvqReduceStoreHalf(const float (&acc)[ncols], int lane, int warp_id, int tid,
 }
 
 // Bias epilogue: plain half store plus a per-output-column bias
-(nullptr = no - op)
-    .template <int ncols>
-    __device__ __forceinline__
-    void MmvqReduceStoreBias(const float (&acc)[ncols], int lane, int warp_id,
-                             int tid, int col_base, int M, int N, int out_idx,
-                             half *__restrict__ output,
-                             const half *__restrict__ bias) {
+// (nullptr = no-op).
+template <int ncols>
+__device__ __forceinline__ void
+MmvqReduceStoreBias(const float (&acc)[ncols], int lane, int warp_id, int tid,
+                    int col_base, int M, int N, int out_idx,
+                    half *__restrict__ output, const half *__restrict__ bias) {
   __shared__ float warp_sums[kMmvqWarps * ncols];
   if (lane == 0) {
 #pragma unroll
