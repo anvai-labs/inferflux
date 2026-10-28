@@ -1642,7 +1642,6 @@ static EmbedGatherPlan ResolveEmbedGather(const WeightMap *weights) {
   return plan;
 }
 
-template <typename T>
 // Checked RMS-norm steps shared by the attention/FFN stage plumbing in
 // Forward(): byte-identical to the per-site ensure-norm lambdas, including
 // their distinct error labels.
@@ -1674,6 +1673,7 @@ bool LlamaForwardTyped<T>::EnsurePostAttnNormChecked(const T *post_attn_norm,
   return true;
 }
 
+template <typename T>
 bool LlamaForwardTyped<T>::Forward(const std::vector<int> &token_ids,
                                    int n_past, int sequence_id,
                                    float *d_logits) {
