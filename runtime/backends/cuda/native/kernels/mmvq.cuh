@@ -313,7 +313,9 @@ template <int ncols, typename OutputT = half, bool UseAtomic = true,
           bool kAccum = true, bool kBias = false>
 __global__ void MmvqQ4KBody(const block_q4_k *__restrict__ weight,
                             const block_q8_1 *__restrict__ act_q8_1,
-                            OutputT *__restrict__ output, int N, int K, int M) {
+                            OutputT *__restrict__ output,
+                            const half *__restrict__ bias, int N, int K,
+                            int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
