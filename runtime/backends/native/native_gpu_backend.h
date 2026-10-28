@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -135,6 +136,13 @@ protected:
   }
 
 private:
+  // Shared single-token step of the standard (non-burst) path in Decode
+  // and Generate: builds the unified input, executes it, and returns the
+  // step result, or nullopt when the caller's loop must break (empty or
+  // failed step, or a terminal-negative token).
+  std::optional<UnifiedBatchOutput>
+  RunUnifiedTokenStep(int sequence_id, int n_past, int current_token,
+                      const SamplingParams &sampling) const;
   bool IsParityDelegateAvailable() const;
   std::shared_ptr<LlamaCppBackend> EnsureParityBackend() const;
   std::shared_ptr<BackendInterface> DelegateBackend() const;
