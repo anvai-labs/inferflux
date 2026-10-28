@@ -368,10 +368,9 @@ LaunchMMAGQAPrefill(const T *Q, const T *K, const T *V, T *O, int batch_size,
 // Dispatch a GQA ratio-parameterized launcher (8/4/2 grouped kernels).
 // Returns cudaErrorNotSupported for other ratios so each caller runs its
 // own non-GQA fallback — the same dispatch the per-site if-chains did.
-template <typename T, template <typename FnT, typename... Args>
-                      static cudaError_t DispatchGqaRatio(
-                          int gqa_ratio, FnT launch2, FnT launch4, FnT launch8,
-                          Args &&...args) {
+template <typename FnT, typename... Args>
+static cudaError_t DispatchGqaRatio(int gqa_ratio, FnT launch2, FnT launch4,
+                                    FnT launch8, Args &&...args) {
   switch (gqa_ratio) {
   case 2:
     return launch2(std::forward<Args>(args)...);
