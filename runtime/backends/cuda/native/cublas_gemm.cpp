@@ -176,17 +176,17 @@ inline bool CreateLtDescAndLayouts(cublasLtMatmulDesc_t *op,
                                    sizeof(tb));
     st = cublasLtMatrixLayoutCreate(ad, dtype, M, K, K);
     if (st == CUBLAS_STATUS_SUCCESS)
-      st = cublasLtMatrixLayoutSetAttribute(ad, CUBLASLT_MATRIX_LAYOUT_ORDER,
+      st = cublasLtMatrixLayoutSetAttribute(*ad, CUBLASLT_MATRIX_LAYOUT_ORDER,
                                             &kRowOrder, sizeof(kRowOrder));
     if (st == CUBLAS_STATUS_SUCCESS)
       st = cublasLtMatrixLayoutCreate(bd, dtype, N, K, K);
     if (st == CUBLAS_STATUS_SUCCESS)
-      st = cublasLtMatrixLayoutSetAttribute(bd, CUBLASLT_MATRIX_LAYOUT_ORDER,
+      st = cublasLtMatrixLayoutSetAttribute(*bd, CUBLASLT_MATRIX_LAYOUT_ORDER,
                                             &kRowOrder, sizeof(kRowOrder));
     if (st == CUBLAS_STATUS_SUCCESS)
       st = cublasLtMatrixLayoutCreate(dd, dtype, M, N, N);
     if (st == CUBLAS_STATUS_SUCCESS)
-      st = cublasLtMatrixLayoutSetAttribute(dd, CUBLASLT_MATRIX_LAYOUT_ORDER,
+      st = cublasLtMatrixLayoutSetAttribute(*dd, CUBLASLT_MATRIX_LAYOUT_ORDER,
                                             &kRowOrder, sizeof(kRowOrder));
   }
   return st == CUBLAS_STATUS_SUCCESS;
