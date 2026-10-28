@@ -311,11 +311,11 @@ inferflux_mmvq_q4k_accum_wide(const block_q4_k *__restrict__ weight,
 
 template <int ncols, typename OutputT = half, bool UseAtomic = true,
           bool kAccum = true, bool kBias = false>
-__global__ void MmvqQ4KBody(const block_q4_k *__restrict__ weight,
-                            const block_q8_1 *__restrict__ act_q8_1,
-                            OutputT *__restrict__ output,
-                            const half *__restrict__ bias, int N, int K,
-                            int M) {
+__device__ __forceinline__ void
+MmvqQ4KBody(const block_q4_k *__restrict__ weight,
+            const block_q8_1 *__restrict__ act_q8_1,
+            OutputT *__restrict__ output, const half *__restrict__ bias, int N,
+            int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -540,9 +540,10 @@ __global__ void inferflux_mmvq_q6k_vec(const block_q6_k *__restrict__ weight,
 // Q6_K × Q8_1 MMVQ accumulate variant (adds to existing output)
 template <int ncols, typename OutputT = half, bool UseAtomic = true,
           bool kAccum = true>
-__global__ void MmvqQ6KBody(const block_q6_k *__restrict__ weight,
-                            const block_q8_1 *__restrict__ act_q8_1,
-                            OutputT *__restrict__ output, int N, int K, int M) {
+__device__ __forceinline__ void
+MmvqQ6KBody(const block_q6_k *__restrict__ weight,
+            const block_q8_1 *__restrict__ act_q8_1,
+            OutputT *__restrict__ output, int N, int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -758,10 +759,10 @@ inferflux_mmvq_q6k_accum_vec(const block_q6_k *__restrict__ weight,
 // Q8_0 × Q8_1 MMVQ accumulate variant (adds to existing output)
 template <int ncols, typename OutputT = half, bool UseAtomic = true,
           bool kAccum = true>
-__global__ void MmvqQ8_0Body(const block_q8_0 *__restrict__ weight,
-                             const block_q8_1 *__restrict__ act_q8_1,
-                             OutputT *__restrict__ output, int N, int K,
-                             int M) {
+__device__ __forceinline__ void
+MmvqQ8_0Body(const block_q8_0 *__restrict__ weight,
+             const block_q8_1 *__restrict__ act_q8_1,
+             OutputT *__restrict__ output, int N, int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
@@ -849,9 +850,10 @@ inferflux_mmvq_q8_0_accum(const block_q8_0 *__restrict__ weight,
 // Q8_K × Q8_1 MMVQ accumulate variant (adds to existing output)
 template <int ncols, typename OutputT = half, bool UseAtomic = true,
           bool kAccum = true>
-__global__ void MmvqQ8KBody(const block_q8_k *__restrict__ weight,
-                            const block_q8_1 *__restrict__ act_q8_1,
-                            OutputT *__restrict__ output, int N, int K, int M) {
+__device__ __forceinline__ void
+MmvqQ8KBody(const block_q8_k *__restrict__ weight,
+            const block_q8_1 *__restrict__ act_q8_1,
+            OutputT *__restrict__ output, int N, int K, int M) {
   const int tid = threadIdx.x;
   const int warp_id = tid >> 5;
   const int lane = tid & 31;
