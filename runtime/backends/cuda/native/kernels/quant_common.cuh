@@ -194,10 +194,6 @@ __device__ __forceinline__ float dequant_q8k_element(const block_q8_k &b,
   return d * static_cast<float>(b.qs[e]);
 }
 
-} // namespace native
-} // namespace cuda
-} // namespace runtime
-
 //==============================================================================
 // Shared RMS + Q8_1 quantization phases (round 7)
 //
@@ -275,5 +271,9 @@ QuantQ8_1DualBlocks(const float *sx, block_q8_1 *out_row, int num_blocks,
     }
   }
 }
+
+} // namespace native
+} // namespace cuda
+} // namespace runtime
 
 } // namespace inferflux
