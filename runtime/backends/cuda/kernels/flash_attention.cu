@@ -2104,8 +2104,10 @@ cudaError_t FlashDecodeMultiSeqStrided(
                             ? (num_heads / num_kv_heads)
                             : 1;
 
-  const cudaError_t gqa_err =
-      DispatchGqaRatio<T, LaunchGQADecode>(gqa_ratio, Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale, stream, split_workspace, split_workspace_bytes, max_kv_hint);
+  const cudaError_t gqa_err = DispatchGqaRatio<T, LaunchGQADecode>(
+      gqa_ratio, Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer, batch_size,
+      num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride,
+      scale, stream, split_workspace, split_workspace_bytes, max_kv_hint);
   if (gqa_err != cudaErrorNotSupported) {
     return gqa_err;
   }
