@@ -432,8 +432,8 @@ cudaError_t FlashAttention2Typed(const T *Q, const T *K, const T *V, T *O,
   const cudaError_t gqa_err = DispatchGqaRatio(
       gqa_ratio, LaunchGQAPrefill<T, 2>, LaunchGQAPrefill<T, 4>,
       LaunchGQAPrefill<T, 8>, Q, K, V, O, batch_size, query_len, kv_len,
-      num_heads, num_kv_heads, head_dim, scale, causal,
-      stream) if (gqa_err != cudaErrorNotSupported) {
+      num_heads, num_kv_heads, head_dim, scale, causal, stream);
+  if (gqa_err != cudaErrorNotSupported) {
     return gqa_err;
   }
 
@@ -2111,7 +2111,8 @@ cudaError_t FlashDecodeMultiSeqStrided(
       LaunchGQADecode<T, 8>, Q, kv_buffer, O, d_seq_ids, d_kv_lens, layer,
       batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride,
       kv_stride, scale, stream, split_workspace, split_workspace_bytes,
-      max_kv_hint) if (gqa_err != cudaErrorNotSupported) {
+      max_kv_hint);
+  if (gqa_err != cudaErrorNotSupported) {
     return gqa_err;
   }
 
@@ -2521,7 +2522,7 @@ cudaError_t FlashDecodeMultiSeqStridedSplit(
   }
 
   const cudaError_t gqa_err =
-      DispatchGqaRatio(gqa_ratio, LaunchSplitGQADecode<T, 2>, LaunchSplitGQADecode<T, 4>, LaunchSplitGQADecode<T, 8>, Q, kv_buffer, O, partials, d_seq_ids, d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale, qsplit, chunk, ksplits, stream))
+      DispatchGqaRatio(gqa_ratio, LaunchSplitGQADecode<T, 2>, LaunchSplitGQADecode<T, 4>, LaunchSplitGQADecode<T, 8>, Q, kv_buffer, O, partials, d_seq_ids, d_kv_lens, layer, batch_size, num_heads, num_kv_heads, head_dim, slot_stride, layer_stride, kv_stride, scale, qsplit, chunk, ksplits, stream));
   if (gqa_err != cudaErrorNotSupported) {
     return gqa_err;
   }
