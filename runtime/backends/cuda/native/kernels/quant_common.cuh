@@ -80,8 +80,7 @@ template <typename BlockType, int Outputs> struct PackedProjectionGroupParams {
 
 // Extract 6-bit scale and min from Q4_K/Q5_K packed scales array.
 // Matches llama.cpp get_scale_min_k4 exactly.
-__device__ __forceinline__ void get_scale_min_k4(int j,
-                                                 const unsigned char *q,
+__device__ __forceinline__ void get_scale_min_k4(int j, const unsigned char *q,
                                                  unsigned char *d,
                                                  unsigned char *m) {
   if (j < 4) {
@@ -97,9 +96,8 @@ __device__ __forceinline__ void get_scale_min_k4(int j,
 //   sb:  sub-block index (0-7), where each sub-block has 32 elements
 //   e:   element within sub-block (0-31)
 // Returns the dequantized FP32 weight value.
-__device__ __forceinline__ float dequant_q4k_element(const block_q4_k &b,
-                                                     float d, float dmin,
-                                                     int sb, int e) {
+__device__ __forceinline__ float
+dequant_q4k_element(const block_q4_k &b, float d, float dmin, int sb, int e) {
   unsigned char sc, m;
   get_scale_min_k4(sb, b.scales, &sc, &m);
 
@@ -123,14 +121,13 @@ __device__ __forceinline__ float dequant_q4k_element(const block_q4_k &b,
 // Q5_K qh layout: qh[e] holds the high bits for element `e` across all
 // sub-blocks. Bit `sb` of qh[e] is the high bit for sub-block `sb`.
 // (Matches llama.cpp dequantize_row_q5_K which uses shifting u1/u2 masks.)
-__device__ __forceinline__ float dequant_q5k_element(const block_q5_k &b,
-                                                     float d, float dmin,
-                                                     int sb, int e) {
+__device__ __forceinline__ float
+dequant_q5k_element(const block_q5_k &b, float d, float dmin, int sb, int e) {
   unsigned char sc, m;
   get_scale_min_k4(sb, b.scales, &sc, &m);
 
-  int group = sb / 2;              // 0-3
-  int ql_base = group * 32;        // qs byte for this pair
+  int group = sb / 2;       // 0-3
+  int ql_base = group * 32; // qs byte for this pair
   unsigned char ql_byte = b.qs[ql_base + e];
   int q_low = (sb & 1) ? (ql_byte >> 4) : (ql_byte & 0x0F);
 
@@ -158,9 +155,8 @@ __device__ __forceinline__ float dequant_q5k_element(const block_q5_k &b,
 //   Sub 2: high nibble of ql[base..+31],    qh bits 4-5
 //   Sub 3: high nibble of ql[base+32..+63], qh bits 6-7
 // Matches llama.cpp dequantize_row_q6_K exactly.
-__device__ __forceinline__ float dequant_q6k_element(const block_q6_k &b,
-                                                     float d, int g, int sub,
-                                                     int e) {
+__device__ __forceinline__ float
+dequant_q6k_element(const block_q6_k &b, float d, int g, int sub, int e) {
   int ql_idx = g * 64 + ((sub & 1) ? 32 : 0) + e;
   unsigned char ql_byte = b.ql[ql_idx];
   int ql_val = (sub >= 2) ? (ql_byte >> 4) : (ql_byte & 0x0F);
@@ -201,4 +197,83 @@ __device__ __forceinline__ float dequant_q8k_element(const block_q8_k &b,
 } // namespace native
 } // namespace cuda
 } // namespace runtime
+
+//==============================================================================
+// Shared RMS + Q8_1 quantization phases (round 7)
+//
+// Factored from the byte-identical phase bodies of the fused rmsnorm-
+// quantize kernels (fused_dequant_gemv.cuh) and the finish/mixed variants
+// (fused_gemv_accum_norm_quant.cuh). Warps is the caller's warp-count
+// constant (both call sites use 8; the parameter keeps the contract
+// explicit).
+//==============================================================================
+
+// Cross-warp sum-of-squares reduction and rsqrt RMS; leaves the rms value
+// in warp_sums[0] and returns it. Contains both barriers of the original.
+template <int Warps>
+__device__ __forceinline__ float
+ComputeRmsFromWarpSums(float *warp_sums, int tid, int K, float eps) {
+  float rms;
+  if (tid == 0) {
+    float total = 0.0f;
+    for (int w = 0; w < Warps; ++w)
+      total += warp_sums[w];
+    warp_sums[0] = rsqrtf(total / static_cast<float>(K) + eps);
+  }
+  __syncthreads();
+  rms = warp_sums[0];
+}
+
+// Dual-block Q8_1 quantization loop: each warp processes block pairs with
+// warp-wide amax/sum reductions (butterfly xor) and lane-0 scale writes.
+template <int Warps>
+__device__ __forceinline__ void
+QuantQ8_1DualBlocks(const float *sx, block_q8_1 *out_row, int num_blocks,
+                    int warp_id, int lane) {
+  for (int blk0 = warp_id * 2; blk0 < num_blocks; blk0 += Warps * 2) {
+    const int blk1 = blk0 + 1;
+    const bool has_blk1 = blk1 < num_blocks;
+
+    float val0 = sx[blk0 * QK8_1 + lane];
+    float val1 = has_blk1 ? sx[blk1 * QK8_1 + lane] : 0.0f;
+
+    float amax0 = fabsf(val0);
+    float amax1 = fabsf(val1);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      amax0 = fmaxf(amax0, __shfl_xor_sync(0xFFFFFFFF, amax0, offset));
+      amax1 = fmaxf(amax1, __shfl_xor_sync(0xFFFFFFFF, amax1, offset));
+    }
+
+    float d0 = amax0 / 127.0f;
+    float inv_d0 = (amax0 > 0.0f) ? 127.0f / amax0 : 0.0f;
+    int q0 = __float2int_rn(val0 * inv_d0);
+    q0 = max(-128, min(127, q0));
+    int sum0 = q0;
+
+    float d1 = amax1 / 127.0f;
+    float inv_d1 = (amax1 > 0.0f) ? 127.0f / amax1 : 0.0f;
+    int q1 = has_blk1 ? __float2int_rn(val1 * inv_d1) : 0;
+    q1 = max(-128, min(127, q1));
+    int sum1 = q1;
+
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, offset);
+      sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, offset);
+    }
+
+    out_row[blk0].qs[lane] = static_cast<int8_t>(q0);
+    if (lane == 0) {
+      out_row[blk0].ds = __halves2half2(
+          __float2half(d0), __float2half(d0 * static_cast<float>(sum0)));
+    }
+    if (has_blk1) {
+      out_row[blk1].qs[lane] = static_cast<int8_t>(q1);
+      if (lane == 0) {
+        out_row[blk1].ds = __halves2half2(
+            __float2half(d1), __float2half(d1 * static_cast<float>(sum1)));
+      }
+    }
+  }
+}
+
 } // namespace inferflux

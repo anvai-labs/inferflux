@@ -1,6 +1,7 @@
 #pragma once
 
 #include "runtime/backends/cuda/native/kernels/dequantization.cuh"
+#include "runtime/backends/cuda/native/kernels/quant_common.cuh"
 
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -72,15 +73,8 @@ __global__ void FinishNormQuantQ8_1Kernel(
   __syncthreads();
 
   // Final reduction by thread 0
-  float rms;
-  if (tid == 0) {
-    float total = 0.0f;
-    for (int w = 0; w < kFinishNormWarps; ++w)
-      total += warp_sums[w];
-    warp_sums[0] = rsqrtf(total / static_cast<float>(K) + rms_norm_eps);
-  }
-  __syncthreads();
-  rms = warp_sums[0];
+  const float rms =
+      ComputeRmsFromWarpSums<kFinishNormWarps>(warp_sums, tid, K, rms_norm_eps);
 
   // Phase 2: Apply norm weights in-place in shared memory (FP32)
   // Also write FP16 output for downstream consumers that read FP16.
@@ -107,53 +101,7 @@ __global__ void FinishNormQuantQ8_1Kernel(
   auto *q8_out = reinterpret_cast<block_q8_1 *>(act_q8_1_out);
   block_q8_1 *out_row = q8_out + row * num_blocks;
 
-  for (int blk0 = warp_id * 2; blk0 < num_blocks;
-       blk0 += kFinishNormWarps * 2) {
-    const int blk1 = blk0 + 1;
-    const bool has_blk1 = blk1 < num_blocks;
-
-    float val0 = sx[blk0 * QK8_1 + lane];
-    float val1 = has_blk1 ? sx[blk1 * QK8_1 + lane] : 0.0f;
-
-    // Warp-level amax reduction
-    float amax0 = fabsf(val0);
-    float amax1 = fabsf(val1);
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      amax0 = fmaxf(amax0, __shfl_xor_sync(0xFFFFFFFF, amax0, offset));
-      amax1 = fmaxf(amax1, __shfl_xor_sync(0xFFFFFFFF, amax1, offset));
-    }
-
-    float d0 = amax0 / 127.0f;
-    float inv_d0 = (amax0 > 0.0f) ? 127.0f / amax0 : 0.0f;
-    int q0 = __float2int_rn(val0 * inv_d0);
-    q0 = max(-128, min(127, q0));
-    int sum0 = q0;
-
-    float d1 = amax1 / 127.0f;
-    float inv_d1 = (amax1 > 0.0f) ? 127.0f / amax1 : 0.0f;
-    int q1 = has_blk1 ? __float2int_rn(val1 * inv_d1) : 0;
-    q1 = max(-128, min(127, q1));
-    int sum1 = q1;
-
-    // Warp-level sum reduction for Q8_1 sum field
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, offset);
-      sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, offset);
-    }
-
-    out_row[blk0].qs[lane] = static_cast<int8_t>(q0);
-    if (lane == 0) {
-      out_row[blk0].ds = __halves2half2(
-          __float2half(d0), __float2half(d0 * static_cast<float>(sum0)));
-    }
-    if (has_blk1) {
-      out_row[blk1].qs[lane] = static_cast<int8_t>(q1);
-      if (lane == 0) {
-        out_row[blk1].ds = __halves2half2(
-            __float2half(d1), __float2half(d1 * static_cast<float>(sum1)));
-      }
-    }
-  }
+  QuantQ8_1DualBlocks<kFinishNormWarps>(sx, out_row, num_blocks, warp_id, lane);
 }
 
 // RmsNormMixedQuantQ8_1: identical to FinishNormQuantQ8_1 but reads an
@@ -189,15 +137,8 @@ __global__ void RmsNormMixedQuantQ8_1Kernel(
     warp_sums[warp_id] = local_sum_sq;
   __syncthreads();
 
-  float rms;
-  if (tid == 0) {
-    float total = 0.0f;
-    for (int w = 0; w < kFinishNormWarps; ++w)
-      total += warp_sums[w];
-    warp_sums[0] = rsqrtf(total / static_cast<float>(K) + rms_norm_eps);
-  }
-  __syncthreads();
-  rms = warp_sums[0];
+  const float rms =
+      ComputeRmsFromWarpSums<kFinishNormWarps>(warp_sums, tid, K, rms_norm_eps);
 
   // Phase 2: norm weights + FP16 output.
   const int K2n = K / 2;
@@ -221,62 +162,17 @@ __global__ void RmsNormMixedQuantQ8_1Kernel(
   auto *q8_out = reinterpret_cast<block_q8_1 *>(act_q8_1_out);
   block_q8_1 *out_row = q8_out + row * num_blocks;
 
-  for (int blk0 = warp_id * 2; blk0 < num_blocks;
-       blk0 += kFinishNormWarps * 2) {
-    const int blk1 = blk0 + 1;
-    const bool has_blk1 = blk1 < num_blocks;
-
-    float val0 = sx[blk0 * QK8_1 + lane];
-    float val1 = has_blk1 ? sx[blk1 * QK8_1 + lane] : 0.0f;
-
-    float amax0 = fabsf(val0);
-    float amax1 = fabsf(val1);
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      amax0 = fmaxf(amax0, __shfl_xor_sync(0xFFFFFFFF, amax0, offset));
-      amax1 = fmaxf(amax1, __shfl_xor_sync(0xFFFFFFFF, amax1, offset));
-    }
-
-    float d0 = amax0 / 127.0f;
-    float inv_d0 = (amax0 > 0.0f) ? 127.0f / amax0 : 0.0f;
-    int q0 = __float2int_rn(val0 * inv_d0);
-    q0 = max(-128, min(127, q0));
-    int sum0 = q0;
-
-    float d1 = amax1 / 127.0f;
-    float inv_d1 = (amax1 > 0.0f) ? 127.0f / amax1 : 0.0f;
-    int q1 = has_blk1 ? __float2int_rn(val1 * inv_d1) : 0;
-    q1 = max(-128, min(127, q1));
-    int sum1 = q1;
-
-    for (int offset = 16; offset > 0; offset >>= 1) {
-      sum0 += __shfl_xor_sync(0xFFFFFFFF, sum0, offset);
-      sum1 += __shfl_xor_sync(0xFFFFFFFF, sum1, offset);
-    }
-
-    out_row[blk0].qs[lane] = static_cast<int8_t>(q0);
-    if (lane == 0) {
-      out_row[blk0].ds = __halves2half2(
-          __float2half(d0), __float2half(d0 * static_cast<float>(sum0)));
-    }
-    if (has_blk1) {
-      out_row[blk1].qs[lane] = static_cast<int8_t>(q1);
-      if (lane == 0) {
-        out_row[blk1].ds = __halves2half2(
-            __float2half(d1), __float2half(d1 * static_cast<float>(sum1)));
-      }
-    }
-  }
+  QuantQ8_1DualBlocks<kFinishNormWarps>(sx, out_row, num_blocks, warp_id, lane);
 }
 
 /// Host API: FP32-residual fused RmsNorm + FP16 out + Q8_1 quantize.
 inline cudaError_t RmsNormMixedQuantQ8_1(const float *residual,
                                          const half *norm_weight,
-                                         half *norm_output,
-                                         void *act_q8_1_out, int M, int K,
-                                         float rms_norm_eps,
+                                         half *norm_output, void *act_q8_1_out,
+                                         int M, int K, float rms_norm_eps,
                                          cudaStream_t stream = 0) {
-  const size_t smem = static_cast<size_t>(K) * sizeof(float) +
-                      kFinishNormWarps * sizeof(float);
+  const size_t smem =
+      static_cast<size_t>(K) * sizeof(float) + kFinishNormWarps * sizeof(float);
   RmsNormMixedQuantQ8_1Kernel<<<M, kFinishNormThreads, smem, stream>>>(
       residual, norm_weight, norm_output, act_q8_1_out, M, K, rms_norm_eps);
   return cudaGetLastError();
@@ -287,13 +183,11 @@ inline cudaError_t RmsNormMixedQuantQ8_1(const float *residual,
 /// matching the production fused_rmsnorm_quantize_q8_1_kernel.
 inline cudaError_t FinishNormQuantQ8_1(const half *residual,
                                        const half *norm_weight,
-                                       half *norm_output,
-                                       void *act_q8_1_out, int M, int K,
-                                       float rms_norm_eps,
+                                       half *norm_output, void *act_q8_1_out,
+                                       int M, int K, float rms_norm_eps,
                                        cudaStream_t stream) {
   const int threads = kFinishNormThreads;
-  const int smem =
-      static_cast<int>((K + kFinishNormWarps) * sizeof(float));
+  const int smem = static_cast<int>((K + kFinishNormWarps) * sizeof(float));
 
   FinishNormQuantQ8_1Kernel<<<M, threads, smem, stream>>>(
       residual, norm_weight, norm_output, act_q8_1_out, M, K, rms_norm_eps);
