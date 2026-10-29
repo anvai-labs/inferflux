@@ -136,7 +136,15 @@ Without that environment variable its two cases are skipped. This test checks
 idle unload and the speculative-owner refusal in separate disposable servers;
 it does not qualify GPU memory release or service restoration.
 
-### 6.3 Routing policy
+### 6.3 Model swapping
+
+For a deliberate lineup change (exchanging the default model), use the
+config-variant + restart path — the lifecycle API's retired-id rule ends
+an A→B→A swap at a restart anyway. Measured evidence, the swap config
+shape, and a workload-grounded recommendation live in
+[MODEL_SWAP.md](MODEL_SWAP.md).
+
+### 6.4 Routing policy
 
 ```bash
 ./build/inferctl admin routing --get --api-key <ADMIN_KEY>
@@ -147,7 +155,7 @@ it does not qualify GPU memory release or service restoration.
   --api-key <ADMIN_KEY>
 ```
 
-### 6.4 API key rotation
+### 6.5 API key rotation
 
 ```bash
 ./build/inferctl admin api-keys --add new-key-001 --scopes generate,read,admin --api-key <ADMIN_KEY>
