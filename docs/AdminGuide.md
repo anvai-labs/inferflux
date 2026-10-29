@@ -117,6 +117,25 @@ curl -s http://127.0.0.1:8080/healthz
 ./build/inferctl admin models --unload model-a --api-key <ADMIN_KEY>
 ```
 
+An idle config-loaded default model can be unloaded without restarting the
+server; the router chooses another registered model as the default. Startup
+references are released once initialization finishes. Actual serving leases,
+including an enabled speculative decoder's draft-model reference, still block
+unload with HTTP 409. Stop dependent work before attempting that transition.
+An unloaded model ID remains retired for the lifetime of the process; this
+change does not enable reloading the same ID without a restart.
+
+The real CPU-model regression is opt-in and requires an existing small GGUF:
+
+```bash
+INFERFLUX_LIFECYCLE_MODEL_PATH=/abs/path/small.gguf \
+  ctest --test-dir build -R '^StartupModelUnloadTests$' -V
+```
+
+Without that environment variable its two cases are skipped. This test checks
+idle unload and the speculative-owner refusal in separate disposable servers;
+it does not qualify GPU memory release or service restoration.
+
 ### 6.3 Routing policy
 
 ```bash

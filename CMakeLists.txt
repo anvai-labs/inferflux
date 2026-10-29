@@ -1233,6 +1233,11 @@ endif()
 if(Python3_Interpreter_FOUND)
   add_test(NAME ModelLoadSpecStartupTests
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/model_load_spec_startup_test.py $<TARGET_FILE:inferfluxd>)
+  add_test(NAME StartupModelUnloadTests
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/startup_model_unload_test.py)
+  set_tests_properties(StartupModelUnloadTests PROPERTIES
+    ENVIRONMENT "INFERFLUX_SERVER_BIN=$<TARGET_FILE:inferfluxd>"
+    TIMEOUT 120 LABELS "model_registry;integration")
   add_test(NAME DualGpuAcceptanceContractTests
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/integration/dual_gpu_acceptance_test.py)
 

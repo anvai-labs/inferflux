@@ -1610,6 +1610,11 @@ int main(int argc, char **argv) {
     speculative_decoder = std::make_shared<inferflux::SpeculativeDecoder>(
         spec_config, device, &tokenizer, draft_backend);
   }
+  // Startup aliases are not serving leases. Keeping them until main() exits
+  // makes the default model appear permanently busy to UnloadModel(). An
+  // enabled speculative decoder retains its own intentional backend lease.
+  draft_backend.reset();
+  llama_backend.reset();
 
   // Build ModelRouter (SingleModelRouter is the default; future multi-model
   // routers can be substituted here without touching Scheduler or HttpServer).
