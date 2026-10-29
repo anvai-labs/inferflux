@@ -218,6 +218,7 @@ ComputeRmsFromWarpSums(float *warp_sums, int tid, int K, float eps) {
   }
   __syncthreads();
   rms = warp_sums[0];
+  return rms;
 }
 
 // Dual-block Q8_1 quantization loop: each warp processes block pairs with
